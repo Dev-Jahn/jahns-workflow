@@ -1,0 +1,25 @@
+---
+name: status
+description: This skill should be used when the user runs "/jahns-workflow:status", asks "what's the status across my projects", "show the project dashboard", "which tasks are active/blocked", or wants a cross-project overview of branches, rounds, and task progress.
+argument-hint: "[project-name] (optional filter)"
+allowed-tools: ["Bash", "Read"]
+---
+
+# jahns-workflow: status
+
+Show the cross-project dashboard. Zero-LLM rendering: run the script, relay its output.
+
+Plugin root = two directories above this skill's base directory.
+
+```bash
+uv run <plugin-root>/scripts/jw_dashboard.py            # all registered projects
+uv run <plugin-root>/scripts/jw_dashboard.py --project <name>
+```
+
+Relay the output verbatim in a code block (it is pre-formatted). Add at most 1–3 sentences
+in the user's configured language only when something needs flagging: blocked tasks whose
+dependencies are all done (stale `blocked` status), projects with `✗ path missing`, or
+pending `decision/...` tasks awaiting the user. Otherwise add nothing.
+
+Projects appear here after `/jahns-workflow:init` registers them. Each project's visual
+dependency graph is its `ROADMAP.md` (rendered by GitHub as Mermaid).

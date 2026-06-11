@@ -1,0 +1,29 @@
+{
+  "description": "jahns-workflow: inject project digest+active tasks at session start/compaction; validate tasks.yaml and regenerate ROADMAP.md on edit. Both hooks no-op fast (<10ms) in projects without .jahns-workflow.yml.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/scripts/session_context.sh",
+            "timeout": 20
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/scripts/tasks_guard.sh",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
