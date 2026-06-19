@@ -103,12 +103,16 @@ def set_config_scalar(text: str, key: str, value: str, section: str | None = Non
             break
     if start is None:
         raise KeyError(f"config section not found: {section}")
+    child_indent = sec_indent + 2  # only a DIRECT child of the section, never a deeper nested key
     for j in range(start + 1, len(lines)):
         ln = lines[j]
         if not ln.strip():
             continue
-        if len(ln) - len(ln.lstrip()) <= sec_indent:
+        cur = len(ln) - len(ln.lstrip())
+        if cur <= sec_indent:
             break  # dedented out of the section
+        if cur != child_indent:
+            continue  # nested deeper than a direct child — skip
         m = key_re.match(ln)
         if m:
             return replace_at(j, m.group(1))
@@ -147,15 +151,19 @@ def close(root: Path, round_id: str, done: list[str], touched: list[str], commit
               "add it (under `state:`) before closing rounds.", file=sys.stderr)
         return 1
 
-    text = tasks_path.read_text(encoding="utf-8")
+    orig_tasks_text = tasks_path.read_text(encoding="utf-8")
+    text = orig_tasks_text
     data0 = yaml.safe_load(text) or {}
     by_id = {t.get("id"): t for t in data0.get("tasks", []) if isinstance(t, dict)}
-    # done tasks must have all deps done (a gate can't be done while a dep isn't)
+    # done tasks must have all deps done — evaluated against the FINAL state (a dependency closed
+    # in the SAME round counts), so closing a dependency and its dependent together is allowed.
+    final_done = {tid for tid, t in by_id.items() if t.get("status") == "done"} | set(done)
     dep_problems = []
     for tid in done:
         for dep in (by_id.get(tid, {}).get("deps") or []):
-            if by_id.get(dep, {}).get("status") != "done":
-                dep_problems.append(f"{tid} cannot be done — dependency {dep} is not done")
+            if dep not in final_done:
+                dep_problems.append(f"{tid} cannot be done — dependency {dep} is not done "
+                                    f"(and is not being closed in this round)")
     if dep_problems:
         for p in dep_problems:
             print(f"jw_round close: {p}", file=sys.stderr)
@@ -188,14 +196,30 @@ def close(root: Path, round_id: str, done: list[str], touched: list[str], commit
             dels = sum(int(p.split("\t")[1]) for p in stat.splitlines() if p.split("\t")[1].isdigit())
             churn = adds + dels
 
-    # --- commit phase (all preflight checks passed) ---
-    tasks_path.write_text(text, encoding="utf-8")
-    cfg_path.write_text(ctext_new, encoding="utf-8")
-    (root / "ROADMAP.md").write_text(jw_roadmap.render(root), encoding="utf-8")
-    if cfg.get("ssot"):
-        import jw_ssot
-        jw_ssot.split(root)
-        jw_ssot.digest(root)
+    # --- commit phase (all preflight checks passed): write with rollback ---
+    # ROADMAP.render reads tasks.yaml from disk, so the new registry must be written first; if any
+    # later step raises, restore the primary mutated files (tasks.yaml, cfg, ROADMAP) so a normal
+    # exception leaves the original state. (SSOT views are a pure projection of the unchanged SSOT
+    # source — any partial regen is idempotently rebuilt next close/audit.)
+    roadmap_path = root / "ROADMAP.md"
+    orig_roadmap = roadmap_path.read_text(encoding="utf-8") if roadmap_path.exists() else None
+    try:
+        tasks_path.write_text(text, encoding="utf-8")
+        cfg_path.write_text(ctext_new, encoding="utf-8")
+        roadmap_path.write_text(jw_roadmap.render(root), encoding="utf-8")
+        if cfg.get("ssot"):
+            import jw_ssot
+            jw_ssot.split(root)
+            jw_ssot.digest(root)
+    except Exception as e:  # noqa: BLE001 — any failure must roll the primary files back
+        tasks_path.write_text(orig_tasks_text, encoding="utf-8")
+        cfg_path.write_text(ctext, encoding="utf-8")
+        if orig_roadmap is None:
+            roadmap_path.unlink(missing_ok=True)
+        else:
+            roadmap_path.write_text(orig_roadmap, encoding="utf-8")
+        print(f"jw_round close: closeout failed mid-write and was rolled back — {e}", file=sys.stderr)
+        return 1
 
     print(f"round {round_id} closed: {len(done)} done, {len(set(done + touched))} stamped; "
           f"watermark set @ {full[:12]}")

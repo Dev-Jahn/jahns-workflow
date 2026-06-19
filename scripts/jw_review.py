@@ -8,10 +8,14 @@
 A review means "reviewer R examined tree SHA X". That fact is stored as machine-readable
 markers in PR comments (GitHub is the canonical event store), never inferred from filenames.
 Identity of a review is (reviewer, review_cycle, reviewed_sha). A marker is only believed if
-its provenance binds: the result's reviewer is a configured reviewer, its cycle is the latest
-cycle, its reviewed_sha is the current head, its verdict is merge-compatible, and it carries no
-unresolved decision; an approval must be authored by a trusted approver and bound to the head.
-Markers quoted inside fenced code blocks are ignored.
+its provenance binds on TWO axes: the logical reviewer it claims AND the GitHub actor who
+posted it. A result must come from a trusted operator (`_author` ∈ review.operators ∪ owner),
+name a configured reviewer, be the latest cycle, at the current head, with a merge-compatible
+verdict and no unresolved decision. Findings/freeze markers are likewise only believed from a
+trusted operator; an approval only from a trusted approver whose claimed `by` equals who posted
+it. Codex is bound differently: a formal Codex review whose `commit_id` equals the head, or the
+SHA the Codex bot names in its own review comment (timing is irrelevant once the tree is pinned).
+Markers in fenced code blocks are ignored.
 
 Markers (HTML comments embedded in PR comment bodies):
   jw-review-cycle  : a freeze — {round_id, cycle, target_sha, reviewers}
@@ -37,7 +41,15 @@ import yaml  # noqa: E402
 
 from jw_common import find_project_root, git_full_sha, load_config  # noqa: E402
 
-CODEX_BOT = "chatgpt-codex-connector[bot]"
+CODEX_BOT = "chatgpt-codex-connector[bot]"  # REST `user.login` form
+
+
+def is_codex(login: str | None) -> bool:
+    """Codex bot author match, robust to the `[bot]` suffix: GraphQL (`gh pr view`) drops it
+    (`chatgpt-codex-connector`), REST keeps it (`chatgpt-codex-connector[bot]`)."""
+    return (login or "").removesuffix("[bot]") == "chatgpt-codex-connector"
+
+
 MARKER_RE = re.compile(r"<!--\s*jw-([a-z-]+):v1\s*\n(.*?)\n\s*-->", re.DOTALL)
 FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
 MERGE_OK_VERDICTS = {"shipped", "shipped-with-risk", "approved", "approve", "lgtm"}
@@ -85,8 +97,12 @@ def parse_bodies(bodies: list[dict]) -> list[dict]:
     return out
 
 
-def latest_cycle(markers: list[dict]) -> dict | None:
-    cycles = [m for m in markers if m.get("_kind") == "review-cycle" and isinstance(m.get("cycle"), int)]
+def latest_cycle(markers: list[dict], operators: tuple = ()) -> dict | None:
+    """The freeze marker with the highest cycle number. When `operators` is given, only freeze
+    markers POSTED by a trusted operator count — an untrusted actor can't inject a higher cycle
+    to hijack the frozen target."""
+    cycles = [m for m in markers if m.get("_kind") == "review-cycle" and isinstance(m.get("cycle"), int)
+              and (not operators or m.get("_author") in operators)]
     return max(cycles, key=lambda m: m["cycle"]) if cycles else None
 
 
@@ -95,17 +111,31 @@ def next_cycle_number(markers: list[dict]) -> int:
     return (lc["cycle"] + 1) if lc else 1
 
 
-def classify(markers: list[dict], current_head: str,
-             macro_reviewers: tuple = (), approvers: tuple = ()) -> dict:
-    """Strict, provenance-bound classification of PR review state vs the current head."""
-    lc = latest_cycle(markers)
+def classify(markers: list[dict], current_head: str, macro_reviewers: tuple = (),
+             approvers: tuple = (), operators: tuple = ()) -> dict:
+    """Strict, provenance-bound classification of PR review state vs the current head.
+
+    A marker's GitHub author (`_author`, the actor who posted it) is a separate provenance from
+    the logical `reviewer`/`by` it claims. When `operators`/`approvers` are given, cycle/result/
+    findings markers are only believed from a trusted operator, and an approval only from a
+    trusted approver whose `by` matches who actually posted it. Conflicting freeze markers for
+    the latest cycle (same number, different target) fail closed (cycle treated as not fresh)."""
+    trusted_cycles = [m for m in markers if m.get("_kind") == "review-cycle"
+                      and isinstance(m.get("cycle"), int)
+                      and (not operators or m.get("_author") in operators)]
+    lc = max(trusted_cycles, key=lambda m: m["cycle"]) if trusted_cycles else None
     cyc = lc["cycle"] if lc else None
     frozen = (lc or {}).get("target_sha")
-    head_matches = bool(lc) and str(frozen) == current_head
+    # two operator freeze markers for the SAME latest cycle but different SHA → ambiguous, block
+    conflict = lc is not None and any(
+        m is not lc and m["cycle"] == cyc and str(m.get("target_sha")) != str(frozen)
+        for m in trusted_cycles)
+    head_matches = bool(lc) and not conflict and str(frozen) == current_head
 
     def result_ok(r: dict) -> bool:
         return (str(r.get("reviewed_sha")) == current_head
                 and r.get("review_cycle") == cyc
+                and (not operators or r.get("_author") in operators)
                 and (not macro_reviewers or r.get("reviewer") in macro_reviewers)
                 and str(r.get("verdict", "")).lower() in MERGE_OK_VERDICTS
                 and not r.get("decision_required"))
@@ -114,19 +144,26 @@ def classify(markers: list[dict], current_head: str,
         author = a.get("_author", "")
         return (str(a.get("sha")) == current_head
                 and bool(author) and not author.endswith("[bot]")
-                and (not approvers or author in approvers))
+                and (not approvers or author in approvers)
+                and str(a.get("by", "")) == author)  # claimed approver must equal who posted it
 
     results = [m for m in markers if m.get("_kind") == "review-result"]
     approvals = [m for m in markers if m.get("_kind") == "approval"]
-    findings = [m for m in markers if m.get("_kind") == "findings"]
+    # findings: only this cycle, only from trusted operators, and the LATEST such state must be
+    # resolved (a later re-adjudication 'resolved: false' must re-block, not be masked by an
+    # earlier 'resolved: true').
+    cyc_findings = [m for m in markers if m.get("_kind") == "findings" and m.get("cycle") == cyc
+                    and (not operators or m.get("_author") in operators)]
+    latest_finding = max(cyc_findings, key=lambda f: f.get("_at") or "") if cyc_findings else None
     return {
         "current_head": current_head,
         "latest_cycle": cyc,
         "frozen_sha": frozen,
+        "cycle_conflict": conflict,
         "cycle_fresh": head_matches,
         "pro_result_at_head": any(result_ok(r) for r in results),
         "approved_at_head": any(approval_ok(a) for a in approvals),
-        "findings_resolved": any(f.get("cycle") == cyc and f.get("resolved") is True for f in findings),
+        "findings_resolved": bool(latest_finding) and latest_finding.get("resolved") is True,
         "n_results": len(results),
         "n_approvals": len(approvals),
     }
@@ -148,8 +185,10 @@ def resolve_repo(root: Path) -> str | None:
 
 def file_at_ref(root: Path, repo: str, path: str, ref: str) -> str | None:
     """Read a file's contents from the PR head SHA on GitHub (decouples the gate from the local
-    checkout, which may be a different/dirty tree)."""
-    rc, out = _gh(root, "api", f"repos/{repo}/contents/{path}", "-f", f"ref={ref}", "-q", ".content")
+    checkout, which may be a different/dirty tree). `--method GET` is mandatory: a bare `-f`
+    flips `gh api` to POST, which the read-only contents endpoint rejects (404)."""
+    rc, out = _gh(root, "api", "--method", "GET", f"repos/{repo}/contents/{path}",
+                  "-f", f"ref={ref}", "-q", ".content")
     if rc != 0 or not out:
         return None
     try:
@@ -158,9 +197,25 @@ def file_at_ref(root: Path, repo: str, path: str, ref: str) -> str | None:
         return None
 
 
-def pr_bundle(root: Path, pr: int) -> dict | None:
+def rest_reviews(root: Path, repo: str, pr: int) -> list[dict]:
+    """Formal PR reviews via REST — the only source that carries `commit_id`, the SHA a review
+    was submitted against (`gh pr view --json reviews` omits it). Empty on any failure."""
+    rc, out = _gh(root, "api", "--method", "GET", f"repos/{repo}/pulls/{pr}/reviews", "--paginate")
+    if rc != 0 or not out:
+        return []
+    try:
+        arr = json.loads(out)
+    except json.JSONDecodeError:
+        return []
+    return [{"author": (r.get("user") or {}).get("login", ""), "body": r.get("body", ""),
+             "state": r.get("state", ""), "commit_id": r.get("commit_id", ""),
+             "at": r.get("submitted_at", "")}
+            for r in arr if isinstance(r, dict)]
+
+
+def pr_bundle(root: Path, pr: int, repo: str | None = None) -> dict | None:
     rc, out = _gh(root, "pr", "view", str(pr), "--json",
-                  "headRefOid,comments,reviews,statusCheckRollup,mergeStateStatus,state,isDraft,baseRefName,headRefName")
+                  "headRefOid,comments,statusCheckRollup,mergeStateStatus,state,isDraft,baseRefName,headRefName")
     if rc != 0:
         print(f"jw_review: gh pr view {pr} failed: {out}", file=sys.stderr)
         return None
@@ -169,23 +224,38 @@ def pr_bundle(root: Path, pr: int) -> dict | None:
     for c in j.get("comments", []):
         bodies.append({"body": c.get("body", ""), "author": (c.get("author") or {}).get("login", ""),
                        "at": c.get("createdAt", "")})
-    for r in j.get("reviews", []):
-        bodies.append({"body": r.get("body", ""), "author": (r.get("author") or {}).get("login", ""),
-                       "at": r.get("submittedAt", ""), "state": r.get("state", "")})
+    if repo is None:
+        repo = resolve_repo(root)
+    reviews = rest_reviews(root, repo, pr) if repo else []
+    # a marker could also live in a formal review body — parse those too (operator-author
+    # filtering still gates whether they're believed)
+    for r in reviews:
+        bodies.append({"body": r["body"], "author": r["author"], "at": r["at"], "state": r["state"]})
     return {
-        "head": j.get("headRefOid", ""), "bodies": bodies,
+        "head": j.get("headRefOid", ""), "bodies": bodies, "reviews": reviews,
         "checks": j.get("statusCheckRollup", []) or [],
         "merge_state": j.get("mergeStateStatus", ""), "state": j.get("state", ""),
         "is_draft": bool(j.get("isDraft")), "base": j.get("baseRefName", ""), "head_ref": j.get("headRefName", ""),
     }
 
 
-def codex_fresh(bundle: dict, since_at: str | None) -> bool:
-    """A Codex bot REVIEW (not just any comment) submitted at-or-after the latest freeze."""
-    for b in bundle["bodies"]:
-        if b["author"] == CODEX_BOT and "state" in b and (since_at is None or (b.get("at") or "") >= since_at):
-            return True
-    return False
+def codex_fresh(reviews: list[dict], comment_bodies: list[dict], target_sha: str | None) -> bool:
+    """Codex reviewed the EXACT target tree. Two GitHub recordings count, both SHA-bound:
+      (1) a formal Codex review whose `commit_id == target_sha`, or
+      (2) a Codex-bot COMMENT naming the target's short SHA — the connector's normal no-issue
+          path posts a comment ("Reviewed commit: <short-sha>"), not a formal review object.
+    Only the GitHub-verified Codex bot login is trusted (un-spoofable), and the comment must name
+    THIS head, so a stale review of an old head never counts. Fail-closed: a bare 👍 reaction
+    (which can't be bound to a SHA) does not count — re-request a textual `@codex review`."""
+    if not target_sha:
+        return False
+    if any(is_codex(r.get("author")) and r.get("commit_id") == target_sha
+           and r.get("state") in ("APPROVED", "COMMENTED", "CHANGES_REQUESTED")
+           for r in reviews):
+        return True
+    short = target_sha[:10]
+    return any(is_codex(b.get("author")) and short in (b.get("body") or "")
+               for b in comment_bodies)
 
 
 def ci_state(bundle: dict) -> str:
@@ -203,7 +273,7 @@ def ci_state(bundle: dict) -> str:
 
 
 def pr_facts(root: Path, pr: int, cfg: dict, repo: str | None) -> dict | None:
-    bundle = pr_bundle(root, pr)
+    bundle = pr_bundle(root, pr, repo)
     if bundle is None:
         return None
     return facts_from_bundle(bundle, cfg, repo)
@@ -212,17 +282,13 @@ def pr_facts(root: Path, pr: int, cfg: dict, repo: str | None) -> dict | None:
 def facts_from_bundle(bundle: dict, cfg: dict, repo: str | None) -> dict:
     owner = (repo.split("/", 1)[0] if repo else "")
     approvers = tuple({owner, *cfg["review"].get("approvers", [])} - {""})
+    operators = tuple({owner, *cfg["review"].get("operators", [])} - {""})
     macro = tuple(r for r in cfg["review"]["reviewers"] if r != "codex")
     markers = parse_bodies(bundle["bodies"])
-    cls = classify(markers, bundle["head"], macro_reviewers=macro, approvers=approvers)
-    lc = latest_cycle(markers)
-    freeze_at = None
-    if lc:
-        for b in bundle["bodies"]:
-            if f"cycle: {lc['cycle']}" in b["body"] and "jw-review-cycle:v1" in b["body"]:
-                freeze_at = b.get("at")
-                break
-    cls["codex_fresh"] = codex_fresh(bundle, freeze_at)
+    cls = classify(markers, bundle["head"], macro_reviewers=macro, approvers=approvers, operators=operators)
+    # Codex must have a SHA-bound signal at the exact head we'd merge — a formal review
+    # (commit_id) or its no-issue comment naming the head.
+    cls["codex_fresh"] = codex_fresh(bundle.get("reviews", []), bundle.get("bodies", []), bundle["head"])
     cls["ci"] = ci_state(bundle)
     cls["pr_state"] = bundle["state"]
     cls["is_draft"] = bundle["is_draft"]

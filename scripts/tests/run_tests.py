@@ -26,6 +26,7 @@ import jw_lanes  # noqa: E402
 import jw_merge  # noqa: E402
 import jw_review  # noqa: E402
 import jw_round  # noqa: E402
+import jw_validate  # noqa: E402
 
 
 def git(root, *args):
@@ -130,6 +131,115 @@ class MarkerTests(unittest.TestCase):
         self.assertEqual(jw_review.ci_state({"checks": [{"conclusion": "SUCCESS"}]}), "passing")
         self.assertEqual(jw_review.ci_state({"checks": [{"conclusion": "PENDING"}]}), "pending")
 
+    def _op_bodies(self, head, *, result_author="owner", findings_author="owner",
+                   cycle_author="owner", reviewer="gpt-5.5-pro", cycle=1, verdict="shipped",
+                   approver="owner", resolved=True):
+        """Bodies where the GitHub author (who POSTED) is distinct from the logical reviewer id —
+        the realistic PR-mode case (a human operator posts the macro reviewer's reply)."""
+        return [
+            {"body": jw_review.emit_marker("review-cycle", {"cycle": 1, "target_sha": head}), "author": cycle_author},
+            {"body": jw_review.emit_marker("review-result", {"reviewer": reviewer, "review_cycle": cycle,
+                "reviewed_sha": head, "verdict": verdict, "decision_required": []}), "author": result_author},
+            {"body": jw_review.emit_marker("approval", {"sha": head, "by": approver}), "author": approver},
+            {"body": jw_review.emit_marker("findings", {"cycle": 1, "resolved": resolved}), "author": findings_author},
+        ]
+
+    def test_classify_operator_provenance(self):
+        head = "e" * 40
+        ops, mr, ap = ("owner",), ("gpt-5.5-pro",), ("owner",)
+        c = jw_review.classify(jw_review.parse_bodies(self._op_bodies(head)), head,
+                               macro_reviewers=mr, approvers=ap, operators=ops)
+        self.assertTrue(c["pro_result_at_head"])
+        self.assertTrue(c["findings_resolved"])
+        self.assertTrue(c["cycle_fresh"])
+        # a non-operator forging the macro result (still claiming reviewer gpt-5.5-pro) is ignored
+        c = jw_review.classify(jw_review.parse_bodies(self._op_bodies(head, result_author="attacker")),
+                               head, macro_reviewers=mr, approvers=ap, operators=ops)
+        self.assertFalse(c["pro_result_at_head"])
+        # a non-operator forging findings-resolved is ignored
+        c = jw_review.classify(jw_review.parse_bodies(self._op_bodies(head, findings_author="attacker")),
+                               head, macro_reviewers=mr, approvers=ap, operators=ops)
+        self.assertFalse(c["findings_resolved"])
+        # a non-operator can't hijack the latest cycle with a higher-numbered freeze
+        bodies = self._op_bodies(head)
+        bodies.append({"body": jw_review.emit_marker("review-cycle", {"cycle": 9, "target_sha": "f" * 40}),
+                       "author": "attacker"})
+        c = jw_review.classify(jw_review.parse_bodies(bodies), head, macro_reviewers=mr, approvers=ap, operators=ops)
+        self.assertEqual(c["latest_cycle"], 1)
+        self.assertTrue(c["cycle_fresh"])
+
+    def test_approval_by_must_match_author(self):
+        head = "e" * 40
+        # an approval whose claimed `by` differs from who actually posted it is rejected
+        bodies = [{"body": jw_review.emit_marker("review-cycle", {"cycle": 1, "target_sha": head}), "author": "owner"},
+                  {"body": jw_review.emit_marker("approval", {"sha": head, "by": "owner"}), "author": "impersonator"}]
+        c = jw_review.classify(jw_review.parse_bodies(bodies), head, approvers=("owner", "impersonator"))
+        self.assertFalse(c["approved_at_head"])
+
+    def test_cycle_conflict_fails_closed(self):
+        head = "e" * 40
+        # two operator freeze markers for the same latest cycle, different SHA → not fresh
+        bodies = [
+            {"body": jw_review.emit_marker("review-cycle", {"cycle": 2, "target_sha": head}), "author": "owner"},
+            {"body": jw_review.emit_marker("review-cycle", {"cycle": 2, "target_sha": "f" * 40}), "author": "owner"},
+        ]
+        c = jw_review.classify(jw_review.parse_bodies(bodies), head, operators=("owner",))
+        self.assertTrue(c["cycle_conflict"])
+        self.assertFalse(c["cycle_fresh"])
+
+    def test_findings_latest_trusted_state_reblocks(self):
+        head = "e" * 40
+        # an earlier resolved:true followed by a later resolved:false must re-block
+        bodies = [
+            {"body": jw_review.emit_marker("review-cycle", {"cycle": 1, "target_sha": head}), "author": "owner"},
+            {"body": jw_review.emit_marker("findings", {"cycle": 1, "resolved": True}), "author": "owner", "at": "2026-06-19T01:00:00Z"},
+            {"body": jw_review.emit_marker("findings", {"cycle": 1, "resolved": False}), "author": "owner", "at": "2026-06-19T02:00:00Z"},
+        ]
+        c = jw_review.classify(jw_review.parse_bodies(bodies), head, operators=("owner",))
+        self.assertFalse(c["findings_resolved"])
+
+    def test_codex_fresh_commit_binding(self):
+        head = "a" * 40
+        # (1) formal review whose commit_id == head
+        self.assertTrue(jw_review.codex_fresh(
+            [{"author": jw_review.CODEX_BOT, "commit_id": head, "state": "COMMENTED"}], [], head))
+        # a review of a DIFFERENT commit does not count for this head
+        self.assertFalse(jw_review.codex_fresh(
+            [{"author": jw_review.CODEX_BOT, "commit_id": "b" * 40, "state": "COMMENTED"}], [], head))
+        # a non-codex author does not count (formal-review path)
+        self.assertFalse(jw_review.codex_fresh(
+            [{"author": "someone", "commit_id": head, "state": "APPROVED"}], [], head))
+        # (2) the connector's no-issue COMMENT naming the head short-SHA counts (real codex path).
+        # GraphQL (gh pr view) drops the [bot] suffix — must still match.
+        comment = {"author": "chatgpt-codex-connector", "body": f"Codex Review: no issues.\nReviewed commit: `{head[:10]}`"}
+        self.assertTrue(jw_review.codex_fresh([], [comment], head))
+        # a codex comment naming a DIFFERENT (old) head does not count
+        stale = {"author": jw_review.CODEX_BOT, "body": "Reviewed commit: `" + ("b" * 10) + "`"}
+        self.assertFalse(jw_review.codex_fresh([], [stale], head))
+        # a non-codex commenter naming the head can't forge it (login is GitHub-verified)
+        forged = {"author": "attacker", "body": f"Reviewed commit: `{head[:10]}`"}
+        self.assertFalse(jw_review.codex_fresh([], [forged], head))
+        # nothing at all (bare 👍 reaction) → fail-closed
+        self.assertFalse(jw_review.codex_fresh([], [], head))
+
+    def test_file_at_ref_uses_explicit_get(self):
+        import base64 as _b64
+        captured = {}
+
+        def fake_gh(root, *args):
+            captured["args"] = args
+            return (0, _b64.b64encode(b"hello: world\n").decode())
+
+        orig = jw_review._gh
+        jw_review._gh = fake_gh
+        try:
+            out = jw_review.file_at_ref(Path("/x"), "o/r", "tasks.yaml", "sha123")
+        finally:
+            jw_review._gh = orig
+        self.assertEqual(out, "hello: world\n")
+        self.assertIn("--method", captured["args"])
+        self.assertEqual(captured["args"][captured["args"].index("--method") + 1], "GET")
+
 
 PASS = dict(cycle_fresh=True, require_ci=True, ci="passing", want_codex=True, codex_fresh=True,
             findings_resolved=True, want_pro=True, pro_result_at_head=True, open_blockers=[],
@@ -210,6 +320,13 @@ class TasksGateTests(unittest.TestCase):
         self.assertEqual(c["open_blockers"], ["fix/a"])
         self.assertEqual(c["open_decisions"], ["decision/c"])
 
+    def test_defensive_on_malformed(self):
+        # a non-list `tasks` must not crash and must not silently report zero open items as valid
+        for bad in ({"tasks": "not-a-list"}, {"tasks": 5}, "garbage", None):
+            self.assertEqual(jw_merge.tasks_gate_counts(bad), {"open_blockers": [], "open_decisions": []}, bad)
+        # such a registry also fails schema validation (the gate's head_read_ok hook)
+        self.assertTrue(jw_validate.validate({"version": 1, "project": "x", "tasks": "not-a-list"}))
+
 
 class RemoteTests(unittest.TestCase):
     def test_pushed_vs_unpushed(self):
@@ -275,6 +392,15 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._cfg("version: 1\nproject: x\nreview:\n  mode: bogus\n")
 
+    def test_operators_default_and_parse(self):
+        self.assertEqual(self._cfg("version: 1\nproject: x\n")["review"]["operators"], [])
+        cfg = self._cfg("version: 1\nproject: x\nreview:\n  mode: pr\n  operators: [alice, bob]\n")
+        self.assertEqual(cfg["review"]["operators"], ["alice", "bob"])
+
+    def test_operators_must_be_list(self):
+        with self.assertRaises(ValueError):
+            self._cfg("version: 1\nproject: x\nreview:\n  operators: notalist\n")
+
 
 TASKS_FIXTURE = """# registry — comments must be preserved
 version: 1
@@ -322,6 +448,13 @@ class TextSurgeryTests(unittest.TestCase):
         self.assertIn("  last_audit_commit: null", out)  # sibling preserved
         with self.assertRaises(KeyError):
             jw_round.set_config_scalar(cfg, "nonexistent_key", "v")
+
+    def test_set_config_scalar_section_exact_child(self):
+        # a deeper nested key of the same name must NOT be touched — only the direct child
+        cfg = "state:\n  last_round_commit: null\n  nested:\n    last_round_commit: deep\n"
+        out = jw_round.set_config_scalar(cfg, "last_round_commit", "X", section="state")
+        self.assertIn("  last_round_commit: X", out)
+        self.assertIn("    last_round_commit: deep", out)
 
 
 class NextActionableTests(unittest.TestCase):
@@ -437,6 +570,39 @@ class RoundCloseTests(unittest.TestCase):
             rc = jw_round.close(root, "2026-06-19-z", done=["gate/beta"], touched=[], commit="HEAD")
             self.assertEqual(rc, 1)
             self.assertEqual((root / "tasks.yaml").read_text(), before)
+
+    def test_close_dependency_and_dependent_together(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._setup(root, "version: 1\nproject: x\nstate:\n  last_round_commit: null\n")
+            # closing a dependency (feat/alpha) and its dependent (gate/beta) in ONE round is valid:
+            # the dep is done in the final state
+            rc = jw_round.close(root, "2026-06-19-z", done=["feat/alpha", "gate/beta"], touched=[], commit="HEAD")
+            self.assertEqual(rc, 0)
+            self.assertEqual((root / "tasks.yaml").read_text().count("status: done"), 2)
+
+    def test_close_rolls_back_on_render_failure(self):
+        import jw_roadmap
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._setup(root, "version: 1\nproject: x\nstate:\n  last_round_commit: null\n")
+            before_tasks = (root / "tasks.yaml").read_text()
+            before_cfg = (root / ".jahns-workflow.yml").read_text()
+
+            def boom(_root):
+                raise RuntimeError("render exploded mid-commit")
+
+            orig = jw_roadmap.render
+            jw_roadmap.render = boom
+            try:
+                rc = jw_round.close(root, "2026-06-19-z", done=["feat/alpha"], touched=["gate/beta"], commit="HEAD")
+            finally:
+                jw_roadmap.render = orig
+            self.assertEqual(rc, 1)
+            # primary files restored; ROADMAP not left behind
+            self.assertEqual((root / "tasks.yaml").read_text(), before_tasks)
+            self.assertEqual((root / ".jahns-workflow.yml").read_text(), before_cfg)
+            self.assertFalse((root / "ROADMAP.md").exists())
 
 
 if __name__ == "__main__":

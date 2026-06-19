@@ -72,6 +72,21 @@ fenced code blocks are ignored. The merge gate reads config/tasks from the **PR 
 the local checkout), refuses non-OPEN/draft PRs, and merges with `--match-head-commit` so a push
 between the gate check and the merge aborts it. CI is strict — only `SUCCESS` is passing.
 
+**Two-axis provenance (v0.2.3).** A marker now binds on *both* the logical reviewer it claims
+*and* the GitHub actor who posted it. `review.operators` (default: the repo owner) lists who may
+post `cycle`/`result`/`findings` markers — so a collaborator can't forge a macro reviewer's
+verdict by writing its name in a comment. An approval's `by` must equal the GitHub login that
+posted it; conflicting freeze markers for the same cycle fail closed; `findings` uses the latest
+trusted state (a later `resolved: false` re-blocks). **Codex** is bound to the head — by a formal
+review whose `commit_id` is the head, or by the SHA the Codex bot names in its own review comment
+(its normal no-issue path; the bot login is GitHub-verified, so only Codex can author it). Timing
+is irrelevant once the tree is pinned; a bare 👍 reaction, which can't be SHA-bound, fail-closes.
+The PR-head `tasks.yaml`
+must pass schema validation, not merely parse. PR-head file reads use an explicit `GET` (a bare
+`-f` flips `gh api` to POST, which the contents endpoint rejects). `jw round close` now rolls the
+primary files back if any step of the commit phase raises, and lets a dependency and its
+dependent close in the same round.
+
 ## Requirements
 
 - `git`, `bash`, [`uv`](https://docs.astral.sh/uv/) on PATH (scripts use PEP 723 inline deps; first run downloads `pyyaml` once).

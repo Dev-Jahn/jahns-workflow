@@ -29,11 +29,13 @@ import yaml  # noqa: E402
 
 from jw_common import load_config, normalize_config  # noqa: E402
 import jw_review  # noqa: E402
+import jw_validate  # noqa: E402
 
 
 # ---- pure gate logic ---------------------------------------------------------
 def tasks_gate_counts(data: dict) -> dict:
-    tasks = [t for t in data.get("tasks", []) if isinstance(t, dict)]
+    raw = data.get("tasks", []) if isinstance(data, dict) else []
+    tasks = [t for t in raw if isinstance(t, dict)] if isinstance(raw, list) else []
     open_blockers = [t.get("id") for t in tasks
                      if t.get("severity") == "blocker" and t.get("status") not in ("done", "dropped")]
     open_decisions = [t.get("id") for t in tasks
@@ -91,7 +93,11 @@ def approve(root: Path, pr: int, sha: str) -> int:
               f"Approval must bind to the exact current head.", file=sys.stderr)
         return 3
     rc, login = jw_review._gh(root, "api", "user", "-q", ".login")
-    by = login if rc == 0 and login else "user"
+    if rc != 0 or not login:
+        print("jw approve: could not resolve your GitHub login (gh api user) — an approval must "
+              "bind to a real actor whose identity matches who posts it.", file=sys.stderr)
+        return 1
+    by = login
     marker = jw_review.emit_marker("approval", {"sha": head, "by": by})
     body = f"Approved for merge at `{head[:12]}`. A new push invalidates this automatically.\n\n{marker}\n"
     rc, out = jw_review._gh(root, "pr", "comment", str(pr), "--body", body)
@@ -124,6 +130,11 @@ def _gather(root: Path, pr: int) -> dict | None:
                 data = yaml.safe_load(tasks_text) or {}
             except (yaml.YAMLError, ValueError):
                 head_read_ok = False
+            else:
+                # PR-head tasks.yaml must be schema-valid, not merely parseable — a malformed
+                # registry must not let the gate read zero blockers/decisions from garbage.
+                if jw_validate.validate(data):
+                    head_read_ok = False
     else:
         head_read_ok = False
     facts = jw_review.facts_from_bundle(bundle, cfg, repo)

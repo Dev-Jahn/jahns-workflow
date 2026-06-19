@@ -98,3 +98,13 @@ filename or a round id alone. No review is requested against an unpushed HEAD.
   unresolved decisions, and a human approval is bound to that exact head. External reviewer
   findings are always claims — reproduce/confirm before acting; the implementing agent and the
   verifying agent are separate.
+
+Provenance in pr mode binds on two axes — the logical reviewer a marker *claims* and the GitHub
+actor who *posted* it. `review.operators` (default: the repo owner) is who may post
+`cycle`/`result`/`findings` markers; `review.approvers` (default: the repo owner) is who may post
+the final approval, whose `by` must match their own login. The macro reviewer's reply is pasted
+by an operator, so the reviewer id is just a label — trust comes from the operator. Codex is the
+exception: it is bound to the head — by a formal review's `commit_id`, or by the SHA the Codex
+bot itself names in its review comment (the bot login is GitHub-verified, so only Codex can
+author it; a bare 👍 reaction can't be SHA-bound and is ignored). A marker from an untrusted
+actor, a conflicting freeze, or a stale SHA is ignored; the gate fail-closes rather than guesses.

@@ -59,6 +59,8 @@ review:
   mode: packet                  # packet (paste to web reviewer) | pr (SHA-bound PR review cycles)
   reviewers: [codex, gpt-5.5-pro]
   require_ci: false             # if true, the merge gate blocks until CI passes
+  # operators: []               # PR mode: extra GitHub logins trusted to post review markers (owner always is)
+  # approvers: []               # PR mode: extra GitHub logins trusted to post the final approval
 state:
   last_audit_commit: null
   last_round_commit: null

@@ -50,11 +50,15 @@ def normalize_config(cfg: dict | None) -> dict:
         raise ValueError(f"generated_dir must be a relative path inside the repo: {cfg['generated_dir']!r}")
     rv = cfg.setdefault("review", {})
     if not isinstance(rv, dict):
-        raise ValueError("review: must be a mapping (mode/reviewers/require_ci/approvers)")
+        raise ValueError("review: must be a mapping (mode/reviewers/require_ci/approvers/operators)")
     rv.setdefault("mode", "packet")  # packet | pr
     rv.setdefault("reviewers", ["codex", "gpt-5.5-pro"])
     rv.setdefault("require_ci", False)
     rv.setdefault("approvers", [])  # extra trusted approver logins beyond the repo owner
+    # GitHub actors trusted to POST cycle/result/findings markers (beyond the repo owner). The
+    # logical `reviewer` in a result marker is just a model id; `operators` is who vouched for it
+    # on GitHub — a separate provenance, so a collaborator can't forge a macro reviewer's verdict.
+    rv.setdefault("operators", [])
     if rv["mode"] not in ("packet", "pr"):
         raise ValueError(f"review.mode must be 'packet' or 'pr', got {rv['mode']!r}")
     if not (isinstance(rv["reviewers"], list) and all(isinstance(r, str) for r in rv["reviewers"])):
@@ -63,6 +67,8 @@ def normalize_config(cfg: dict | None) -> dict:
         raise ValueError("review.require_ci must be a boolean")
     if not (isinstance(rv["approvers"], list) and all(isinstance(a, str) for a in rv["approvers"])):
         raise ValueError("review.approvers must be a list of strings")
+    if not (isinstance(rv["operators"], list) and all(isinstance(o, str) for o in rv["operators"])):
+        raise ValueError("review.operators must be a list of strings")
     return cfg
 
 
