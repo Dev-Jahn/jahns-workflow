@@ -240,6 +240,88 @@ class MarkerTests(unittest.TestCase):
         self.assertIn("--method", captured["args"])
         self.assertEqual(captured["args"][captured["args"].index("--method") + 1], "GET")
 
+    def test_base_sha_binding(self):
+        # B4: a cycle frozen at (head H, base B1) is stale once the base moves to B2
+        head = "h" * 40
+        cyc = {"body": jw_review.emit_marker("review-cycle", {"cycle": 1, "target_sha": head, "base_sha": "b1" + "0" * 38}),
+               "author": "owner"}
+        ms = jw_review.parse_bodies([cyc])
+        self.assertTrue(jw_review.classify(ms, head, operators=("owner",), current_base="b1" + "0" * 38)["cycle_fresh"])
+        self.assertFalse(jw_review.classify(ms, head, operators=("owner",), current_base="b2" + "0" * 38)["cycle_fresh"])
+
+    def test_result_uses_latest_not_any(self):
+        # B2: a later not-shipped (with a stop decision) cancels an earlier shipped
+        head = "c" * 40
+        bodies = [
+            {"body": jw_review.emit_marker("review-cycle", {"cycle": 1, "target_sha": head}), "author": "owner"},
+            {"body": jw_review.emit_marker("review-result", {"reviewer": "gpt-5.5-pro", "review_cycle": 1,
+                "reviewed_sha": head, "verdict": "shipped", "decision_required": []}),
+             "author": "owner", "at": "2026-06-19T01:00:00Z"},
+            {"body": jw_review.emit_marker("review-result", {"reviewer": "gpt-5.5-pro", "review_cycle": 1,
+                "reviewed_sha": head, "verdict": "not-shipped", "decision_required": ["stop"]}),
+             "author": "owner", "at": "2026-06-19T02:00:00Z"},
+        ]
+        c = jw_review.classify(jw_review.parse_bodies(bodies), head, macro_reviewers=("gpt-5.5-pro",), operators=("owner",))
+        self.assertFalse(c["pro_result_at_head"])
+
+    def test_all_macro_reviewers_required(self):
+        # B2: with two configured macro reviewers, one passing result is not enough
+        head = "c" * 40
+        bodies = [
+            {"body": jw_review.emit_marker("review-cycle", {"cycle": 1, "target_sha": head}), "author": "owner"},
+            {"body": jw_review.emit_marker("review-result", {"reviewer": "gpt-5.5-pro", "review_cycle": 1,
+                "reviewed_sha": head, "verdict": "shipped", "decision_required": []}), "author": "owner"},
+        ]
+        c = jw_review.classify(jw_review.parse_bodies(bodies), head,
+                               macro_reviewers=("gpt-5.5-pro", "other-reviewer"), operators=("owner",))
+        self.assertFalse(c["pro_result_at_head"])  # 'other-reviewer' has no result
+
+    def test_new_codex_signal_reblocks_findings_and_approval(self):
+        # B3: a Codex signal newer than the findings resolution / approval re-blocks both
+        head = "c" * 40
+        bodies = [
+            {"body": jw_review.emit_marker("review-cycle", {"cycle": 1, "target_sha": head}), "author": "owner"},
+            {"body": jw_review.emit_marker("findings", {"cycle": 1, "resolved": True}), "author": "owner", "at": "2026-06-19T01:00:00Z"},
+            {"body": jw_review.emit_marker("approval", {"sha": head, "by": "owner"}), "author": "owner", "at": "2026-06-19T01:30:00Z"},
+        ]
+        ms = jw_review.parse_bodies(bodies)
+        # no later codex signal → both hold
+        ok = jw_review.classify(ms, head, approvers=("owner",), operators=("owner",), codex_signal_at=None)
+        self.assertTrue(ok["findings_resolved"]); self.assertTrue(ok["approved_at_head"])
+        # a Codex signal at T03:00 (after resolution & approval) → both go stale
+        blocked = jw_review.classify(ms, head, approvers=("owner",), operators=("owner",),
+                                     codex_signal_at="2026-06-19T03:00:00Z")
+        self.assertFalse(blocked["findings_resolved"]); self.assertFalse(blocked["approved_at_head"])
+
+    def test_codex_comment_negative_context_not_fresh(self):
+        # M5: a SHA appearing in prose (not the 'Reviewed commit' field) must not count
+        head = "1234567890" + "a" * 30
+        neg = {"author": "chatgpt-codex-connector",
+               "body": f"Reviewed commit: `deadbeef00`.\nI did NOT review {head[:10]}; rerun required."}
+        self.assertFalse(jw_review.codex_fresh([], [neg], head))
+        pos = {"author": "chatgpt-codex-connector", "body": f"**Reviewed commit:** `{head[:10]}`"}
+        self.assertTrue(jw_review.codex_fresh([], [pos], head))
+
+    def test_ci_completed_not_passing(self):
+        # M7: COMPLETED is a run status, not a success conclusion
+        self.assertEqual(jw_review.ci_state({"checks": [{"conclusion": "COMPLETED"}]}), "failing")
+        self.assertEqual(jw_review.ci_state({"checks": [{"state": "COMPLETED"}]}), "failing")
+        self.assertEqual(jw_review.ci_state({"checks": [{"conclusion": "SUCCESS"}, {"conclusion": "COMPLETED"}]}), "failing")
+
+    def test_rest_reviews_flattens_slurped_pages(self):
+        # M6: --slurp returns an array of per-page arrays; rest_reviews must flatten them
+        import json as _json
+        pages = [[{"id": 1, "user": {"login": "a"}, "commit_id": "x", "state": "COMMENTED", "submitted_at": "t1"}],
+                 [{"id": 2, "user": {"login": "b"}, "commit_id": "y", "state": "APPROVED", "submitted_at": "t2"}]]
+        orig = jw_review._gh
+        jw_review._gh = lambda root, *a: (0, _json.dumps(pages))
+        try:
+            out = jw_review.rest_reviews(Path("/x"), "o/r", 5)
+        finally:
+            jw_review._gh = orig
+        self.assertEqual([r["id"] for r in out], [1, 2])
+        self.assertEqual(out[1]["author"], "b")
+
 
 PASS = dict(cycle_fresh=True, require_ci=True, ci="passing", want_codex=True, codex_fresh=True,
             findings_resolved=True, want_pro=True, pro_result_at_head=True, open_blockers=[],
@@ -299,7 +381,7 @@ class MergeGateTests(unittest.TestCase):
     def test_pr_state_and_head_read_block(self):
         g = dict(PASS); g["head_read_ok"] = False
         ok, fails = jw_merge.merge_gate(g)
-        self.assertFalse(ok); self.assertTrue(any("PR head" in f for f in fails))
+        self.assertFalse(ok); self.assertTrue(any("policy@base" in f or "tasks@head" in f for f in fails))
         for key, val in (("pr_state", "MERGED"), ("is_draft", True)):
             g = dict(PASS); g[key] = val
             self.assertFalse(jw_merge.merge_gate(g)[0], key)
@@ -326,6 +408,15 @@ class TasksGateTests(unittest.TestCase):
             self.assertEqual(jw_merge.tasks_gate_counts(bad), {"open_blockers": [], "open_decisions": []}, bad)
         # such a registry also fails schema validation (the gate's head_read_ok hook)
         self.assertTrue(jw_validate.validate({"version": 1, "project": "x", "tasks": "not-a-list"}))
+
+    def test_validator_malformed_deps_no_crash(self):
+        # M8: a non-list `deps` must be a clean validation error, never a process crash
+        for bad in (5, "feat/x", None, {"a": 1}):
+            data = {"version": 1, "project": "proj", "tasks": [
+                {"id": "feat/foo", "title": "a properly explained task", "deps": bad}]}
+            errs = jw_validate.validate(data)  # must not raise
+            if bad is not None:  # None == absent → no deps error
+                self.assertTrue(any("deps" in e for e in errs), bad)
 
 
 class RemoteTests(unittest.TestCase):
@@ -603,6 +694,84 @@ class RoundCloseTests(unittest.TestCase):
             self.assertEqual((root / "tasks.yaml").read_text(), before_tasks)
             self.assertEqual((root / ".jahns-workflow.yml").read_text(), before_cfg)
             self.assertFalse((root / "ROADMAP.md").exists())
+
+    def test_close_restores_generated_ssot_on_digest_failure(self):
+        import jw_ssot
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            init_repo(root)
+            (root / ".jahns-workflow.yml").write_text(
+                "version: 1\nproject: x\nssot: SSOT.md\ngenerated_dir: docs/ssot\n"
+                "state:\n  last_round_commit: null\n")
+            (root / "tasks.yaml").write_text(TASKS_FIXTURE)
+            (root / "SSOT.md").write_text("# Title\n\n## A\nalpha\n\n## B\nbeta\n")
+            git(root, "add", "-A"); git(root, "commit", "-qm", "setup")
+            jw_ssot.split(root); jw_ssot.digest(root)
+            gen = root / "docs/ssot"
+            v1_hash = (gen / ".hash").read_text()
+            v1_digest = (gen / "DIGEST.md").read_text()
+            # the SSOT changes during the round; close() will re-split, then digest will fail
+            (root / "SSOT.md").write_text("# Title\n\n## A\nalpha2\n\n## B\nbeta\n\n## C\ngamma\n")
+            git(root, "add", "-A"); git(root, "commit", "-qm", "ssot edit")
+
+            def boom(_root):
+                raise RuntimeError("digest exploded after split")
+
+            orig = jw_ssot.digest
+            jw_ssot.digest = boom
+            try:
+                rc = jw_round.close(root, "2026-06-19-z", done=["feat/alpha"], touched=[], commit="HEAD")
+            finally:
+                jw_ssot.digest = orig
+            self.assertEqual(rc, 1)
+            # generated dir fully rolled back: split/.hash/DIGEST all consistent at v1
+            self.assertEqual((gen / ".hash").read_text(), v1_hash)
+            self.assertEqual((gen / "DIGEST.md").read_text(), v1_digest)
+            self.assertEqual((root / "tasks.yaml").read_text(), TASKS_FIXTURE)  # primary restored too
+
+
+class BasePolicyTests(unittest.TestCase):
+    """B1: the merge-gate trust policy must come from the PR BASE SHA, never the candidate head —
+    so a branch can't make itself an operator/approver, drop reviewers, or disable CI."""
+
+    def test_policy_read_from_base_not_head(self):
+        STRICT_BASE = ("version: 1\nproject: x\nreview:\n  mode: pr\n  reviewers: [codex, gpt-5.5-pro]\n"
+                       "  require_ci: true\n  operators: [owner]\n  approvers: [owner]\n")
+        RELAXED_HEAD = ("version: 1\nproject: x\nreview:\n  mode: pr\n  reviewers: []\n"
+                        "  require_ci: false\n  operators: [attacker]\n  approvers: [attacker]\n")
+        TASKS = "version: 1\nproject: x\ntasks: []\n"
+        bundle = {"head": "H" * 40, "base_sha": "B" * 40, "bodies": [], "reviews": [], "checks": [],
+                  "merge_state": "", "state": "OPEN", "is_draft": False, "base": "main", "head_ref": "feat/x"}
+        calls = []
+
+        def fake_file_at_ref(root, repo, path, ref):
+            calls.append((path, ref))
+            if path == ".jahns-workflow.yml":
+                return STRICT_BASE if ref == bundle["base_sha"] else RELAXED_HEAD
+            return TASKS  # tasks.yaml @ head
+
+        saved = (jw_review.resolve_repo, jw_review.pr_bundle, jw_review.file_at_ref, jw_review._gh)
+        jw_review.resolve_repo = lambda root: "owner/repo"
+        jw_review.pr_bundle = lambda root, pr, repo=None: bundle
+        jw_review.file_at_ref = fake_file_at_ref
+        jw_review._gh = lambda root, *a: (0, "main")
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                # a local config must exist for the load_config fallback; the gate must ignore it
+                # in favour of the base-SHA policy
+                (Path(d) / ".jahns-workflow.yml").write_text("version: 1\nproject: x\nreview:\n  mode: pr\n")
+                g = jw_merge._gather(Path(d), 7)
+        finally:
+            jw_review.resolve_repo, jw_review.pr_bundle, jw_review.file_at_ref, jw_review._gh = saved
+        # policy taken from the STRICT base, not the RELAXED head
+        self.assertTrue(g["head_read_ok"])
+        self.assertTrue(g["require_ci"])   # base = true (head said false)
+        self.assertTrue(g["want_codex"])   # base lists codex (head dropped it)
+        self.assertTrue(g["want_pro"])     # base lists gpt-5.5-pro (head dropped it)
+        # the config was read at the base SHA; tasks at the head SHA
+        self.assertIn((".jahns-workflow.yml", bundle["base_sha"]), calls)
+        self.assertIn(("tasks.yaml", bundle["head"]), calls)
+        self.assertNotIn((".jahns-workflow.yml", bundle["head"]), calls)
 
 
 if __name__ == "__main__":

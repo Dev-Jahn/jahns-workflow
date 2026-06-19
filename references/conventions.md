@@ -108,3 +108,9 @@ exception: it is bound to the head — by a formal review's `commit_id`, or by t
 bot itself names in its review comment (the bot login is GitHub-verified, so only Codex can
 author it; a bare 👍 reaction can't be SHA-bound and is ignored). A marker from an untrusted
 actor, a conflicting freeze, or a stale SHA is ignored; the gate fail-closes rather than guesses.
+
+The trust *policy* itself (who is an operator/approver/reviewer, whether CI is required) is read
+from the PR's **base SHA** — the protected target branch — not the candidate head, so a branch
+can't relax its own merge rules. A cycle is frozen against both head and base SHA; a base advance
+makes it stale. Every fact is the latest source-bound state: a later not-shipped cancels an
+earlier shipped, and a Codex signal newer than a findings resolution or approval re-blocks both.

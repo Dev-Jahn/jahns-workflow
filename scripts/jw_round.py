@@ -127,6 +127,8 @@ def _parse_ids(s: str | None) -> list[str]:
 def close(root: Path, round_id: str, done: list[str], touched: list[str], commit: str) -> int:
     """Fail-closed: resolve the commit and confirm the watermark slot up front, apply edits in
     memory and validate BEFORE writing anything, then write tasks.yaml → views → watermark."""
+    import shutil
+    import tempfile
     import yaml
     import jw_roadmap
     import jw_validate
@@ -197,12 +199,18 @@ def close(root: Path, round_id: str, done: list[str], touched: list[str], commit
             churn = adds + dels
 
     # --- commit phase (all preflight checks passed): write with rollback ---
-    # ROADMAP.render reads tasks.yaml from disk, so the new registry must be written first; if any
-    # later step raises, restore the primary mutated files (tasks.yaml, cfg, ROADMAP) so a normal
-    # exception leaves the original state. (SSOT views are a pure projection of the unchanged SSOT
-    # source — any partial regen is idempotently rebuilt next close/audit.)
+    # ROADMAP.render reads tasks.yaml from disk, so the new registry must be written first. If any
+    # later step raises, restore the primary mutated files (tasks.yaml, cfg, ROADMAP) AND the whole
+    # generated SSOT dir from a snapshot — split/index/.hash/DIGEST must stay mutually consistent,
+    # else `jw_ssot.check()` (which only diffs .hash) would report "up to date" over a stale digest.
     roadmap_path = root / "ROADMAP.md"
     orig_roadmap = roadmap_path.read_text(encoding="utf-8") if roadmap_path.exists() else None
+    gen_dir = (root / cfg["generated_dir"]) if cfg.get("ssot") else None
+    gen_existed = bool(gen_dir and gen_dir.exists())
+    gen_backup = None
+    if gen_existed:
+        gen_backup = Path(tempfile.mkdtemp(prefix="jw-ssot-bak-")) / "g"
+        shutil.copytree(gen_dir, gen_backup)
     try:
         tasks_path.write_text(text, encoding="utf-8")
         cfg_path.write_text(ctext_new, encoding="utf-8")
@@ -211,15 +219,23 @@ def close(root: Path, round_id: str, done: list[str], touched: list[str], commit
             import jw_ssot
             jw_ssot.split(root)
             jw_ssot.digest(root)
-    except Exception as e:  # noqa: BLE001 — any failure must roll the primary files back
+    except Exception as e:  # noqa: BLE001 — any failure must roll every written artifact back
         tasks_path.write_text(orig_tasks_text, encoding="utf-8")
         cfg_path.write_text(ctext, encoding="utf-8")
         if orig_roadmap is None:
             roadmap_path.unlink(missing_ok=True)
         else:
             roadmap_path.write_text(orig_roadmap, encoding="utf-8")
+        if gen_dir is not None:
+            shutil.rmtree(gen_dir, ignore_errors=True)
+            if gen_existed:
+                shutil.copytree(gen_backup, gen_dir)
+        if gen_backup is not None:
+            shutil.rmtree(gen_backup.parent, ignore_errors=True)
         print(f"jw_round close: closeout failed mid-write and was rolled back — {e}", file=sys.stderr)
         return 1
+    if gen_backup is not None:
+        shutil.rmtree(gen_backup.parent, ignore_errors=True)
 
     print(f"round {round_id} closed: {len(done)} done, {len(set(done + touched))} stamped; "
           f"watermark set @ {full[:12]}")

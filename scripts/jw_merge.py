@@ -47,7 +47,7 @@ def merge_gate(g: dict) -> tuple[bool, list[str]]:
     """Pure. `g` is a flat dict of facts; returns (ok, failures)."""
     f = []
     if not g.get("head_read_ok", True):
-        f.append("could not read config/tasks at the PR head — cannot evaluate the gate safely")
+        f.append("could not read policy@base / tasks@head — cannot evaluate the gate safely")
         return (False, f)
     if g.get("pr_state") and g["pr_state"] != "OPEN":
         f.append(f"PR is not OPEN (state={g['pr_state']})")
@@ -56,7 +56,7 @@ def merge_gate(g: dict) -> tuple[bool, list[str]]:
     if g.get("expected_base") and g.get("base") and g["base"] != g["expected_base"]:
         f.append(f"PR base is {g['base']!r}, expected {g['expected_base']!r}")
     if not g.get("cycle_fresh"):
-        f.append("review cycle is stale: head advanced past the frozen SHA — re-freeze (jw review freeze)")
+        f.append("review cycle is stale: head or base advanced past the frozen SHAs — re-freeze (jw review freeze)")
     if g.get("require_ci"):
         if g.get("ci") == "failing":
             f.append("CI is failing")
@@ -109,40 +109,43 @@ def approve(root: Path, pr: int, sha: str) -> int:
 
 
 def _gather(root: Path, pr: int) -> dict | None:
-    """Build gate facts from the PR HEAD (config/tasks read at the PR head SHA, not the local
-    checkout — which may be a different or dirty tree)."""
+    """Build gate facts. The trust POLICY (reviewers/operators/approvers/require_ci) is read from
+    the PR's BASE SHA — the protected target branch — NOT the PR head, so a candidate branch
+    cannot relax its own merge rules (add itself as operator/approver, drop reviewers, disable
+    CI). The CONTENT being merged (tasks.yaml blockers/decisions) is read from the head."""
     repo = jw_review.resolve_repo(root)
-    bundle = jw_review.pr_bundle(root, pr)
+    bundle = jw_review.pr_bundle(root, pr, repo)
     if bundle is None:
         return None
     head = bundle["head"]
-    head_read_ok = True
-    cfg = load_config(root)  # fallback only
+    base_sha = bundle.get("base_sha")
+    read_ok = True
+    policy = load_config(root)  # fallback only
     data = {}
-    if repo and head:
-        cfg_text = jw_review.file_at_ref(root, repo, ".jahns-workflow.yml", head)
-        tasks_text = jw_review.file_at_ref(root, repo, "tasks.yaml", head)
-        if cfg_text is None or tasks_text is None:
-            head_read_ok = False
+    if repo and head and base_sha:
+        pol_text = jw_review.file_at_ref(root, repo, ".jahns-workflow.yml", base_sha)  # POLICY @ base
+        tasks_text = jw_review.file_at_ref(root, repo, "tasks.yaml", head)             # CONTENT @ head
+        if pol_text is None or tasks_text is None:
+            read_ok = False
         else:
             try:
-                cfg = normalize_config(yaml.safe_load(cfg_text))
+                policy = normalize_config(yaml.safe_load(pol_text))
                 data = yaml.safe_load(tasks_text) or {}
             except (yaml.YAMLError, ValueError):
-                head_read_ok = False
+                read_ok = False
             else:
-                # PR-head tasks.yaml must be schema-valid, not merely parseable — a malformed
+                # head tasks.yaml must be schema-valid, not merely parseable — a malformed
                 # registry must not let the gate read zero blockers/decisions from garbage.
                 if jw_validate.validate(data):
-                    head_read_ok = False
+                    read_ok = False
     else:
-        head_read_ok = False
-    facts = jw_review.facts_from_bundle(bundle, cfg, repo)
-    reviewers = cfg["review"]["reviewers"]
+        read_ok = False
+    facts = jw_review.facts_from_bundle(bundle, policy, repo)
+    reviewers = policy["review"]["reviewers"]
     return {
         **facts,
-        "head_read_ok": head_read_ok,
-        "require_ci": cfg["review"]["require_ci"],
+        "head_read_ok": read_ok,
+        "require_ci": policy["review"]["require_ci"],
         "want_codex": "codex" in reviewers,
         "want_pro": any(("gpt" in r or "pro" in r) and r != "codex" for r in reviewers),
         "remote_contains_head": None,

@@ -87,6 +87,19 @@ must pass schema validation, not merely parse. PR-head file reads use an explici
 primary files back if any step of the commit phase raises, and lets a dependency and its
 dependent close in the same round.
 
+**Closing the trust boundary (v0.2.4).** The merge **policy** (reviewers, operators, approvers,
+`require_ci`) is read from the PR's **base SHA** — the protected target branch — never the
+candidate head, so a branch can't make itself an operator/approver, drop reviewers, or disable CI
+to wave itself through (only the *content* — `tasks.yaml` blockers/decisions — comes from the
+head). A review cycle is frozen against **both** the head and the base SHA; a base advance makes
+it stale (the merged tree would differ from what was reviewed). Every signal is the *latest*
+trusted state, source-bound: each configured macro reviewer must have a latest merge-compatible
+result (a later not-shipped cancels an earlier shipped); a Codex signal newer than the findings
+resolution or the human approval re-blocks both; a Codex comment must name the head in its exact
+`Reviewed commit:` field (no loose substring); CI passes only on a `SUCCESS` conclusion; REST
+review pages are `--slurp`-merged (correct past 30 reviews); and `jw round close` rolls the whole
+generated SSOT view set back together on failure.
+
 ## Requirements
 
 - `git`, `bash`, [`uv`](https://docs.astral.sh/uv/) on PATH (scripts use PEP 723 inline deps; first run downloads `pyyaml` once).

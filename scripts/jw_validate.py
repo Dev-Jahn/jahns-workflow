@@ -116,9 +116,10 @@ def validate(data: object) -> list[str]:
                 if "depends_on" in lane and not isinstance(lane["depends_on"], list):
                     errs.append(f"{loc}.lane.depends_on: must be a list")
 
-    # Dependency references and cycles (only over well-formed ids).
+    # Dependency references and cycles (only over well-formed ids). A non-list `deps` is already
+    # flagged above; normalize it to [] here so graph construction can't raise on it.
     graph = {
-        t["id"]: [d for d in t.get("deps", []) if isinstance(d, str)]
+        t["id"]: [d for d in (t.get("deps") if isinstance(t.get("deps"), list) else []) if isinstance(d, str)]
         for t in tasks
         if isinstance(t, dict) and isinstance(t.get("id"), str) and t["id"] in ids
     }

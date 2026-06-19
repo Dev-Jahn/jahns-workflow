@@ -18,7 +18,7 @@ SHA the Codex bot names in its own review comment (timing is irrelevant once the
 Markers in fenced code blocks are ignored.
 
 Markers (HTML comments embedded in PR comment bodies):
-  jw-review-cycle  : a freeze — {round_id, cycle, target_sha, reviewers}
+  jw-review-cycle  : a freeze — {round_id, cycle, target_sha, base_sha, reviewers}
   jw-review-result : an external reviewer reply footer — {reviewer, review_cycle, reviewed_sha, verdict, decision_required}
   jw-findings      : adjudication outcome for a cycle — {cycle, resolved}
   jw-approval      : SHA-bound human approval — {sha, by}
@@ -112,58 +112,82 @@ def next_cycle_number(markers: list[dict]) -> int:
 
 
 def classify(markers: list[dict], current_head: str, macro_reviewers: tuple = (),
-             approvers: tuple = (), operators: tuple = ()) -> dict:
-    """Strict, provenance-bound classification of PR review state vs the current head.
+             approvers: tuple = (), operators: tuple = (), current_base: str | None = None,
+             codex_signal_at: str | None = None) -> dict:
+    """Strict, provenance-bound classification of PR review state vs the current head/base.
 
     A marker's GitHub author (`_author`, the actor who posted it) is a separate provenance from
     the logical `reviewer`/`by` it claims. When `operators`/`approvers` are given, cycle/result/
     findings markers are only believed from a trusted operator, and an approval only from a
-    trusted approver whose `by` matches who actually posted it. Conflicting freeze markers for
-    the latest cycle (same number, different target) fail closed (cycle treated as not fresh)."""
+    trusted approver whose `by` matches who actually posted it.
+
+    Each fact is the LATEST trusted state, never "one past success": every configured macro
+    reviewer must have a latest merge-compatible result (a later not-shipped cancels an earlier
+    shipped); findings use the latest resolution. A cycle is fresh only if BOTH the frozen head
+    and the frozen base equal the current head/base (`current_base` given) — base drift means the
+    merged tree differs from what was reviewed. When `codex_signal_at` is given, findings and the
+    human approval must POST-DATE the newest Codex signal at this head, so a new Codex finding
+    re-blocks a stale resolution/approval. Conflicting freeze markers for the latest cycle fail
+    closed."""
     trusted_cycles = [m for m in markers if m.get("_kind") == "review-cycle"
                       and isinstance(m.get("cycle"), int)
                       and (not operators or m.get("_author") in operators)]
     lc = max(trusted_cycles, key=lambda m: m["cycle"]) if trusted_cycles else None
     cyc = lc["cycle"] if lc else None
     frozen = (lc or {}).get("target_sha")
+    frozen_base = (lc or {}).get("base_sha")
     # two operator freeze markers for the SAME latest cycle but different SHA → ambiguous, block
     conflict = lc is not None and any(
         m is not lc and m["cycle"] == cyc and str(m.get("target_sha")) != str(frozen)
         for m in trusted_cycles)
-    head_matches = bool(lc) and not conflict and str(frozen) == current_head
+    base_ok = current_base is None or str(frozen_base) == current_base
+    head_matches = bool(lc) and not conflict and str(frozen) == current_head and base_ok
 
-    def result_ok(r: dict) -> bool:
-        return (str(r.get("reviewed_sha")) == current_head
-                and r.get("review_cycle") == cyc
-                and (not operators or r.get("_author") in operators)
-                and (not macro_reviewers or r.get("reviewer") in macro_reviewers)
-                and str(r.get("verdict", "")).lower() in MERGE_OK_VERDICTS
-                and not r.get("decision_required"))
+    def newer_than_codex(at: str) -> bool:
+        return codex_signal_at is None or (at or "") >= codex_signal_at
+
+    # results: per macro reviewer, the LATEST trusted result must be merge-compatible (all-of)
+    results = [m for m in markers if m.get("_kind") == "review-result"
+               and str(m.get("reviewed_sha")) == current_head and m.get("review_cycle") == cyc
+               and (not operators or m.get("_author") in operators)]
+
+    def reviewer_ok(reviewer: str) -> bool:
+        rs = [r for r in results if r.get("reviewer") == reviewer]
+        if not rs:
+            return False
+        latest = max(rs, key=lambda r: r.get("_at") or "")
+        return (str(latest.get("verdict", "")).lower() in MERGE_OK_VERDICTS
+                and not latest.get("decision_required"))
+
+    pro_ok = all(reviewer_ok(rv) for rv in macro_reviewers) if macro_reviewers else True
 
     def approval_ok(a: dict) -> bool:
         author = a.get("_author", "")
         return (str(a.get("sha")) == current_head
                 and bool(author) and not author.endswith("[bot]")
                 and (not approvers or author in approvers)
-                and str(a.get("by", "")) == author)  # claimed approver must equal who posted it
+                and str(a.get("by", "")) == author  # claimed approver must equal who posted it
+                and newer_than_codex(a.get("_at", "")))
 
-    results = [m for m in markers if m.get("_kind") == "review-result"]
     approvals = [m for m in markers if m.get("_kind") == "approval"]
-    # findings: only this cycle, only from trusted operators, and the LATEST such state must be
-    # resolved (a later re-adjudication 'resolved: false' must re-block, not be masked by an
-    # earlier 'resolved: true').
+    # findings: only this cycle, only from trusted operators; the LATEST state must be resolved
+    # AND post-date the newest Codex signal (a later 'resolved: false' or a fresh Codex finding
+    # re-blocks).
     cyc_findings = [m for m in markers if m.get("_kind") == "findings" and m.get("cycle") == cyc
                     and (not operators or m.get("_author") in operators)]
     latest_finding = max(cyc_findings, key=lambda f: f.get("_at") or "") if cyc_findings else None
+    findings_resolved = (bool(latest_finding) and latest_finding.get("resolved") is True
+                         and newer_than_codex(latest_finding.get("_at", "")))
     return {
         "current_head": current_head,
         "latest_cycle": cyc,
         "frozen_sha": frozen,
+        "frozen_base": frozen_base,
         "cycle_conflict": conflict,
         "cycle_fresh": head_matches,
-        "pro_result_at_head": any(result_ok(r) for r in results),
+        "pro_result_at_head": pro_ok,
         "approved_at_head": any(approval_ok(a) for a in approvals),
-        "findings_resolved": bool(latest_finding) and latest_finding.get("resolved") is True,
+        "findings_resolved": findings_resolved,
         "n_results": len(results),
         "n_approvals": len(approvals),
     }
@@ -199,63 +223,86 @@ def file_at_ref(root: Path, repo: str, path: str, ref: str) -> str | None:
 
 def rest_reviews(root: Path, repo: str, pr: int) -> list[dict]:
     """Formal PR reviews via REST — the only source that carries `commit_id`, the SHA a review
-    was submitted against (`gh pr view --json reviews` omits it). Empty on any failure."""
-    rc, out = _gh(root, "api", "--method", "GET", f"repos/{repo}/pulls/{pr}/reviews", "--paginate")
+    was submitted against (`gh pr view --json reviews` omits it). `--slurp` is required with
+    `--paginate`: without it gh concatenates one JSON array per page (invalid combined JSON), so a
+    PR with >30 reviews would fail to parse and silently drop reviews. Empty on any failure."""
+    rc, out = _gh(root, "api", "--method", "GET", f"repos/{repo}/pulls/{pr}/reviews",
+                  "--paginate", "--slurp")
     if rc != 0 or not out:
         return []
     try:
-        arr = json.loads(out)
+        pages = json.loads(out)
     except json.JSONDecodeError:
         return []
-    return [{"author": (r.get("user") or {}).get("login", ""), "body": r.get("body", ""),
-             "state": r.get("state", ""), "commit_id": r.get("commit_id", ""),
-             "at": r.get("submitted_at", "")}
-            for r in arr if isinstance(r, dict)]
+    flat = []
+    for page in (pages if isinstance(pages, list) else []):
+        flat.extend(page if isinstance(page, list) else [page])
+    return [{"id": r.get("id"), "author": (r.get("user") or {}).get("login", ""),
+             "body": r.get("body", ""), "state": r.get("state", ""),
+             "commit_id": r.get("commit_id", ""), "at": r.get("submitted_at", "")}
+            for r in flat if isinstance(r, dict)]
 
 
 def pr_bundle(root: Path, pr: int, repo: str | None = None) -> dict | None:
     rc, out = _gh(root, "pr", "view", str(pr), "--json",
-                  "headRefOid,comments,statusCheckRollup,mergeStateStatus,state,isDraft,baseRefName,headRefName")
+                  "headRefOid,baseRefOid,comments,statusCheckRollup,mergeStateStatus,state,isDraft,baseRefName,headRefName")
     if rc != 0:
         print(f"jw_review: gh pr view {pr} failed: {out}", file=sys.stderr)
         return None
     j = json.loads(out)
     bodies = []
     for c in j.get("comments", []):
-        bodies.append({"body": c.get("body", ""), "author": (c.get("author") or {}).get("login", ""),
-                       "at": c.get("createdAt", "")})
+        bodies.append({"id": c.get("id"), "body": c.get("body", ""),
+                       "author": (c.get("author") or {}).get("login", ""), "at": c.get("createdAt", "")})
     if repo is None:
         repo = resolve_repo(root)
     reviews = rest_reviews(root, repo, pr) if repo else []
     # a marker could also live in a formal review body — parse those too (operator-author
     # filtering still gates whether they're believed)
     for r in reviews:
-        bodies.append({"body": r["body"], "author": r["author"], "at": r["at"], "state": r["state"]})
+        bodies.append({"id": r["id"], "body": r["body"], "author": r["author"],
+                       "at": r["at"], "state": r["state"]})
     return {
-        "head": j.get("headRefOid", ""), "bodies": bodies, "reviews": reviews,
+        "head": j.get("headRefOid", ""), "base_sha": j.get("baseRefOid", ""),
+        "bodies": bodies, "reviews": reviews,
         "checks": j.get("statusCheckRollup", []) or [],
         "merge_state": j.get("mergeStateStatus", ""), "state": j.get("state", ""),
         "is_draft": bool(j.get("isDraft")), "base": j.get("baseRefName", ""), "head_ref": j.get("headRefName", ""),
     }
 
 
-def codex_fresh(reviews: list[dict], comment_bodies: list[dict], target_sha: str | None) -> bool:
-    """Codex reviewed the EXACT target tree. Two GitHub recordings count, both SHA-bound:
+# Codex prints exactly "**Reviewed commit:** `<sha>`" — parse that one field, never a loose
+# substring (a body like "I did NOT review <sha>" must not register as a review of <sha>).
+REVIEWED_COMMIT_RE = re.compile(r"reviewed\s+commit:\**\s*`?([0-9a-f]{7,40})`?", re.IGNORECASE)
+
+
+def _codex_comment_reviews(body: str, target_sha: str) -> bool:
+    return any(target_sha.startswith(h.lower()) for h in REVIEWED_COMMIT_RE.findall(body or ""))
+
+
+def codex_signals_at_head(reviews: list[dict], comment_bodies: list[dict],
+                          target_sha: str | None) -> list[dict]:
+    """Every Codex signal bound to the EXACT target tree, as {kind, id, at}. Two recordings count:
       (1) a formal Codex review whose `commit_id == target_sha`, or
-      (2) a Codex-bot COMMENT naming the target's short SHA — the connector's normal no-issue
-          path posts a comment ("Reviewed commit: <short-sha>"), not a formal review object.
-    Only the GitHub-verified Codex bot login is trusted (un-spoofable), and the comment must name
-    THIS head, so a stale review of an old head never counts. Fail-closed: a bare 👍 reaction
-    (which can't be bound to a SHA) does not count — re-request a textual `@codex review`."""
+      (2) a Codex-bot COMMENT whose `Reviewed commit:` field names target_sha (the connector's
+          normal no-issue path posts a comment, not a formal review object).
+    Only the GitHub-verified Codex bot login is trusted (un-spoofable). A bare 👍 reaction can't be
+    SHA-bound and is not a signal — re-request a textual `@codex review`."""
     if not target_sha:
-        return False
-    if any(is_codex(r.get("author")) and r.get("commit_id") == target_sha
-           and r.get("state") in ("APPROVED", "COMMENTED", "CHANGES_REQUESTED")
-           for r in reviews):
-        return True
-    short = target_sha[:10]
-    return any(is_codex(b.get("author")) and short in (b.get("body") or "")
-               for b in comment_bodies)
+        return []
+    out = []
+    for r in reviews:
+        if (is_codex(r.get("author")) and r.get("commit_id") == target_sha
+                and r.get("state") in ("APPROVED", "COMMENTED", "CHANGES_REQUESTED")):
+            out.append({"kind": "review", "id": r.get("id"), "at": r.get("at") or ""})
+    for b in comment_bodies:
+        if is_codex(b.get("author")) and _codex_comment_reviews(b.get("body") or "", target_sha):
+            out.append({"kind": "comment", "id": b.get("id"), "at": b.get("at") or ""})
+    return out
+
+
+def codex_fresh(reviews: list[dict], comment_bodies: list[dict], target_sha: str | None) -> bool:
+    return bool(codex_signals_at_head(reviews, comment_bodies, target_sha))
 
 
 def ci_state(bundle: dict) -> str:
@@ -267,7 +314,9 @@ def ci_state(bundle: dict) -> str:
     states = [(c.get("conclusion") or c.get("state") or "").upper() for c in checks]
     if any(s in ("", "PENDING", "IN_PROGRESS", "QUEUED", "EXPECTED", "WAITING", "REQUESTED") for s in states):
         return "pending"
-    if all(s in ("SUCCESS", "COMPLETED") for s in states):
+    # Only a SUCCESS *conclusion* passes. COMPLETED is a run *status* (it finished), not a verdict;
+    # NEUTRAL/SKIPPED/ACTION_REQUIRED and any unknown enum fail closed.
+    if all(s == "SUCCESS" for s in states):
         return "passing"
     return "failing"
 
@@ -285,10 +334,15 @@ def facts_from_bundle(bundle: dict, cfg: dict, repo: str | None) -> dict:
     operators = tuple({owner, *cfg["review"].get("operators", [])} - {""})
     macro = tuple(r for r in cfg["review"]["reviewers"] if r != "codex")
     markers = parse_bodies(bundle["bodies"])
-    cls = classify(markers, bundle["head"], macro_reviewers=macro, approvers=approvers, operators=operators)
-    # Codex must have a SHA-bound signal at the exact head we'd merge — a formal review
-    # (commit_id) or its no-issue comment naming the head.
-    cls["codex_fresh"] = codex_fresh(bundle.get("reviews", []), bundle.get("bodies", []), bundle["head"])
+    # Codex signals bound to the exact head we'd merge — a formal review (commit_id) or its
+    # no-issue comment naming the head. The newest one's timestamp gates findings/approval
+    # freshness so a late Codex finding re-blocks a stale resolution/approval.
+    signals = codex_signals_at_head(bundle.get("reviews", []), bundle.get("bodies", []), bundle["head"])
+    codex_at = max((s["at"] for s in signals), default=None) if signals else None
+    cls = classify(markers, bundle["head"], macro_reviewers=macro, approvers=approvers,
+                   operators=operators, current_base=bundle.get("base_sha") or None,
+                   codex_signal_at=codex_at)
+    cls["codex_fresh"] = bool(signals)
     cls["ci"] = ci_state(bundle)
     cls["pr_state"] = bundle["state"]
     cls["is_draft"] = bundle["is_draft"]
@@ -324,14 +378,17 @@ def freeze(root: Path, pr: int, round_id: str | None) -> int:
     if bundle is None:
         return 1
     head = bundle["head"] or git_full_sha(root, "HEAD")
+    base_sha = bundle.get("base_sha", "")
     markers = parse_bodies(bundle["bodies"])
     n = next_cycle_number(markers)
     reviewers = cfg["review"]["reviewers"]
     marker = emit_marker("review-cycle", {
-        "round_id": round_id or "(unset)", "cycle": n, "target_sha": head, "reviewers": reviewers,
+        "round_id": round_id or "(unset)", "cycle": n, "target_sha": head,
+        "base_sha": base_sha, "reviewers": reviewers,
     })
-    body = (f"## Review cycle {n} — frozen at `{head[:12]}`\n\n"
-            f"Immutable review target for cycle {n}. A new push makes this cycle stale.\n\n"
+    body = (f"## Review cycle {n} — frozen at `{head[:12]}` (base `{base_sha[:12]}`)\n\n"
+            f"Immutable review target for cycle {n}. A new push — or a base advance — makes this "
+            f"cycle stale.\n\n"
             + ("@codex review\n\n" if "codex" in reviewers else "")
             + (f"Macro reviewer: review at the SHA above; end your reply with a `jw-review-result` "
                f"footer carrying `reviewed_sha: {head}` and `review_cycle: {n}`.\n\n"
