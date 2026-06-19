@@ -84,8 +84,8 @@ class MarkerTests(unittest.TestCase):
         self.assertFalse(c2["approved_at_head"])
 
 
-PASS = dict(cycle_fresh=True, require_ci=True, ci="passing", codex_fresh=True,
-            findings_resolved=True, pro_result_at_head=True, open_blockers=[],
+PASS = dict(cycle_fresh=True, require_ci=True, ci="passing", want_codex=True, codex_fresh=True,
+            findings_resolved=True, want_pro=True, pro_result_at_head=True, open_blockers=[],
             open_decisions=[], approved_at_head=True, remote_contains_head=None)
 
 
@@ -126,6 +126,17 @@ class MergeGateTests(unittest.TestCase):
 
     def test_unpushed_local_head_blocks(self):
         g = dict(PASS); g["remote_contains_head"] = False
+        self.assertFalse(jw_merge.merge_gate(g)[0])
+
+    def test_gate_only_requires_configured_reviewers(self):
+        # codex not wanted: a missing/false codex review must not block
+        g = dict(PASS); g["want_codex"] = False; g["codex_fresh"] = False; g["findings_resolved"] = False
+        self.assertTrue(jw_merge.merge_gate(g)[0], jw_merge.merge_gate(g)[1])
+        # pro not wanted: a missing pro result must not block
+        g = dict(PASS); g["want_pro"] = False; g["pro_result_at_head"] = False
+        self.assertTrue(jw_merge.merge_gate(g)[0], jw_merge.merge_gate(g)[1])
+        # but when wanted, they still block
+        g = dict(PASS); g["want_codex"] = True; g["codex_fresh"] = False
         self.assertFalse(jw_merge.merge_gate(g)[0])
 
 

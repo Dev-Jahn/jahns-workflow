@@ -25,7 +25,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from jw_common import find_project_root, head_pushed, load_config, load_tasks  # noqa: E402
+from jw_common import load_config, load_tasks  # noqa: E402
 import jw_review  # noqa: E402
 
 
@@ -49,12 +49,13 @@ def merge_gate(g: dict) -> tuple[bool, list[str]]:
             f.append("CI is failing")
         elif g.get("ci") != "passing":
             f.append(f"CI is not passing (state={g.get('ci')}) and require_ci is set")
-    if not g.get("codex_fresh"):
-        f.append("no fresh Codex review at the current head")
-    if not g.get("findings_resolved"):
-        f.append("Codex findings for the current cycle are not marked resolved")
-    if not g.get("pro_result_at_head"):
-        f.append("no external (GPT) review result bound to the current head")
+    if g.get("want_codex"):
+        if not g.get("codex_fresh"):
+            f.append("no fresh Codex review at the current head")
+        if not g.get("findings_resolved"):
+            f.append("Codex findings for the current cycle are not marked resolved")
+    if g.get("want_pro") and not g.get("pro_result_at_head"):
+        f.append("no external (macro) review result bound to the current head")
     nb = len(g.get("open_blockers", []))
     if nb:
         f.append(f"{nb} open blocker task(s): {', '.join(g['open_blockers'])}")
@@ -93,11 +94,13 @@ def _gather(root: Path, pr: int) -> dict | None:
     facts = jw_review.pr_facts(root, pr)
     if facts is None:
         return None
-    pushed, _ = head_pushed(root, fetch=False)
     counts = tasks_gate_counts(load_tasks(root))
+    reviewers = cfg["review"]["reviewers"]
     return {
         **facts,
         "require_ci": cfg["review"]["require_ci"],
+        "want_codex": "codex" in reviewers,
+        "want_pro": any(("gpt" in r or "pro" in r) and r != "codex" for r in reviewers),
         "remote_contains_head": None,  # PR head is remote by definition; local-clone push is informational
         **counts,
     }
