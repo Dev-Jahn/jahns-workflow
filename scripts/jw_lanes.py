@@ -48,12 +48,17 @@ def check_lane(root: Path, task_id: str, lane: dict) -> list[str]:
     return fails
 
 
-def verify(root: Path) -> int:
+def verify(root: Path, round_id: str | None = None) -> int:
     data = load_tasks(root)
+    # only verify lanes still in flight — a merged-and-deleted historical lane (done/dropped)
+    # must not fail the current round forever. Optionally scope to one round.
     lanes = [(t["id"], t["lane"]) for t in data.get("tasks", [])
-             if isinstance(t, dict) and isinstance(t.get("lane"), dict)]
+             if isinstance(t, dict) and isinstance(t.get("lane"), dict)
+             and t.get("status") not in ("done", "dropped")
+             and (round_id is None or t.get("round") == round_id)]
     if not lanes:
-        print("lanes: no tasks carry a lane manifest — nothing to verify")
+        print("lanes: no in-flight lane manifests to verify"
+              + (f" for round {round_id}" if round_id else ""))
         return 0
     all_fails = []
     for tid, lane in lanes:
@@ -72,12 +77,14 @@ def main() -> int:
     if not argv or argv[0] != "verify":
         print(__doc__, file=sys.stderr)
         return 1
-    positional = [a for a in argv[1:] if not a.startswith("--")]
+    rest = argv[1:]
+    round_id = rest[rest.index("--round") + 1] if "--round" in rest and rest.index("--round") < len(rest) - 1 else None
+    positional = [a for i, a in enumerate(rest) if not a.startswith("--") and (i == 0 or rest[i - 1] != "--round")]
     root = Path(positional[0]).resolve() if positional else find_project_root(Path.cwd())
     if root is None:
         print("jw_lanes: no initialized project", file=sys.stderr)
         return 1
-    return verify(root)
+    return verify(root, round_id)
 
 
 if __name__ == "__main__":

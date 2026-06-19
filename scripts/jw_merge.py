@@ -25,7 +25,9 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from jw_common import load_config, load_tasks  # noqa: E402
+import yaml  # noqa: E402
+
+from jw_common import load_config, normalize_config  # noqa: E402
 import jw_review  # noqa: E402
 
 
@@ -42,6 +44,15 @@ def tasks_gate_counts(data: dict) -> dict:
 def merge_gate(g: dict) -> tuple[bool, list[str]]:
     """Pure. `g` is a flat dict of facts; returns (ok, failures)."""
     f = []
+    if not g.get("head_read_ok", True):
+        f.append("could not read config/tasks at the PR head — cannot evaluate the gate safely")
+        return (False, f)
+    if g.get("pr_state") and g["pr_state"] != "OPEN":
+        f.append(f"PR is not OPEN (state={g['pr_state']})")
+    if g.get("is_draft"):
+        f.append("PR is a draft")
+    if g.get("expected_base") and g.get("base") and g["base"] != g["expected_base"]:
+        f.append(f"PR base is {g['base']!r}, expected {g['expected_base']!r}")
     if not g.get("cycle_fresh"):
         f.append("review cycle is stale: head advanced past the frozen SHA — re-freeze (jw review freeze)")
     if g.get("require_ci"):
@@ -75,34 +86,58 @@ def approve(root: Path, pr: int, sha: str) -> int:
     if bundle is None:
         return 1
     head = bundle["head"]
-    if sha not in (head, head[: len(sha)]) or len(sha) < 7:
+    if len(sha) < 7 or not head.startswith(sha):
         print(f"jw approve: refusing — --sha {sha} is not the current PR head ({head[:12]}). "
               f"Approval must bind to the exact current head.", file=sys.stderr)
         return 3
-    marker = jw_review.emit_marker("approval", {"sha": head, "by": "user"})
+    rc, login = jw_review._gh(root, "api", "user", "-q", ".login")
+    by = login if rc == 0 and login else "user"
+    marker = jw_review.emit_marker("approval", {"sha": head, "by": by})
     body = f"Approved for merge at `{head[:12]}`. A new push invalidates this automatically.\n\n{marker}\n"
     rc, out = jw_review._gh(root, "pr", "comment", str(pr), "--body", body)
     if rc != 0:
         print(f"jw approve: gh pr comment failed: {out}", file=sys.stderr)
         return 1
-    print(f"approval recorded for PR #{pr} at {head[:12]}")
+    print(f"approval recorded for PR #{pr} at {head[:12]} by {by}")
     return 0
 
 
 def _gather(root: Path, pr: int) -> dict | None:
-    cfg = load_config(root)
-    facts = jw_review.pr_facts(root, pr)
-    if facts is None:
+    """Build gate facts from the PR HEAD (config/tasks read at the PR head SHA, not the local
+    checkout — which may be a different or dirty tree)."""
+    repo = jw_review.resolve_repo(root)
+    bundle = jw_review.pr_bundle(root, pr)
+    if bundle is None:
         return None
-    counts = tasks_gate_counts(load_tasks(root))
+    head = bundle["head"]
+    head_read_ok = True
+    cfg = load_config(root)  # fallback only
+    data = {}
+    if repo and head:
+        cfg_text = jw_review.file_at_ref(root, repo, ".jahns-workflow.yml", head)
+        tasks_text = jw_review.file_at_ref(root, repo, "tasks.yaml", head)
+        if cfg_text is None or tasks_text is None:
+            head_read_ok = False
+        else:
+            try:
+                cfg = normalize_config(yaml.safe_load(cfg_text))
+                data = yaml.safe_load(tasks_text) or {}
+            except (yaml.YAMLError, ValueError):
+                head_read_ok = False
+    else:
+        head_read_ok = False
+    facts = jw_review.facts_from_bundle(bundle, cfg, repo)
     reviewers = cfg["review"]["reviewers"]
     return {
         **facts,
+        "head_read_ok": head_read_ok,
         "require_ci": cfg["review"]["require_ci"],
         "want_codex": "codex" in reviewers,
         "want_pro": any(("gpt" in r or "pro" in r) and r != "codex" for r in reviewers),
-        "remote_contains_head": None,  # PR head is remote by definition; local-clone push is informational
-        **counts,
+        "remote_contains_head": None,
+        "expected_base": jw_review._gh(root, "repo", "view", "--json", "defaultBranchRef",
+                                       "-q", ".defaultBranchRef.name")[1] or None,
+        **tasks_gate_counts(data),
     }
 
 
@@ -128,11 +163,13 @@ def merge(root: Path, pr: int, execute: bool, method: str | None) -> int:
     if method not in ("squash", "rebase", "merge"):
         print("jw merge --execute requires a method: --squash | --rebase | --merge", file=sys.stderr)
         return 1
-    rc, out = jw_review._gh(root, "pr", "merge", str(pr), f"--{method}")
+    # bind the merge to the exact validated head — a push between gate and merge aborts it
+    rc, out = jw_review._gh(root, "pr", "merge", str(pr), f"--{method}",
+                            "--match-head-commit", g["current_head"])
     if rc != 0:
-        print(f"jw merge: gh pr merge failed: {out}", file=sys.stderr)
+        print(f"jw merge: gh pr merge failed (head may have moved since the gate): {out}", file=sys.stderr)
         return 1
-    print(f"merged PR #{pr} via {method}")
+    print(f"merged PR #{pr} via {method} at {g['current_head'][:12]}")
     return 0
 
 

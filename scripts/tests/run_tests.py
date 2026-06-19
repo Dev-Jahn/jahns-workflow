@@ -68,22 +68,67 @@ class MarkerTests(unittest.TestCase):
         ms = jw_review.parse_markers(jw_review.emit_marker("review-cycle", {"cycle": 1, "target_sha": head}))
         self.assertTrue(jw_review.classify(ms, head)["cycle_fresh"])
 
-    def test_classify_approval_and_pro_bound_to_head(self):
+    def _bodies(self, head, *, reviewer="gpt-5.5-pro", cycle=1, verdict="shipped",
+                approver="owner", decision=None):
+        return [
+            {"body": jw_review.emit_marker("review-cycle", {"cycle": 1, "target_sha": head}), "author": "owner"},
+            {"body": jw_review.emit_marker("review-result", {"reviewer": reviewer, "review_cycle": cycle,
+                                                             "reviewed_sha": head, "verdict": verdict,
+                                                             "decision_required": decision or []}), "author": reviewer},
+            {"body": jw_review.emit_marker("approval", {"sha": head, "by": approver}), "author": approver},
+            {"body": jw_review.emit_marker("findings", {"cycle": 1, "resolved": True}), "author": "owner"},
+        ]
+
+    def test_classify_valid_binding(self):
         head = "c" * 40
-        text = "\n".join([
-            jw_review.emit_marker("review-cycle", {"cycle": 1, "target_sha": head}),
-            jw_review.emit_marker("review-result", {"reviewer": "gpt-5.5-pro", "review_cycle": 1, "reviewed_sha": head}),
-            jw_review.emit_marker("approval", {"sha": head, "by": "user"}),
-            jw_review.emit_marker("findings", {"cycle": 1, "resolved": True}),
-        ])
-        c = jw_review.classify(jw_review.parse_markers(text), head)
+        c = jw_review.classify(jw_review.parse_bodies(self._bodies(head)), head,
+                               macro_reviewers=("gpt-5.5-pro",), approvers=("owner",))
         self.assertTrue(c["pro_result_at_head"])
         self.assertTrue(c["approved_at_head"])
         self.assertTrue(c["findings_resolved"])
-        # a different head invalidates all three
-        c2 = jw_review.classify(jw_review.parse_markers(text), "d" * 40)
+        # different head invalidates all three (SHA-binding)
+        c2 = jw_review.classify(jw_review.parse_bodies(self._bodies(head)), "d" * 40,
+                                macro_reviewers=("gpt-5.5-pro",), approvers=("owner",))
         self.assertFalse(c2["pro_result_at_head"])
         self.assertFalse(c2["approved_at_head"])
+
+    def test_classify_rejects_bad_provenance(self):
+        head = "c" * 40
+        mr, ap = ("gpt-5.5-pro",), ("owner",)
+        # wrong reviewer
+        c = jw_review.classify(jw_review.parse_bodies(self._bodies(head, reviewer="random-user")), head, macro_reviewers=mr, approvers=ap)
+        self.assertFalse(c["pro_result_at_head"])
+        # wrong cycle (result for cycle 99, latest is 1)
+        c = jw_review.classify(jw_review.parse_bodies(self._bodies(head, cycle=99)), head, macro_reviewers=mr, approvers=ap)
+        self.assertFalse(c["pro_result_at_head"])
+        # not-shipped verdict
+        c = jw_review.classify(jw_review.parse_bodies(self._bodies(head, verdict="not-shipped")), head, macro_reviewers=mr, approvers=ap)
+        self.assertFalse(c["pro_result_at_head"])
+        # decision required
+        c = jw_review.classify(jw_review.parse_bodies(self._bodies(head, decision=["stop"])), head, macro_reviewers=mr, approvers=ap)
+        self.assertFalse(c["pro_result_at_head"])
+        # approval by untrusted author
+        c = jw_review.classify(jw_review.parse_bodies(self._bodies(head, approver="anyone")), head, macro_reviewers=mr, approvers=ap)
+        self.assertFalse(c["approved_at_head"])
+
+    def test_fenced_marker_ignored(self):
+        head = "c" * 40
+        fenced = "```yaml\n" + jw_review.emit_marker("approval", {"sha": head, "by": "owner"}) + "\n```"
+        self.assertEqual(jw_review.parse_markers(fenced), [])
+        c = jw_review.classify(jw_review.parse_bodies([{"body": fenced, "author": "owner"}]), head, approvers=("owner",))
+        self.assertFalse(c["approved_at_head"])
+
+    def test_findings_resolved_strict_bool(self):
+        # a non-True 'resolved' (e.g. arbitrary string) must not count as resolved
+        m = jw_review.parse_markers(jw_review.emit_marker("findings", {"cycle": 1, "resolved": "maybe"}))
+        c = jw_review.classify([{"_kind": "review-cycle", "cycle": 1, "target_sha": "x"}, *m], "x")
+        self.assertFalse(c["findings_resolved"])
+
+    def test_ci_strict(self):
+        for bad in ("ACTION_REQUIRED", "NEUTRAL", "SKIPPED", "STALE", "WHATEVER"):
+            self.assertEqual(jw_review.ci_state({"checks": [{"conclusion": bad}]}), "failing", bad)
+        self.assertEqual(jw_review.ci_state({"checks": [{"conclusion": "SUCCESS"}]}), "passing")
+        self.assertEqual(jw_review.ci_state({"checks": [{"conclusion": "PENDING"}]}), "pending")
 
 
 PASS = dict(cycle_fresh=True, require_ci=True, ci="passing", want_codex=True, codex_fresh=True,
@@ -141,6 +186,16 @@ class MergeGateTests(unittest.TestCase):
         g = dict(PASS); g["want_codex"] = True; g["codex_fresh"] = False
         self.assertFalse(jw_merge.merge_gate(g)[0])
 
+    def test_pr_state_and_head_read_block(self):
+        g = dict(PASS); g["head_read_ok"] = False
+        ok, fails = jw_merge.merge_gate(g)
+        self.assertFalse(ok); self.assertTrue(any("PR head" in f for f in fails))
+        for key, val in (("pr_state", "MERGED"), ("is_draft", True)):
+            g = dict(PASS); g[key] = val
+            self.assertFalse(jw_merge.merge_gate(g)[0], key)
+        g = dict(PASS); g["base"] = "feature"; g["expected_base"] = "main"
+        self.assertFalse(jw_merge.merge_gate(g)[0])
+
 
 class TasksGateTests(unittest.TestCase):
     def test_counts(self):
@@ -183,6 +238,20 @@ class RemoteTests(unittest.TestCase):
             pushed, info = jw_common.head_pushed(work, fetch=False)
             self.assertFalse(pushed)
             self.assertIn("reason", info)
+
+    def test_fetch_failure_fails_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            bare = d / "remote.git"; work = d / "work"
+            subprocess.run(["git", "init", "-q", "--bare", str(bare)])
+            work.mkdir(); init_repo(work)
+            git(work, "remote", "add", "origin", str(bare))
+            git(work, "push", "-q", "-u", "origin", "main")
+            import shutil
+            shutil.rmtree(bare)  # remote now unreachable
+            pushed, info = jw_common.head_pushed(work, fetch=True)
+            self.assertFalse(pushed)  # must NOT trust the stale ref
+            self.assertIn("fetch failed", info.get("reason", ""))
 
 
 class ConfigTests(unittest.TestCase):
@@ -296,6 +365,17 @@ class LaneTests(unittest.TestCase):
             fails = jw_lanes.check_lane(root, "t", {"branch": "no/such", "base_sha": base})
             self.assertTrue(fails and "does not exist" in fails[0])
 
+    def test_done_lane_with_deleted_branch_not_verified(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            init_repo(root)
+            (root / ".jahns-workflow.yml").write_text("version: 1\nproject: x\n")
+            (root / "tasks.yaml").write_text(
+                "version: 1\nproject: x\ntasks:\n"
+                "  - id: feat/old-lane\n    title: 'a merged & cleaned-up lane'\n    status: done\n"
+                "    lane:\n      branch: deleted/gone\n      base_sha: deadbeef\n")
+            self.assertEqual(jw_lanes.verify(root), 0)  # done lane skipped, not a permanent failure
+
 
 class RoundCloseTests(unittest.TestCase):
     def test_close_integration(self):
@@ -322,6 +402,41 @@ class RoundCloseTests(unittest.TestCase):
             self.assertTrue((root / "ROADMAP.md").is_file())
             head = git(root, "rev-parse", "HEAD").stdout.strip()
             self.assertIn(f"last_round_commit: {head}", (root / ".jahns-workflow.yml").read_text())
+
+    def _setup(self, root, cfg_body):
+        init_repo(root)
+        (root / ".jahns-workflow.yml").write_text(cfg_body)
+        (root / "tasks.yaml").write_text(TASKS_FIXTURE)
+        git(root, "add", "-A"); git(root, "commit", "-qm", "setup")
+
+    def test_missing_watermark_fails_closed_no_write(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._setup(root, "version: 1\nproject: x\n")  # no state.last_round_commit
+            before = (root / "tasks.yaml").read_text()
+            rc = jw_round.close(root, "2026-06-19-z", done=["feat/alpha"], touched=[], commit="HEAD")
+            self.assertEqual(rc, 1)
+            self.assertEqual((root / "tasks.yaml").read_text(), before)  # nothing written
+            self.assertFalse((root / "ROADMAP.md").exists())
+
+    def test_unresolvable_commit_fails_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._setup(root, "version: 1\nproject: x\nstate:\n  last_round_commit: null\n")
+            before = (root / "tasks.yaml").read_text()
+            rc = jw_round.close(root, "2026-06-19-z", done=["feat/alpha"], touched=[], commit="nope-not-a-ref")
+            self.assertEqual(rc, 1)
+            self.assertEqual((root / "tasks.yaml").read_text(), before)
+
+    def test_done_task_with_unmet_dep_fails_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._setup(root, "version: 1\nproject: x\nstate:\n  last_round_commit: null\n")
+            before = (root / "tasks.yaml").read_text()
+            # gate/beta depends on feat/alpha (active) — closing gate/beta as done must fail
+            rc = jw_round.close(root, "2026-06-19-z", done=["gate/beta"], touched=[], commit="HEAD")
+            self.assertEqual(rc, 1)
+            self.assertEqual((root / "tasks.yaml").read_text(), before)
 
 
 if __name__ == "__main__":

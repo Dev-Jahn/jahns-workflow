@@ -27,7 +27,7 @@
     ],
     "SessionEnd": [
       {
-        "matcher": "clear|logout|other",
+        "matcher": "clear|resume|logout|prompt_input_exit|bypass_permissions_disabled|other",
         "hooks": [
           {
             "type": "command",

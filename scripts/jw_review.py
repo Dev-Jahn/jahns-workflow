@@ -7,9 +7,11 @@
 
 A review means "reviewer R examined tree SHA X". That fact is stored as machine-readable
 markers in PR comments (GitHub is the canonical event store), never inferred from filenames.
-Identity of a review is (reviewer, review_cycle, reviewed_sha) — so a re-review after
-remediation (cycle 2 at SHA B) is distinct from cycle 1 at SHA A, and a new push makes prior
-cycles stale.
+Identity of a review is (reviewer, review_cycle, reviewed_sha). A marker is only believed if
+its provenance binds: the result's reviewer is a configured reviewer, its cycle is the latest
+cycle, its reviewed_sha is the current head, its verdict is merge-compatible, and it carries no
+unresolved decision; an approval must be authored by a trusted approver and bound to the head.
+Markers quoted inside fenced code blocks are ignored.
 
 Markers (HTML comments embedded in PR comment bodies):
   jw-review-cycle  : a freeze — {round_id, cycle, target_sha, reviewers}
@@ -20,11 +22,10 @@ Markers (HTML comments embedded in PR comment bodies):
 Subcommands (also `jw review <sub>`):
   freeze --pr N [--round ID] [root]   stamp the current PR head as a new review cycle + post request
   status [--pr N] [root]              show per-cycle review status (PR mode) or packet pairs (packet mode)
-
-The marker emit/parse and status classification are pure functions (tested); gh I/O is isolated.
 """
 from __future__ import annotations
 
+import base64
 import json
 import re
 import subprocess
@@ -38,6 +39,8 @@ from jw_common import find_project_root, git_full_sha, load_config  # noqa: E402
 
 CODEX_BOT = "chatgpt-codex-connector[bot]"
 MARKER_RE = re.compile(r"<!--\s*jw-([a-z-]+):v1\s*\n(.*?)\n\s*-->", re.DOTALL)
+FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
+MERGE_OK_VERDICTS = {"shipped", "shipped-with-risk", "approved", "approve", "lgtm"}
 
 
 # ---- pure marker logic -------------------------------------------------------
@@ -52,10 +55,11 @@ def emit_marker(kind: str, fields: dict) -> str:
 
 
 def parse_markers(text: str, kind: str | None = None) -> list[dict]:
-    """Extract all jw-*:v1 markers from a blob (or list of blobs joined). Returns dicts with
-    an added '_kind' key; filter by `kind` if given."""
+    """Extract jw-*:v1 markers from a blob. Markers inside ``` fenced blocks are ignored
+    (a quoted example must not be read as live state)."""
     out = []
-    for m in MARKER_RE.finditer(text or ""):
+    clean = FENCE_RE.sub("", text or "")
+    for m in MARKER_RE.finditer(clean):
         k, body = m.group(1), m.group(2)
         if kind and k != kind:
             continue
@@ -70,6 +74,17 @@ def parse_markers(text: str, kind: str | None = None) -> list[dict]:
     return out
 
 
+def parse_bodies(bodies: list[dict]) -> list[dict]:
+    """Parse markers per comment, preserving the comment author/timestamp as _author/_at."""
+    out = []
+    for b in bodies:
+        for m in parse_markers(b.get("body", "")):
+            m["_author"] = b.get("author", "")
+            m["_at"] = b.get("at", "")
+            out.append(m)
+    return out
+
+
 def latest_cycle(markers: list[dict]) -> dict | None:
     cycles = [m for m in markers if m.get("_kind") == "review-cycle" and isinstance(m.get("cycle"), int)]
     return max(cycles, key=lambda m: m["cycle"]) if cycles else None
@@ -80,25 +95,38 @@ def next_cycle_number(markers: list[dict]) -> int:
     return (lc["cycle"] + 1) if lc else 1
 
 
-def classify(markers: list[dict], current_head: str) -> dict:
-    """Pure classification of PR review state vs the current head SHA."""
+def classify(markers: list[dict], current_head: str,
+             macro_reviewers: tuple = (), approvers: tuple = ()) -> dict:
+    """Strict, provenance-bound classification of PR review state vs the current head."""
     lc = latest_cycle(markers)
+    cyc = lc["cycle"] if lc else None
+    frozen = (lc or {}).get("target_sha")
+    head_matches = bool(lc) and str(frozen) == current_head
+
+    def result_ok(r: dict) -> bool:
+        return (str(r.get("reviewed_sha")) == current_head
+                and r.get("review_cycle") == cyc
+                and (not macro_reviewers or r.get("reviewer") in macro_reviewers)
+                and str(r.get("verdict", "")).lower() in MERGE_OK_VERDICTS
+                and not r.get("decision_required"))
+
+    def approval_ok(a: dict) -> bool:
+        author = a.get("_author", "")
+        return (str(a.get("sha")) == current_head
+                and bool(author) and not author.endswith("[bot]")
+                and (not approvers or author in approvers))
+
     results = [m for m in markers if m.get("_kind") == "review-result"]
     approvals = [m for m in markers if m.get("_kind") == "approval"]
     findings = [m for m in markers if m.get("_kind") == "findings"]
-    head_matches = bool(lc) and str(lc.get("target_sha")) == current_head
-    pro_at_head = any(str(r.get("reviewed_sha")) == current_head for r in results)
-    approved_at_head = any(str(a.get("sha")) == current_head for a in approvals)
-    cyc = lc["cycle"] if lc else None
-    findings_resolved = any(f.get("cycle") == cyc and bool(f.get("resolved")) for f in findings)
     return {
         "current_head": current_head,
         "latest_cycle": cyc,
-        "frozen_sha": (lc or {}).get("target_sha"),
-        "cycle_fresh": head_matches,         # no push since freeze
-        "pro_result_at_head": pro_at_head,
-        "approved_at_head": approved_at_head,
-        "findings_resolved": findings_resolved,
+        "frozen_sha": frozen,
+        "cycle_fresh": head_matches,
+        "pro_result_at_head": any(result_ok(r) for r in results),
+        "approved_at_head": any(approval_ok(a) for a in approvals),
+        "findings_resolved": any(f.get("cycle") == cyc and f.get("resolved") is True for f in findings),
         "n_results": len(results),
         "n_approvals": len(approvals),
     }
@@ -118,58 +146,75 @@ def resolve_repo(root: Path) -> str | None:
     return out if rc == 0 and out else None
 
 
+def file_at_ref(root: Path, repo: str, path: str, ref: str) -> str | None:
+    """Read a file's contents from the PR head SHA on GitHub (decouples the gate from the local
+    checkout, which may be a different/dirty tree)."""
+    rc, out = _gh(root, "api", f"repos/{repo}/contents/{path}", "-f", f"ref={ref}", "-q", ".content")
+    if rc != 0 or not out:
+        return None
+    try:
+        return base64.b64decode(out).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
 def pr_bundle(root: Path, pr: int) -> dict | None:
-    """Fetch the PR's head SHA, comment bodies, and reviews via gh; return a normalized bundle."""
     rc, out = _gh(root, "pr", "view", str(pr), "--json",
-                  "headRefOid,comments,reviews,statusCheckRollup,mergeStateStatus")
+                  "headRefOid,comments,reviews,statusCheckRollup,mergeStateStatus,state,isDraft,baseRefName,headRefName")
     if rc != 0:
         print(f"jw_review: gh pr view {pr} failed: {out}", file=sys.stderr)
         return None
-    pr_json = json.loads(out)
+    j = json.loads(out)
     bodies = []
-    for c in pr_json.get("comments", []):
+    for c in j.get("comments", []):
         bodies.append({"body": c.get("body", ""), "author": (c.get("author") or {}).get("login", ""),
                        "at": c.get("createdAt", "")})
-    for r in pr_json.get("reviews", []):
+    for r in j.get("reviews", []):
         bodies.append({"body": r.get("body", ""), "author": (r.get("author") or {}).get("login", ""),
                        "at": r.get("submittedAt", ""), "state": r.get("state", "")})
-    checks = pr_json.get("statusCheckRollup", []) or []
     return {
-        "head": pr_json.get("headRefOid", ""),
-        "bodies": bodies,
-        "all_marker_text": "\n".join(b["body"] for b in bodies),
-        "checks": checks,
-        "merge_state": pr_json.get("mergeStateStatus", ""),
+        "head": j.get("headRefOid", ""), "bodies": bodies,
+        "checks": j.get("statusCheckRollup", []) or [],
+        "merge_state": j.get("mergeStateStatus", ""), "state": j.get("state", ""),
+        "is_draft": bool(j.get("isDraft")), "base": j.get("baseRefName", ""), "head_ref": j.get("headRefName", ""),
     }
 
 
 def codex_fresh(bundle: dict, since_at: str | None) -> bool:
-    """Codex bot activity at-or-after the latest freeze comment timestamp."""
+    """A Codex bot REVIEW (not just any comment) submitted at-or-after the latest freeze."""
     for b in bundle["bodies"]:
-        if b["author"] == CODEX_BOT and (since_at is None or (b.get("at") or "") >= since_at):
+        if b["author"] == CODEX_BOT and "state" in b and (since_at is None or (b.get("at") or "") >= since_at):
             return True
     return False
 
 
 def ci_state(bundle: dict) -> str:
+    """Strict: only SUCCESS counts as passing. Unknown/neutral/skipped/action-required are
+    treated as non-passing (fail-closed under require_ci)."""
     checks = bundle.get("checks", [])
     if not checks:
         return "none"
     states = [(c.get("conclusion") or c.get("state") or "").upper() for c in checks]
-    if any(s in ("FAILURE", "ERROR", "CANCELLED", "TIMED_OUT") for s in states):
-        return "failing"
-    if any(s in ("", "PENDING", "IN_PROGRESS", "QUEUED", "EXPECTED") for s in states):
+    if any(s in ("", "PENDING", "IN_PROGRESS", "QUEUED", "EXPECTED", "WAITING", "REQUESTED") for s in states):
         return "pending"
-    return "passing"
+    if all(s in ("SUCCESS", "COMPLETED") for s in states):
+        return "passing"
+    return "failing"
 
 
-def pr_facts(root: Path, pr: int) -> dict | None:
-    """Everything the merge gate and status need about a PR, normalized."""
+def pr_facts(root: Path, pr: int, cfg: dict, repo: str | None) -> dict | None:
     bundle = pr_bundle(root, pr)
     if bundle is None:
         return None
-    markers = parse_markers(bundle["all_marker_text"])
-    cls = classify(markers, bundle["head"])
+    return facts_from_bundle(bundle, cfg, repo)
+
+
+def facts_from_bundle(bundle: dict, cfg: dict, repo: str | None) -> dict:
+    owner = (repo.split("/", 1)[0] if repo else "")
+    approvers = tuple({owner, *cfg["review"].get("approvers", [])} - {""})
+    macro = tuple(r for r in cfg["review"]["reviewers"] if r != "codex")
+    markers = parse_bodies(bundle["bodies"])
+    cls = classify(markers, bundle["head"], macro_reviewers=macro, approvers=approvers)
     lc = latest_cycle(markers)
     freeze_at = None
     if lc:
@@ -179,7 +224,10 @@ def pr_facts(root: Path, pr: int) -> dict | None:
                 break
     cls["codex_fresh"] = codex_fresh(bundle, freeze_at)
     cls["ci"] = ci_state(bundle)
-    cls["merge_state"] = bundle.get("merge_state", "")
+    cls["pr_state"] = bundle["state"]
+    cls["is_draft"] = bundle["is_draft"]
+    cls["base"] = bundle["base"]
+    cls["merge_state"] = bundle["merge_state"]
     return cls
 
 
@@ -193,8 +241,9 @@ def _opt(argv: list[str], name: str) -> str | None:
 
 
 def _root(argv: list[str]) -> Path | None:
-    positional = [a for a in argv if not a.startswith("--")
-                  and argv[argv.index(a) - 1] not in ("--pr", "--round")]
+    flags = ("--pr", "--round", "--sha", "--commit")
+    positional = [a for i, a in enumerate(argv)
+                  if not a.startswith("--") and (i == 0 or argv[i - 1] not in flags)]
     if positional:
         return Path(positional[-1]).resolve()
     return find_project_root(Path.cwd())
@@ -203,24 +252,23 @@ def _root(argv: list[str]) -> Path | None:
 def freeze(root: Path, pr: int, round_id: str | None) -> int:
     cfg = load_config(root)
     if cfg["review"]["mode"] != "pr":
-        print("jw_review freeze: review.mode is 'packet'; freeze is for PR mode. "
-              "Set review.mode: pr in .jahns-workflow.yml.", file=sys.stderr)
+        print("jw_review freeze: review.mode is 'packet'; freeze is for PR mode.", file=sys.stderr)
         return 1
     bundle = pr_bundle(root, pr)
     if bundle is None:
         return 1
     head = bundle["head"] or git_full_sha(root, "HEAD")
-    markers = parse_markers(bundle["all_marker_text"])
+    markers = parse_bodies(bundle["bodies"])
     n = next_cycle_number(markers)
     reviewers = cfg["review"]["reviewers"]
     marker = emit_marker("review-cycle", {
         "round_id": round_id or "(unset)", "cycle": n, "target_sha": head, "reviewers": reviewers,
     })
     body = (f"## Review cycle {n} — frozen at `{head[:12]}`\n\n"
-            f"This is the immutable review target for cycle {n}. A new push makes this cycle stale.\n\n"
+            f"Immutable review target for cycle {n}. A new push makes this cycle stale.\n\n"
             + ("@codex review\n\n" if "codex" in reviewers else "")
-            + ("External macro reviewer: review this PR at the SHA above; end your reply with a "
-               "`jw-review-result` footer carrying `reviewed_sha: " + head + "`.\n\n"
+            + (f"Macro reviewer: review at the SHA above; end your reply with a `jw-review-result` "
+               f"footer carrying `reviewed_sha: {head}` and `review_cycle: {n}`.\n\n"
                if any("gpt" in r or "pro" in r for r in reviewers) else "")
             + marker + "\n")
     rc, out = _gh(root, "pr", "comment", str(pr), "--body", body)
@@ -234,20 +282,19 @@ def freeze(root: Path, pr: int, round_id: str | None) -> int:
 def status(root: Path, pr: int | None) -> int:
     cfg = load_config(root)
     if pr is not None:
-        facts = pr_facts(root, pr)
+        facts = pr_facts(root, pr, cfg, resolve_repo(root))
         if facts is None:
             return 1
-        print(f"PR #{pr} review status:")
+        print(f"PR #{pr} review status ({facts['pr_state']}{', DRAFT' if facts['is_draft'] else ''}):")
         print(f"  current head:   {facts['current_head'][:12]}")
         print(f"  latest cycle:   {facts['latest_cycle']} (frozen {str(facts['frozen_sha'])[:12]})")
-        print(f"  cycle fresh:    {facts['cycle_fresh']}  (False = a push happened after freeze → re-freeze)")
+        print(f"  cycle fresh:    {facts['cycle_fresh']}  (False = push after freeze → re-freeze)")
         print(f"  codex fresh:    {facts['codex_fresh']}")
         print(f"  CI:             {facts['ci']}")
-        print(f"  pro result@head:{facts['pro_result_at_head']}  ({facts['n_results']} result(s) total)")
+        print(f"  pro result@head:{facts['pro_result_at_head']}  ({facts['n_results']} result(s))")
         print(f"  findings resolved: {facts['findings_resolved']}")
-        print(f"  approved@head:  {facts['approved_at_head']}  ({facts['n_approvals']} approval(s) total)")
+        print(f"  approved@head:  {facts['approved_at_head']}  ({facts['n_approvals']} approval(s))")
         return 0
-    # packet mode: derive request/feedback pairs from reviews_dir
     rdir = root / cfg["reviews_dir"]
     if not rdir.is_dir():
         print("no reviews dir yet")

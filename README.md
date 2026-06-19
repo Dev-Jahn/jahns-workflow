@@ -64,6 +64,14 @@ Set `review.mode` in `.jahns-workflow.yml`:
 Both modes share a hard push gate (`jw remote verify`): no review is requested against an
 unpushed HEAD. Deterministic core is tested under `scripts/tests/` (`uv run scripts/tests/run_tests.py`).
 
+**Provenance binding (v0.2.2).** A review marker is only believed when its provenance binds: a
+result must come from a configured reviewer, for the latest cycle, at the current head, with a
+merge-compatible verdict and no unresolved decision; an approval must be authored by a trusted
+approver (the repo owner or `review.approvers`) and bound to the head; markers quoted inside
+fenced code blocks are ignored. The merge gate reads config/tasks from the **PR head SHA** (not
+the local checkout), refuses non-OPEN/draft PRs, and merges with `--match-head-commit` so a push
+between the gate check and the merge aborts it. CI is strict — only `SUCCESS` is passing.
+
 ## Requirements
 
 - `git`, `bash`, [`uv`](https://docs.astral.sh/uv/) on PATH (scripts use PEP 723 inline deps; first run downloads `pyyaml` once).

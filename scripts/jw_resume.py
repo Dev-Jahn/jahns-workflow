@@ -16,11 +16,13 @@ Usage (also `jw resume`): jw_resume.py [root]   |   jw_resume.py --path [root]
 from __future__ import annotations
 
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from jw_common import (  # noqa: E402
-    find_project_root, git, git_branch_info, load_config, load_tasks, next_actionable, resume_path,
+    find_project_root, git, git_branch_info, git_full_sha, load_config, load_tasks,
+    next_actionable, resume_path,
 )
 
 
@@ -35,7 +37,9 @@ def snapshot(root: Path) -> str:
     rounds = sorted({t["round"] for t in active if t.get("round")})
     nxt = next_actionable(data, cap=6)
 
-    L = [f"[jahns-workflow resume] {data.get('project', root.name)} — re-entry pointer",
+    L = [f"captured_head: {git_full_sha(root, 'HEAD') or 'none'}",
+         f"captured_at: {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}",
+         f"[jahns-workflow resume] {data.get('project', root.name)} — re-entry pointer",
          f"branch: {g['branch']} ({'dirty +' + str(g['dirty']) if g['dirty'] else 'clean'}) | HEAD: {head}"]
     if rounds:
         L.append(f"active round: {', '.join(rounds)}")

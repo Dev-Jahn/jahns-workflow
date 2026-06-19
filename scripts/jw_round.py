@@ -64,28 +64,55 @@ def set_task_field(text: str, task_id: str, field: str, value: str) -> str:
     start, end = span
     nl = "\n" if not lines[start].endswith("\r\n") else "\r\n"
     field_indent = len(lines[start]) - len(lines[start].lstrip()) + 2
-    field_re = re.compile(r"^(\s*)" + re.escape(field) + r":\s*.*$")
+    # match ONLY a task-level field at the exact sibling indent — never a deeper nested key
+    # (e.g. a `lane:`/`status:` sub-mapping must not be mistaken for the task's `status`).
+    field_re = re.compile(rf"^ {{{field_indent}}}{re.escape(field)}:\s*.*$")
     for k in range(start + 1, end):
         if field_re.match(lines[k]):
-            ind = lines[k][: len(lines[k]) - len(lines[k].lstrip())]
-            lines[k] = f"{ind}{field}: {value}{nl}"
+            lines[k] = f"{' ' * field_indent}{field}: {value}{nl}"
             return "".join(lines)
     lines.insert(start + 1, f"{' ' * field_indent}{field}: {value}{nl}")
     return "".join(lines)
 
 
-def set_config_scalar(text: str, key: str, value: str) -> str:
-    """Replace the value of a `<key>:` line (e.g. last_round_commit) preserving indent/comments.
-    Matches the first such key line at any indent. Raises if absent."""
-    line_re = re.compile(r"^(\s*)" + re.escape(key) + r":\s*.*$")
+def set_config_scalar(text: str, key: str, value: str, section: str | None = None) -> str:
+    """Replace the value of a `<key>:` line preserving indent/comments. When `section` is given
+    (e.g. 'state'), only a key INSIDE that block is matched — so `last_round_commit` can't be
+    confused with a same-named key elsewhere. Raises if absent."""
     lines = text.splitlines(keepends=True)
+    key_re = re.compile(r"^(\s*)" + re.escape(key) + r":\s*.*$")
+
+    def replace_at(i: int, indent: str) -> str:
+        nl = "\r\n" if lines[i].endswith("\r\n") else "\n"
+        lines[i] = f"{indent}{key}: {value}{nl}"
+        return "".join(lines)
+
+    if section is None:
+        for i, ln in enumerate(lines):
+            m = key_re.match(ln)
+            if m:
+                return replace_at(i, m.group(1))
+        raise KeyError(f"config key not found: {key}")
+
+    sec_re = re.compile(r"^(\s*)" + re.escape(section) + r":\s*$")
+    start = sec_indent = None
     for i, ln in enumerate(lines):
-        m = line_re.match(ln)
+        m = sec_re.match(ln)
         if m:
-            nl = "\r\n" if ln.endswith("\r\n") else "\n"
-            lines[i] = f"{m.group(1)}{key}: {value}{nl}"
-            return "".join(lines)
-    raise KeyError(f"config key not found: {key}")
+            start, sec_indent = i, len(m.group(1))
+            break
+    if start is None:
+        raise KeyError(f"config section not found: {section}")
+    for j in range(start + 1, len(lines)):
+        ln = lines[j]
+        if not ln.strip():
+            continue
+        if len(ln) - len(ln.lstrip()) <= sec_indent:
+            break  # dedented out of the section
+        m = key_re.match(ln)
+        if m:
+            return replace_at(j, m.group(1))
+    raise KeyError(f"config key {key!r} not found under section {section!r}")
 
 
 # ---- orchestration -----------------------------------------------------------
@@ -94,43 +121,65 @@ def _parse_ids(s: str | None) -> list[str]:
 
 
 def close(root: Path, round_id: str, done: list[str], touched: list[str], commit: str) -> int:
+    """Fail-closed: resolve the commit and confirm the watermark slot up front, apply edits in
+    memory and validate BEFORE writing anything, then write tasks.yaml → views → watermark."""
+    import yaml
+    import jw_roadmap
+    import jw_validate
+
     if not ROUND_RE.match(round_id):
         print(f"jw_round close: --round must match YYYY-MM-DD-<slug>, got {round_id!r}", file=sys.stderr)
         return 1
     cfg = load_config(root)
+    cfg_path = root / ".jahns-workflow.yml"
     tasks_path = root / "tasks.yaml"
+
+    # --- preflight (no writes) ---
+    full = git_full_sha(root, commit)
+    if full is None:
+        print(f"jw_round close: --commit {commit!r} does not resolve to a commit", file=sys.stderr)
+        return 1
+    ctext = cfg_path.read_text(encoding="utf-8")
+    try:
+        ctext_new = set_config_scalar(ctext, "last_round_commit", full, section="state")
+    except KeyError:
+        print("jw_round close: state.last_round_commit is missing from .jahns-workflow.yml — "
+              "add it (under `state:`) before closing rounds.", file=sys.stderr)
+        return 1
+
     text = tasks_path.read_text(encoding="utf-8")
+    data0 = yaml.safe_load(text) or {}
+    by_id = {t.get("id"): t for t in data0.get("tasks", []) if isinstance(t, dict)}
+    # done tasks must have all deps done (a gate can't be done while a dep isn't)
+    dep_problems = []
+    for tid in done:
+        for dep in (by_id.get(tid, {}).get("deps") or []):
+            if by_id.get(dep, {}).get("status") != "done":
+                dep_problems.append(f"{tid} cannot be done — dependency {dep} is not done")
+    if dep_problems:
+        for p in dep_problems:
+            print(f"jw_round close: {p}", file=sys.stderr)
+        return 1
+
     try:
         for tid in done:
             text = set_task_field(text, tid, "status", "done")
-        for tid in dict.fromkeys(done + touched):  # stamp round on everything worked, de-duped
+        for tid in dict.fromkeys(done + touched):
             text = set_task_field(text, tid, "round", round_id)
     except KeyError as e:
         print(f"jw_round close: {e}", file=sys.stderr)
         return 1
-    tasks_path.write_text(text, encoding="utf-8")
 
-    # validate + regenerate views (import the deterministic siblings)
-    import yaml
-    import jw_roadmap
-    import jw_validate
-    errs = jw_validate.validate(yaml.safe_load(tasks_path.read_text(encoding="utf-8")))
+    errs = jw_validate.validate(yaml.safe_load(text))
     if errs:
-        print(f"jw_round close: tasks.yaml invalid after edits ({len(errs)} issue(s)) — review/revert:",
-              file=sys.stderr)
+        print(f"jw_round close: edits would make tasks.yaml invalid ({len(errs)} issue(s)) — aborted, "
+              f"nothing written:", file=sys.stderr)
         for e in errs[:10]:
             print(f"  - {e}", file=sys.stderr)
         return 2
-    (root / "ROADMAP.md").write_text(jw_roadmap.render(root), encoding="utf-8")
-    if cfg.get("ssot"):
-        import jw_ssot
-        jw_ssot.split(root)
-        jw_ssot.digest(root)
 
-    # churn since the previous round watermark (before we overwrite it)
-    cfg_path = root / ".jahns-workflow.yml"
+    # churn since the previous watermark (computed before advancing it)
     prev = (cfg.get("state") or {}).get("last_round_commit")
-    full = git_full_sha(root, commit) or commit
     churn = None
     if prev and cfg.get("ssot"):
         stat = git(root, "diff", "--numstat", f"{prev}..{full}", "--", cfg["ssot"])
@@ -139,17 +188,17 @@ def close(root: Path, round_id: str, done: list[str], touched: list[str], commit
             dels = sum(int(p.split("\t")[1]) for p in stat.splitlines() if p.split("\t")[1].isdigit())
             churn = adds + dels
 
-    # advance the watermark
-    ctext = cfg_path.read_text(encoding="utf-8")
-    try:
-        ctext = set_config_scalar(ctext, "last_round_commit", full)
-        cfg_path.write_text(ctext, encoding="utf-8")
-        wm = "set"
-    except KeyError:
-        wm = "MISSING state.last_round_commit — add it to .jahns-workflow.yml"
+    # --- commit phase (all preflight checks passed) ---
+    tasks_path.write_text(text, encoding="utf-8")
+    cfg_path.write_text(ctext_new, encoding="utf-8")
+    (root / "ROADMAP.md").write_text(jw_roadmap.render(root), encoding="utf-8")
+    if cfg.get("ssot"):
+        import jw_ssot
+        jw_ssot.split(root)
+        jw_ssot.digest(root)
 
     print(f"round {round_id} closed: {len(done)} done, {len(set(done + touched))} stamped; "
-          f"watermark {wm} @ {full[:12]}")
+          f"watermark set @ {full[:12]}")
     if churn is not None:
         flag = "  ⚠ BULK EDIT (>100 lines) — run /jahns-workflow:audit on changed sections" if churn > 100 else ""
         print(f"SSOT churn since last round: {churn} lines{flag}")

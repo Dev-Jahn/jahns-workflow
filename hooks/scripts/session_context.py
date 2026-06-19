@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
-from jw_common import git_branch_info, load_config, load_tasks, next_actionable  # noqa: E402
+from jw_common import git_branch_info, git_full_sha, load_config, load_tasks, next_actionable, resume_path  # noqa: E402
 
 MAX_CHARS = 8000
 MAX_TASK_LINES = 8
@@ -56,6 +56,22 @@ def main() -> int:
         for tid, title in nxt:
             lines.append(f"  → {tid} — {title}")
     lines.append(f"Task registry: tasks.yaml | Roadmap: ROADMAP.md | Conventions: see CLAUDE.md workflow section")
+
+    # consume a PreCompact/SessionEnd resume pointer if one was left, flagging staleness
+    rp = resume_path(root)
+    if rp.is_file():
+        try:
+            snap = rp.read_text(encoding="utf-8")
+            captured = next((ln.split(":", 1)[1].strip() for ln in snap.splitlines()
+                             if ln.startswith("captured_head:")), "")
+            at = next((ln.split(":", 1)[1].strip() for ln in snap.splitlines()
+                       if ln.startswith("captured_at:")), "")
+            cur = git_full_sha(root, "HEAD") or ""
+            stale = " [STALE: HEAD has moved since]" if captured and cur and captured != cur else ""
+            lines.append(f"last checkpoint: {at} @ {captured[:12]}{stale}")
+            rp.unlink()  # consume — a fresh one is written at the next PreCompact/SessionEnd
+        except OSError:
+            pass
 
     digest = root / cfg["generated_dir"] / "DIGEST.md"
     if digest.is_file():

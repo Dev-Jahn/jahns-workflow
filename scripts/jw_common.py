@@ -1,6 +1,7 @@
 """Shared helpers for jahns-workflow scripts (imported by sibling scripts)."""
 from __future__ import annotations
 
+import hashlib
 import re
 import subprocess
 from pathlib import Path
@@ -35,8 +36,9 @@ def load_yaml(path: Path):
         return yaml.safe_load(f)
 
 
-def load_config(root: Path) -> dict:
-    cfg = load_yaml(root / CONFIG_NAME) or {}
+def normalize_config(cfg: dict | None) -> dict:
+    """Apply defaults + validation to a parsed config mapping (from disk OR from a PR head)."""
+    cfg = dict(cfg or {})
     cfg.setdefault("progress", "PROGRESS.md")
     cfg.setdefault("adr_dir", "docs/adr")
     cfg.setdefault("reviews_dir", "docs/reviews")
@@ -48,13 +50,24 @@ def load_config(root: Path) -> dict:
         raise ValueError(f"generated_dir must be a relative path inside the repo: {cfg['generated_dir']!r}")
     rv = cfg.setdefault("review", {})
     if not isinstance(rv, dict):
-        raise ValueError("review: must be a mapping (mode/reviewers/require_ci)")
+        raise ValueError("review: must be a mapping (mode/reviewers/require_ci/approvers)")
     rv.setdefault("mode", "packet")  # packet | pr
     rv.setdefault("reviewers", ["codex", "gpt-5.5-pro"])
     rv.setdefault("require_ci", False)
+    rv.setdefault("approvers", [])  # extra trusted approver logins beyond the repo owner
     if rv["mode"] not in ("packet", "pr"):
         raise ValueError(f"review.mode must be 'packet' or 'pr', got {rv['mode']!r}")
+    if not (isinstance(rv["reviewers"], list) and all(isinstance(r, str) for r in rv["reviewers"])):
+        raise ValueError("review.reviewers must be a list of strings")
+    if not isinstance(rv["require_ci"], bool):
+        raise ValueError("review.require_ci must be a boolean")
+    if not (isinstance(rv["approvers"], list) and all(isinstance(a, str) for a in rv["approvers"])):
+        raise ValueError("review.approvers must be a list of strings")
     return cfg
+
+
+def load_config(root: Path) -> dict:
+    return normalize_config(load_yaml(root / CONFIG_NAME))
 
 
 def git_rc(root: Path, *args: str) -> tuple[int, str, str]:
@@ -88,12 +101,15 @@ def is_ancestor(root: Path, a: str, b: str) -> bool:
 
 def head_pushed(root: Path, fetch: bool = True) -> tuple[bool, dict]:
     """Is the current HEAD contained in its tracked upstream (i.e. actually pushed)?
-    Returns (pushed, info). info carries upstream/head/behind for reporting."""
+    Returns (pushed, info). Fail-closed: a fetch failure (network/auth/remote) returns
+    (False, reason) rather than trusting a stale ref. Pass fetch=False for explicit offline use."""
     up = upstream_ref(root)
     if not up:
         return (False, {"reason": "no upstream tracking branch"})
     if fetch:
-        git_rc(root, "fetch", "--quiet", up.split("/", 1)[0])
+        rc, _, err = git_rc(root, "fetch", "--quiet", up.split("/", 1)[0])
+        if rc != 0:
+            return (False, {"reason": f"fetch failed — remote unverifiable: {err or 'error'}", "upstream": up})
     head = git_full_sha(root, "HEAD")
     pushed = is_ancestor(root, "HEAD", up)
     rc, out, _ = git_rc(root, "rev-list", "--count", f"HEAD..{up}")
@@ -142,9 +158,12 @@ def next_actionable(data: dict, cap: int = 6) -> list[tuple[str, str]]:
 
 
 def resume_path(root: Path) -> Path:
-    """Plugin-local ephemeral re-entry snapshot for a project (NOT committed to the repo)."""
-    slug = re.sub(r"[^A-Za-z0-9]+", "-", str(root.resolve())).strip("-")
-    return Path.home() / ".claude" / "jahns-workflow" / "resume" / f"{slug}.md"
+    """Plugin-local ephemeral re-entry snapshot for a project (NOT committed to the repo).
+    Includes a hash of the absolute path so different repos can't collide on a truncated slug."""
+    rp = str(root.resolve())
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", rp).strip("-")[:60].rstrip("-")
+    h = hashlib.sha1(rp.encode("utf-8")).hexdigest()[:8]
+    return Path.home() / ".claude" / "jahns-workflow" / "resume" / f"{slug}-{h}.md"
 
 
 def slugify(text: str, max_len: int = 40) -> str:
