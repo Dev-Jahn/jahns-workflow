@@ -114,6 +114,10 @@ from the PR's **base SHA** — the protected target branch — not the candidate
 can't relax its own merge rules. A cycle is frozen against both head and base SHA; a base advance
 makes it stale. Every fact is the latest source-bound state: a later not-shipped cancels an
 earlier shipped, and a Codex signal newer than a findings resolution or approval re-blocks both.
+Evidence is cycle-bound — a Codex signal must post-date the latest freeze, and the human approval
+binds to `(cycle, head, base)` and must come after all evidence — so re-freezing to a new
+cycle/base can never reuse a previous cycle's Codex review or approval. Markers tied on the newest
+timestamp with conflicting content fail closed.
 
 Trust-model note: approval binds to a trusted approver's GitHub login, but a coding agent that
 shares that login's `gh` credential can post an approval indistinguishable from a hand-made one.

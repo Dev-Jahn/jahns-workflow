@@ -84,27 +84,38 @@ def merge_gate(g: dict) -> tuple[bool, list[str]]:
 
 # ---- CLI ---------------------------------------------------------------------
 def approve(root: Path, pr: int, sha: str) -> int:
-    bundle = jw_review.pr_bundle(root, pr)
+    repo = jw_review.resolve_repo(root)
+    bundle = jw_review.pr_bundle(root, pr, repo)
     if bundle is None:
         return 1
     head = bundle["head"]
+    base_sha = bundle.get("base_sha", "")
     if len(sha) < 7 or not head.startswith(sha):
         print(f"jw approve: refusing — --sha {sha} is not the current PR head ({head[:12]}). "
               f"Approval must bind to the exact current head.", file=sys.stderr)
         return 3
+    # bind the approval to the current cycle, so a later re-freeze (new cycle/base) invalidates it
+    owner = repo.split("/", 1)[0] if repo else ""
+    operators = tuple({owner, *load_config(root)["review"].get("operators", [])} - {""})
+    lc = jw_review.latest_cycle(jw_review.parse_bodies(bundle["bodies"]), operators)
+    if lc is None:
+        print("jw approve: no review cycle is frozen yet — run `jw review freeze` first.", file=sys.stderr)
+        return 1
     rc, login = jw_review._gh(root, "api", "user", "-q", ".login")
     if rc != 0 or not login:
         print("jw approve: could not resolve your GitHub login (gh api user) — an approval must "
               "bind to a real actor whose identity matches who posts it.", file=sys.stderr)
         return 1
     by = login
-    marker = jw_review.emit_marker("approval", {"sha": head, "by": by})
-    body = f"Approved for merge at `{head[:12]}`. A new push invalidates this automatically.\n\n{marker}\n"
+    marker = jw_review.emit_marker("approval",
+                                   {"sha": head, "base_sha": base_sha, "cycle": lc["cycle"], "by": by})
+    body = (f"Approved for merge at `{head[:12]}` (cycle {lc['cycle']}, base `{base_sha[:12]}`). "
+            f"A new push, a base advance, or a re-freeze invalidates this automatically.\n\n{marker}\n")
     rc, out = jw_review._gh(root, "pr", "comment", str(pr), "--body", body)
     if rc != 0:
         print(f"jw approve: gh pr comment failed: {out}", file=sys.stderr)
         return 1
-    print(f"approval recorded for PR #{pr} at {head[:12]} by {by}")
+    print(f"approval recorded for PR #{pr} at {head[:12]} (cycle {lc['cycle']}) by {by}")
     return 0
 
 
@@ -142,12 +153,15 @@ def _gather(root: Path, pr: int) -> dict | None:
         read_ok = False
     facts = jw_review.facts_from_bundle(bundle, policy, repo)
     reviewers = policy["review"]["reviewers"]
+    # any configured reviewer other than codex is a mandatory macro reviewer — never guess by name
+    # (a reviewer like 'research-auditor' must not be silently dropped from the gate).
+    macro = [r for r in reviewers if r != "codex"]
     return {
         **facts,
         "head_read_ok": read_ok,
         "require_ci": policy["review"]["require_ci"],
         "want_codex": "codex" in reviewers,
-        "want_pro": any(("gpt" in r or "pro" in r) and r != "codex" for r in reviewers),
+        "want_pro": bool(macro),
         "remote_contains_head": None,
         "expected_base": jw_review._gh(root, "repo", "view", "--json", "defaultBranchRef",
                                        "-q", ".defaultBranchRef.name")[1] or None,

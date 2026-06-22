@@ -125,10 +125,11 @@ def classify(markers: list[dict], current_head: str, macro_reviewers: tuple = ()
     reviewer must have a latest merge-compatible result (a later not-shipped cancels an earlier
     shipped); findings use the latest resolution. A cycle is fresh only if BOTH the frozen head
     and the frozen base equal the current head/base (`current_base` given) — base drift means the
-    merged tree differs from what was reviewed. When `codex_signal_at` is given, findings and the
-    human approval must POST-DATE the newest Codex signal at this head, so a new Codex finding
-    re-blocks a stale resolution/approval. Conflicting freeze markers for the latest cycle fail
-    closed."""
+    merged tree differs from what was reviewed. The human approval is bound to (cycle, head, base)
+    and must POST-DATE every piece of evidence (the newest Codex signal, the latest macro result,
+    the latest findings resolution), so re-freezing to a new cycle/base cannot reuse a stale
+    approval. Markers sharing the newest timestamp with conflicting content fail closed.
+    Conflicting freeze markers for the latest cycle fail closed."""
     trusted_cycles = [m for m in markers if m.get("_kind") == "review-cycle"
                       and isinstance(m.get("cycle"), int)
                       and (not operators or m.get("_author") in operators)]
@@ -136,48 +137,68 @@ def classify(markers: list[dict], current_head: str, macro_reviewers: tuple = ()
     cyc = lc["cycle"] if lc else None
     frozen = (lc or {}).get("target_sha")
     frozen_base = (lc or {}).get("base_sha")
-    # two operator freeze markers for the SAME latest cycle but different SHA → ambiguous, block
+    # two operator freeze markers for the SAME latest cycle but a different (head, base) → block
     conflict = lc is not None and any(
-        m is not lc and m["cycle"] == cyc and str(m.get("target_sha")) != str(frozen)
+        m is not lc and m["cycle"] == cyc
+        and (str(m.get("target_sha")) != str(frozen) or str(m.get("base_sha")) != str(frozen_base))
         for m in trusted_cycles)
     base_ok = current_base is None or str(frozen_base) == current_base
     head_matches = bool(lc) and not conflict and str(frozen) == current_head and base_ok
 
-    def newer_than_codex(at: str) -> bool:
-        return codex_signal_at is None or (at or "") >= codex_signal_at
+    def at(m: dict) -> str:
+        return m.get("_at") or ""
 
-    # results: per macro reviewer, the LATEST trusted result must be merge-compatible (all-of)
+    def latest_group(items: list[dict]) -> list[dict]:
+        """All markers sharing the newest timestamp — so a same-timestamp conflict fails closed
+        instead of arbitrarily picking the first of a tie."""
+        mx = max((at(i) for i in items), default="")
+        return [i for i in items if at(i) == mx]
+
+    # results: this head+cycle, trusted operator. Per macro reviewer, the newest result(s) must
+    # ALL be merge-compatible (a same-second shipped/not-shipped tie → not ok).
     results = [m for m in markers if m.get("_kind") == "review-result"
                and str(m.get("reviewed_sha")) == current_head and m.get("review_cycle") == cyc
                and (not operators or m.get("_author") in operators)]
 
+    def mergeable(r: dict) -> bool:
+        return str(r.get("verdict", "")).lower() in MERGE_OK_VERDICTS and not r.get("decision_required")
+
     def reviewer_ok(reviewer: str) -> bool:
         rs = [r for r in results if r.get("reviewer") == reviewer]
-        if not rs:
-            return False
-        latest = max(rs, key=lambda r: r.get("_at") or "")
-        return (str(latest.get("verdict", "")).lower() in MERGE_OK_VERDICTS
-                and not latest.get("decision_required"))
+        return bool(rs) and all(mergeable(r) for r in latest_group(rs))
 
     pro_ok = all(reviewer_ok(rv) for rv in macro_reviewers) if macro_reviewers else True
+
+    # findings: this cycle, trusted operator; the newest resolution(s) must all be resolved AND
+    # post-date the newest Codex signal (a later 'resolved: false' or a fresh Codex finding blocks).
+    cyc_findings = [m for m in markers if m.get("_kind") == "findings" and m.get("cycle") == cyc
+                    and (not operators or m.get("_author") in operators)]
+    findings_group = latest_group(cyc_findings) if cyc_findings else []
+    findings_at = max((at(f) for f in findings_group), default="")
+    findings_resolved = (bool(findings_group) and all(f.get("resolved") is True for f in findings_group)
+                         and (codex_signal_at is None or findings_at >= codex_signal_at))
+
+    # the approval must come AFTER every piece of evidence at this head
+    evidence = []
+    if results:
+        evidence.append(max(at(r) for r in results))
+    if cyc_findings:
+        evidence.append(findings_at)
+    if codex_signal_at:
+        evidence.append(codex_signal_at)
+    evidence_at = max(evidence) if evidence else None
 
     def approval_ok(a: dict) -> bool:
         author = a.get("_author", "")
         return (str(a.get("sha")) == current_head
+                and (cyc is None or a.get("cycle") == cyc)            # bound to THIS cycle
+                and (current_base is None or str(a.get("base_sha")) == current_base)  # and base
                 and bool(author) and not author.endswith("[bot]")
                 and (not approvers or author in approvers)
                 and str(a.get("by", "")) == author  # claimed approver must equal who posted it
-                and newer_than_codex(a.get("_at", "")))
+                and (evidence_at is None or at(a) >= evidence_at))  # after all evidence
 
     approvals = [m for m in markers if m.get("_kind") == "approval"]
-    # findings: only this cycle, only from trusted operators; the LATEST state must be resolved
-    # AND post-date the newest Codex signal (a later 'resolved: false' or a fresh Codex finding
-    # re-blocks).
-    cyc_findings = [m for m in markers if m.get("_kind") == "findings" and m.get("cycle") == cyc
-                    and (not operators or m.get("_author") in operators)]
-    latest_finding = max(cyc_findings, key=lambda f: f.get("_at") or "") if cyc_findings else None
-    findings_resolved = (bool(latest_finding) and latest_finding.get("resolved") is True
-                         and newer_than_codex(latest_finding.get("_at", "")))
     return {
         "current_head": current_head,
         "latest_cycle": cyc,
@@ -281,22 +302,30 @@ def _codex_comment_reviews(body: str, target_sha: str) -> bool:
 
 
 def codex_signals_at_head(reviews: list[dict], comment_bodies: list[dict],
-                          target_sha: str | None) -> list[dict]:
+                          target_sha: str | None, since_at: str | None = None) -> list[dict]:
     """Every Codex signal bound to the EXACT target tree, as {kind, id, at}. Two recordings count:
       (1) a formal Codex review whose `commit_id == target_sha`, or
       (2) a Codex-bot COMMENT whose `Reviewed commit:` field names target_sha (the connector's
           normal no-issue path posts a comment, not a formal review object).
     Only the GitHub-verified Codex bot login is trusted (un-spoofable). A bare 👍 reaction can't be
-    SHA-bound and is not a signal — re-request a textual `@codex review`."""
+    SHA-bound and is not a signal — re-request a textual `@codex review`. When `since_at` is given
+    (the latest freeze time), only signals AT-OR-AFTER it count, so a re-freeze (new cycle/base on
+    the same head) cannot reuse a Codex review from a previous cycle."""
     if not target_sha:
         return []
+
+    def fresh(ts: str) -> bool:
+        return since_at is None or (ts or "") >= since_at
+
     out = []
     for r in reviews:
         if (is_codex(r.get("author")) and r.get("commit_id") == target_sha
-                and r.get("state") in ("APPROVED", "COMMENTED", "CHANGES_REQUESTED")):
+                and r.get("state") in ("APPROVED", "COMMENTED", "CHANGES_REQUESTED")
+                and fresh(r.get("at") or "")):
             out.append({"kind": "review", "id": r.get("id"), "at": r.get("at") or ""})
     for b in comment_bodies:
-        if is_codex(b.get("author")) and _codex_comment_reviews(b.get("body") or "", target_sha):
+        if (is_codex(b.get("author")) and _codex_comment_reviews(b.get("body") or "", target_sha)
+                and fresh(b.get("at") or "")):
             out.append({"kind": "comment", "id": b.get("id"), "at": b.get("at") or ""})
     return out
 
@@ -334,10 +363,13 @@ def facts_from_bundle(bundle: dict, cfg: dict, repo: str | None) -> dict:
     operators = tuple({owner, *cfg["review"].get("operators", [])} - {""})
     macro = tuple(r for r in cfg["review"]["reviewers"] if r != "codex")
     markers = parse_bodies(bundle["bodies"])
-    # Codex signals bound to the exact head we'd merge — a formal review (commit_id) or its
-    # no-issue comment naming the head. The newest one's timestamp gates findings/approval
-    # freshness so a late Codex finding re-blocks a stale resolution/approval.
-    signals = codex_signals_at_head(bundle.get("reviews", []), bundle.get("bodies", []), bundle["head"])
+    # Codex signals must be bound to the exact head AND post-date the latest freeze — so a re-freeze
+    # (new cycle/base, same head) can't reuse a Codex review from a previous cycle. The newest
+    # signal's timestamp also gates findings/approval freshness.
+    lc = latest_cycle(markers, operators)
+    freeze_at = lc.get("_at") if lc else None
+    signals = codex_signals_at_head(bundle.get("reviews", []), bundle.get("bodies", []),
+                                    bundle["head"], since_at=freeze_at)
     codex_at = max((s["at"] for s in signals), default=None) if signals else None
     cls = classify(markers, bundle["head"], macro_reviewers=macro, approvers=approvers,
                    operators=operators, current_base=bundle.get("base_sha") or None,

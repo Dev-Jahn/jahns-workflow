@@ -76,7 +76,7 @@ class MarkerTests(unittest.TestCase):
             {"body": jw_review.emit_marker("review-result", {"reviewer": reviewer, "review_cycle": cycle,
                                                              "reviewed_sha": head, "verdict": verdict,
                                                              "decision_required": decision or []}), "author": reviewer},
-            {"body": jw_review.emit_marker("approval", {"sha": head, "by": approver}), "author": approver},
+            {"body": jw_review.emit_marker("approval", {"sha": head, "cycle": 1, "by": approver}), "author": approver},
             {"body": jw_review.emit_marker("findings", {"cycle": 1, "resolved": True}), "author": "owner"},
         ]
 
@@ -140,7 +140,7 @@ class MarkerTests(unittest.TestCase):
             {"body": jw_review.emit_marker("review-cycle", {"cycle": 1, "target_sha": head}), "author": cycle_author},
             {"body": jw_review.emit_marker("review-result", {"reviewer": reviewer, "review_cycle": cycle,
                 "reviewed_sha": head, "verdict": verdict, "decision_required": []}), "author": result_author},
-            {"body": jw_review.emit_marker("approval", {"sha": head, "by": approver}), "author": approver},
+            {"body": jw_review.emit_marker("approval", {"sha": head, "cycle": 1, "by": approver}), "author": approver},
             {"body": jw_review.emit_marker("findings", {"cycle": 1, "resolved": resolved}), "author": findings_author},
         ]
 
@@ -172,7 +172,7 @@ class MarkerTests(unittest.TestCase):
         head = "e" * 40
         # an approval whose claimed `by` differs from who actually posted it is rejected
         bodies = [{"body": jw_review.emit_marker("review-cycle", {"cycle": 1, "target_sha": head}), "author": "owner"},
-                  {"body": jw_review.emit_marker("approval", {"sha": head, "by": "owner"}), "author": "impersonator"}]
+                  {"body": jw_review.emit_marker("approval", {"sha": head, "cycle": 1, "by": "owner"}), "author": "impersonator"}]
         c = jw_review.classify(jw_review.parse_bodies(bodies), head, approvers=("owner", "impersonator"))
         self.assertFalse(c["approved_at_head"])
 
@@ -282,7 +282,7 @@ class MarkerTests(unittest.TestCase):
         bodies = [
             {"body": jw_review.emit_marker("review-cycle", {"cycle": 1, "target_sha": head}), "author": "owner"},
             {"body": jw_review.emit_marker("findings", {"cycle": 1, "resolved": True}), "author": "owner", "at": "2026-06-19T01:00:00Z"},
-            {"body": jw_review.emit_marker("approval", {"sha": head, "by": "owner"}), "author": "owner", "at": "2026-06-19T01:30:00Z"},
+            {"body": jw_review.emit_marker("approval", {"sha": head, "cycle": 1, "by": "owner"}), "author": "owner", "at": "2026-06-19T01:30:00Z"},
         ]
         ms = jw_review.parse_bodies(bodies)
         # no later codex signal → both hold
@@ -321,6 +321,69 @@ class MarkerTests(unittest.TestCase):
             jw_review._gh = orig
         self.assertEqual([r["id"] for r in out], [1, 2])
         self.assertEqual(out[1]["author"], "b")
+
+    # ---- v0.2.5: cycle-bound evidence (no reuse across a re-freeze) ----
+    def test_old_codex_signal_stale_after_refreeze(self):
+        head = "h" * 40
+        reviews = [{"author": jw_review.CODEX_BOT, "commit_id": head, "state": "COMMENTED",
+                    "at": "2026-06-19T01:00:00Z", "id": 1}]
+        self.assertTrue(jw_review.codex_fresh(reviews, [], head))  # no freeze gate → counts
+        # re-freeze at a later time → the pre-freeze Codex review no longer counts
+        self.assertEqual(jw_review.codex_signals_at_head(reviews, [], head, since_at="2026-06-20T05:00:00Z"), [])
+
+    def test_old_approval_rejected_for_new_cycle_and_base(self):
+        head, B2 = "h" * 40, "b2" + "0" * 38
+        cyc2 = {"body": jw_review.emit_marker("review-cycle", {"cycle": 2, "target_sha": head, "base_sha": B2}),
+                "author": "owner", "at": "2026-06-20T05:00:00Z"}
+        old = {"body": jw_review.emit_marker("approval", {"sha": head, "cycle": 1, "by": "owner"}),
+               "author": "owner", "at": "2026-06-19T02:00:00Z"}  # cycle 1, no base
+        c = jw_review.classify(jw_review.parse_bodies([cyc2, old]), head,
+                               approvers=("owner",), operators=("owner",), current_base=B2)
+        self.assertFalse(c["approved_at_head"])
+        # a fresh approval bound to (cycle 2, head, base B2) is accepted
+        new = {"body": jw_review.emit_marker("approval", {"sha": head, "base_sha": B2, "cycle": 2, "by": "owner"}),
+               "author": "owner", "at": "2026-06-20T06:00:00Z"}
+        c2 = jw_review.classify(jw_review.parse_bodies([cyc2, new]), head,
+                                approvers=("owner",), operators=("owner",), current_base=B2)
+        self.assertTrue(c2["approved_at_head"])
+
+    def test_approval_before_evidence_invalid(self):
+        head = "c" * 40
+        bodies = [
+            {"body": jw_review.emit_marker("review-cycle", {"cycle": 1, "target_sha": head}), "author": "owner", "at": "t0"},
+            {"body": jw_review.emit_marker("approval", {"sha": head, "cycle": 1, "by": "owner"}),
+             "author": "owner", "at": "2026-06-19T01:00:00Z"},  # approved early
+            {"body": jw_review.emit_marker("review-result", {"reviewer": "gpt-5.5-pro", "review_cycle": 1,
+                "reviewed_sha": head, "verdict": "shipped", "decision_required": []}),
+             "author": "owner", "at": "2026-06-19T02:00:00Z"},  # evidence arrived later
+        ]
+        c = jw_review.classify(jw_review.parse_bodies(bodies), head,
+                               macro_reviewers=("gpt-5.5-pro",), approvers=("owner",), operators=("owner",))
+        self.assertTrue(c["pro_result_at_head"])
+        self.assertFalse(c["approved_at_head"])  # approval predates the result it claims to clear
+
+    def test_same_timestamp_conflicting_results_fail_closed(self):
+        head = "c" * 40
+        T = "2026-06-20T05:00:00Z"
+        bodies = [
+            {"body": jw_review.emit_marker("review-cycle", {"cycle": 1, "target_sha": head}), "author": "owner", "at": "t0"},
+            {"body": jw_review.emit_marker("review-result", {"reviewer": "gpt-5.5-pro", "review_cycle": 1,
+                "reviewed_sha": head, "verdict": "shipped", "decision_required": []}), "author": "owner", "at": T},
+            {"body": jw_review.emit_marker("review-result", {"reviewer": "gpt-5.5-pro", "review_cycle": 1,
+                "reviewed_sha": head, "verdict": "not-shipped", "decision_required": ["stop"]}), "author": "owner", "at": T},
+        ]
+        c = jw_review.classify(jw_review.parse_bodies(bodies), head, macro_reviewers=("gpt-5.5-pro",), operators=("owner",))
+        self.assertFalse(c["pro_result_at_head"])
+
+    def test_base_conflict_same_cycle_fails_closed(self):
+        head, B1, B2 = "h" * 40, "b1" + "0" * 38, "b2" + "0" * 38
+        bodies = [
+            {"body": jw_review.emit_marker("review-cycle", {"cycle": 1, "target_sha": head, "base_sha": B1}), "author": "owner", "at": "t1"},
+            {"body": jw_review.emit_marker("review-cycle", {"cycle": 1, "target_sha": head, "base_sha": B2}), "author": "owner", "at": "t2"},
+        ]
+        c = jw_review.classify(jw_review.parse_bodies(bodies), head, operators=("owner",), current_base=B2)
+        self.assertTrue(c["cycle_conflict"])
+        self.assertFalse(c["cycle_fresh"])
 
 
 PASS = dict(cycle_fresh=True, require_ci=True, ci="passing", want_codex=True, codex_fresh=True,
@@ -772,6 +835,26 @@ class BasePolicyTests(unittest.TestCase):
         self.assertIn((".jahns-workflow.yml", bundle["base_sha"]), calls)
         self.assertIn(("tasks.yaml", bundle["head"]), calls)
         self.assertNotIn((".jahns-workflow.yml", bundle["head"]), calls)
+
+    def test_custom_named_macro_reviewer_is_mandatory(self):
+        # a reviewer that isn't 'codex' and isn't named gpt/pro must still gate the merge
+        BASE = ("version: 1\nproject: x\nreview:\n  mode: pr\n  reviewers: [codex, research-auditor]\n"
+                "  require_ci: false\n  operators: [owner]\n  approvers: [owner]\n")
+        bundle = {"head": "H" * 40, "base_sha": "B" * 40, "bodies": [], "reviews": [], "checks": [],
+                  "merge_state": "", "state": "OPEN", "is_draft": False, "base": "main", "head_ref": "feat/x"}
+        saved = (jw_review.resolve_repo, jw_review.pr_bundle, jw_review.file_at_ref, jw_review._gh)
+        jw_review.resolve_repo = lambda root: "owner/repo"
+        jw_review.pr_bundle = lambda root, pr, repo=None: bundle
+        jw_review.file_at_ref = lambda root, repo, path, ref: (BASE if path == ".jahns-workflow.yml"
+                                                               else "version: 1\nproject: x\ntasks: []\n")
+        jw_review._gh = lambda root, *a: (0, "main")
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                (Path(d) / ".jahns-workflow.yml").write_text("version: 1\nproject: x\nreview:\n  mode: pr\n")
+                g = jw_merge._gather(Path(d), 7)
+        finally:
+            jw_review.resolve_repo, jw_review.pr_bundle, jw_review.file_at_ref, jw_review._gh = saved
+        self.assertTrue(g["want_pro"])  # research-auditor must be required, not name-guessed away
 
 
 if __name__ == "__main__":

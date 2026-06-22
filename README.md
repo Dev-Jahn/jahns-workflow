@@ -100,6 +100,16 @@ resolution or the human approval re-blocks both; a Codex comment must name the h
 review pages are `--slurp`-merged (correct past 30 reviews); and `jw round close` rolls the whole
 generated SSOT view set back together on failure.
 
+**Cycle-bound evidence (v0.2.5).** Evidence can't survive a re-freeze. A Codex signal counts only
+if it post-dates the latest freeze (so re-freezing to a new cycle/base on the same head forces a
+re-review); the human approval is bound to `(cycle, head, base)` and must post-date every piece of
+evidence (the newest Codex signal, the latest macro result, the latest findings resolution), so an
+approval can't be reused for a later cycle or be granted before the evidence it clears. Markers
+sharing the newest timestamp with conflicting content fail closed (a same-second
+shipped/not-shipped tie does not pass); any configured reviewer other than `codex` is a mandatory
+macro reviewer (never inferred from its name); and two freezes for one cycle that disagree on
+*either* head or base fail closed.
+
 ## Requirements
 
 - `git`, `bash`, [`uv`](https://docs.astral.sh/uv/) on PATH (scripts use PEP 723 inline deps; first run downloads `pyyaml` once).
