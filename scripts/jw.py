@@ -11,7 +11,7 @@ Groups:
   ssot     split|digest|check [root] SSOT generated views
   status   [--project N]             cross-project dashboard
   remote   verify|drift [root]       is HEAD pushed / how far behind
-  review   freeze|status ...         SHA-bound review cycles (PR mode)
+  review   freeze|status|ingest ...  SHA-bound review cycles (PR mode); ingest = byte-exact reply copy
   approve  --pr N --sha X            SHA-bound human approval
   round    merge --pr N ...          deterministic merge guard
 

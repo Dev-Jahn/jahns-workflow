@@ -936,5 +936,49 @@ class BasePolicyTests(unittest.TestCase):
         self.assertTrue(g["want_pro"])  # research-auditor must be required, not name-guessed away
 
 
+class IngestTests(unittest.TestCase):
+    def _root(self, d):
+        root = Path(d)
+        (root / ".jahns-workflow.yml").write_text("version: 1\nproject: x\n")
+        return root
+
+    def test_byte_exact_copy_and_consume(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root(d)
+            src = root / "inbox.md"
+            # tricky bytes: CRLF, trailing spaces, multibyte utf-8, NO final newline
+            body = "## Review\r\n  trailing   \nutf8: é한\nno final newline".encode("utf-8")
+            src.write_bytes(body)
+            rc = jw_review.ingest(root, "2026-06-22-x", src=src, reviewer="gpt-5.5-pro")
+            self.assertEqual(rc, 0)
+            dest = root / "docs/reviews/2026-06-22-x-feedback.md"
+            content = dest.read_bytes()
+            self.assertTrue(content.endswith(body))          # body byte-exact, verbatim
+            self.assertIn(b"round: 2026-06-22-x", content)
+            self.assertIn(b"reviewer: gpt-5.5-pro", content)
+            self.assertFalse(src.exists())                   # drop-file consumed
+
+    def test_missing_inbox_fails_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root(d)
+            self.assertEqual(jw_review.ingest(root, "2026-06-22-x", src=root / "nope.md"), 1)
+
+    def test_empty_inbox_fails_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root(d)
+            src = root / "inbox.md"; src.write_bytes(b"   \n\n")
+            self.assertEqual(jw_review.ingest(root, "2026-06-22-x", src=src), 1)
+            self.assertTrue(src.exists())  # not consumed on failure
+
+    def test_round_inferred_from_request(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root(d)
+            rdir = root / "docs/reviews"; rdir.mkdir(parents=True)
+            (rdir / "2026-06-20-a-request.md").write_text("req")
+            src = root / "inbox.md"; src.write_bytes(b"review body")
+            self.assertEqual(jw_review.ingest(root, None, src=src), 0)
+            self.assertTrue((rdir / "2026-06-20-a-feedback.md").is_file())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

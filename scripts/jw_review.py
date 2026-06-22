@@ -26,6 +26,7 @@ Markers (HTML comments embedded in PR comment bodies):
 Subcommands (also `jw review <sub>`):
   freeze --pr N [--round ID] [root]   stamp the current PR head as a new review cycle + post request
   status [--pr N] [root]              show per-cycle review status (PR mode) or packet pairs (packet mode)
+  ingest [--round ID] [--reviewer M]  byte-exact copy /tmp/review.md → <reviews_dir>/<id>-feedback.md
 """
 from __future__ import annotations
 
@@ -42,6 +43,7 @@ import yaml  # noqa: E402
 from jw_common import find_project_root, git_full_sha, load_config  # noqa: E402
 
 CODEX_BOT = "chatgpt-codex-connector[bot]"  # REST `user.login` form
+INBOX = Path("/tmp/review.md")  # fixed drop-file: user saves the reviewer reply here, byte-exact
 
 
 def is_codex(login: str | None) -> bool:
@@ -425,7 +427,7 @@ def _opt(argv: list[str], name: str) -> str | None:
 
 
 def _root(argv: list[str]) -> Path | None:
-    flags = ("--pr", "--round", "--sha", "--commit")
+    flags = ("--pr", "--round", "--sha", "--commit", "--reviewer")
     positional = [a for i, a in enumerate(argv)
                   if not a.startswith("--") and (i == 0 or argv[i - 1] not in flags)]
     if positional:
@@ -496,8 +498,49 @@ def status(root: Path, pr: int | None) -> int:
     return 0
 
 
+def ingest(root: Path, round_id: str | None, src: Path = INBOX, reviewer: str | None = None) -> int:
+    """Byte-exact ingest of an external review reply. The user saves the reviewer's reply to
+    `src` (default /tmp/review.md) in a separate shell (`cat > /tmp/review.md`, paste, Ctrl-D) —
+    this copies the body VERBATIM into <reviews_dir>/<round-id>-feedback.md with a metadata header,
+    with NO model re-typing (the whole point), then consumes the drop-file so a forgotten save next
+    round can't silently re-ingest a stale reply."""
+    import datetime
+    cfg = load_config(root)
+    if not src.is_file():
+        print(f"jw_review ingest: no review at {src}. In a SEPARATE shell run `cat > {src}`, paste "
+              f"the reviewer's reply, press Ctrl-D, then re-run.", file=sys.stderr)
+        return 1
+    body = src.read_bytes()
+    if not body.strip():
+        print(f"jw_review ingest: {src} is empty — save the reply there first.", file=sys.stderr)
+        return 1
+    rdir = root / cfg["reviews_dir"]
+    if round_id is None:
+        reqs = sorted(p.stem[: -len("-request")] for p in rdir.glob("*-request.md"))
+        if not reqs:
+            print("jw_review ingest: no --round given and no *-request.md to infer it from.", file=sys.stderr)
+            return 1
+        round_id = reqs[-1]
+    rdir.mkdir(parents=True, exist_ok=True)
+    dest = rdir / f"{round_id}-feedback.md"
+    header = (
+        "<!-- jahns-workflow feedback: the body below is the reviewer reply VERBATIM (byte-exact "
+        "copy via `jw review ingest`) — do not edit it; add only the triage table beneath. -->\n"
+        f"round: {round_id}\n"
+        f"reviewer: {reviewer or '(unknown)'}\n"
+        f"ingested: {datetime.date.today().isoformat()}\n"
+        f"source: {src}\n\n---\n\n"
+    )
+    with open(dest, "wb") as f:
+        f.write(header.encode("utf-8"))
+        f.write(body)
+    src.unlink()
+    print(f"ingested {len(body)} bytes verbatim → {dest} (consumed {src})")
+    return 0
+
+
 def main(argv: list[str]) -> int:
-    if not argv or argv[0] not in ("freeze", "status"):
+    if not argv or argv[0] not in ("freeze", "status", "ingest"):
         print(__doc__, file=sys.stderr)
         return 1
     sub, rest = argv[0], argv[1:]
@@ -505,6 +548,8 @@ def main(argv: list[str]) -> int:
     if root is None:
         print("jw_review: no initialized project (missing .jahns-workflow.yml)", file=sys.stderr)
         return 1
+    if sub == "ingest":
+        return ingest(root, _opt(rest, "--round"), reviewer=_opt(rest, "--reviewer"))
     pr_s = _opt(rest, "--pr")
     if sub == "freeze":
         if not pr_s:

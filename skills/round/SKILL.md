@@ -79,6 +79,11 @@ treat "a comment appeared" as "review done" — a review is `(reviewer, cycle, r
 
 Report in the user's configured language: shipped tasks (id — title), registry/roadmap state,
 SSOT churn (+ quarantine flag if triggered), where the review packet is, and a suggested
-commit message (`docs(round): close <round-id>`). Remind: paste the packet to the external
-reviewer and ingest the reply with `/jahns-workflow:review <round-id>`. Do not commit unless
-the project's conventions say rounds end in a commit and the user has authorized committing.
+commit message (`docs(round): close <round-id>`). Do not commit unless the project's conventions
+say rounds end in a commit and the user has authorized committing.
+
+End with the **next-step reminder** (so the reply is preserved byte-exact, not re-typed by a model):
+
+> Paste the packet to the external reviewer. To ingest the reply, save it **in a separate shell**:
+> `cat > /tmp/review.md` → paste → `Ctrl-D`. Then run `/jahns-workflow:review <round-id>`, which
+> copies `/tmp/review.md` verbatim into the reviews dir (no model retyping).

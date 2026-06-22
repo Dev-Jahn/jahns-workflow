@@ -1,7 +1,7 @@
 ---
 name: review
 description: This skill should be used when the user runs "/jahns-workflow:review", pastes an external review reply (e.g. from web ChatGPT / GPT reviewer) to be processed, or asks to "ingest the review", "process the reviewer feedback", "record the external review". Preserves the review verbatim and triages findings into the task registry.
-argument-hint: "[round-slug] — paste the review text in the same or next message"
+argument-hint: "[round-slug] — first save the reply: cat > /tmp/review.md, paste, Ctrl-D"
 ---
 
 # jahns-workflow: review
@@ -11,16 +11,25 @@ text), verify each finding, and register real findings as tracked tasks.
 
 Requires an initialized project. Plugin root = two directories above this skill's base directory.
 
-## Step 1 — Obtain text and round
+## Step 1 — Locate the reply and round
 
-The review text comes from the invocation or the user's paste; if absent, ask the user to
-paste it and stop. Round id from the argument, else the newest `<reviews_dir>/*-request.md`.
+The reviewer's reply is at the fixed drop-file `/tmp/review.md` — the user saves it there in a
+separate shell (`cat > /tmp/review.md`, paste, `Ctrl-D`) so it never passes through the model.
+Round id from the argument, else the newest `<reviews_dir>/*-request.md`.
 
-## Step 2 — Preserve verbatim
+## Step 2 — Preserve verbatim (deterministic copy — never re-type it)
 
-Write `<reviews_dir>/<round-id>-feedback.md`: a short metadata header (date, reviewer model if
-known, round, request-packet pointer) followed by the review **verbatim — no paraphrasing,
-no trimming**.
+Do **not** write the verbatim copy yourself (a model re-emitting text is not byte-exact). Run the
+deterministic ingest, which copies `/tmp/review.md` byte-exact into the feedback file under a
+metadata header and consumes the drop-file:
+
+```bash
+uv run <plugin-root>/scripts/jw.py review ingest . --round <round-id> --reviewer "<model, e.g. gpt-5.5-pro>"
+```
+
+If it reports `no review at /tmp/review.md`, tell the user to save the reply first
+(`cat > /tmp/review.md`, paste, `Ctrl-D`) and stop. Then read the written
+`<reviews_dir>/<round-id>-feedback.md` to triage.
 
 ## Step 3 — Verify, then triage (never blindly implement)
 
