@@ -110,6 +110,16 @@ shipped/not-shipped tie does not pass); any configured reviewer other than `code
 macro reviewer (never inferred from its name); and two freezes for one cycle that disagree on
 *either* head or base fail closed.
 
+**Canonical event log + strict ordering (v0.2.6).** Order checks are *strictly after*, never
+"at or after" — a Codex signal must post-date the freeze, findings the newest Codex signal, the
+approval all evidence; an equal timestamp is order-ambiguous and fails closed (re-post to resolve).
+The freeze boundary is the *latest* marker of the highest cycle, so re-posting a cycle advances the
+boundary (a Codex review from before it goes stale). PR comments are read as a paginated REST event
+log (`issues/{pr}/comments --slurp`, not the 100-cap `gh pr view`), keyed on each comment's
+*effective* time (`updated_at`), so a 101st state-flipping comment is seen and an edited old comment
+can't pose as old. The Codex `Reviewed commit:` line is matched anchored to its own line (quoted or
+negated prose mentioning the SHA is not a signal).
+
 ## Requirements
 
 - `git`, `bash`, [`uv`](https://docs.astral.sh/uv/) on PATH (scripts use PEP 723 inline deps; first run downloads `pyyaml` once).

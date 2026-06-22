@@ -87,23 +87,27 @@ def parse_markers(text: str, kind: str | None = None) -> list[dict]:
 
 
 def parse_bodies(bodies: list[dict]) -> list[dict]:
-    """Parse markers per comment, preserving the comment author/timestamp as _author/_at."""
+    """Parse markers per comment, preserving author / effective-timestamp / id as _author/_at/_id.
+    `_at` is the comment's EFFECTIVE time (updated_at, not created_at) so editing an old comment
+    into a marker can't masquerade as having been posted at the old time."""
     out = []
     for b in bodies:
         for m in parse_markers(b.get("body", "")):
             m["_author"] = b.get("author", "")
             m["_at"] = b.get("at", "")
+            m["_id"] = b.get("id")
             out.append(m)
     return out
 
 
 def latest_cycle(markers: list[dict], operators: tuple = ()) -> dict | None:
-    """The freeze marker with the highest cycle number. When `operators` is given, only freeze
-    markers POSTED by a trusted operator count — an untrusted actor can't inject a higher cycle
-    to hijack the frozen target."""
+    """The freeze boundary: the LATEST marker (by timestamp) of the highest cycle number — a
+    re-post of the same cycle advances the boundary. When `operators` is given, only freeze markers
+    POSTED by a trusted operator count, so an untrusted actor can't inject a higher cycle to hijack
+    the frozen target."""
     cycles = [m for m in markers if m.get("_kind") == "review-cycle" and isinstance(m.get("cycle"), int)
               and (not operators or m.get("_author") in operators)]
-    return max(cycles, key=lambda m: m["cycle"]) if cycles else None
+    return max(cycles, key=lambda m: (m["cycle"], m.get("_at") or "")) if cycles else None
 
 
 def next_cycle_number(markers: list[dict]) -> int:
@@ -130,23 +134,26 @@ def classify(markers: list[dict], current_head: str, macro_reviewers: tuple = ()
     the latest findings resolution), so re-freezing to a new cycle/base cannot reuse a stale
     approval. Markers sharing the newest timestamp with conflicting content fail closed.
     Conflicting freeze markers for the latest cycle fail closed."""
+    def at(m: dict) -> str:
+        return m.get("_at") or ""
+
     trusted_cycles = [m for m in markers if m.get("_kind") == "review-cycle"
                       and isinstance(m.get("cycle"), int)
                       and (not operators or m.get("_author") in operators)]
-    lc = max(trusted_cycles, key=lambda m: m["cycle"]) if trusted_cycles else None
+    # the freeze boundary is the LATEST marker of the highest cycle (a re-post of the same cycle is
+    # a new boundary — Codex must review after it). Same cycle with a different (head, base) → block.
+    if trusted_cycles:
+        max_cycle = max(m["cycle"] for m in trusted_cycles)
+        same_cycle = [m for m in trusted_cycles if m["cycle"] == max_cycle]
+        conflict = len({(str(m.get("target_sha")), str(m.get("base_sha"))) for m in same_cycle}) > 1
+        lc = max(same_cycle, key=at)
+    else:
+        conflict, lc = False, None
     cyc = lc["cycle"] if lc else None
     frozen = (lc or {}).get("target_sha")
     frozen_base = (lc or {}).get("base_sha")
-    # two operator freeze markers for the SAME latest cycle but a different (head, base) → block
-    conflict = lc is not None and any(
-        m is not lc and m["cycle"] == cyc
-        and (str(m.get("target_sha")) != str(frozen) or str(m.get("base_sha")) != str(frozen_base))
-        for m in trusted_cycles)
     base_ok = current_base is None or str(frozen_base) == current_base
     head_matches = bool(lc) and not conflict and str(frozen) == current_head and base_ok
-
-    def at(m: dict) -> str:
-        return m.get("_at") or ""
 
     def latest_group(items: list[dict]) -> list[dict]:
         """All markers sharing the newest timestamp — so a same-timestamp conflict fails closed
@@ -176,7 +183,7 @@ def classify(markers: list[dict], current_head: str, macro_reviewers: tuple = ()
     findings_group = latest_group(cyc_findings) if cyc_findings else []
     findings_at = max((at(f) for f in findings_group), default="")
     findings_resolved = (bool(findings_group) and all(f.get("resolved") is True for f in findings_group)
-                         and (codex_signal_at is None or findings_at >= codex_signal_at))
+                         and (codex_signal_at is None or findings_at > codex_signal_at))
 
     # the approval must come AFTER every piece of evidence at this head
     evidence = []
@@ -196,7 +203,7 @@ def classify(markers: list[dict], current_head: str, macro_reviewers: tuple = ()
                 and bool(author) and not author.endswith("[bot]")
                 and (not approvers or author in approvers)
                 and str(a.get("by", "")) == author  # claimed approver must equal who posted it
-                and (evidence_at is None or at(a) >= evidence_at))  # after all evidence
+                and (evidence_at is None or at(a) > evidence_at))  # strictly after all evidence
 
     approvals = [m for m in markers if m.get("_kind") == "approval"]
     return {
@@ -264,22 +271,43 @@ def rest_reviews(root: Path, repo: str, pr: int) -> list[dict]:
             for r in flat if isinstance(r, dict)]
 
 
+def rest_comments(root: Path, repo: str, pr: int) -> list[dict]:
+    """ALL PR issue comments via REST (paginated) — `gh pr view --json comments` caps at the first
+    100, so a 101st comment that flips state (a new freeze, a not-shipped result, a reopened
+    finding) would be invisible. `at` is the EFFECTIVE time (updated_at) so an edited old comment
+    can't pose as old. Empty on any failure."""
+    rc, out = _gh(root, "api", "--method", "GET", f"repos/{repo}/issues/{pr}/comments",
+                  "--paginate", "--slurp")
+    if rc != 0 or not out:
+        return []
+    try:
+        pages = json.loads(out)
+    except json.JSONDecodeError:
+        return []
+    flat = []
+    for page in (pages if isinstance(pages, list) else []):
+        flat.extend(page if isinstance(page, list) else [page])
+    return [{"id": c.get("id"), "author": (c.get("user") or {}).get("login", ""),
+             "body": c.get("body", ""),
+             "at": c.get("updated_at") or c.get("created_at") or "",
+             "created_at": c.get("created_at", ""), "updated_at": c.get("updated_at", "")}
+            for c in flat if isinstance(c, dict)]
+
+
 def pr_bundle(root: Path, pr: int, repo: str | None = None) -> dict | None:
     rc, out = _gh(root, "pr", "view", str(pr), "--json",
-                  "headRefOid,baseRefOid,comments,statusCheckRollup,mergeStateStatus,state,isDraft,baseRefName,headRefName")
+                  "headRefOid,baseRefOid,statusCheckRollup,mergeStateStatus,state,isDraft,baseRefName,headRefName")
     if rc != 0:
         print(f"jw_review: gh pr view {pr} failed: {out}", file=sys.stderr)
         return None
     j = json.loads(out)
-    bodies = []
-    for c in j.get("comments", []):
-        bodies.append({"id": c.get("id"), "body": c.get("body", ""),
-                       "author": (c.get("author") or {}).get("login", ""), "at": c.get("createdAt", "")})
     if repo is None:
         repo = resolve_repo(root)
+    # comments + formal reviews are both fetched via paginated REST (the canonical event log) — a
+    # marker can live in either, and operator/author filtering decides whether it's believed.
+    comments = rest_comments(root, repo, pr) if repo else []
+    bodies = [{"id": c["id"], "body": c["body"], "author": c["author"], "at": c["at"]} for c in comments]
     reviews = rest_reviews(root, repo, pr) if repo else []
-    # a marker could also live in a formal review body — parse those too (operator-author
-    # filtering still gates whether they're believed)
     for r in reviews:
         bodies.append({"id": r["id"], "body": r["body"], "author": r["author"],
                        "at": r["at"], "state": r["state"]})
@@ -292,9 +320,12 @@ def pr_bundle(root: Path, pr: int, repo: str | None = None) -> dict | None:
     }
 
 
-# Codex prints exactly "**Reviewed commit:** `<sha>`" — parse that one field, never a loose
-# substring (a body like "I did NOT review <sha>" must not register as a review of <sha>).
-REVIEWED_COMMIT_RE = re.compile(r"reviewed\s+commit:\**\s*`?([0-9a-f]{7,40})`?", re.IGNORECASE)
+# Codex prints exactly "**Reviewed commit:** `<sha>`" on its OWN line — match only that, anchored
+# to line start/end with required backticks, never a loose substring. Rejects quoted ("> ..."),
+# negated ("Not reviewed commit", "I did not review ... Reviewed commit: ..."), and inline-prose
+# occurrences of the SHA.
+REVIEWED_COMMIT_RE = re.compile(
+    r"(?mi)^\s*\*{0,2}Reviewed commit:\*{0,2}\s*`([0-9a-f]{10,40})`\s*\.?\s*$")
 
 
 def _codex_comment_reviews(body: str, target_sha: str) -> bool:
@@ -309,13 +340,14 @@ def codex_signals_at_head(reviews: list[dict], comment_bodies: list[dict],
           normal no-issue path posts a comment, not a formal review object).
     Only the GitHub-verified Codex bot login is trusted (un-spoofable). A bare 👍 reaction can't be
     SHA-bound and is not a signal — re-request a textual `@codex review`. When `since_at` is given
-    (the latest freeze time), only signals AT-OR-AFTER it count, so a re-freeze (new cycle/base on
-    the same head) cannot reuse a Codex review from a previous cycle."""
+    (the latest freeze time), only signals STRICTLY AFTER it count, so a re-freeze (new cycle/base
+    on the same head) cannot reuse a Codex review from a previous cycle; an equal timestamp is
+    order-ambiguous and fails closed."""
     if not target_sha:
         return []
 
     def fresh(ts: str) -> bool:
-        return since_at is None or (ts or "") >= since_at
+        return since_at is None or (ts or "") > since_at
 
     out = []
     for r in reviews:
@@ -418,13 +450,14 @@ def freeze(root: Path, pr: int, round_id: str | None) -> int:
         "round_id": round_id or "(unset)", "cycle": n, "target_sha": head,
         "base_sha": base_sha, "reviewers": reviewers,
     })
+    macro = [r for r in reviewers if r != "codex"]
     body = (f"## Review cycle {n} — frozen at `{head[:12]}` (base `{base_sha[:12]}`)\n\n"
             f"Immutable review target for cycle {n}. A new push — or a base advance — makes this "
             f"cycle stale.\n\n"
             + ("@codex review\n\n" if "codex" in reviewers else "")
-            + (f"Macro reviewer: review at the SHA above; end your reply with a `jw-review-result` "
-               f"footer carrying `reviewed_sha: {head}` and `review_cycle: {n}`.\n\n"
-               if any("gpt" in r or "pro" in r for r in reviewers) else "")
+            + (f"Macro reviewer(s) — {', '.join(macro)}: review at the SHA above; end your reply with "
+               f"a `jw-review-result` footer carrying `reviewed_sha: {head}` and `review_cycle: {n}`.\n\n"
+               if macro else "")
             + marker + "\n")
     rc, out = _gh(root, "pr", "comment", str(pr), "--body", body)
     if rc != 0:

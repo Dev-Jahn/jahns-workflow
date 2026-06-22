@@ -72,12 +72,12 @@ class MarkerTests(unittest.TestCase):
     def _bodies(self, head, *, reviewer="gpt-5.5-pro", cycle=1, verdict="shipped",
                 approver="owner", decision=None):
         return [
-            {"body": jw_review.emit_marker("review-cycle", {"cycle": 1, "target_sha": head}), "author": "owner"},
+            {"body": jw_review.emit_marker("review-cycle", {"cycle": 1, "target_sha": head}), "author": "owner", "at": "2026-06-01T00:00:00Z"},
             {"body": jw_review.emit_marker("review-result", {"reviewer": reviewer, "review_cycle": cycle,
                                                              "reviewed_sha": head, "verdict": verdict,
-                                                             "decision_required": decision or []}), "author": reviewer},
-            {"body": jw_review.emit_marker("approval", {"sha": head, "cycle": 1, "by": approver}), "author": approver},
-            {"body": jw_review.emit_marker("findings", {"cycle": 1, "resolved": True}), "author": "owner"},
+                                                             "decision_required": decision or []}), "author": reviewer, "at": "2026-06-01T01:00:00Z"},
+            {"body": jw_review.emit_marker("approval", {"sha": head, "cycle": 1, "by": approver}), "author": approver, "at": "2026-06-01T03:00:00Z"},
+            {"body": jw_review.emit_marker("findings", {"cycle": 1, "resolved": True}), "author": "owner", "at": "2026-06-01T02:00:00Z"},
         ]
 
     def test_classify_valid_binding(self):
@@ -137,11 +137,11 @@ class MarkerTests(unittest.TestCase):
         """Bodies where the GitHub author (who POSTED) is distinct from the logical reviewer id —
         the realistic PR-mode case (a human operator posts the macro reviewer's reply)."""
         return [
-            {"body": jw_review.emit_marker("review-cycle", {"cycle": 1, "target_sha": head}), "author": cycle_author},
+            {"body": jw_review.emit_marker("review-cycle", {"cycle": 1, "target_sha": head}), "author": cycle_author, "at": "2026-06-01T00:00:00Z"},
             {"body": jw_review.emit_marker("review-result", {"reviewer": reviewer, "review_cycle": cycle,
-                "reviewed_sha": head, "verdict": verdict, "decision_required": []}), "author": result_author},
-            {"body": jw_review.emit_marker("approval", {"sha": head, "cycle": 1, "by": approver}), "author": approver},
-            {"body": jw_review.emit_marker("findings", {"cycle": 1, "resolved": resolved}), "author": findings_author},
+                "reviewed_sha": head, "verdict": verdict, "decision_required": []}), "author": result_author, "at": "2026-06-01T01:00:00Z"},
+            {"body": jw_review.emit_marker("approval", {"sha": head, "cycle": 1, "by": approver}), "author": approver, "at": "2026-06-01T03:00:00Z"},
+            {"body": jw_review.emit_marker("findings", {"cycle": 1, "resolved": resolved}), "author": findings_author, "at": "2026-06-01T02:00:00Z"},
         ]
 
     def test_classify_operator_provenance(self):
@@ -384,6 +384,85 @@ class MarkerTests(unittest.TestCase):
         c = jw_review.classify(jw_review.parse_bodies(bodies), head, operators=("owner",), current_base=B2)
         self.assertTrue(c["cycle_conflict"])
         self.assertFalse(c["cycle_fresh"])
+
+    # ---- v0.2.6: strict ordering + canonical paginated comment log ----
+    def test_strict_ordering_equal_timestamp_fails(self):
+        head, B, T = "c" * 40, "b" * 40, "2026-06-22T00:00:00Z"
+        # a Codex review AT the freeze time is not strictly after → stale
+        revs = [{"author": jw_review.CODEX_BOT, "commit_id": head, "state": "COMMENTED", "at": T, "id": 1}]
+        self.assertEqual(jw_review.codex_signals_at_head(revs, [], head, since_at=T), [])
+        # an approval at the SAME second as its evidence is order-ambiguous → invalid
+        bodies = [
+            {"body": jw_review.emit_marker("review-cycle", {"cycle": 1, "target_sha": head, "base_sha": B}), "author": "owner", "at": "2026-06-21T00:00:00Z"},
+            {"body": jw_review.emit_marker("review-result", {"reviewer": "gpt-5.5-pro", "review_cycle": 1,
+                "reviewed_sha": head, "verdict": "shipped", "decision_required": []}), "author": "owner", "at": T},
+            {"body": jw_review.emit_marker("findings", {"cycle": 1, "resolved": True}), "author": "owner", "at": T},
+            {"body": jw_review.emit_marker("approval", {"sha": head, "base_sha": B, "cycle": 1, "by": "owner"}), "author": "owner", "at": T},
+        ]
+        c = jw_review.classify(jw_review.parse_bodies(bodies), head, macro_reviewers=("gpt-5.5-pro",),
+                               approvers=("owner",), operators=("owner",), current_base=B, codex_signal_at=None)
+        self.assertTrue(c["pro_result_at_head"])
+        self.assertFalse(c["approved_at_head"])
+
+    def test_refreeze_same_cycle_advances_boundary(self):
+        head, B = "c" * 40, "b" * 40
+        bodies = [
+            {"body": jw_review.emit_marker("review-cycle", {"cycle": 2, "target_sha": head, "base_sha": B}), "author": "owner", "at": "2026-06-22T00:00:00Z"},
+            {"body": jw_review.emit_marker("review-cycle", {"cycle": 2, "target_sha": head, "base_sha": B}), "author": "owner", "at": "2026-06-22T02:00:00Z"},
+        ]
+        ms = jw_review.parse_bodies(bodies)
+        self.assertEqual(jw_review.latest_cycle(ms, ("owner",))["_at"], "2026-06-22T02:00:00Z")  # later re-freeze wins
+        # a Codex review between the two freezes is stale vs the advanced boundary
+        revs = [{"author": jw_review.CODEX_BOT, "commit_id": head, "state": "COMMENTED", "at": "2026-06-22T01:00:00Z", "id": 1}]
+        self.assertEqual(jw_review.codex_signals_at_head(revs, [], head, since_at="2026-06-22T02:00:00Z"), [])
+        c = jw_review.classify(ms, head, operators=("owner",), current_base=B)
+        self.assertFalse(c["cycle_conflict"])  # same head/base → re-freeze, not a conflict
+        self.assertTrue(c["cycle_fresh"])
+
+    def test_rest_comments_paginates_and_uses_updated_at(self):
+        import json as _json
+        pages = [[{"id": 1, "user": {"login": "a"}, "body": "first", "created_at": "t0", "updated_at": "t0"}],
+                 [{"id": 2, "user": {"login": "b"}, "body": "edited later", "created_at": "t0", "updated_at": "t5"}]]
+        orig = jw_review._gh
+        jw_review._gh = lambda root, *a: (0, _json.dumps(pages))
+        try:
+            out = jw_review.rest_comments(Path("/x"), "o/r", 9)
+        finally:
+            jw_review._gh = orig
+        self.assertEqual([c["id"] for c in out], [1, 2])           # both pages flattened
+        self.assertEqual(out[1]["at"], "t5")                       # effective time = updated_at
+
+    def test_codex_regex_anchored_rejects_prose(self):
+        head = "9b896a84c0" + "0" * 30  # valid 40-hex
+        bot = "chatgpt-codex-connector"
+        for neg in (f"I did not review this. Previous Reviewed commit: `{head[:10]}`",
+                    f"Not reviewed commit: `{head[:10]}`",
+                    f"> **Reviewed commit:** `{head[:10]}` stale quote",
+                    f"foo reviewed commit:** `{head[:10]}` bar"):
+            self.assertFalse(jw_review.codex_fresh([], [{"author": bot, "body": neg}], head), neg)
+        self.assertTrue(jw_review.codex_fresh([], [{"author": bot, "body": f"**Reviewed commit:** `{head[:10]}`"}], head))
+
+    def test_freeze_request_lists_custom_macro_reviewer(self):
+        captured = {}
+        bundle = {"head": "H" * 40, "base_sha": "B" * 40, "bodies": []}
+
+        def fake_gh(root, *args):
+            if len(args) >= 2 and args[0] == "pr" and args[1] == "comment":
+                captured["body"] = args[args.index("--body") + 1]
+            return (0, "")
+
+        saved = (jw_review.pr_bundle, jw_review._gh)
+        jw_review.pr_bundle = lambda root, pr, repo=None: bundle
+        jw_review._gh = fake_gh
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                (Path(d) / ".jahns-workflow.yml").write_text(
+                    "version: 1\nproject: x\nreview:\n  mode: pr\n  reviewers: [codex, research-auditor]\n")
+                jw_review.freeze(Path(d), 3, "2026-06-22-r")
+        finally:
+            jw_review.pr_bundle, jw_review._gh = saved
+        self.assertIn("research-auditor", captured.get("body", ""))  # custom reviewer prompted, not name-guessed
+        self.assertIn("@codex review", captured["body"])
 
 
 PASS = dict(cycle_fresh=True, require_ci=True, ci="passing", want_codex=True, codex_fresh=True,

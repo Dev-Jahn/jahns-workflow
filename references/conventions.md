@@ -117,7 +117,10 @@ earlier shipped, and a Codex signal newer than a findings resolution or approval
 Evidence is cycle-bound — a Codex signal must post-date the latest freeze, and the human approval
 binds to `(cycle, head, base)` and must come after all evidence — so re-freezing to a new
 cycle/base can never reuse a previous cycle's Codex review or approval. Markers tied on the newest
-timestamp with conflicting content fail closed.
+timestamp with conflicting content fail closed. Ordering is strict (post-date, not equal-or-after);
+the freeze boundary is the latest marker of the highest cycle, so re-freezing advances it. PR
+comments are read as a paginated REST event log keyed on each comment's effective (`updated_at`)
+time, so neither a 101st comment nor an edited-to-look-old comment can hide state from the gate.
 
 Trust-model note: approval binds to a trusted approver's GitHub login, but a coding agent that
 shares that login's `gh` credential can post an approval indistinguishable from a hand-made one.
