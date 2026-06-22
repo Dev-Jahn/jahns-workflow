@@ -114,3 +114,10 @@ from the PR's **base SHA** — the protected target branch — not the candidate
 can't relax its own merge rules. A cycle is frozen against both head and base SHA; a base advance
 makes it stale. Every fact is the latest source-bound state: a later not-shipped cancels an
 earlier shipped, and a Codex signal newer than a findings resolution or approval re-blocks both.
+
+Trust-model note: approval binds to a trusted approver's GitHub login, but a coding agent that
+shares that login's `gh` credential can post an approval indistinguishable from a hand-made one.
+The gate therefore guarantees *who is authorised*, not *that a human personally acted* — for a
+solo developer driving agents, treat approval as an audit trail and merge speed-bump, not a hard
+human-in-the-loop control. A true human gate requires running the agent under a separate bot
+identity and reserving the approver credential for interactive use.
