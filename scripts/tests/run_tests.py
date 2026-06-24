@@ -1632,6 +1632,30 @@ class BundleTests(unittest.TestCase):
                 rc = jw_bundle.bundle(work, "2026-06-23-r", None, out_dir=d / "out")
             self.assertEqual(rc, 1)  # HEAD advanced past the round with CODE → wrong-tree guard fires
 
+    def test_round_binding_uses_round_tip_config(self):
+        # A later commit that WIDENS generated_dir (and adds code under the new dir) must NOT
+        # retroactively reclassify that forward CODE as bookkeeping: the closeout check binds to the
+        # config AS OF the round tip, not the mutable working-tree config. Else a post-close config
+        # change could ship next-round code under this round's label (the binding invariant breaks).
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            work, base, head = self._packet_repo(d)  # round tip config: generated_dir defaults to docs/ssot
+            # forward commit: widen generated_dir to a CODE dir AND add code there, without re-closing
+            (work / ".jahns-workflow.yml").write_text(
+                "version: 1\nproject: demo\nreviews_dir: docs/reviews\ngenerated_dir: src\n"
+                "review:\n  mode: packet\n")
+            (work / "src").mkdir()
+            (work / "src/app.py").write_text("forward feature code\n")
+            git(work, "add", "-A")
+            git(work, "commit", "-qm", "widen generated_dir + add code")
+            git(work, "push", "-q", "origin", "main")  # pushed → only the round-binding guard can refuse
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                rc = jw_bundle.bundle(work, "2026-06-23-r", None, out_dir=d / "out")
+            self.assertEqual(rc, 1)  # forward code under a widened generated_dir → refused
+            self.assertEqual(list((d / "out").glob("*.review.zip")) if (d / "out").exists() else [], [])
+
     def test_read_blobs_missing_object_fails_closed(self):
         with tempfile.TemporaryDirectory() as d:
             work = Path(d)
@@ -1696,9 +1720,8 @@ class BundleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)
             work, base, head = self._packet_repo(d)
-            cfg = jw_common.load_config(work)
             with self.assertRaises(jw_common.WorkflowError):
-                jw_bundle._closeout_only(work, cfg, "0" * 40, head)
+                jw_bundle._closeout_only(work, "0" * 40, head)
 
     def test_request_symlink_refused(self):
         # GPT 7th review #2: a symlinked request must be refused (read_bytes() would follow it and
@@ -1921,6 +1944,32 @@ class BundleIngestTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 rc_ok = jw_review.ingest(work, "2026-06-23-r", src=ok)
             self.assertEqual(rc_ok, 0)  # reviewed_sha == live HEAD → accepted (degraded, no bundle record)
+
+    def test_no_record_rejects_wrong_round(self):
+        # degraded path (no bundle record): a reply that reviewed the live HEAD but is labeled for a
+        # DIFFERENT round must NOT pass on the SHA alone — round_id/project are cross-checked too, so a
+        # reply to another request whose round merely shares the HEAD can't be ingested as this one.
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as d:
+            work = Path(d)
+            init_repo(work)
+            (work / ".jahns-workflow.yml").write_text(
+                "version: 1\nproject: demo\nreviews_dir: docs/reviews\nreview:\n  mode: packet\n")
+            live = git(work, "rev-parse", "HEAD").stdout.strip()
+            (work / "docs/reviews").mkdir(parents=True)  # NO sidecar → identity is None
+            reply = (
+                "# R\n\n<!-- jw-review-summary:v1\nprotocol: jw-chatgpt-reviewer/v1\nreviewer: gpt\n"
+                "project: demo\nround_id: 2026-06-22-other\nreview_mode: packet\nreview_cycle: null\n"
+                f"base_sha: none\nreviewed_sha: {live}\nverdict: shipped\ndecision_required: false\n"
+                "blocker: 0\nmajor: 0\nminor: 0\n-->\n"
+            ).encode("utf-8")
+            src = work / "in.md"
+            src.write_bytes(reply)
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                rc = jw_review.ingest(work, "2026-06-23-r", src=src)  # ingest target ≠ marker round_id
+            self.assertEqual(rc, 3)  # wrong round → fail closed despite the SHA matching live HEAD
+            self.assertIn("round_id", (work / "docs/reviews/2026-06-23-r-feedback.md").read_text())
 
 
 if __name__ == "__main__":

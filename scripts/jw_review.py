@@ -668,17 +668,24 @@ def ingest(root: Path, round_id: str | None, src: Path = INBOX, reviewer: str | 
         mismatches.append(f"{len(summaries)} jw-review-summary markers — identity ambiguous")
         check_status = "MISMATCH"
     elif identity is None:
-        # No recorded bundle head (bundle not built yet, or reset by a re-close). A reply that DOES
-        # carry a reviewed_sha is still cross-checked against the live committed HEAD, fail-closed, so
-        # this degraded path can't become a silent pass for a wrong-SHA reply.
+        # No recorded bundle head (bundle not built yet, or reset by a re-close). Bind with every
+        # axis available WITHOUT the record: a reply must be FOR this round/project AND have reviewed
+        # the live committed HEAD. SHA-alone is NOT enough — a reply to a DIFFERENT round/request that
+        # merely shares the HEAD must not pass (cycle/base can't be cross-checked without the record,
+        # so this stays a degraded path, but not a blind one). Fail-closed on each axis.
         live = git_full_sha(root, "HEAD")
         reviewed = sm.get("reviewed_sha")
-        if live and _is_sha(reviewed) and str(reviewed) == live:
-            check_status = "MATCH (vs live HEAD — no bundle record; run `jw review bundle` to bind fully)"
-        else:
+        if not (live and _is_sha(reviewed) and str(reviewed) == live):
             shown = str(reviewed)[:12] if reviewed else "(missing)"
             mismatches.append(f"reviewed_sha {shown} ≠ live HEAD {(live or '?')[:12]} (no bundle record)")
-            check_status = "MISMATCH"
+        if str(sm.get("protocol")) != "jw-chatgpt-reviewer/v1":
+            mismatches.append(f"protocol {sm.get('protocol')!r} ≠ 'jw-chatgpt-reviewer/v1'")
+        if str(sm.get("round_id")) != round_id:
+            mismatches.append(f"round_id {sm.get('round_id')!r} ≠ {round_id!r}")
+        if cfg.get("project") and str(sm.get("project")) != str(cfg["project"]):
+            mismatches.append(f"project {sm.get('project')!r} ≠ {cfg['project']!r}")
+        check_status = "MISMATCH" if mismatches else \
+            "MATCH (vs live HEAD — no bundle record; run `jw review bundle` to bind fully)"
     else:
         # FULL identity binding: a reply must match the bundle on every identity axis, not just the
         # SHA — a cycle-1 reply of the same head must NOT pass against a cycle-2 bundle, so
