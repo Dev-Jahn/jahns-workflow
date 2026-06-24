@@ -53,6 +53,7 @@ jobs:
           fi
           git config user.name "jahns-workflow-ci"
           git config user.email "ci@users.noreply.github.com"
+          git add -- "$f"
           git commit -qm "chore(jahns-workflow): pin v${NEW_VERSION} @ ${NEW_SHA:0:7} (auto-sync from main)"
           git push origin HEAD:main
           echo "marketplace updated → v${NEW_VERSION} @ ${NEW_SHA:0:7}"
