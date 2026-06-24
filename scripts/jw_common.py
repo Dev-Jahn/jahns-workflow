@@ -170,13 +170,25 @@ def next_actionable(data: dict, cap: int = 6) -> list[tuple[str, str]]:
     return sorted(out)[:cap]
 
 
-def resume_path(root: Path) -> Path:
-    """Plugin-local ephemeral re-entry snapshot for a project (NOT committed to the repo).
-    Includes a hash of the absolute path so different repos can't collide on a truncated slug."""
+def _project_slug(root: Path) -> str:
     rp = str(root.resolve())
     slug = re.sub(r"[^A-Za-z0-9]+", "-", rp).strip("-")[:60].rstrip("-")
-    h = hashlib.sha1(rp.encode("utf-8")).hexdigest()[:8]
-    return Path.home() / ".claude" / "jahns-workflow" / "resume" / f"{slug}-{h}.md"
+    return f"{slug}-{hashlib.sha1(rp.encode('utf-8')).hexdigest()[:8]}"
+
+
+def resume_path(root: Path) -> Path:
+    """Plugin-local EPHEMERAL re-entry snapshot for a project (NOT committed to the repo). Written
+    deterministically by the PreCompact/SessionEnd hook (structured: HEAD/round/tasks) and CONSUMED
+    by the next SessionStart. Hashed path so different repos can't collide on a truncated slug."""
+    return Path.home() / ".claude" / "jahns-workflow" / "resume" / f"{_project_slug(root)}.md"
+
+
+def start_here_path(root: Path) -> Path:
+    """Plugin-local PERSISTENT re-entry pointer for a project (NOT committed, NOT consumed). The
+    MODEL overwrites it at round close / after review with a bounded live-frontier narrative; the
+    SessionStart hook injects it so a new/resumed session picks up without a manual 'pick up where
+    we left off'. Complements the ephemeral structured resume_path — narrative vs. structured."""
+    return Path.home() / ".claude" / "jahns-workflow" / "start_here" / f"{_project_slug(root)}.md"
 
 
 def slugify(text: str, max_len: int = 40) -> str:

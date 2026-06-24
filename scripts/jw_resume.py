@@ -22,7 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from jw_common import (  # noqa: E402
     find_project_root, git, git_branch_info, git_full_sha, load_config, load_tasks,
-    next_actionable, resume_path,
+    next_actionable, resume_path, start_here_path,
 )
 
 
@@ -65,10 +65,16 @@ def write(root: Path) -> int:
 def main() -> int:
     argv = sys.argv[1:]
     want_path = "--path" in argv
+    want_start_here = "--start-here-path" in argv
     positional = [a for a in argv if not a.startswith("--")]
     root = Path(positional[0]).resolve() if positional else find_project_root(Path.cwd())
     if root is None:
         return 0  # silent no-op outside a project (hook fast-path safety)
+    if want_start_here:
+        sh = start_here_path(root)
+        sh.parent.mkdir(parents=True, exist_ok=True)  # so the model can Write to it directly
+        print(sh)
+        return 0
     if want_path:
         print(resume_path(root))
         return 0

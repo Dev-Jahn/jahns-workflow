@@ -50,6 +50,12 @@ first with their task IDs. Remind that blockers must be resolved before the next
 consumes downstream work; offer to start on them. Suggested commit message:
 `docs(review): ingest <round-id> feedback`.
 
+Then **refresh the re-entry pointer** (the review moved the frontier): get its path with
+`uv run <plugin-root>/scripts/jw.py resume --start-here-path .` and **Write** (overwrite, ≤ ~35
+lines) the post-review frontier — open blockers/decisions and what to pick up next, detail linked
+to the feedback/PROGRESS files. The SessionStart hook injects this so the next session resumes
+without re-explaining. (Same file the round skill writes; see round Step 6.)
+
 ## PR mode (review.mode: pr) — SHA-bound cycle + merge gate
 
 When the project uses PR-mode review, the same verify-then-register discipline applies, plus:

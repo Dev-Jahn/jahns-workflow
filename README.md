@@ -41,6 +41,14 @@ A unified front door `scripts/jw.py` dispatches `jw <group>`
   active/blocked tasks, next-actionable) to a plugin-local file — closing the "update memory
   before compaction" loop. The SessionStart injection now also lists **next-actionable** tasks
   (deps satisfied, including stale-`blocked` ones whose deps are now done).
+- **START_HERE re-entry pointer.** `round close` and `review` overwrite a bounded (~35-line)
+  model-authored "where am I" narrative — the live frontier (what just landed, the open
+  decision / next probe, active lanes; detail linked, not inlined) — to a plugin-local file
+  (`jw resume --start-here-path .`), **reset every round** so it can't grow unbounded. The
+  SessionStart hook injects it, so a new or post-compaction session resumes the frontier without
+  a manual "pick up where we left off". Complements the deterministic structured snapshot above
+  (narrative vs. structured); keeps this out of the agent-memory `MEMORY.md`, which would
+  otherwise accumulate forever.
 - **`jw lanes verify .`** checks each task's `lane:` manifest — that the lane branch *contains*
   its recorded `base_sha` (the correct invariant; not descent from the moving integration tip).
   For parallel worktree lanes, set `worktree.baseRef: "head"` in Claude Code settings so lanes

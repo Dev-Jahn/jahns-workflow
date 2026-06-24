@@ -79,3 +79,23 @@ End with the **next-step reminder** (so the reply is preserved byte-exact, not r
 > Paste the packet to the external reviewer. To ingest the reply, save it **in a separate shell**:
 > `cat > /tmp/review.md` → paste → `Ctrl-D`. Then run `/jahns-workflow:review <round-id>`, which
 > copies `/tmp/review.md` verbatim into the reviews dir (no model retyping).
+
+## Step 6 — Refresh the re-entry pointer
+
+**OVERWRITE** the project's persistent re-entry file so the next session — or a post-compaction
+resume — picks up the live frontier without you re-explaining "where were we". Get its path:
+
+```bash
+uv run <plugin-root>/scripts/jw.py resume --start-here-path .
+```
+
+Then **Write** that file (overwrite — never append), **≤ ~35 lines / ~2.5KB**:
+
+- first line: `# re-entry @ <round-id> / HEAD <short-sha>`
+- then the live frontier: what just landed, the open decision / next probe and **why**, the active
+  lane(s) — with detail **linked** to PROGRESS / topic files, not inlined.
+
+This replaces the old habit of growing a "START HERE" blob inside the agent-memory `MEMORY.md`
+(which accumulates unbounded). The SessionStart hook injects this file automatically each session;
+it is reset every round, so keep it short and current. Authoritative state stays in
+tasks.yaml / PROGRESS — this is only a pointer.

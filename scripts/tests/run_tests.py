@@ -24,6 +24,7 @@ sys.path.insert(0, str(SCRIPTS))
 import jw_common  # noqa: E402
 import jw_lanes  # noqa: E402
 import jw_merge  # noqa: E402
+import jw_resume  # noqa: E402
 import jw_review  # noqa: E402
 import jw_round  # noqa: E402
 import jw_validate  # noqa: E402
@@ -603,6 +604,91 @@ class RemoteTests(unittest.TestCase):
             pushed, info = jw_common.head_pushed(work, fetch=True)
             self.assertFalse(pushed)  # must NOT trust the stale ref
             self.assertIn("fetch failed", info.get("reason", ""))
+
+
+class ResumeStartHereTests(unittest.TestCase):
+    """Persistent model-authored re-entry pointer (START_HERE) + its SessionStart injection."""
+
+    def test_start_here_path_distinct_and_deterministic(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self.assertEqual(jw_common.start_here_path(root), jw_common.start_here_path(root))  # per-repo stable
+            self.assertNotEqual(jw_common.start_here_path(root), jw_common.resume_path(root))   # vs ephemeral
+            self.assertIn("start_here", str(jw_common.start_here_path(root)))
+            self.assertNotEqual(jw_common.start_here_path(root), jw_common.start_here_path(root / "sub"))
+
+    def _with_home(self, home: Path, fn):
+        import os
+        env_bak, argv_bak = os.environ.get("HOME"), sys.argv
+        os.environ["HOME"] = str(home)
+        try:
+            return fn()
+        finally:
+            sys.argv = argv_bak
+            if env_bak is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = env_bak
+
+    def test_start_here_path_cli_creates_parent(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "proj"
+            root.mkdir()
+            init_repo(root)
+            (root / ".jahns-workflow.yml").write_text("version: 1\nproject: x\n")
+            home = Path(d) / "home"
+            home.mkdir()
+
+            def run():
+                sys.argv = ["jw_resume.py", "--start-here-path", str(root)]
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = jw_resume.main()
+                return rc, buf.getvalue().strip()
+
+            rc, printed = self._with_home(home, run)
+            self.assertEqual(rc, 0)
+            self.assertTrue(printed.startswith(str(home)))   # under the (temp) home, not the real ~/.claude
+            self.assertIn("start_here", printed)
+            self.assertTrue(Path(printed).parent.is_dir())   # parent created so the model can Write to it
+
+    def test_session_context_injects_and_caps_start_here(self):
+        import contextlib
+        import io
+        import json as _json
+        sys.path.insert(0, str(SCRIPTS.parent / "hooks" / "scripts"))
+        import session_context
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "proj"
+            root.mkdir()
+            init_repo(root)
+            (root / ".jahns-workflow.yml").write_text("version: 1\nproject: demo\n")
+            (root / "tasks.yaml").write_text("version: 1\nproject: demo\ntasks: []\n")
+            home = Path(d) / "home"
+            home.mkdir()
+
+            def ctx_for(start_here_body: str) -> str:
+                def run():
+                    sh = jw_common.start_here_path(root)
+                    sh.parent.mkdir(parents=True, exist_ok=True)
+                    sh.write_text(start_here_body, encoding="utf-8")
+                    sys.argv = ["session_context.py", str(root)]
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        session_context.main()
+                    return _json.loads(buf.getvalue())["hookSpecificOutput"]["additionalContext"]
+                return self._with_home(home, run)
+
+            ctx = ctx_for("# re-entry @ 2026-06-24-x / HEAD abc1234\nMARKER-FRONTIER-LINE\n")
+            self.assertIn("START HERE", ctx)            # labeled and surfaced
+            self.assertIn("MARKER-FRONTIER-LINE", ctx)  # the model's narrative is injected
+
+            # an over-budget file is capped at read-time (never truncates the file itself)
+            ctx_big = ctx_for("Z" * (session_context.MAX_START_HERE + 800))
+            self.assertIn("truncated", ctx_big)
+            self.assertLess(ctx_big.count("Z"), session_context.MAX_START_HERE + 800)
 
 
 class ConfigTests(unittest.TestCase):
