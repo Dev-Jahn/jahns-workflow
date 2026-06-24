@@ -54,7 +54,6 @@ reviews_dir: docs/reviews
 progress_archive_dir: docs/progress
 generated_dir: docs/ssot
 digest_max_lines: 150
-oracles: []                     # sections with cheap executable checks; see audit skill
 review:
   mode: packet                  # packet (paste to web reviewer) | pr (SHA-bound PR review cycles)
   reviewers: [codex, gpt-5.5-pro]
@@ -62,18 +61,19 @@ review:
   # operators: []               # PR mode: extra GitHub logins trusted to post review markers (owner always is)
   # approvers: []               # PR mode: extra GitHub logins trusted to post the final approval
 state:
-  last_audit_commit: null
   last_round_commit: null
 ```
 
-Ask the user which `review.mode` fits: `packet` (default — close a round, push, paste a
-request packet to the web reviewer) or `pr` (open a PR per round, freeze a SHA-bound review
-cycle, and let a deterministic gate guard the merge). PR mode suits repos that already work
-through PRs with a `@codex` bot.
+Ask the user which `review.mode` fits: `packet` (default — close a round, push, then build a
+self-contained `*.review.zip` bundle with `jw review bundle` and attach it to the web reviewer)
+or `pr` (open a PR per round, freeze a SHA-bound review cycle, and let a deterministic gate guard
+the merge). PR mode suits repos that already work through PRs with a `@codex` bot; its macro
+reviewer also consumes the same bundle. For either mode, the web reviewer's ChatGPT Project is set
+up once with `/jahns-workflow:reviewer-kit` (static protocol + Project instructions).
 
 2. `tasks.yaml` — minimal valid registry (`version: 1`, `project:`, `milestones: []`, `tasks: []`),
    with a YAML comment documenting the optional task fields (`deps`, `milestone`, `round`,
-   `anchor` — §-anchor of the SSOT section the task governs, used by audits — `severity`,
+   `anchor` — §-anchor of the SSOT section the task governs — `severity`,
    `origin`, `branch`, `notes`, `ruling` — the user's decision on a `decision/...` task,
    `result` — a recorded measurement/outcome, `lane` — `{branch, base_sha, depends_on}` for
    parallel worktree lanes, verified by `jw lanes verify`).

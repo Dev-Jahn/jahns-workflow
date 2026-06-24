@@ -15,10 +15,11 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
-from jw_common import git_branch_info, git_full_sha, load_config, load_tasks, next_actionable, resume_path  # noqa: E402
+from jw_common import git_branch_info, git_full_sha, load_config, load_tasks, next_actionable, resume_path, start_here_path  # noqa: E402
 
 MAX_CHARS = 8000
 MAX_TASK_LINES = 8
+MAX_START_HERE = 2560  # ~2.5KB cap on the injected re-entry narrative (read-time, never truncates the file)
 
 
 def main() -> int:
@@ -45,6 +46,22 @@ def main() -> int:
         f"[jahns-workflow] project: {data.get('project', root.name)} | branch: {g['branch']}"
         f" ({'dirty +' + str(g['dirty']) if g['dirty'] else 'clean'}) | tasks: {done}/{len(tasks)} done",
     ]
+
+    # persistent re-entry pointer (model-authored at round close / after review) — surfaced FIRST so a
+    # new or post-compaction session picks up the live frontier without a manual "pick up". Read-time
+    # capped; the file itself is never truncated. Authoritative state still lives in tasks.yaml/PROGRESS.
+    sh = start_here_path(root)
+    if sh.is_file():
+        try:
+            body = sh.read_text(encoding="utf-8").strip()
+        except OSError:
+            body = ""
+        if body:
+            if len(body) > MAX_START_HERE:
+                body = body[:MAX_START_HERE].rstrip() + "\n…[START_HERE truncated — keep it ≤~35 lines]"
+            lines.append("▶ START HERE (re-entry pointer — rewritten at round close / after review):")
+            lines.append(body)
+
     if rounds:
         lines.append(f"active round: {', '.join(rounds)}")
     for label, group in (("active", active), ("blocked", blocked), ("pending decision", decisions)):

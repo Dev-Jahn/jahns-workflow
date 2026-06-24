@@ -32,15 +32,15 @@ IDs share one mental model. Branch names may reuse the task ID verbatim (`feat/s
 Every task carries a `title`: one explanatory phrase a person seeing the repo for the first
 time can understand. Titles, not IDs, are what roadmap nodes and dashboards display alongside
 the ID. A task that governs a specific SSOT section also carries an `anchor:` field
-(§-anchor string such as `"DESIGN §5.6"`) — audits use these anchors to scope verification,
-so set them whenever the binding section is known.
+(§-anchor string such as `"DESIGN §5.6"`) — it documents the binding section, surfaces in the
+roadmap view, and scopes review findings, so set it whenever the binding section is known.
 
 **Banned:** bare letter-number codenames (`P0`, `E3`, `Q1`, `T7`, `P-3`, …) as identifiers of
 work. They collide across projects and decay into noise. (Domain terms inside prose are fine.)
 
 ## 2. Severity — `blocker` > `major` > `minor`
 
-Used on review/audit findings (a `severity:` field on the task, never part of the ID):
+Used on review findings (a `severity:` field on the task, never part of the ID):
 
 - **blocker** — wrong results, data loss, or invalidates dependent work. Resolve before the next round consumes anything downstream.
 - **major** — real defect or hazard; schedule within the current milestone.
@@ -58,8 +58,6 @@ Used on review/audit findings (a `severity:` field on the task, never part of th
 2. **Cite by §-anchor or heading, never by line number.** Line numbers rot with every edit.
 3. **Read sections, not the whole file.** Navigate via the generated INDEX; the DIGEST is injected each session for orientation.
 4. **Binding but falsifiable.** When implementation evidence contradicts the SSOT: stop, register a `decision/...` task describing the discrepancy, get a ruling, then amend the SSOT via ADR. Never silently comply with a spec that evidence contradicts; never silently diverge from it either.
-5. **Bulk-edit quarantine.** Any single round that changes more than ~100 SSOT lines is presumed risky (this is exactly how spec FATALs historically slipped in): run `/jahns-workflow:audit` on the changed sections before downstream work consumes them.
-6. **Verifiable claims get executable twins.** Where a section's correctness is mechanically checkable with a *cheap* oracle — a side-effect-free check that finishes in seconds (the constraint is wall-clock cost, not which hardware it uses) — declare it under `oracles:` in `.jahns-workflow.yml` with its expected runtime so audits can exercise it.
 
 ## 5. Document homes (one home per fact)
 
@@ -87,8 +85,26 @@ task is `done` only when the bar actually passed, with evidence linked in PROGRE
 A review means "reviewer R examined tree SHA X" — it is always bound to a commit, never to a
 filename or a round id alone. No review is requested against an unpushed HEAD.
 
-- **packet mode**: a round closes, is pushed, and a request packet (pinned to the load-bearing
-  commit) goes to a web reviewer; the reply is ingested verbatim and triaged.
+- **packet mode**: a round closes, is pushed, and a self-contained **review bundle**
+  (`jahns-review-bundle/v1`) goes to a web reviewer; the reply is ingested verbatim and triaged.
+  The bundle builds `repo/` directly from git objects of the reviewed head (`git ls-tree`/`cat-file`
+  — exact tracked tree, no `.git`/caches/credentials, no `.gitattributes` export-ignore; a tracked
+  symlink ships as a regular file holding its target string, recorded in `manifest.symlinks` and never
+  a link entry an extractor could rebuild, so it can't resolve to an out-of-tree file; a symlinked
+  request/checks input is refused for the same reason), a base→head `DIFF.patch`/`CHANGED_FILES`/`COMMITS`, and a schema-validated `MANIFEST.yaml`
+  binding review identity (project/round/mode/cycle/base/head); the model-authored falsifiable
+  request rides along as `__review__/REQUEST.md`. Control material lives in `__review__/`, OUTSIDE
+  `repo/`, so repository content can't masquerade as bundle metadata; bundles land in an untracked
+  `<reviews_dir>/bundles/`. The reviewed head is the committed HEAD (so `repo/tasks.yaml`/PROGRESS
+  and the manifest scope are one tree), bound to the round — the bundler refuses a HEAD that advanced
+  past the round tip with non-closeout commits or after a newer round closed; the base is the previous
+  round's watermark (captured at `round close` atomically with the closeout, since the live watermark
+  is then overwritten), never inferred from the round name, and must be an ancestor of head. The web reviewer's ChatGPT Project
+  holds a static protocol kit (`/jahns-workflow:reviewer-kit`); its reply ends with a
+  `jw-review-summary` marker that ingest cross-checks against the bundle on every identity axis
+  (protocol/project/round/mode/cycle/base/reviewed_sha) — a reply bound to a different SHA, or the
+  same head under a different cycle, fails closed. The bundle is built by a deterministic script,
+  never hand-assembled by a model.
 - **pr mode**: each round opens a PR; `review freeze` stamps the current head as cycle N (an
   immutable target recorded as a PR-comment marker). A review is identified by
   `(reviewer, cycle, reviewed_sha)`. Remediation produces a new head → the cycle goes stale →
@@ -129,6 +145,6 @@ time, so neither a 101st comment nor an edited-to-look-old comment can hide stat
 Trust-model note: approval binds to a trusted approver's GitHub login, but a coding agent that
 shares that login's `gh` credential can post an approval indistinguishable from a hand-made one.
 The gate therefore guarantees *who is authorised*, not *that a human personally acted* — for a
-solo developer driving agents, treat approval as an audit trail and merge speed-bump, not a hard
-human-in-the-loop control. A true human gate requires running the agent under a separate bot
+solo developer driving agents, treat approval as a provenance record and merge speed-bump, not a
+hard human-in-the-loop control. A true human gate requires running the agent under a separate bot
 identity and reserving the approver credential for interactive use.

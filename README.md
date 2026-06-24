@@ -2,7 +2,8 @@
 
 A Claude Code plugin that harnesses SSOT-anchored agentic development: one global naming
 convention across all projects, a machine-validated task registry, zero-token roadmap/digest
-generation, round-based progress discipline, external-review ingestion, and scoped SSOT audits.
+generation, round-based progress discipline, deterministic SHA-pinned review bundles for an
+external web reviewer, and external-review ingestion.
 
 Generalizes a research-workflow battle-tested on theory-heavy repos, but applies to any
 programming project (web, systems, ML) that anchors work on one design document.
@@ -10,9 +11,9 @@ programming project (web, systems, ML) that anchors work on one design document.
 ## What it enforces (from adoption onward — never retroactively)
 
 - **Task IDs** `<type>/<kebab-slug>` (`feat|fix|perf|gate|spike|decision|docs|chore`) registered in `tasks.yaml` with explanatory titles before first use. Bare codenames (`P0`, `E3`, `Q1`) are rejected by a validator hook.
-- **Severities** `blocker > major > minor` on review/audit findings.
+- **Severities** `blocker > major > minor` on review findings.
 - **One home per fact**: SSOT (design), `tasks.yaml` (registry), `ROADMAP.md` (generated view), `PROGRESS.md` (log, auto-archived monthly), ADRs (decisions), reviews dir (external feedback, verbatim).
-- **SSOT discipline**: §-anchor citations only; generated section split + INDEX + session-injected DIGEST; "binding but falsifiable" discrepancy rule; bulk-edit quarantine (>100 changed lines → audit before dependent work).
+- **SSOT discipline**: §-anchor citations only; generated section split + INDEX + session-injected DIGEST; "binding but falsifiable" discrepancy rule (implementation evidence that contradicts the SSOT → register a `decision`, amend via ADR).
 
 Full convention: [references/conventions.md](references/conventions.md).
 
@@ -21,11 +22,10 @@ Full convention: [references/conventions.md](references/conventions.md).
 | | |
 |---|---|
 | `/jahns-workflow:init` | One-click setup; non-destructive retrofit for in-progress projects (incl. agent-memory cleanup, project registration) |
-| `/jahns-workflow:round` | Close a work round: sync registry → PROGRESS entry + archive → refresh views → review-request packet |
-| `/jahns-workflow:review` | Ingest an external review reply: preserve verbatim → verify each finding → register as tasks |
-| `/jahns-workflow:audit` | Scoped, tiered SSOT audit (consistency / independent re-derivation / cheap-oracle checks). Cost cap is wall-clock, not hardware — never runs production suites or expensive builds |
+| `/jahns-workflow:round` | Close a work round: sync registry → PROGRESS entry + archive → refresh views → build the review bundle |
+| `/jahns-workflow:review` | Ingest an external review reply: preserve verbatim → bundle-identity cross-check → verify each finding → register as tasks |
+| `/jahns-workflow:reviewer-kit` | One-time: render the web reviewer's ChatGPT Project kit (static protocol + Project instructions) |
 | `/jahns-workflow:status` | Cross-project terminal dashboard (branches, rounds, active/blocked tasks). Registry entries can be local (`path`) or remote (`repo: owner/name`, fetched via `gh api` — for projects not cloned on this machine) |
-| `spec-auditor` agent | Independent verifier fanned out by the audit skill |
 | SessionStart hook | Injects digest + active tasks on startup/resume/clear/**compact** (capped ~8KB; no-ops in ~30ms in non-initialized projects) |
 | PostToolUse hook | On `tasks.yaml` edits only: schema validation (exit-2 feedback) + deterministic `ROADMAP.md` regeneration. ~13ms no-op otherwise |
 
@@ -37,12 +37,20 @@ A unified front door `scripts/jw.py` dispatches `jw <group>`
 
 - **`jw round close . --round <id> --done <ids> --touched <ids>`** does the whole deterministic
   closeout ritual atomically: comment-preserving status/round flips on tasks.yaml, validate,
-  regenerate ROADMAP/SSOT views, advance the `last_round_commit` watermark, and report SSOT churn
-  (flagging the >100-line bulk-edit quarantine). No more hand-edited watermarks or per-task flips.
+  regenerate ROADMAP/SSOT views, and advance the `last_round_commit` watermark. No more hand-edited
+  watermarks or per-task flips.
 - **PreCompact / SessionEnd hooks** snapshot a re-entry pointer (HEAD, branch, active round,
   active/blocked tasks, next-actionable) to a plugin-local file — closing the "update memory
   before compaction" loop. The SessionStart injection now also lists **next-actionable** tasks
   (deps satisfied, including stale-`blocked` ones whose deps are now done).
+- **START_HERE re-entry pointer.** `round close` and `review` overwrite a bounded (~35-line)
+  model-authored "where am I" narrative — the live frontier (what just landed, the open
+  decision / next probe, active lanes; detail linked, not inlined) — to a plugin-local file
+  (`jw resume --start-here-path .`), **reset every round** so it can't grow unbounded. The
+  SessionStart hook injects it, so a new or post-compaction session resumes the frontier without
+  a manual "pick up where we left off". Complements the deterministic structured snapshot above
+  (narrative vs. structured); keeps this out of the agent-memory `MEMORY.md`, which would
+  otherwise accumulate forever.
 - **`jw lanes verify .`** checks each task's `lane:` manifest — that the lane branch *contains*
   its recorded `base_sha` (the correct invariant; not descent from the moving integration tip).
   For parallel worktree lanes, set `worktree.baseRef: "head"` in Claude Code settings so lanes
@@ -52,7 +60,8 @@ A unified front door `scripts/jw.py` dispatches `jw <group>`
 
 Set `review.mode` in `.jahns-workflow.yml`:
 
-- **`packet`** (default) — close a round, push, paste a request packet to a web reviewer.
+- **`packet`** (default) — close a round, push, and attach a self-contained review bundle to a web
+  reviewer (see *Review bundle + reviewer kit (v0.3.0)* below).
 - **`pr`** — SHA-bound review cycles on a GitHub PR, with a deterministic merge gate. A review
   is identified by `(reviewer, cycle, reviewed_sha)`, stored as machine-readable markers in PR
   comments (GitHub is the canonical store, never inferred from filenames). A new push makes a
@@ -135,6 +144,42 @@ structure fails closed. (C) *Closeout/views* — library helpers raise a catchab
 `jw ssot check` verifies every view's exact bytes (not just `.hash`) and flags missing/extra files;
 `deps` elements must be task ids. The threat model and acceptance contract for v0.2 are frozen.
 
+## Review bundle + reviewer kit (v0.3.0)
+
+The web reviewer can no longer browse the repo through the ChatGPT GitHub connector, so packet
+mode now ships a **self-contained, SHA-pinned review bundle** instead of a paste-and-browse packet.
+
+- **`jw review bundle . --round <id>`** (packet) **/ `--pr <N>`** (the PR macro reviewer, which also
+  lost repo browsing) builds a `jahns-review-bundle/v1` zip: `repo/` is assembled **directly from git
+  objects** of the reviewed head (`git ls-tree`/`cat-file` — exact tracked tree, no `.git`/caches/
+  credentials, no `.gitattributes` export-ignore surprises; a tracked symlink ships as a **regular file
+  holding its target string** — recorded in `manifest.symlinks`, never a link entry `unzip` could rebuild
+  — so it can't resolve to an out-of-tree file at the reviewer), plus a base→head
+  `DIFF.patch` + `CHANGED_FILES.txt` + `COMMITS.txt`, the model-authored falsifiable `REQUEST.md`, and
+  a schema-validated `MANIFEST.yaml` binding review identity. Generation is script-deterministic, never
+  a model hand-assembling a zip. Control material lives in `__review__/`, OUTSIDE `repo/`, so repository
+  content can't masquerade as bundle metadata; bundles are written to an untracked `<reviews_dir>/bundles/`.
+- **The reviewed head is the committed HEAD** (so `repo/tasks.yaml`, PROGRESS, and the manifest scope
+  are all computed from the same tree — no pre-/post-closeout provenance split), **bound to the round**:
+  the sidecar records the round's tip, and the bundler refuses if HEAD advanced past it with
+  non-closeout (code) commits, or if a newer round has since been closed — so `bundle --round X`
+  can't ship the wrong tree under round X's label. **Base** is the previous round's watermark, captured
+  by `round close` into a `<round-id>-bundle.yaml` sidecar (the live `last_round_commit` is overwritten
+  to this round's tip) — never inferred from the round name; it must be reachable and an ancestor of
+  head. Head must be pushed (durable-commit precondition).
+- **`/jahns-workflow:reviewer-kit`** renders the reviewer's ChatGPT Project once: `PROJECT_INSTRUCTIONS.txt`
+  (control plane) + five `JW_*.md` Project Sources (static protocol: authority order, repository
+  contract, review playbook, output contract, examples) + a hash-stamped `KIT_MANIFEST.yaml`.
+- **Structured ingest.** The reviewer's reply ends with a `jw-review-summary` marker; `jw review
+  ingest` preserves the reply byte-exact, then **appends** (never edits the verbatim body) a
+  bundle-identity cross-check that binds the reply to the recorded bundle on **every** axis
+  (`protocol`/`project`/`round_id`/`review_mode`/`review_cycle`/`base_sha`/`reviewed_sha`), so a
+  reply bound to a different SHA — or the same head under a different cycle — **fails closed**,
+  halting triage; a missing/duplicate/fenced marker is flagged, not silently passed. Plus a
+  `JW-GPT-NNN` finding triage skeleton. The pr-mode output contract appends the `jw-review-result`
+  marker (with `decision_required` as a list, as the merge gate requires), so one bundle serves both
+  review profiles.
+
 ## Requirements
 
 - `git`, `bash`, [`uv`](https://docs.astral.sh/uv/) on PATH (scripts use PEP 723 inline deps; first run downloads `pyyaml` once).
@@ -154,13 +199,13 @@ Then in each project: `/jahns-workflow:init`. **Restart Claude Code after instal
 ## Files a project gains
 
 ```
-.jahns-workflow.yml      # config: SSOT path, dir mapping, oracles, audit watermark
+.jahns-workflow.yml      # config: SSOT path, dir mapping, review mode
 tasks.yaml               # THE codename registry (validated on every edit)
 ROADMAP.md               # generated Mermaid dependency graph + task table (GitHub renders it)
 PROGRESS.md              # round log (older months auto-archived to docs/progress/)
 docs/CONVENTIONS.md      # verbatim copy of the global convention
 docs/ssot/               # generated: sections/ split, INDEX.md, DIGEST.md
-docs/adr/  docs/reviews/ # decisions; review request/feedback/audit records
+docs/adr/  docs/reviews/ # decisions; review request/feedback records
 CLAUDE.md                # gains a marker-delimited workflow stanza
 ```
 

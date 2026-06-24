@@ -27,9 +27,14 @@ metadata header and consumes the drop-file:
 uv run <plugin-root>/scripts/jw.py review ingest . --round <round-id> --reviewer "<model, e.g. gpt-5.5-pro>"
 ```
 
-If it reports `no review at /tmp/review.md`, tell the user to save the reply first
-(`cat > /tmp/review.md`, paste, `Ctrl-D`) and stop. Then read the written
-`<reviews_dir>/<round-id>-feedback.md` to triage.
+Besides the byte-exact copy, ingest **appends** (never edits the verbatim body) a *bundle identity
+check* and a *finding triage skeleton* beneath it: it parses the reply's `jw-review-summary:v1`
+marker and cross-checks `reviewed_sha`/`round_id`/`project` against the round's bundle record
+(`<round-id>-bundle.yaml`). **If it exits 3 (identity MISMATCH)** the reply reviewed a different
+SHA than was shipped — do NOT triage; re-bundle the correct head or get a reply bound to it. If it
+reports `no review at /tmp/review.md`, tell the user to save the reply first (`cat > /tmp/review.md`,
+paste, `Ctrl-D`) and stop. For a PR-mode cycle, pass `--pr <N>` so the cross-check binds to the
+frozen cycle head. Then read `<reviews_dir>/<round-id>-feedback.md` to triage.
 
 ## Step 3 — Verify, then triage (never blindly implement)
 
@@ -41,7 +46,8 @@ Reviewer findings are claims, not facts. For each distinct finding:
    - `NEEDS-RULING` — turns on an SSOT interpretation → register a `decision/...` task instead of acting.
 2. Register each REAL finding in `tasks.yaml`: appropriate type (`fix`/`perf`/`docs`), explanatory title, `severity: blocker|major|minor`, `origin: review-<round-id>`, and `anchor:` when the finding binds to an SSOT section. The guard hook validates on save.
 
-Append a triage table to the feedback file (in the user's configured language; quoted reviewer text verbatim): finding → verdict → evidence → task id.
+Fill in the triage-skeleton table ingest appended to the feedback file (in the user's configured
+language; quoted reviewer text verbatim): for each `JW-GPT-NNN` row set verdict → evidence → task id.
 
 ## Step 4 — Report
 
@@ -49,6 +55,12 @@ Report in the user's configured language: counts by verdict and severity, blocke
 first with their task IDs. Remind that blockers must be resolved before the next round
 consumes downstream work; offer to start on them. Suggested commit message:
 `docs(review): ingest <round-id> feedback`.
+
+Then **refresh the re-entry pointer** (the review moved the frontier): get its path with
+`uv run <plugin-root>/scripts/jw.py resume --start-here-path .` and **Write** (overwrite, ≤ ~35
+lines) the post-review frontier — open blockers/decisions and what to pick up next, detail linked
+to the feedback/PROGRESS files. The SessionStart hook injects this so the next session resumes
+without re-explaining. (Same file the round skill writes; see round Step 6.)
 
 ## PR mode (review.mode: pr) — SHA-bound cycle + merge gate
 
