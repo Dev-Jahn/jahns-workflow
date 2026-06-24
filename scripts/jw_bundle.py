@@ -36,7 +36,7 @@ import yaml  # noqa: E402
 
 from jw_common import (  # noqa: E402
     CONFIG_NAME, WorkflowError, find_project_root, git_full_sha, git_rc, is_ancestor,
-    load_config, upstream_ref,
+    load_config, normalize_config, upstream_ref,
 )
 
 # git's canonical empty tree — the base for a first-round (base=None) review, so DIFF/CHANGED_FILES
@@ -249,12 +249,33 @@ def _read_blobs(root: Path, shas: list[str]) -> dict[str, bytes]:
 
 # bookkeeping paths a round-close commit may touch — used to tell a legitimate closeout commit (head
 # == round tip + bookkeeping edits) apart from forward/next-round CODE commits.
-def _closeout_only(root: Path, cfg: dict, frm: str, head: str) -> bool:
+def _config_at(root: Path, ref: str) -> dict:
+    """Parse + normalize .jahns-workflow.yml AS OF `ref` (the reviewed round tip). Fail CLOSED: a
+    config that can't be read/parsed at the round tip means we can't define that round's bookkeeping
+    surface, so we refuse rather than fall back to the (mutable) working-tree config — a later commit
+    must not be able to widen the bookkeeping dirs and reclassify forward CODE as a closeout edit."""
+    rc, out, err = git_rc(root, "show", f"{ref}:{CONFIG_NAME}")
+    if rc != 0:
+        raise WorkflowError(
+            f"cannot read {CONFIG_NAME} at round tip {ref[:12]} ({err.strip() or 'not found'}) — "
+            f"cannot verify the round's bookkeeping surface; re-close the round before bundling.")
+    try:
+        return normalize_config(yaml.safe_load(out))
+    except (yaml.YAMLError, ValueError) as e:
+        raise WorkflowError(
+            f"{CONFIG_NAME} at round tip {ref[:12]} is unparseable ({e}) — cannot verify the round's "
+            f"bookkeeping surface; re-close the round before bundling.")
+
+
+def _closeout_only(root: Path, frm: str, head: str) -> bool:
     rc, out, err = git_rc(root, "diff", "--name-only", f"{frm}..{head}")
     if rc != 0:  # fail CLOSED: an empty stdout on a *failed* diff must never read as "closeout-only"
         raise WorkflowError(
             f"cannot verify round binding: `git diff {frm[:12]}..{head[:12]}` failed "
             f"({err.strip() or 'error'}) — refusing to bundle on an unverifiable diff.")
+    # bookkeeping surface is the config AS OF the round tip (`frm`), never the working tree — else a
+    # post-close `generated_dir`/etc. change could wave forward CODE through under this round's label.
+    cfg = _config_at(root, frm)
     ok_files = {"tasks.yaml", CONFIG_NAME, "ROADMAP.md", cfg.get("progress", "PROGRESS.md")}
     ok_dirs = tuple(str(d).rstrip("/") + "/" for d in
                     (cfg.get("generated_dir"), cfg.get("reviews_dir"),
@@ -292,7 +313,7 @@ def _round_binding_error(root: Path, cfg: dict, identity: dict, head: str) -> st
                     f"bundle the current round, or re-close this one.")
     if head != rcommit:
         try:
-            if not _closeout_only(root, cfg, rcommit, head):
+            if not _closeout_only(root, rcommit, head):
                 return (f"HEAD has commit(s) past the round tip {rcommit[:12]} that change non-bookkeeping "
                         f"files — commit only the round closeout before bundling, or re-close the round.")
         except WorkflowError as e:  # a failed binding diff fails closed (not silently closeout-only)
