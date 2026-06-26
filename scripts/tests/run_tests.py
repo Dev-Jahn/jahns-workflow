@@ -1518,6 +1518,30 @@ class BundleTests(unittest.TestCase):
             self.assertIsNone(rec["head_sha"])        # head is stamped by `jw review bundle`, not at close
             self.assertEqual(rec["review_mode"], "packet")
 
+    def test_round_close_expands_short_watermark_base(self):
+        # A SHORT watermark in config (hand-edited / legacy) must be expanded to a FULL 40-hex sha in
+        # the sidecar base: jw_bundle._is_sha accepts only 40-hex, so a short base_sha would be dropped
+        # to None → bundle diffs against the empty tree and ships the WHOLE repo instead of base..head.
+        with tempfile.TemporaryDirectory() as d:
+            work = Path(d)
+            init_repo(work)  # c0 — the previous watermark (stored SHORT below)
+            base = git(work, "rev-parse", "HEAD").stdout.strip()
+            (work / ".jahns-workflow.yml").write_text(
+                "version: 1\nproject: demo\nreviews_dir: docs/reviews\nreview:\n  mode: packet\n"
+                "state:\n  last_round_commit: " + base[:8] + "\n")   # SHORT (8-hex) watermark
+            (work / "tasks.yaml").write_text(
+                "version: 1\nproject: demo\ntasks:\n"
+                "- id: feat/x-thing\n  title: the x thing that does y\n  status: active\n")
+            (work / "code.txt").write_text("impl\n")
+            git(work, "add", "-A")
+            git(work, "commit", "-qm", "c1")
+            with self._quiet():
+                rc = jw_round.close(work, "2026-06-23-r", ["feat/x-thing"], [], "HEAD")
+            self.assertEqual(rc, 0)
+            rec = yaml.safe_load((work / "docs/reviews/2026-06-23-r-bundle.yaml").read_text())
+            self.assertEqual(rec["base_sha"], base)            # expanded to the FULL watermark sha
+            self.assertTrue(jw_bundle._is_sha(rec["base_sha"]))  # so the bundler will honor it as base
+
     def test_reviewer_kit_render(self):
         with tempfile.TemporaryDirectory() as d:
             out = Path(d) / "kit"
