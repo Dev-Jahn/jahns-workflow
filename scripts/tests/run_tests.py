@@ -723,6 +723,19 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._cfg("version: 1\nproject: x\nreview:\n  operators: notalist\n")
 
+    def test_default_packet_transport_raw_zip(self):
+        # packet transport defaults to the loose raw-repo-zip flow (reviewer gets .git + a brief),
+        # not the strict bundle — the strict bundle is opt-in for PR/provenance-gated review.
+        self.assertEqual(self._cfg("version: 1\nproject: x\n")["review"]["packet_transport"], "raw-zip")
+
+    def test_packet_transport_strict_bundle_ok(self):
+        cfg = self._cfg("version: 1\nproject: x\nreview:\n  packet_transport: strict-bundle\n")
+        self.assertEqual(cfg["review"]["packet_transport"], "strict-bundle")
+
+    def test_invalid_packet_transport_raises(self):
+        with self.assertRaises(ValueError):
+            self._cfg("version: 1\nproject: x\nreview:\n  packet_transport: zipfile\n")
+
 
 TASKS_FIXTURE = """# registry — comments must be preserved
 version: 1
@@ -1546,7 +1559,7 @@ class BundleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             out = Path(d) / "kit"
             with self._quiet():
-                rc = jw_bundle.kit(out)
+                rc = jw_bundle.kit(out, mode="strict")  # strict = the SHA-pinned JW_* protocol kit
             self.assertEqual(rc, 0)
             for name in jw_bundle.KIT_SOURCES:
                 self.assertTrue((out / name).is_file(), name)
@@ -1557,6 +1570,23 @@ class BundleTests(unittest.TestCase):
             import hashlib
             for name, h in man["templates"].items():
                 self.assertEqual(hashlib.sha256((out / name).read_bytes()).hexdigest(), h)
+
+    def test_reviewer_kit_loose_is_default(self):
+        # default render is the LOOSE domain-reviewer setup, not the strict JW_* protocol: short
+        # instructions + optional context, no protocol manifest, with the "don't audit the harness"
+        # guardrail so the reviewer stays on domain review.
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "kit"
+            with self._quiet():
+                rc = jw_bundle.kit(out)  # no mode → loose
+            self.assertEqual(rc, 0)
+            for name in jw_bundle.KIT_LOOSE_SOURCES:
+                self.assertTrue((out / name).is_file(), name)
+            self.assertFalse((out / "KIT_MANIFEST.yaml").exists())   # loose is not a versioned protocol
+            self.assertFalse((out / "JW_INSTRUCTION.md").exists())   # no strict protocol sources
+            body = (out / "REVIEWER_INSTRUCTIONS.md").read_text()
+            self.assertIn("jahns-workflow harness", body)            # the don't-audit-the-harness guardrail
+            self.assertIn("domain reviewer", body.lower())
 
     def test_first_round_base_none_is_coherent(self):
         import zipfile
