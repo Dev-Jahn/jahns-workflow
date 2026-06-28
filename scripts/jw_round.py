@@ -26,7 +26,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from jw_common import (  # noqa: E402
-    ROUND_RE, WorkflowError, find_project_root, git, git_full_sha, load_config,
+    ROUND_RE, WorkflowError, find_project_root, git_full_sha, load_config,
 )
 
 
@@ -217,32 +217,6 @@ def close(root: Path, round_id: str, done: list[str], touched: list[str], commit
         gen_backup = Path(tempfile.mkdtemp(prefix="jw-ssot-bak-")) / "g"
         shutil.copytree(gen_dir, gen_backup)
 
-    # packet-mode bundle record (written INSIDE the atomic block, rolled back on failure): the BASE
-    # watermark for `jw review bundle`. base = the previous watermark; on a re-close (prev already
-    # advanced to this tip) keep any base a prior close captured, so re-closing can't collapse the
-    # range. The HEAD is stamped later by `jw review bundle` (the actual reviewed commit).
-    sidecar = None
-    if (cfg.get("review", {}) or {}).get("mode") == "packet":
-        import jw_bundle
-        prev = (cfg.get("state") or {}).get("last_round_commit")  # previous watermark (pre-advance) = bundle base
-        # expand a short/ref watermark to a FULL 40-hex sha: jw_bundle._is_sha accepts only 40-hex, so
-        # a short base would be dropped to None at bundle time → diff vs the empty tree → whole repo.
-        # Also makes the re-close check (prev == full) compare full-vs-full, not short-vs-full.
-        prev = git_full_sha(root, str(prev)) if prev else None
-        base = prev if (prev and prev != full) else None
-        if base is None:
-            ex = jw_bundle.read_record(root, cfg, round_id)
-            if ex and ex.get("base_sha"):
-                base = git_full_sha(root, str(ex.get("base_sha")))
-        sc_path = jw_bundle.record_path(root, cfg, round_id)
-        sidecar = {
-            "path": sc_path,
-            "orig": sc_path.read_text(encoding="utf-8") if sc_path.is_file() else None,
-            "base": base,
-            "identity": {"project": cfg.get("project") or data0.get("project"), "round_id": round_id,
-                         "branch": git(root, "branch", "--show-current") or None, "base_sha": base,
-                         "round_commit": full},  # binds `jw review bundle` to THIS round's tip
-        }
     try:
         tasks_path.write_text(text, encoding="utf-8")
         cfg_path.write_text(ctext_new, encoding="utf-8")
@@ -250,8 +224,6 @@ def close(root: Path, round_id: str, done: list[str], touched: list[str], commit
         if cfg.get("ssot"):
             import jw_ssot
             jw_ssot.regenerate(root)  # one full regen; raises WorkflowError (caught below) not sys.exit
-        if sidecar is not None:
-            jw_bundle.write_record(root, cfg, sidecar["identity"])
     except Exception as e:  # noqa: BLE001 — any failure must roll every written artifact back
         tasks_path.write_text(orig_tasks_text, encoding="utf-8")
         cfg_path.write_text(ctext, encoding="utf-8")
@@ -265,25 +237,18 @@ def close(root: Path, round_id: str, done: list[str], touched: list[str], commit
                 shutil.copytree(gen_backup, gen_dir)
         if gen_backup is not None:
             shutil.rmtree(gen_backup.parent, ignore_errors=True)
-        if sidecar is not None:  # restore/remove the bundle record too — best-effort (tasks/config
-            try:                 # are already restored above), so a pathological path can't crash rollback
-                if sidecar["orig"] is None:
-                    sidecar["path"].unlink(missing_ok=True)
-                else:
-                    sidecar["path"].write_text(sidecar["orig"], encoding="utf-8")
-            except OSError:
-                pass
         print(f"jw_round close: closeout failed mid-write and was rolled back — {e}", file=sys.stderr)
         return 1
     if gen_backup is not None:
         shutil.rmtree(gen_backup.parent, ignore_errors=True)
 
+    # report the watermark move so the review request can name the diff base (prev tip → this tip).
+    # `prev_wm` is the watermark BEFORE this close advanced it — the previous round's tip; resolve it
+    # to a full sha (it may be stored short) so it can be copied verbatim as the review base.
+    prev_wm = git_full_sha(root, str(prev_raw)) if (prev_raw := (cfg.get("state") or {}).get("last_round_commit")) else None
     print(f"round {round_id} closed: {len(done)} done, {len(set(done + touched))} stamped; "
-          f"watermark set @ {full[:12]}")
-    if sidecar is not None:
-        b = sidecar["base"]
-        print(f"bundle record → {cfg['reviews_dir']}/{round_id}-bundle.yaml "
-              f"(base {b[:12] if b else '(root)'}; head stamped at `jw review bundle`)")
+          f"watermark {(prev_wm[:12] if prev_wm else '(root)')} → {full[:12]}")
+    print(f"  review diff base = {prev_wm or '(root)'}  (previous round tip; head = {full})")
     return 0
 
 

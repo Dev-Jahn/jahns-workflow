@@ -26,8 +26,8 @@ Markers (HTML comments embedded in PR comment bodies):
 Subcommands (also `jw review <sub>`):
   freeze --pr N [--round ID] [root]   stamp the current PR head as a new review cycle + post request
   status [--pr N] [root]              show per-cycle review status (PR mode) or packet pairs (packet mode)
-  ingest [--round ID] [--reviewer M] [--pr N]  byte-exact copy /tmp/review.md → <id>-feedback.md,
-                                      then append a bundle-identity cross-check + finding skeleton
+  ingest [--round ID] [--reviewer M]  byte-exact copy /tmp/review.md → <id>-feedback.md,
+                                      then append a finding triage skeleton
 """
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import yaml  # noqa: E402
 
 from jw_common import (  # noqa: E402
-    CONFIG_NAME, WorkflowError, find_project_root, git_full_sha, load_config, normalize_config,
+    CONFIG_NAME, find_project_root, git_full_sha, load_config, normalize_config,
 )
 
 CODEX_BOT = "chatgpt-codex-connector[bot]"  # REST `user.login` form
@@ -581,43 +581,14 @@ def _parse_findings(text: str) -> list[dict]:
     return out
 
 
-def _norm_opt(v: object) -> str | None:
-    """Normalize an optional identity field for comparison: None / '' / 'none' / 'null' → None."""
-    if v is None:
-        return None
-    s = str(v).strip()
-    return None if s.lower() in ("", "none", "null") else s
-
-
-def _bundle_identity(root: Path, cfg: dict, round_id: str | None, pr: int | None) -> dict | None:
-    """The recorded review identity to cross-check the reply against: the frozen cycle (pr) or the
-    round's bundle sidecar (packet). None if no bundle was built yet (the sidecar's head is stamped
-    by `jw review bundle`), so ingest can't bind a reply that has no recorded reviewed head."""
-    import jw_bundle
-    try:
-        if pr is not None:
-            return jw_bundle._resolve_pr(root, pr, round_id)
-        rec = jw_bundle.read_record(root, cfg, round_id) if round_id else None
-        if rec is None or not rec.get("head_sha"):
-            return None
-        return {"project": rec.get("project"), "round_id": rec.get("round_id"),
-                "head_sha": rec.get("head_sha"), "review_mode": rec.get("review_mode", "packet"),
-                "review_cycle": rec.get("review_cycle"), "base_sha": rec.get("base_sha")}
-    except WorkflowError:
-        return None
-
-
-def ingest(root: Path, round_id: str | None, src: Path = INBOX, reviewer: str | None = None,
-           pr: int | None = None) -> int:
-    """Byte-exact ingest of an external review reply, plus a fail-closed identity cross-check.
+def ingest(root: Path, round_id: str | None, src: Path = INBOX, reviewer: str | None = None) -> int:
+    """Byte-exact ingest of an external review reply.
 
     The user saves the reviewer's reply to `src` (default /tmp/review.md) in a separate shell
     (`cat > /tmp/review.md`, paste, Ctrl-D); this copies the body VERBATIM into
-    <reviews_dir>/<round-id>-feedback.md (NO model re-typing — the whole point), then APPENDS a
-    structured section beneath it: a `jw-review-summary` identity check against the recorded bundle
-    (rejects a reply that reviewed a different SHA than was shipped) and a finding triage skeleton.
-    The verbatim body is never edited; only structured sections are added beneath it. Returns 3 on a
-    bundle-identity mismatch (so triage does not silently proceed on a stale/wrong-SHA reply)."""
+    <reviews_dir>/<round-id>-feedback.md (NO model re-typing — the whole point) under a metadata
+    header, then APPENDS a finding triage skeleton beneath it. The verbatim body is never edited.
+    Round id from --round, else the newest <reviews_dir>/*-request.md."""
     import datetime
     cfg = load_config(root)
     if not src.is_file():
@@ -633,119 +604,33 @@ def ingest(root: Path, round_id: str | None, src: Path = INBOX, reviewer: str | 
         reqs = sorted(p.stem[: -len("-request")] for p in rdir.glob("*-request.md")) if rdir.is_dir() else []
         if reqs:
             round_id = reqs[-1]
-        elif pr is not None:
-            # PR mode writes no request file (freeze posts the request to GitHub) — take the round
-            # id from the frozen cycle so `jw review ingest --pr N` works without an explicit --round.
-            prident = _bundle_identity(root, cfg, None, pr)
-            round_id = prident.get("round_id") if prident else None
-        if round_id is None:
-            print("jw_review ingest: no --round given and no *-request.md (or PR cycle) to infer it from.",
+        else:
+            print("jw_review ingest: no --round given and no *-request.md to infer it from.",
                   file=sys.stderr)
             return 1
     rdir.mkdir(parents=True, exist_ok=True)
     dest = rdir / f"{round_id}-feedback.md"
 
-    text = body.decode("utf-8", "replace")
-    summaries = parse_markers(text, "review-summary")
-    sm = summaries[0] if summaries else None
-    identity = _bundle_identity(root, cfg, round_id, pr)
-    findings = _parse_findings(text)
+    findings = _parse_findings(body.decode("utf-8", "replace"))
 
-    # --- identity cross-check (fail-closed) ---
-    # Once a summary marker is present, its identity fields are REQUIRED to match: a present-but-
-    # absent/empty reviewed_sha (or round) must FAIL, not pass — the load-bearing field's absence
-    # cannot be a silent MATCH. Multiple markers (ambiguous) and a fenced/unparseable marker are
-    # surfaced rather than silently dropped to the same soft path as a genuinely marker-less reply.
-    mismatches: list[str] = []
-    unusable = False
-    if not summaries:
-        if "jw-review-summary:v1" in text:  # token present but fenced/malformed → flag, don't pass silently
-            unusable = True
-            check_status = "UNUSABLE-MARKER (present but fenced/unparseable — verify the SHA manually)"
-        else:
-            check_status = "no-marker (manual triage — reply has no jw-review-summary)"
-    elif len(summaries) > 1:
-        mismatches.append(f"{len(summaries)} jw-review-summary markers — identity ambiguous")
-        check_status = "MISMATCH"
-    elif identity is None:
-        # No recorded bundle head (bundle not built yet, or reset by a re-close). Bind with every
-        # axis available WITHOUT the record: a reply must be FOR this round/project AND have reviewed
-        # the live committed HEAD. SHA-alone is NOT enough — a reply to a DIFFERENT round/request that
-        # merely shares the HEAD must not pass (cycle/base can't be cross-checked without the record,
-        # so this stays a degraded path, but not a blind one). Fail-closed on each axis.
-        live = git_full_sha(root, "HEAD")
-        reviewed = sm.get("reviewed_sha")
-        if not (live and _is_sha(reviewed) and str(reviewed) == live):
-            shown = str(reviewed)[:12] if reviewed else "(missing)"
-            mismatches.append(f"reviewed_sha {shown} ≠ live HEAD {(live or '?')[:12]} (no bundle record)")
-        if str(sm.get("protocol")) != "jw-chatgpt-reviewer/v1":
-            mismatches.append(f"protocol {sm.get('protocol')!r} ≠ 'jw-chatgpt-reviewer/v1'")
-        if str(sm.get("round_id")) != round_id:
-            mismatches.append(f"round_id {sm.get('round_id')!r} ≠ {round_id!r}")
-        if cfg.get("project") and str(sm.get("project")) != str(cfg["project"]):
-            mismatches.append(f"project {sm.get('project')!r} ≠ {cfg['project']!r}")
-        check_status = "MISMATCH" if mismatches else \
-            "MATCH (vs live HEAD — no bundle record; run `jw review bundle` to bind fully)"
-    else:
-        # FULL identity binding: a reply must match the bundle on every identity axis, not just the
-        # SHA — a cycle-1 reply of the same head must NOT pass against a cycle-2 bundle, so
-        # review_cycle / base_sha / review_mode / protocol are all compared, strictly.
-        head = str(identity.get("head_sha") or "")
-        reviewed = sm.get("reviewed_sha")
-        if not (head and _is_sha(reviewed) and str(reviewed) == head):
-            shown = str(reviewed)[:12] if reviewed else "(missing)"
-            mismatches.append(f"reviewed_sha {shown} ≠ head {head[:12]}")
-        if str(sm.get("protocol")) != "jw-chatgpt-reviewer/v1":
-            mismatches.append(f"protocol {sm.get('protocol')!r} ≠ 'jw-chatgpt-reviewer/v1'")
-        if str(sm.get("round_id")) != round_id:
-            mismatches.append(f"round_id {sm.get('round_id')!r} ≠ {round_id!r}")
-        if str(sm.get("review_mode")) != str(identity.get("review_mode")):
-            mismatches.append(f"review_mode {sm.get('review_mode')!r} ≠ {identity.get('review_mode')!r}")
-        if _norm_opt(sm.get("review_cycle")) != _norm_opt(identity.get("review_cycle")):
-            mismatches.append(f"review_cycle {sm.get('review_cycle')!r} ≠ {identity.get('review_cycle')!r}")
-        if _norm_opt(sm.get("base_sha")) != _norm_opt(identity.get("base_sha")):
-            mismatches.append(f"base_sha {sm.get('base_sha')!r} ≠ {identity.get('base_sha')!r}")
-        if identity.get("project") and str(sm.get("project")) != str(identity["project"]):
-            mismatches.append(f"project {sm.get('project')!r} ≠ {identity['project']!r}")
-        check_status = "MISMATCH" if mismatches else "MATCH"
-
-    # --- compose appended structured sections (beneath the verbatim body) ---
-    lines = ["", "", "---", "", "## Bundle identity check (`jw review ingest`)", ""]
-    lines.append(f"- check: **{check_status}**")
-    if sm is not None:
-        lines.append(f"- summary: verdict `{sm.get('verdict')}`  decision_required `{sm.get('decision_required')}`"
-                     f"  counts {sm.get('blocker')}b/{sm.get('major')}m/{sm.get('minor')}k")
-        lines.append(f"- reviewed_sha: `{sm.get('reviewed_sha')}`  cycle `{sm.get('review_cycle')}`  mode `{sm.get('review_mode')}`")
-    if identity is not None:
-        lines.append(f"- bundle head_sha: `{identity.get('head_sha')}`  ({identity.get('review_mode')})")
-    for mm in mismatches:
-        lines.append(f"- ⚠ {mm}")
-    if check_status == "MISMATCH":
-        if identity is not None:  # strict/PR: a recorded head exists, so a mismatch is a wrong target
-            lines.append("- **DO NOT triage automatically — the reply reviewed a different target than was "
-                         "shipped. Re-bundle the correct SHA or obtain a reply bound to it.**")
-        else:  # degraded/raw-zip: no recorded head — the mismatch may just be HEAD advancing since review
-            lines.append("- **DO NOT triage automatically — the reviewed SHA doesn't match the live HEAD. "
-                         "This may simply mean HEAD advanced since you sent the review; confirm the reviewer "
-                         "reviewed the SHA you sent (and the right round/project) before triaging.**")
-    lines += ["", "## Findings (triage skeleton — verify each before registering)", ""]
+    # --- appended triage skeleton (beneath the verbatim body, which is never edited) ---
+    lines = ["", "", "---", "", "## Findings (triage skeleton — verify each before registering)", ""]
     if findings:
         lines.append("| finding | severity | verdict (REAL/REJECTED/NEEDS-RULING) | evidence | task id |")
         lines.append("|---|---|---|---|---|")
         for f in findings:
             lines.append(f"| {f['id']} — {f['title']} | {f['severity']} |  |  |  |")
     else:
-        lines.append("_No `JW-GPT-NNN` finding blocks parsed — triage the verbatim reply manually._")
+        lines.append("_No `JW-GPT-NNN` finding blocks parsed — triage the verbatim reply directly._")
     appended = ("\n".join(lines) + "\n").encode("utf-8")
 
     header = (
         "<!-- jahns-workflow feedback: the body below is the reviewer reply VERBATIM (byte-exact "
-        "copy via `jw review ingest`) — do not edit it; structured sections are appended beneath it. -->\n"
+        "copy via `jw review ingest`) — do not edit it; a triage skeleton is appended beneath it. -->\n"
         f"round: {round_id}\n"
         f"reviewer: {reviewer or '(unknown)'}\n"
         f"ingested: {datetime.date.today().isoformat()}\n"
-        f"source: {src}\n"
-        f"identity_check: {check_status}\n\n---\n\n"
+        f"source: {src}\n\n---\n\n"
     )
     with open(dest, "wb") as f:
         f.write(header.encode("utf-8"))
@@ -753,13 +638,7 @@ def ingest(root: Path, round_id: str | None, src: Path = INBOX, reviewer: str | 
         f.write(appended)
     src.unlink()
     print(f"ingested {len(body)} bytes verbatim → {dest} (consumed {src})")
-    print(f"  identity: {check_status}  |  {len(findings)} finding(s) parsed")
-    if check_status == "MISMATCH":
-        print("  ⚠ bundle-identity MISMATCH — triage halted; see the feedback file.", file=sys.stderr)
-        return 3
-    if unusable:
-        print("  ⚠ a jw-review-summary marker was present but unparseable (fenced/malformed) — "
-              "verify the reviewed SHA by hand before triage.", file=sys.stderr)
+    print(f"  {len(findings)} finding(s) parsed — verify each before registering")
     return 0
 
 
@@ -773,9 +652,7 @@ def main(argv: list[str]) -> int:
         print("jw_review: no initialized project (missing .jahns-workflow.yml)", file=sys.stderr)
         return 1
     if sub == "ingest":
-        pr_opt = _opt(rest, "--pr")
-        return ingest(root, _opt(rest, "--round"), reviewer=_opt(rest, "--reviewer"),
-                      pr=int(pr_opt) if pr_opt else None)
+        return ingest(root, _opt(rest, "--round"), reviewer=_opt(rest, "--reviewer"))
     pr_s = _opt(rest, "--pr")
     if sub == "freeze":
         if not pr_s:
