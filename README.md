@@ -2,9 +2,8 @@
 
 A Claude Code plugin that harnesses SSOT-anchored agentic development: one global naming
 convention across all projects, a machine-validated task registry, zero-token roadmap/digest
-generation, round-based progress discipline, external domain review (a per-round brief + a
-`.git`-inclusive repo zip by default, or a deterministic SHA-pinned bundle for provenance-gated
-review), and external-review ingestion.
+generation, round-based progress discipline, a per-round markdown review request for an external
+domain reviewer that reads the repo over git, and verbatim review ingestion.
 
 Generalizes a research-workflow battle-tested on theory-heavy repos, but applies to any
 programming project (web, systems, ML) that anchors work on one design document.
@@ -23,9 +22,8 @@ Full convention: [references/conventions.md](references/conventions.md).
 | | |
 |---|---|
 | `/jahns-workflow:init` | One-click setup; non-destructive retrofit for in-progress projects (incl. agent-memory cleanup, project registration) |
-| `/jahns-workflow:round` | Close a work round: sync registry → PROGRESS entry + archive → refresh views → prepare the review packet (brief + repo zip; strict bundle opt-in) |
-| `/jahns-workflow:review` | Ingest an external review reply: preserve verbatim → verify each finding → register as tasks (a bundle-identity cross-check binds strict-bundle/PR replies; raw-zip replies are usually marker-less and go straight to triage) |
-| `/jahns-workflow:reviewer-kit` | One-time: render the web reviewer's ChatGPT Project kit — loose domain-reviewer setup by default, `--strict` for the SHA-pinned JW_* protocol |
+| `/jahns-workflow:round` | Close a work round: sync registry → PROGRESS entry + archive → refresh views → write the round's markdown review request |
+| `/jahns-workflow:review` | Ingest an external review reply: preserve verbatim → verify each finding → register REAL ones as tasks |
 | `/jahns-workflow:status` | Cross-project terminal dashboard (branches, rounds, active/blocked tasks). Registry entries can be local (`path`) or remote (`repo: owner/name`, fetched via `gh api` — for projects not cloned on this machine) |
 | SessionStart hook | Injects digest + active tasks on startup/resume/clear/**compact** (capped ~8KB; no-ops in ~30ms in non-initialized projects) |
 | PostToolUse hook | On `tasks.yaml` edits only: schema validation (exit-2 feedback) + deterministic `ROADMAP.md` regeneration. ~13ms no-op otherwise |
@@ -61,10 +59,9 @@ A unified front door `scripts/jw.py` dispatches `jw <group>`
 
 Set `review.mode` in `.jahns-workflow.yml`:
 
-- **`packet`** (default) — close a round, push, and hand a web reviewer the change for review. The
-  transport is set by `review.packet_transport`: **`raw-zip`** (default) — the user attaches a
-  `.git`-inclusive repo zip + a domain brief and the reviewer runs git directly — or
-  **`strict-bundle`** — a self-contained SHA-pinned bundle (see *External review* below).
+- **`packet`** (default) — close a round, push, and hand a web reviewer the round's markdown review
+  request (`<reviews_dir>/<round-id>-request.md`). The reviewer reads the repo over git and does a
+  domain review (see *External review* below).
 - **`pr`** — SHA-bound review cycles on a GitHub PR, with a deterministic merge gate. A review
   is identified by `(reviewer, cycle, reviewed_sha)`, stored as machine-readable markers in PR
   comments (GitHub is the canonical store, never inferred from filenames). A new push makes a
@@ -147,62 +144,30 @@ structure fails closed. (C) *Closeout/views* — library helpers raise a catchab
 `jw ssot check` verifies every view's exact bytes (not just `.hash`) and flags missing/extra files;
 `deps` elements must be task ids. The threat model and acceptance contract for v0.2 are frozen.
 
-## External review (v0.4.0)
+## External review
 
-Packet review defaults to a **loose, domain-first** flow (`review.packet_transport: raw-zip`): the
-reviewer is treated as a domain reviewer, not a workflow auditor.
+Review is a single, simple flow: round closeout writes one markdown **review request**, and the
+reviewer reads the repo over git (GitHub connector, a repo zip, or a local clone — the plugin
+doesn't care how). The reviewer is a *domain* reviewer, not a workflow auditor.
 
-- **`/jahns-workflow:round`** writes a **review brief** (`<reviews_dir>/<round-id>-request.md` from
-  `templates/review-request.md`): what changed and *why*, files to read first, falsifiable claims to
-  attack, evidence pointers, known weak spots, and the domain lens. It is a map to cut the reviewer's
-  ramp-up time, not a control protocol.
-- The user attaches a repo zip **including `.git`** (the round skill prints a `zip -y` command that
-  keeps `.git` and excludes caches/venv/data + common secret globs). The reviewer extracts it and
-  runs `git log`/`git diff`/`git show` directly — and CPU tests if useful — instead of reading a
-  sandboxed tree. **Caveat:** this ships the whole worktree (incl. untracked files) **and full
-  `.git` history** to the reviewer — any secret ever committed stays in history. If history was ever
-  cleaned, or you can't risk it, use `strict-bundle` (ships only the tracked HEAD tree).
-- **`/jahns-workflow:reviewer-kit`** (default) renders a short **loose** ChatGPT Project setup
-  (`REVIEWER_INSTRUCTIONS.md` + optional `REVIEWER_CONTEXT.md`) that keeps the reviewer on domain
-  correctness and explicitly **off** the jahns-workflow harness. Per-project domain priorities live
-  in a repo-local `docs/review-profile.md` (from `templates/review-profile.md`), referenced by the
-  brief. Ingest accepts a marker-less reply (verbatim copy → triage); the binding is the brief's
-  "Reviewed HEAD" the reviewer confirms plus your Step-3 verification.
+- **`/jahns-workflow:round`** writes `<reviews_dir>/<round-id>-request.md` from
+  `templates/review-request.md`: what changed and *why*, files to read first, falsifiable claims to
+  attack, evidence pointers, known weak spots, the domain lens, and the response wanted. It names the
+  reviewed branch/HEAD and diff base as orientation — a map to cut ramp-up time, not a control
+  protocol. Per-project domain priorities can live in a repo-local `docs/review-profile.md` (from
+  `templates/review-profile.md`), referenced by the request.
+- **`jw review ingest`** preserves the reviewer's reply **byte-exact** (the user saves it to
+  `/tmp/review.md` in a separate shell; no model re-typing) into `<round-id>-feedback.md` under a
+  metadata header, then appends a finding triage skeleton. The model verifies each finding
+  (`REAL`/`REJECTED`/`NEEDS-RULING`) against the code/SSOT and registers REAL ones as tasks.
 
-The **strict bundle** remains for provenance-gated review (`review.packet_transport: strict-bundle`,
-or PR mode's macro reviewer, or any reviewer that can't run git). `reviewer-kit --strict` renders the
-JW_* protocol kit for it.
-
-- **`jw review bundle . --round <id>`** (strict packet) **/ `--pr <N>`** (the PR macro reviewer, which
-  also lost repo browsing) builds a `jahns-review-bundle/v1` zip: `repo/` is assembled **directly from git
-  objects** of the reviewed head (`git ls-tree`/`cat-file` — exact tracked tree, no `.git`/caches/
-  credentials, no `.gitattributes` export-ignore surprises; a tracked symlink ships as a **regular file
-  holding its target string** — recorded in `manifest.symlinks`, never a link entry `unzip` could rebuild
-  — so it can't resolve to an out-of-tree file at the reviewer), plus a base→head
-  `DIFF.patch` + `CHANGED_FILES.txt` + `COMMITS.txt`, the model-authored falsifiable `REQUEST.md`, and
-  a schema-validated `MANIFEST.yaml` binding review identity. Generation is script-deterministic, never
-  a model hand-assembling a zip. Control material lives in `__review__/`, OUTSIDE `repo/`, so repository
-  content can't masquerade as bundle metadata; bundles are written to an untracked `<reviews_dir>/bundles/`.
-- **The reviewed head is the committed HEAD** (so `repo/tasks.yaml`, PROGRESS, and the manifest scope
-  are all computed from the same tree — no pre-/post-closeout provenance split), **bound to the round**:
-  the sidecar records the round's tip, and the bundler refuses if HEAD advanced past it with
-  non-closeout (code) commits, or if a newer round has since been closed — so `bundle --round X`
-  can't ship the wrong tree under round X's label. **Base** is the previous round's watermark, captured
-  by `round close` into a `<round-id>-bundle.yaml` sidecar (the live `last_round_commit` is overwritten
-  to this round's tip) — never inferred from the round name; it must be reachable and an ancestor of
-  head. Head must be pushed (durable-commit precondition).
-- **`/jahns-workflow:reviewer-kit`** renders the reviewer's ChatGPT Project once: `PROJECT_INSTRUCTIONS.txt`
-  (control plane) + five `JW_*.md` Project Sources (static protocol: authority order, repository
-  contract, review playbook, output contract, examples) + a hash-stamped `KIT_MANIFEST.yaml`.
-- **Structured ingest.** The reviewer's reply ends with a `jw-review-summary` marker; `jw review
-  ingest` preserves the reply byte-exact, then **appends** (never edits the verbatim body) a
-  bundle-identity cross-check that binds the reply to the recorded bundle on **every** axis
-  (`protocol`/`project`/`round_id`/`review_mode`/`review_cycle`/`base_sha`/`reviewed_sha`), so a
-  reply bound to a different SHA — or the same head under a different cycle — **fails closed**,
-  halting triage; a missing/duplicate/fenced marker is flagged, not silently passed. Plus a
-  `JW-GPT-NNN` finding triage skeleton. The pr-mode output contract appends the `jw-review-result`
-  marker (with `decision_required` as a list, as the merge gate requires), so one bundle serves both
-  review profiles.
+**PR mode** (`review.mode: pr`) adds a deterministic **merge gate** on top: SHA-bound review cycles
+on a GitHub PR, identified by `(reviewer, cycle, reviewed_sha)` and stored as machine-readable
+markers in PR comments (GitHub is the canonical store). `jw review freeze` stamps the current PR head
+as a cycle and posts the `@codex` request; `jw round merge` prints PASS only when — at the *current*
+head — the cycle is fresh, CI is ok (if `require_ci`), a fresh Codex review + resolved findings + a
+macro-reviewer result are bound to the head, there are zero open blockers/decisions, and a human
+approval (`jw approve --pr N --sha <head>`) is bound to the head. The gate is computed, never judged.
 
 ## Requirements
 

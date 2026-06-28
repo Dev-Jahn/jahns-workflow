@@ -12,8 +12,6 @@ Groups:
   status   [--project N]             cross-project dashboard
   remote   verify|drift [root]       is HEAD pushed / how far behind
   review   freeze|status|ingest ...  SHA-bound review cycles (PR mode); ingest = byte-exact reply copy
-  review   bundle --round ID|--pr N  build a jahns-review-bundle/v1 zip for the web reviewer
-  reviewer kit [--out dir]           render the ChatGPT reviewer kit (static protocol templates)
   approve  --pr N --sha X            SHA-bound human approval
   round    merge --pr N ...          deterministic merge guard
 
@@ -44,13 +42,7 @@ def main(argv: list[str]) -> int:
     group, rest = argv[0], argv[1:]
 
     # new-style modules expose main(argv)
-    if group == "reviewer":
-        import jw_bundle
-        return jw_bundle.main(["kit", *rest[1:]] if rest and rest[0] == "kit" else rest)
     if group == "review":
-        if rest and rest[0] == "bundle":
-            import jw_bundle
-            return jw_bundle.main(["bundle", *rest[1:]])
         import jw_review
         return jw_review.main(rest)
     if group == "remote":
