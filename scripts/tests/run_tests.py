@@ -27,6 +27,7 @@ import jw_merge  # noqa: E402
 import jw_resume  # noqa: E402
 import jw_review  # noqa: E402
 import jw_round  # noqa: E402
+import jw_tasks  # noqa: E402
 import jw_validate  # noqa: E402
 import yaml  # noqa: E402
 
@@ -1294,6 +1295,266 @@ class IntegrationSmokeTests(unittest.TestCase):
             jw_review._gh = orig
         self.assertEqual(rc_pass, 0)    # full lifecycle → gate PASS (dry run)
         self.assertEqual(rc_stale, 3)   # after re-freeze, cycle-1 evidence is stale → BLOCKED
+
+
+class TaskCliTests(unittest.TestCase):
+    def test_render_list_filters(self):
+        data = {"tasks": [
+            {"id": "feat/a", "title": "alpha task here", "status": "active"},
+            {"id": "fix/b", "title": "beta fix here", "status": "done"},
+            {"id": "feat/c", "title": "gamma task here", "status": "pending"},
+        ]}
+        self.assertEqual(len(jw_tasks.render_list(data)), 3)
+        active = jw_tasks.render_list(data, status="active")
+        self.assertEqual(len(active), 1)
+        self.assertIn("feat/a", active[0])
+        feats = jw_tasks.render_list(data, type_="feat")
+        self.assertEqual({ln.split()[0] for ln in feats}, {"feat/a", "feat/c"})
+
+    def test_show_missing_raises(self):
+        with self.assertRaises(KeyError):
+            jw_tasks.render_show({"tasks": []}, "feat/x")
+
+    def test_show_returns_record(self):
+        data = {"tasks": [{"id": "feat/a", "title": "alpha task here", "status": "active"}]}
+        out = jw_tasks.render_show(data, "feat/a")
+        self.assertIn("feat/a", out)
+        self.assertIn("alpha task here", out)
+
+    def test_add_appends_valid_block(self):
+        out = jw_tasks.append_task_block(TASKS_FIXTURE, {
+            "id": "fix/gamma", "title": "a newly registered fix", "status": "pending",
+            "severity": "major", "deps": ["feat/alpha"]})
+        data = yaml.safe_load(out)
+        self.assertEqual(jw_validate.validate(data), [])
+        self.assertIn("# registry — comments must be preserved", out)  # comment preserved
+        self.assertEqual([t["id"] for t in data["tasks"]], ["feat/alpha", "gate/beta", "fix/gamma"])
+        g = next(t for t in data["tasks"] if t["id"] == "fix/gamma")
+        self.assertEqual(g["severity"], "major")
+        self.assertEqual(g["deps"], ["feat/alpha"])
+
+    def test_add_into_empty_tasks(self):
+        out = jw_tasks.append_task_block(
+            "version: 1\nproject: x\ntasks: []\n", {"id": "feat/first", "title": "the very first task"})
+        data = yaml.safe_load(out)
+        self.assertEqual(jw_validate.validate(data), [])
+        self.assertEqual([t["id"] for t in data["tasks"]], ["feat/first"])
+
+    def test_main_add_set_drop_end_to_end(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / ".jahns-workflow.yml").write_text("version: 1\nproject: x\n")
+            (root / "tasks.yaml").write_text(TASKS_FIXTURE)
+            self.assertEqual(jw_tasks.main(["add", "fix/new", str(root), "--title", "a brand new fix task"]), 0)
+            self.assertEqual(jw_tasks.main(["set", "fix/new", "status", "active", str(root)]), 0)
+            self.assertEqual(jw_tasks.main(["drop", "gate/beta", str(root)]), 0)
+            data = yaml.safe_load((root / "tasks.yaml").read_text())
+            byid = {t["id"]: t for t in data["tasks"]}
+            self.assertEqual(byid["fix/new"]["status"], "active")
+            self.assertEqual(byid["gate/beta"]["status"], "dropped")
+            self.assertEqual(jw_validate.validate(data), [])
+            self.assertIn("# registry — comments must be preserved", (root / "tasks.yaml").read_text())
+
+    def test_main_add_rejects_invalid_id(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / ".jahns-workflow.yml").write_text("version: 1\nproject: x\n")
+            (root / "tasks.yaml").write_text(TASKS_FIXTURE)
+            before = (root / "tasks.yaml").read_text()
+            self.assertEqual(jw_tasks.main(["add", "P0", str(root), "--title", "a banned codename task"]), 2)
+            self.assertEqual((root / "tasks.yaml").read_text(), before)  # fail-closed, nothing written
+
+
+def _registry(n_done, n_active=2):
+    rows = []
+    for i in range(n_done):
+        rows.append(f'  - id: fix/done-{i:03d}\n    title: "done task number {i}"\n'
+                    f"    status: done\n    round: 2026-01-01-r\n")
+    for i in range(n_active):
+        rows.append(f'  - id: feat/active-{i:03d}\n    title: "active task number {i}"\n    status: active\n')
+    return "version: 1\nproject: x\ntasks:\n" + "".join(rows)
+
+
+class TaskArchiveTests(unittest.TestCase):
+    def test_under_threshold_noop(self):
+        data = yaml.safe_load(_registry(3))
+        self.assertEqual(jw_tasks.select_for_archive(data, threshold=100, keep=10), [])
+
+    def test_selects_old_terminal_keeps_recent(self):
+        data = yaml.safe_load(_registry(20, 2))  # 22 tasks total
+        ids = jw_tasks.select_for_archive(data, threshold=10, keep=5)
+        self.assertEqual(len(ids), 15)                       # 20 done − last 5 kept
+        self.assertIn("fix/done-000", ids)                   # oldest archived
+        self.assertNotIn("fix/done-019", ids)                # among the last 5 kept
+        self.assertTrue(all(i.startswith("fix/done") for i in ids))  # never an active task
+
+    def test_never_archives_terminal_depended_on_by_remaining(self):
+        text = _registry(20, 0) + ("  - id: feat/live\n    title: \"a live task needing an old dep\"\n"
+                                    "    status: active\n    deps: [fix/done-000]\n")
+        data = yaml.safe_load(text)
+        ids = jw_tasks.select_for_archive(data, threshold=10, keep=5)
+        self.assertNotIn("fix/done-000", ids)  # protected: a remaining task still depends on it
+
+    def test_archive_main_moves_accumulates_and_stays_valid(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / ".jahns-workflow.yml").write_text("version: 1\nproject: x\n")
+            (root / "tasks.yaml").write_text(_registry(20, 2))
+            self.assertEqual(jw_tasks.main(["archive", str(root), "--threshold", "10", "--keep", "5"]), 0)
+            data = yaml.safe_load((root / "tasks.yaml").read_text())
+            self.assertEqual(jw_validate.validate(data), [])
+            self.assertEqual(len(data["tasks"]), 7)          # 5 kept done + 2 active
+            arch = yaml.safe_load((root / "tasks.archive.yaml").read_text())
+            self.assertEqual(len(arch["tasks"]), 15)
+            # registry now has 7 tasks (< threshold 10): a second run is a clean no-op
+            self.assertEqual(jw_tasks.main(["archive", str(root), "--threshold", "10", "--keep", "5"]), 0)
+            self.assertEqual(len(yaml.safe_load((root / "tasks.archive.yaml").read_text())["tasks"]), 15)
+
+
+class TaskReadNudgeTests(unittest.TestCase):
+    def setUp(self):
+        sys.path.insert(0, str(SCRIPTS.parent / "hooks" / "scripts"))
+        import tasks_read_nudge
+        self.nudge = tasks_read_nudge
+
+    def test_denies_read_of_canonical_tasks_yaml(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / ".jahns-workflow.yml").write_text("version: 1\nproject: x\n")
+            (root / "tasks.yaml").write_text(TASKS_FIXTURE)
+            out = self.nudge.decide({"tool_name": "Read",
+                                     "tool_input": {"file_path": str(root / "tasks.yaml")}})
+            self.assertIsNotNone(out)
+            self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+            self.assertIn("jw task", out["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_allows_other_files_and_tools(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / ".jahns-workflow.yml").write_text("version: 1\nproject: x\n")
+            (root / "tasks.yaml").write_text(TASKS_FIXTURE)
+            (root / "other.yaml").write_text("x: 1\n")
+            # a different file → no decision
+            self.assertIsNone(self.nudge.decide(
+                {"tool_name": "Read", "tool_input": {"file_path": str(root / "other.yaml")}}))
+            # a non-Read tool on tasks.yaml → no decision (only Read is nudged)
+            self.assertIsNone(self.nudge.decide(
+                {"tool_name": "Edit", "tool_input": {"file_path": str(root / "tasks.yaml")}}))
+            # a same-named file outside an initialized project → no decision
+            with tempfile.TemporaryDirectory() as d2:
+                stray = Path(d2) / "tasks.yaml"
+                stray.write_text("x: 1\n")
+                self.assertIsNone(self.nudge.decide(
+                    {"tool_name": "Read", "tool_input": {"file_path": str(stray)}}))
+
+
+class TaskRegressionTests(unittest.TestCase):
+    """Regressions from the v0.5.0 adversarial review (no-trailing-newline surgery, transitive
+    archive protection, round-recency, value quoting, fail-closed archive, symlink nudge)."""
+
+    def setUp(self):
+        sys.path.insert(0, str(SCRIPTS.parent / "hooks" / "scripts"))
+        import tasks_read_nudge
+        self.nudge = tasks_read_nudge
+
+    NO_NL = ('version: 1\nproject: x\ntasks:\n'
+             '  - id: feat/last\n    title: "the last existing task"\n    status: active')  # no trailing \n
+
+    def test_add_no_trailing_newline_keeps_last_task(self):
+        out = jw_tasks.append_task_block(self.NO_NL, {"id": "fix/added", "title": "an added fix task"})
+        data = yaml.safe_load(out)
+        self.assertEqual(jw_validate.validate(data), [])
+        byid = {t["id"]: t for t in data["tasks"]}
+        self.assertEqual(byid["feat/last"]["status"], "active")  # not stolen by the inserted block
+        self.assertIn("fix/added", byid)
+
+    def test_set_last_field_no_trailing_newline_updates(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / ".jahns-workflow.yml").write_text("version: 1\nproject: x\n")
+            (root / "tasks.yaml").write_text(self.NO_NL)
+            self.assertEqual(jw_tasks.main(["set", "feat/last", "status", "done", str(root)]), 0)
+            data = yaml.safe_load((root / "tasks.yaml").read_text())
+            self.assertEqual(data["tasks"][0]["status"], "done")  # actually updated, not a silent no-op
+
+    def test_remove_last_task_no_trailing_newline(self):
+        out = jw_tasks.remove_task_blocks(
+            self.NO_NL + '\n  - id: fix/tail\n    title: "the tail done task"\n    status: done',
+            ["fix/tail"])
+        data = yaml.safe_load(out)
+        self.assertEqual([t["id"] for t in data["tasks"]], ["feat/last"])
+        self.assertEqual(data["tasks"][0]["status"], "active")  # tail's status not re-parented onto it
+
+    def test_add_preserves_crlf(self):
+        base = ('version: 1\r\nproject: x\r\ntasks:\r\n'
+                '  - id: feat/win\r\n    title: "a windows task"\r\n    status: active\r\n')
+        out = jw_tasks.append_task_block(base, {"id": "fix/win2", "title": "another windows task"})
+        self.assertEqual(jw_validate.validate(yaml.safe_load(out)), [])
+        self.assertNotIn("\n", out.replace("\r\n", ""))  # no bare LF introduced
+
+    def test_set_value_with_colon(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / ".jahns-workflow.yml").write_text("version: 1\nproject: x\n")
+            (root / "tasks.yaml").write_text(TASKS_FIXTURE)
+            self.assertEqual(jw_tasks.main(["set", "feat/alpha", "notes", "blocked by X: see ticket 5", str(root)]), 0)
+            data = {t["id"]: t for t in yaml.safe_load((root / "tasks.yaml").read_text())["tasks"]}
+            self.assertEqual(data["feat/alpha"]["notes"], "blocked by X: see ticket 5")
+
+    def test_set_invalid_value_fails_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / ".jahns-workflow.yml").write_text("version: 1\nproject: x\n")
+            (root / "tasks.yaml").write_text(TASKS_FIXTURE)
+            before = (root / "tasks.yaml").read_text()
+            self.assertEqual(jw_tasks.main(["set", "feat/alpha", "status", "bogus", str(root)]), 2)
+            self.assertEqual((root / "tasks.yaml").read_text(), before)
+
+    def test_transitive_deps_protected(self):
+        text = ("version: 1\nproject: x\ntasks:\n"
+                '  - id: fix/leaf\n    title: "oldest done leaf task"\n    status: done\n'
+                '  - id: fix/mid\n    title: "middle done task here"\n    status: done\n    deps: [fix/leaf]\n'
+                '  - id: feat/top\n    title: "active task at the top"\n    status: active\n    deps: [fix/mid]\n')
+        ids = jw_tasks.select_for_archive(yaml.safe_load(text), threshold=3, keep=0)
+        self.assertEqual(ids, [])  # mid pinned by top, leaf pinned transitively by mid → registry stays valid
+
+    def test_recency_by_round_keeps_latest_closed(self):
+        text = ("version: 1\nproject: x\ntasks:\n"
+                '  - id: fix/early-file\n    title: "closed recently but early in file"\n    status: done\n    round: 2026-06-01-z\n'
+                '  - id: fix/late-file\n    title: "closed long ago but late in file"\n    status: done\n    round: 2026-01-01-a\n')
+        ids = jw_tasks.select_for_archive(yaml.safe_load(text), threshold=2, keep=1)
+        self.assertEqual(ids, ["fix/late-file"])  # earlier round archived despite later file position
+
+    def test_negative_keep_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / ".jahns-workflow.yml").write_text("version: 1\nproject: x\n")
+            (root / "tasks.yaml").write_text(_registry(20, 2))
+            before = (root / "tasks.yaml").read_text()
+            self.assertEqual(jw_tasks.main(["archive", str(root), "--threshold", "10", "--keep", "-1"]), 1)
+            self.assertEqual((root / "tasks.yaml").read_text(), before)
+
+    def test_malformed_archive_file_aborts(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / ".jahns-workflow.yml").write_text("version: 1\nproject: x\n")
+            (root / "tasks.yaml").write_text(_registry(20, 2))
+            (root / "tasks.archive.yaml").write_text("just a string, not a registry\n")
+            before = (root / "tasks.yaml").read_text()
+            self.assertEqual(jw_tasks.main(["archive", str(root), "--threshold", "10", "--keep", "5"]), 2)
+            self.assertEqual((root / "tasks.yaml").read_text(), before)                       # live registry untouched
+            self.assertEqual((root / "tasks.archive.yaml").read_text(), "just a string, not a registry\n")  # history preserved
+
+    def test_symlinked_tasks_yaml_is_denied(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / ".jahns-workflow.yml").write_text("version: 1\nproject: x\n")
+            (root / "real.yaml").write_text(TASKS_FIXTURE)
+            (root / "tasks.yaml").symlink_to(root / "real.yaml")
+            out = self.nudge.decide({"tool_name": "Read",
+                                     "tool_input": {"file_path": str(root / "tasks.yaml")}})
+            self.assertIsNotNone(out)
+            self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
 
 
 if __name__ == "__main__":
