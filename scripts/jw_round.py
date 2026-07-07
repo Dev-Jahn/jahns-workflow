@@ -96,7 +96,13 @@ def set_task_field(text: str, task_id: str, field: str, value: str) -> str:
     field_re = re.compile(rf"^ {{{field_indent}}}{re.escape(field)}:\s*.*$")
     for k in range(start + 1, end):
         if field_re.match(lines[k]):
-            lines[k] = f"{' ' * field_indent}{field}: {value}{nl}"
+            # the value may span multiple lines (a block list/mapping): consume the contiguous run
+            # of more-indented continuation lines, so replacing with a flow value doesn't orphan
+            # them. An inline value has no such run, so only line k is replaced (unchanged path).
+            j = k + 1
+            while j < end and lines[j].strip() and len(lines[j]) - len(lines[j].lstrip()) > field_indent:
+                j += 1
+            lines[k:j] = [f"{' ' * field_indent}{field}: {value}{nl}"]
             return "".join(lines)
     lines.insert(start + 1, f"{' ' * field_indent}{field}: {value}{nl}")
     return "".join(lines)

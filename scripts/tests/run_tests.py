@@ -779,6 +779,19 @@ class TextSurgeryTests(unittest.TestCase):
         self.assertIn("  last_round_commit: X", out)
         self.assertIn("    last_round_commit: deep", out)
 
+    def test_set_replaces_block_list_value(self):
+        # a field whose existing value is a BLOCK list must be fully replaced — the continuation
+        # lines consumed, not left orphaned under a new flow value (which would break the YAML).
+        doc = ("version: 1\nproject: x\ntasks:\n"
+               '  - id: feat/alpha\n    title: "base task alpha"\n    status: done\n'
+               '  - id: feat/gamma\n    title: "gamma depends on alpha"\n    status: active\n    deps:\n      - feat/alpha\n')
+        out = jw_round.set_task_field(doc, "feat/gamma", "deps", '["feat/alpha"]')
+        data = yaml.safe_load(out)  # parses only if the `- feat/alpha` block line was not orphaned
+        byid = {t["id"]: t for t in data["tasks"]}
+        self.assertEqual(byid["feat/gamma"]["deps"], ["feat/alpha"])
+        self.assertNotIn("      - feat/alpha", out)
+        self.assertEqual(jw_validate.validate(data), [])
+
 
 class NextActionableTests(unittest.TestCase):
     def test_deps_gate(self):
@@ -1363,6 +1376,42 @@ class TaskCliTests(unittest.TestCase):
             before = (root / "tasks.yaml").read_text()
             self.assertEqual(jw_tasks.main(["add", "P0", str(root), "--title", "a banned codename task"]), 2)
             self.assertEqual((root / "tasks.yaml").read_text(), before)  # fail-closed, nothing written
+
+    def test_set_deps_repoints_and_extends(self):
+        doc = ("version: 1\nproject: x\ntasks:\n"
+               '  - id: feat/alpha\n    title: "base task alpha"\n    status: done\n'
+               '  - id: feat/beta\n    title: "base task beta"\n    status: done\n'
+               '  - id: feat/gamma\n    title: "gamma depends on alpha"\n    status: active\n    deps: [feat/alpha]\n')
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / ".jahns-workflow.yml").write_text("version: 1\nproject: x\n")
+            (root / "tasks.yaml").write_text(doc)
+            # re-point gamma's dep alpha→beta (the list-field edit that was impossible before)
+            self.assertEqual(jw_tasks.main(["set", "feat/gamma", "deps", "feat/beta", str(root)]), 0)
+            byid = {t["id"]: t for t in yaml.safe_load((root / "tasks.yaml").read_text())["tasks"]}
+            self.assertEqual(byid["feat/gamma"]["deps"], ["feat/beta"])
+            # extend to several ids, comma-separated (same convention as `add --deps`)
+            self.assertEqual(jw_tasks.main(["set", "feat/gamma", "deps", "feat/alpha,feat/beta", str(root)]), 0)
+            byid = {t["id"]: t for t in yaml.safe_load((root / "tasks.yaml").read_text())["tasks"]}
+            self.assertEqual(byid["feat/gamma"]["deps"], ["feat/alpha", "feat/beta"])
+            # clear with an empty value
+            self.assertEqual(jw_tasks.main(["set", "feat/gamma", "deps", "", str(root)]), 0)
+            byid = {t["id"]: t for t in yaml.safe_load((root / "tasks.yaml").read_text())["tasks"]}
+            self.assertEqual(byid["feat/gamma"]["deps"], [])
+
+    def test_set_deps_over_block_list_repoints(self):
+        doc = ("version: 1\nproject: x\ntasks:\n"
+               '  - id: feat/alpha\n    title: "base task alpha"\n    status: done\n'
+               '  - id: feat/beta\n    title: "base task beta"\n    status: done\n'
+               '  - id: feat/gamma\n    title: "gamma depends on alpha in block form"\n    status: active\n    deps:\n      - feat/alpha\n')
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / ".jahns-workflow.yml").write_text("version: 1\nproject: x\n")
+            (root / "tasks.yaml").write_text(doc)
+            self.assertEqual(jw_tasks.main(["set", "feat/gamma", "deps", "feat/beta", str(root)]), 0)
+            text = (root / "tasks.yaml").read_text()
+            self.assertEqual({t["id"]: t for t in yaml.safe_load(text)["tasks"]}["feat/gamma"]["deps"], ["feat/beta"])
+            self.assertNotIn("- feat/alpha", text)  # block dep fully removed, not orphaned
 
 
 def _registry(n_done, n_active=2):

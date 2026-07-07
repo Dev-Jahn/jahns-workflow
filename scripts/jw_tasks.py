@@ -11,7 +11,7 @@ error-prone. These verbs give the agent a small surface so it never touches the 
   jw task list   [root] [--status S] [--type T] [--milestone M] [--round R]   compact one-line view
   jw task show   <id> [root]                                                  one task's full record
   jw task add    <id> [root] --title "..." [--status/--severity/--deps/...]   insert a validated block
-  jw task set    <id> <field> <value> [root]                                  edit one scalar field
+  jw task set    <id> <field> <value> [root]                                  set one field (deps: comma-separated ids)
   jw task drop   <id> [root]                                                  status -> dropped
   jw task archive [root] [--threshold N] [--keep K]                           relocate old done/dropped
 
@@ -41,6 +41,9 @@ TERMINAL = ("done", "dropped")
 # field order for a written task block (only fields actually supplied are emitted)
 _FIELD_ORDER = ("title", "status", "severity", "milestone", "deps",
                 "anchor", "origin", "branch", "notes", "round", "ruling", "result")
+
+# task fields whose value is a YAML list, set from a comma-separated CLI value (like `add --deps`)
+_LIST_FIELDS = ("deps",)
 
 
 # ---- pure helpers ------------------------------------------------------------
@@ -198,16 +201,22 @@ def cmd_add(root: Path, fields: dict) -> int:
 
 def cmd_set(root: Path, task_id: str, field: str, value: str) -> int:
     tasks_path = root / "tasks.yaml"
-    try:
-        # quote the value (a free-form CLI string may contain ': ', '#', etc.) so it can never
+    if field in _LIST_FIELDS:
+        # a list field (e.g. deps) is given comma-separated, exactly like `add --deps`, and written
+        # as a flow sequence — so it can hold several ids (or [] to clear), never a scalar string.
+        formatted = _fmt([x.strip() for x in value.split(",") if x.strip()])
+    else:
+        # quote the scalar (a free-form CLI string may contain ': ', '#', etc.) so it can never
         # produce a malformed document; the schema check then catches semantically-wrong values.
-        new_text = jw_round.set_task_field(tasks_path.read_text(encoding="utf-8"), task_id, field, _fmt(value))
+        formatted = _fmt(value)
+    try:
+        new_text = jw_round.set_task_field(tasks_path.read_text(encoding="utf-8"), task_id, field, formatted)
     except (KeyError, jw_round.WorkflowError) as e:
         print(f"task set: {e}", file=sys.stderr)
         return 1
     rc = _write_validated(tasks_path, new_text, "set")
     if rc == 0:
-        print(f"task set: {task_id}.{field} = {value}")
+        print(f"task set: {task_id}.{field} = {formatted if field in _LIST_FIELDS else value}")
     return rc
 
 
