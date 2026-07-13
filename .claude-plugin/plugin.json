@@ -1,6 +1,6 @@
 {
   "name": "jahns-workflow",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "SSOT-anchored agentic development workflow harness: Socratic project ideation that forges the north-star SSOT, one-click project setup, a structured task-registry CLI (read/mutate/archive without slurping the file) with a global naming convention, zero-token roadmap rendering, round closeout, a per-round markdown review request for an external reviewer that reads the repo over git, verbatim review ingestion (plus an optional SHA-bound PR review-cycle merge gate), and /improve: an advisory report mined from your actual Claude Code session history and review evidence — deterministic trace/audit with provenance-labeled facts, recommendations you accept or reject (recorded, never auto-applied).",
   "author": {
     "name": "Jahn",
@@ -8,5 +8,12 @@
   },
   "repository": "https://github.com/Dev-Jahn/jahns-workflow",
   "license": "MIT",
-  "keywords": ["workflow", "ssot", "ideation", "task-registry", "roadmap", "agentic-development"]
+  "keywords": [
+    "workflow",
+    "ssot",
+    "ideation",
+    "task-registry",
+    "roadmap",
+    "agentic-development"
+  ]
 }
