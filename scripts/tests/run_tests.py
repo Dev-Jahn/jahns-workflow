@@ -3152,6 +3152,13 @@ class DelegateProfileTests(unittest.TestCase):
             jw_delegate._runner_model("claude:sonnet")
         self.assertEqual(jw_delegate._runner_model("codex:gpt-5.4-codex"), "gpt-5.4-codex")
 
+    def test_invalid_effort_field_is_rejected(self):
+        profile = {"bindings": {"implementer": {
+            "execution": "external-runner", "backend": "codex:x", "effort": "extreme"}}}
+        with self.assertRaises(jw_delegate.WorkflowError) as cm:
+            jw_delegate._resolve_binding(profile, "implementer")
+        self.assertIn("effort", str(cm.exception))
+
 
 def _packet_registry():
     return {"project": "demo", "tasks": [
@@ -3518,6 +3525,31 @@ def _deleg_run(root, home, fake, task="feat/xyz", accept=None):
 
 def _latest_rec(root, home):
     return _run_with_home(home, lambda: sorted(jw_delegate._delegations_dir(root).iterdir())[-1])
+
+
+class DelegateEffortTests(unittest.TestCase):
+    """0.8.0 M2 §20 — optional profile effort is explicit in execution and exposure."""
+
+    def test_set_effort_reaches_fake_runner_and_exposure(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _deleg_project(d)
+            _write_profile(home, (
+                "schema: jw-profile-1\nbindings:\n"
+                "  implementer: {execution: external-runner, backend: \"codex:gpt-test\", "
+                "effort: high}\n"))
+            seen = {}
+
+            def fake(worktree, model, prompt_path, record_dir, *, effort=None):
+                seen["effort"] = effort
+                (worktree / "impl.py").write_text("x\n")
+                (record_dir / "last_message.md").write_text("summary")
+                return (0, 0.1)
+
+            _deleg_run(root, home, fake)
+            rec = _latest_rec(root, home)
+            exposure = _json.loads((rec / "exposure.json").read_text())
+            self.assertEqual(seen["effort"], "high")
+            self.assertEqual(exposure["binding"]["effort"], "high")
 
 
 class DelegateApplyTests(unittest.TestCase):
@@ -5126,6 +5158,34 @@ class UvCacheTests(unittest.TestCase):
             self.assertNotIn(".jw-uv-cache", patch)
             after = info_exclude.read_bytes() if info_exclude.exists() else None
             self.assertEqual(after, before)
+
+    def test_codex_effort_flag_is_exact_and_absent_when_unset(self):
+        import types
+        with tempfile.TemporaryDirectory() as d:
+            worktree = Path(d) / "wt"
+            record = Path(d) / "record"
+            worktree.mkdir()
+            record.mkdir()
+            prompt = Path(d) / "prompt.txt"
+            prompt.write_text("prompt")
+            commands = []
+            orig = jw_delegate.subprocess.run
+
+            def fake(cmd, **kwargs):
+                commands.append(cmd)
+                return types.SimpleNamespace(returncode=0)
+
+            jw_delegate.subprocess.run = fake
+            try:
+                jw_delegate._run_codex(
+                    worktree, "gpt-test", prompt, record, effort="high")
+                jw_delegate._run_codex(worktree, "gpt-test", prompt, record)
+            finally:
+                jw_delegate.subprocess.run = orig
+            self.assertIn("-c", commands[0])
+            self.assertIn('model_reasoning_effort="high"', commands[0])
+            self.assertNotIn("-c", commands[1])
+            self.assertFalse(any(arg.startswith("model_reasoning_effort=") for arg in commands[1]))
 
 
 class ContractInjectTests(unittest.TestCase):

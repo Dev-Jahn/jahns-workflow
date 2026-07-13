@@ -175,7 +175,8 @@ brought back through an explicit artifact contract. The invariants:
 Artifacts live plugin-local (`~/.claude/jahns-workflow/delegations/…`, worktrees under
 `~/.claude/jahns-workflow/worktrees/…`), never committed to the repo. The runner backend (model)
 is bound per role in `~/.claude/jahns-workflow/profile.yml`; a missing binding fails loud rather
-than guessing a default.
+than guessing a default. A binding may set `effort` to `none`, `minimal`, `low`, `medium`, `high`,
+or `xhigh`; when omitted, the Codex configuration default is left untouched.
 
 ## 9. Adaptive overlays, warnings, and evidence
 

@@ -7,6 +7,8 @@ Binding rules:
   scope goes in the JW_REPORT `escalations` list, not fixed silently.
 - The environment is already prepared and there is no network. Do NOT install dependencies or work
   around a missing environment — use what is provided. If something you need is absent, escalate it.
+- If blocked, do NOT revert, reset, or clean away completed work. Preserve the worktree as-is and
+  report the blocker under JW_REPORT `limitations`, plus any resulting uncertainty under `risks`.
 
 ## Task
 

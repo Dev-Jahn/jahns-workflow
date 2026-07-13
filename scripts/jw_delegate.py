@@ -43,6 +43,7 @@ from jw_common import (  # noqa: E402
 DELEG_REF_NS = "refs/jw/delegations"
 TERMINAL_STATES = ("applied", "discarded")
 _TEMPLATE_PATH = Path(__file__).resolve().parent.parent / "templates" / "delegate-prompt.md"
+_EFFORT_VALUES = ("none", "minimal", "low", "medium", "high", "xhigh")
 
 # lockfile -> (prep command, kind), first match wins (S7). None env_prep in config falls through here.
 _LOCKFILE_DETECT = (
@@ -56,7 +57,7 @@ _LOCKFILE_DETECT = (
 _PROFILE_EXAMPLE = (
     "schema: jw-profile-1\n"
     "bindings:\n"
-    "  implementer: {execution: external-runner, backend: \"codex:gpt-5.6-sol\"}\n"
+    "  implementer: {execution: external-runner, backend: \"codex:gpt-5.6-sol\", effort: xhigh}\n"
     "  verifier: {execution: codex-companion, backend: \"codex:gpt-5.6-sol\", "
     "entry: adversarial-review}\n"
 )
@@ -221,7 +222,14 @@ def _resolve_binding(profile: dict, role: str) -> dict:
         raise WorkflowError(f"binding execution {execution!r} not implemented in M1 (only 'external-runner')")
     if not isinstance(backend, str) or ":" not in backend or not backend.split(":", 1)[1]:
         raise WorkflowError(f"binding backend must be '<runner>:<model>', got {backend!r}")
-    return {"role": role, "execution": execution, "backend": backend, "source": "profile"}
+    binding = {"role": role, "execution": execution, "backend": backend, "source": "profile"}
+    if "effort" in b:
+        effort = b["effort"]
+        if not isinstance(effort, str) or effort not in _EFFORT_VALUES:
+            raise WorkflowError(
+                f"binding field effort must be one of {', '.join(_EFFORT_VALUES)}, got {effort!r}")
+        binding["effort"] = effort
+    return binding
 
 
 def _resolve_verifier_binding(profile: dict) -> dict:
@@ -334,11 +342,15 @@ def _run_env_prep(worktree: Path, commands: list[str]) -> tuple[int, str]:
 
 
 # ---- runner (§6 — codex exec; isolated for monkeypatching in tests) -----------
-def _run_codex(worktree: Path, model: str, prompt_path: Path, record_dir: Path) -> tuple[int, float]:
+def _run_codex(worktree: Path, model: str, prompt_path: Path, record_dir: Path,
+               *, effort: str | None = None) -> tuple[int, float]:
     """Invoke `codex exec` in the worktree (workspace-write sandbox hardcoded, S8). Returns (rc,
     duration_s). The full --json stream and last message are preserved as local evidence."""
-    cmd = ["codex", "exec", "-C", str(worktree), "-m", model, "-s", "workspace-write",
-           "--color", "never", "--output-last-message", str(record_dir / "last_message.md"), "--json"]
+    cmd = ["codex", "exec", "-C", str(worktree), "-m", model, "-s", "workspace-write"]
+    if effort is not None:
+        cmd.extend(["-c", f'model_reasoning_effort="{effort}"'])
+    cmd.extend(["--color", "never", "--output-last-message",
+                str(record_dir / "last_message.md"), "--json"])
     start = time.monotonic()
     env = {**os.environ, "UV_CACHE_DIR": str(worktree / ".jw-uv-cache")}
     try:
@@ -579,7 +591,13 @@ def run_delegation(root: Path, task_id: str, role: str, accept_flags: list[str])
             f"env prep failed (rc {env_rc}) — worktree preserved at {worktree_path}\n{env_tail}")
 
     (record_dir / "prompt.txt").write_text(_render_prompt(packet, base_sha), encoding="utf-8")
-    runner_rc, duration = _run_codex(worktree_path, model, record_dir / "prompt.txt", record_dir)
+    if "effort" in binding:
+        runner_rc, duration = _run_codex(
+            worktree_path, model, record_dir / "prompt.txt", record_dir,
+            effort=binding["effort"])
+    else:
+        runner_rc, duration = _run_codex(
+            worktree_path, model, record_dir / "prompt.txt", record_dir)
     print(f"runner: backend={binding['backend']} rc={runner_rc}")
     if runner_rc != 0:
         _set_state(record_dir, "failed-runner", env=env_rec, error=f"runner rc {runner_rc}")
