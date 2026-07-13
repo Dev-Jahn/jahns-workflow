@@ -24,7 +24,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-PARSER_VERSION = "jw-trace-2"
+PARSER_VERSION = "jw-trace-3"
 
 
 # --------------------------------------------------------------------------- util
@@ -125,6 +125,7 @@ SESSION_STATE_TYPES = {
     "custom-title": "custom_title",
     "queue-operation": "queue_operation",
     "pr-link": "pr_link",
+    "frame-link": "frame_link",
     "agent-setting": "agent_setting",
     "summary": "summary",
 }
@@ -477,11 +478,15 @@ def parse_transcript_file(
     agent_id: str | None,
     workflow_id: str | None,
     is_sidechain_file: bool,
+    stop_before_line: int | None = None,
 ) -> dict[str, Any]:
     """Parse one transcript file into events / tool_calls / tool_results rows.
 
     Returns those lists plus `replayed_skipped` (resume/compaction re-emissions dropped) and
-    `partial_tail_lines` (a truncated final line of an active session — NOT a parse_error)."""
+    `partial_tail_lines` (a truncated final line of an active session — NOT a parse_error).
+
+    `stop_before_line` (1-based) stops parsing before that raw line — the line and everything after
+    are excluded from all outputs (used for self-session truncation; None = parse the whole file)."""
     events: list[dict[str, Any]] = []
     tool_calls: list[dict[str, Any]] = []
     tool_results: list[dict[str, Any]] = []
@@ -494,6 +499,8 @@ def parse_transcript_file(
 
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         for line_no, raw in enumerate(f, start=1):
+            if stop_before_line is not None and line_no >= stop_before_line:
+                break
             # a truncated final line of an active session has no trailing newline; only the last
             # line of a file can lack one, so "decode failed AND no newline" == partial tail.
             had_newline = raw.endswith("\n")
