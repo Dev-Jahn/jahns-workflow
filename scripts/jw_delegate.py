@@ -324,20 +324,38 @@ def _run_codex(worktree: Path, model: str, prompt_path: Path, record_dir: Path) 
 
 
 # ---- status.json (mutable lifecycle) ------------------------------------------
-def _read_status(record_dir: Path) -> dict:
+def _read_status_raw(record_dir: Path) -> dict | None:
+    """Lenient read: None = corrupt/unreadable (the caller decides fail-safe vs fail-loud, H3)."""
     p = record_dir / "status.json"
-    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _read_status(record_dir: Path) -> dict:
+    """Strict read for single-record paths — a corrupt file names itself (WorkflowError, exit 1),
+    never an uncaught traceback (H3)."""
+    st = _read_status_raw(record_dir)
+    if st is None:
+        raise WorkflowError(f"corrupt status.json in delegation record: {record_dir / 'status.json'}")
+    return st
 
 
 def _set_state(record_dir: Path, state: str, *, env: dict | None = None, error: str | None = None) -> dict:
-    st = _read_status(record_dir)
+    st = _read_status_raw(record_dir) or {}  # a corrupt file is superseded — discard IS the recovery path
     st.setdefault("at_transitions", []).append({"state": state, "at": _now_iso()})
     st["state"] = state
     if env is not None:
         st["env"] = env
     if error is not None:
         st["error"] = error
-    (record_dir / "status.json").write_text(json.dumps(st, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp = record_dir / "status.json.tmp"  # atomic replace: a crash mid-write must not corrupt the record
+    tmp.write_text(json.dumps(st, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, record_dir / "status.json")
     return st
 
 
@@ -351,12 +369,51 @@ def _iter_delegations(root: Path):
             yield sub.name, sub
 
 
+def _load_exposure(rec: Path) -> dict:
+    """Strict exposure load — corrupt JSON names the file (WorkflowError), never a traceback (H3)."""
+    p = rec / "exposure.json"
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise WorkflowError(f"corrupt exposure.json in delegation record: {p} ({e})")
+    if not isinstance(data, dict):
+        raise WorkflowError(f"corrupt exposure.json in delegation record: {p}")
+    return data
+
+
+def _load_contract(rec: Path) -> dict:
+    """Strict contract load — corrupt YAML names the file (WorkflowError), never a traceback (H3)."""
+    p = rec / "artifact" / "contract.yaml"
+    try:
+        data = yaml.safe_load(p.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as e:
+        raise WorkflowError(f"corrupt contract.yaml in delegation record: {p} ({e})")
+    if not isinstance(data, dict):
+        raise WorkflowError(f"corrupt contract.yaml in delegation record: {p}")
+    return data
+
+
 def _active_delegation_for_task(root: Path, task_id: str) -> tuple[str, str] | None:
+    """Owner-lock scan. Fail-safe on corruption (H3): a record whose state cannot be read, or whose
+    task binding cannot be read, is treated as HOLDING the lock — the refusal names the corrupt file
+    and the clearing path (discard) instead of guessing the record terminal."""
     for did, sub in _iter_delegations(root):
-        exposure = json.loads((sub / "exposure.json").read_text(encoding="utf-8"))
-        state = _read_status(sub).get("state")
-        if exposure.get("task_id") == task_id and state not in TERMINAL_STATES:
-            return did, state
+        st = _read_status_raw(sub)
+        state = st.get("state") if st is not None else None
+        if state in TERMINAL_STATES:
+            continue
+        try:
+            tid = _load_exposure(sub).get("task_id")
+        except WorkflowError:
+            tid = None
+        if tid is not None and tid != task_id:
+            continue  # a healthy record of another task never blocks this one
+        if st is None or tid is None:
+            broken = "status.json" if st is None else "exposure.json"
+            raise WorkflowError(
+                f"delegation record {did} has a corrupt {broken} — treated as an active lock (fail-safe); "
+                f"run `jw delegate discard {did}` to clear it")
+        return did, state
     return None
 
 
@@ -546,7 +603,7 @@ def apply_delegation(root: Path, did: str) -> int:
     state = _read_status(rec).get("state")
     if state != "needs-review":
         raise WorkflowError(f"delegation {did} is {state} — only a needs-review delegation can be applied")
-    contract = yaml.safe_load((rec / "artifact" / "contract.yaml").read_text(encoding="utf-8"))
+    contract = _load_contract(rec)
     if not contract.get("empty"):
         rc, out, err = _git(root, "apply", str(rec / "artifact" / "changes.patch"))
         if rc != 0:
@@ -561,9 +618,11 @@ def apply_delegation(root: Path, did: str) -> int:
 
 def discard_delegation(root: Path, did: str) -> int:
     """Reject a delegation: state=discarded + worktree/ref cleanup (record dir kept). Accepts any
-    non-terminal state, including a crash-remnant `running` (§4/R1)."""
+    non-terminal state, including a crash-remnant `running` (§4/R1) and a corrupt record — the
+    cleanup path must not block itself on the corruption it clears (H3)."""
     rec = _load_delegation(root, did)
-    state = _read_status(rec).get("state")
+    st = _read_status_raw(rec)
+    state = st.get("state") if st is not None else None
     if state in TERMINAL_STATES:
         raise WorkflowError(f"delegation {did} is already {state}")
     _cleanup(root, did)
@@ -572,9 +631,16 @@ def discard_delegation(root: Path, did: str) -> int:
     return 0
 
 
-def _status_row(root: Path, did: str, rec: Path) -> str:
-    st = _read_status(rec)
-    exposure = json.loads((rec / "exposure.json").read_text(encoding="utf-8"))
+def _status_row(did: str, rec: Path) -> str:
+    """One list line. Lenient: a corrupt record renders as [corrupt] instead of killing the whole
+    listing (H3) — single-record verbs (show/apply) are the strict, file-naming paths."""
+    st = _read_status_raw(rec)
+    try:
+        exposure = _load_exposure(rec)
+    except WorkflowError:
+        exposure = None
+    if st is None or exposure is None:
+        return f"{did}  ?  [corrupt]  ?  ?"
     base7 = (exposure.get("base", {}).get("snapshot_sha") or "")[:7]
     at = (st.get("at_transitions") or [{}])[0].get("at", "?")
     return f"{did}  {exposure.get('task_id', '?')}  [{st.get('state', '?')}]  {base7}  {at}"
@@ -583,17 +649,18 @@ def _status_row(root: Path, did: str, rec: Path) -> str:
 def status(root: Path, did: str | None) -> int:
     if did:
         rec = _load_delegation(root, did)
-        print(_status_row(root, did, rec))
+        print(_status_row(did, rec))
         return 0
     for name, rec in _iter_delegations(root):
-        print(_status_row(root, name, rec))
+        print(_status_row(name, rec))
     return 0
 
 
 def show(root: Path, did: str, opt: str | None) -> int:
     rec = _load_delegation(root, did)
-    state = _read_status(rec).get("state")
+    state = _read_status(rec).get("state")  # strict: show is a single-record path (H3)
     if opt == "exposure":
+        _load_exposure(rec)  # validate before dumping — corrupt names the file
         print((rec / "exposure.json").read_text(encoding="utf-8").rstrip())
         return 0
     if opt in ("patch", "report"):
@@ -613,10 +680,11 @@ def show(root: Path, did: str, opt: str | None) -> int:
                 sys.stdout.write(data.decode("utf-8", errors="replace"))
         return 0
     # summary
-    print(_status_row(root, did, rec))
+    _load_exposure(rec)  # strict: corrupt exposure names the file rather than rendering [corrupt]
+    print(_status_row(did, rec))
     contract_p = rec / "artifact" / "contract.yaml"
     if contract_p.exists():
-        contract = yaml.safe_load(contract_p.read_text(encoding="utf-8"))
+        contract = _load_contract(rec)
         rep = contract.get("delegate_report", {}).get("present")
         rep_str = {True: "present", False: "absent", "invalid": "invalid"}.get(rep, str(rep))
         print(f"changed_files: {len(contract.get('changed_files', []))}")

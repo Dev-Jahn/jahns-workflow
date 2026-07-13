@@ -3561,6 +3561,98 @@ class DelegateApplyTests(unittest.TestCase):
             self.assertTrue((rec / "exposure.json").exists())  # record preserved
 
 
+class DelegateCorruptRecordTests(unittest.TestCase):
+    """H3 — corrupt record JSON fails safe (named file, lock held, list survives), never a traceback."""
+
+    def test_owner_lock_scan_fail_safe_on_corrupt_status(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _deleg_project(d)
+            _deleg_run(root, home, _deleg_fake({"impl.py": "x\n"}))
+            rec = _latest_rec(root, home)
+            (rec / "status.json").write_text("{ corrupt", encoding="utf-8")
+            with self.assertRaises(jw_delegate.WorkflowError) as cm:
+                _deleg_run(root, home, _deleg_fake({"impl.py": "y\n"}))
+            msg = str(cm.exception)
+            self.assertIn("corrupt", msg)
+            self.assertIn("discard", msg)  # the clearing path is named
+
+    def test_status_list_marks_corrupt_row_and_keeps_healthy(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _deleg_project(d)
+            (root / "tasks.yaml").write_text(
+                "version: 1\nproject: demo\ntasks:\n"
+                '  - id: feat/xyz\n    title: "implement xyz feature"\n    status: active\n'
+                '    accept:\n      - "criterion alpha here"\n'
+                '  - id: feat/two\n    title: "the second task here"\n    status: active\n'
+                '    accept:\n      - "criterion beta here"\n')
+            orig = jw_delegate._make_did
+            try:
+                jw_delegate._make_did = lambda tid: "20260713T000001Z-" + tid.replace("/", "-")
+                _deleg_run(root, home, _deleg_fake({"a.py": "x\n"}), task="feat/xyz")
+                jw_delegate._make_did = lambda tid: "20260713T000002Z-" + tid.replace("/", "-")
+                _deleg_run(root, home, _deleg_fake({"b.py": "y\n"}), task="feat/two")
+            finally:
+                jw_delegate._make_did = orig
+            recs = _run_with_home(home, lambda: sorted(jw_delegate._delegations_dir(root).iterdir()))
+            (recs[0] / "status.json").write_text("{ corrupt", encoding="utf-8")
+            import contextlib
+            import io
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = _run_with_home(home, lambda: jw_delegate.main(["status", "--root", str(root)]))
+            self.assertEqual(rc, 0)
+            out = buf.getvalue()
+            self.assertIn("[corrupt]", out)          # the broken row is surfaced, not fatal
+            self.assertIn("feat/two", out)           # ...and the healthy row still renders
+            self.assertIn("needs-review", out)
+
+    def test_show_corrupt_status_exit1(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _deleg_project(d)
+            _deleg_run(root, home, _deleg_fake({"impl.py": "x\n"}))
+            rec = _latest_rec(root, home)
+            (rec / "status.json").write_text("{ corrupt", encoding="utf-8")
+            import contextlib
+            import io
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = _run_with_home(home, lambda: jw_delegate.main(["show", rec.name, "--root", str(root)]))
+            self.assertEqual(rc, 1)                  # WorkflowError, never a traceback
+            self.assertIn("status.json", err.getvalue())
+
+    def test_apply_corrupt_contract_exit1(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _deleg_project(d)
+            _deleg_run(root, home, _deleg_fake({"impl.py": "x\n"}))
+            rec = _latest_rec(root, home)
+            (rec / "artifact" / "contract.yaml").write_text("{invalid: [unclosed", encoding="utf-8")
+            import contextlib
+            import io
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = _run_with_home(home, lambda: jw_delegate.main(["apply", rec.name, "--root", str(root)]))
+            self.assertEqual(rc, 1)
+            self.assertIn("contract.yaml", err.getvalue())
+            self.assertEqual(jw_delegate._read_status(rec)["state"], "needs-review")  # unchanged
+
+    def test_discard_accepts_corrupt_record(self):
+        # the cleanup path must not block itself on the very corruption it is meant to clear
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _deleg_project(d)
+            _deleg_run(root, home, _deleg_fake({"impl.py": "x\n"}))
+            rec = _latest_rec(root, home)
+            wt = _run_with_home(home, lambda: jw_delegate._worktree_path(root, rec.name))
+            (rec / "status.json").write_text("{ corrupt", encoding="utf-8")
+            (rec / "exposure.json").write_text("{ corrupt", encoding="utf-8")
+            import contextlib
+            import io
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = _run_with_home(home, lambda: jw_delegate.discard_delegation(root, rec.name))
+            self.assertEqual(rc, 0)
+            self.assertEqual(jw_delegate._read_status(rec)["state"], "discarded")
+            self.assertFalse(wt.exists())
+
+
 class DelegateCliTests(unittest.TestCase):
     """0.8.0 M1 §2 — arg parsing, exit codes, status/show surfaces (incl. R11 no-artifact refusal)."""
 
