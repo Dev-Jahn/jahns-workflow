@@ -4528,5 +4528,284 @@ class EvidenceTests(unittest.TestCase):
                              [r for r in self._rows(out) if "task_id" in r])
 
 
+class DelegateVerifyTests(unittest.TestCase):
+    """0.8.0 M2 §11/§12 — same-base independent verifier transport (synthetic only)."""
+
+    _PROFILE = (
+        "schema: jw-profile-1\nbindings:\n"
+        "  implementer: {execution: external-runner, backend: \"codex:gpt-5.6-sol\"}\n"
+        "  verifier: {execution: codex-companion, backend: \"codex:gpt-5.6-sol\", "
+        "entry: adversarial-review}\n")
+
+    def _setup(self, d, *, committed=True):
+        root, home = _deleg_project(d)
+        _write_profile(home, self._PROFILE)
+        (root / ".gitignore").write_text(".ignored-cache/\n")
+        git(root, "add", ".gitignore")
+        git(root, "commit", "-qm", "ignore fixture")
+        plugin = home / "codex-plugin"
+        (plugin / "scripts").mkdir(parents=True)
+        (plugin / "scripts" / "codex-companion.mjs").write_text("// synthetic fixture\n")
+        registry = home / ".claude" / "plugins" / "installed_plugins.json"
+        registry.parent.mkdir(parents=True)
+        registry.write_text(_json.dumps({"plugins": {"codex@openai-codex": [
+            {"installPath": str(plugin)}]}}))
+
+        def runner(worktree, model, prompt_path, record_dir):
+            (worktree / "f.txt").write_text("delegate result\n")
+            (worktree / "new.txt").write_text("new result\n")
+            (worktree / "blob.bin").write_bytes(bytes(range(256)))
+            (record_dir / "last_message.md").write_text("summary")
+            if committed:
+                git(worktree, "add", "-A")
+                git(worktree, "commit", "-qm", "delegate local commit")
+            return (0, 0.1)
+
+        _deleg_run(root, home, runner)
+        rec = _latest_rec(root, home)
+        worktree = _run_with_home(home, lambda: jw_delegate._worktree_path(root, rec.name))
+        ignored = worktree / ".ignored-cache" / "keep.txt"
+        ignored.parent.mkdir()
+        ignored.write_text("keep")
+        return root, home, rec, worktree, plugin
+
+    def _with_companion(self, fake, fn):
+        orig = jw_delegate._run_companion
+        jw_delegate._run_companion = fake
+        try:
+            return fn()
+        finally:
+            jw_delegate._run_companion = orig
+
+    def test_success_normalizes_committed_delegate_and_preserves_labels(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home, rec, worktree, plugin = self._setup(d, committed=True)
+            calls = []
+
+            def fake(wt, args, record_dir):
+                calls.append((wt, args, record_dir))
+                return (0, _json.dumps({"verdict": "challenge", "findings": []}))
+
+            import contextlib
+            import io
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = _run_with_home(home, lambda: self._with_companion(
+                    fake, lambda: jw_delegate.verify_delegation(root, rec.name)))
+            self.assertEqual(rc, 0)
+            contract = yaml.safe_load((rec / "artifact" / "contract.yaml").read_text())
+            self.assertEqual(git(worktree, "rev-parse", "HEAD").stdout.strip(), contract["base_sha"])
+            self.assertEqual((worktree / "f.txt").read_text(), "delegate result\n")
+            self.assertEqual((worktree / "blob.bin").read_bytes(), bytes(range(256)))
+            self.assertTrue((worktree / ".ignored-cache" / "keep.txt").exists())
+            self.assertEqual(jw_delegate._read_status(rec)["state"], "needs-review")
+            self.assertEqual(len(calls), 1)
+            args = calls[0][1]
+            self.assertEqual(args[:-1], [
+                "node", str(plugin / "scripts" / "codex-companion.mjs"),
+                "adversarial-review", "--json", "--wait", "--scope", "working-tree",
+                "-C", str(worktree), "-m", "gpt-5.6-sol"])
+            self.assertLessEqual(len(args[-1].encode("utf-8")), 1024)
+            artifact = _json.loads((rec / "artifact" / "verify-1.json").read_text())
+            self.assertEqual(artifact["schema"], "jw-verify-1")
+            self.assertEqual(artifact["backend"], "codex:gpt-5.6-sol")
+            self.assertEqual(artifact["provenance"], "independent-verifier")
+            self.assertEqual(artifact["payload"]["verdict"], "challenge")
+
+    def test_repeated_verify_increments_and_show_surfaces_latest(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home, rec, worktree, plugin = self._setup(d, committed=False)
+            n = {"value": 0}
+
+            def fake(*args):
+                n["value"] += 1
+                return (0, _json.dumps({"run": n["value"]}))
+
+            import contextlib
+            import io
+            with contextlib.redirect_stdout(io.StringIO()):
+                for _ in range(2):
+                    _run_with_home(home, lambda: self._with_companion(
+                        fake, lambda: jw_delegate.verify_delegation(root, rec.name)))
+            self.assertTrue((rec / "artifact" / "verify-1.json").exists())
+            self.assertTrue((rec / "artifact" / "verify-2.json").exists())
+            summary = io.StringIO()
+            latest = io.StringIO()
+            with contextlib.redirect_stdout(summary):
+                _run_with_home(home, lambda: jw_delegate.show(root, rec.name, None))
+            with contextlib.redirect_stdout(latest):
+                _run_with_home(home, lambda: jw_delegate.show(root, rec.name, "verify"))
+            self.assertIn("verify_artifacts: 2", summary.getvalue())
+            self.assertEqual(_json.loads(latest.getvalue())["payload"]["run"], 2)
+
+    def test_plugin_missing_and_wrong_state_fail_before_companion(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home, rec, worktree, plugin = self._setup(d)
+            (home / ".claude" / "plugins" / "installed_plugins.json").unlink()
+            called = {"n": 0}
+
+            def fake(*args):
+                called["n"] += 1
+                return (0, "{}")
+
+            with self.assertRaises(jw_delegate.WorkflowError) as cm:
+                _run_with_home(home, lambda: self._with_companion(
+                    fake, lambda: jw_delegate.verify_delegation(root, rec.name)))
+            self.assertIn("codex plugin not installed", str(cm.exception))
+            self.assertEqual(called["n"], 0)
+            _run_with_home(home, lambda: jw_delegate._set_state(rec, "applied"))
+            with self.assertRaises(jw_delegate.WorkflowError):
+                _run_with_home(home, lambda: self._with_companion(
+                    fake, lambda: jw_delegate.verify_delegation(root, rec.name)))
+            self.assertEqual(called["n"], 0)
+
+    def test_unimplemented_execution_and_entry_fail_loud(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home, rec, worktree, plugin = self._setup(d)
+            for verifier, needle in (
+                ("{execution: external-runner, backend: \"codex:x\", entry: adversarial-review}",
+                 "not implemented in M2"),
+                ("{execution: codex-companion, backend: \"codex:x\", entry: review}",
+                 "entry 'review' not implemented in M2"),
+            ):
+                body = ("schema: jw-profile-1\nbindings:\n"
+                        "  implementer: {execution: external-runner, backend: \"codex:x\"}\n"
+                        f"  verifier: {verifier}\n")
+                _write_profile(home, body)
+                with self.assertRaises(jw_delegate.WorkflowError) as cm:
+                    _run_with_home(home, lambda: jw_delegate.verify_delegation(root, rec.name))
+                self.assertIn(needle, str(cm.exception))
+
+    def test_normalization_failure_and_companion_failure_leave_state_unchanged(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home, rec, worktree, plugin = self._setup(d)
+            contract_path = rec / "artifact" / "contract.yaml"
+            contract = yaml.safe_load(contract_path.read_text())
+            contract["base_sha"] = "0" * 40
+            contract_path.write_text(yaml.safe_dump(contract, sort_keys=False))
+            called = {"n": 0}
+
+            def fake(*args):
+                called["n"] += 1
+                return (3, "failed")
+
+            with self.assertRaises(jw_delegate.WorkflowError):
+                _run_with_home(home, lambda: self._with_companion(
+                    fake, lambda: jw_delegate.verify_delegation(root, rec.name)))
+            self.assertEqual(called["n"], 0)
+            self.assertEqual(jw_delegate._read_status(rec)["state"], "needs-review")
+            self.assertEqual(list((rec / "artifact").glob("verify-*.json")), [])
+
+            contract["base_sha"] = _json.loads((rec / "exposure.json").read_text())["base"]["snapshot_sha"]
+            contract_path.write_text(yaml.safe_dump(contract, sort_keys=False))
+            with self.assertRaises(jw_delegate.WorkflowError):
+                _run_with_home(home, lambda: self._with_companion(
+                    fake, lambda: jw_delegate.verify_delegation(root, rec.name)))
+            self.assertEqual(called["n"], 1)
+            self.assertEqual(jw_delegate._read_status(rec)["state"], "needs-review")
+            self.assertEqual(list((rec / "artifact").glob("verify-*.json")), [])
+
+    def test_broker_shutdown_rpc_targets_only_exact_worktree_key(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "repo"
+            root.mkdir()
+            init_repo(root)
+            state_root = Path(d) / "state"
+            state_dir = jw_delegate._companion_state_dir(root, state_root=state_root)
+            state_dir.mkdir(parents=True)
+            other = state_root / "other-deadbeef"
+            other.mkdir(parents=True)
+            (other / "broker.json").write_text('{"sentinel": true}')
+            sock_path = Path(d) / "broker.sock"
+            calls = {"connect": [], "sent": []}
+
+            class FakeSocket:
+                def settimeout(self, value):
+                    pass
+
+                def connect(self, value):
+                    calls["connect"].append(value)
+
+                def sendall(self, value):
+                    calls["sent"].append(value.decode())
+
+                def recv(self, size):
+                    return b'{"id":1,"result":{}}\n'
+
+                def close(self):
+                    pass
+
+            (state_dir / "broker.json").write_text(_json.dumps({
+                "endpoint": f"unix:{sock_path}", "pid": 999999, "cwd": str(root.resolve())}))
+            orig = jw_delegate.socket.socket
+            jw_delegate.socket.socket = lambda *args: FakeSocket()
+            try:
+                result = jw_delegate._cleanup_companion_broker(root, state_root=state_root)
+            finally:
+                jw_delegate.socket.socket = orig
+            self.assertEqual(calls["connect"], [str(sock_path)])
+            self.assertIn('"method":"broker/shutdown"', calls["sent"][0].replace(" ", ""))
+            self.assertIn("shutdown", result)
+            self.assertEqual((other / "broker.json").read_text(), '{"sentinel": true}')
+
+
+class UvCacheTests(unittest.TestCase):
+    """0.8.0 M2 §13 — worktree-local uv cache env and result-snapshot exclusion."""
+
+    def test_env_is_passed_to_prep_and_codex_without_global_mutation(self):
+        import os
+        import types
+        with tempfile.TemporaryDirectory() as d:
+            worktree = Path(d) / "wt"
+            record = Path(d) / "record"
+            worktree.mkdir()
+            record.mkdir()
+            prompt = Path(d) / "prompt.txt"
+            prompt.write_text("prompt")
+            seen = []
+            orig = jw_delegate.subprocess.run
+
+            def fake(*args, **kwargs):
+                seen.append(kwargs.get("env"))
+                return types.SimpleNamespace(returncode=0, stderr="")
+
+            before = os.environ.get("UV_CACHE_DIR")
+            jw_delegate.subprocess.run = fake
+            try:
+                self.assertEqual(jw_delegate._run_env_prep(worktree, ["true"])[0], 0)
+                self.assertEqual(jw_delegate._run_codex(
+                    worktree, "gpt-5.6-sol", prompt, record)[0], 0)
+            finally:
+                jw_delegate.subprocess.run = orig
+            expected = str(worktree / ".jw-uv-cache")
+            self.assertEqual([env["UV_CACHE_DIR"] for env in seen], [expected, expected])
+            self.assertEqual(os.environ.get("UV_CACHE_DIR"), before)
+
+    def test_cache_is_excluded_but_other_untracked_result_is_kept(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _deleg_project(d)
+            info_exclude = Path(git(root, "rev-parse", "--git-path", "info/exclude").stdout.strip())
+            if not info_exclude.is_absolute():
+                info_exclude = root / info_exclude
+            before = info_exclude.read_bytes() if info_exclude.exists() else None
+
+            def fake(worktree, model, prompt_path, record_dir):
+                cache = worktree / ".jw-uv-cache"
+                cache.mkdir()
+                (cache / "junk").write_text("cache")
+                (worktree / "kept.txt").write_text("keep")
+                (record_dir / "last_message.md").write_text("summary")
+                return (0, 0.1)
+
+            _deleg_run(root, home, fake)
+            rec = _latest_rec(root, home)
+            contract = yaml.safe_load((rec / "artifact" / "contract.yaml").read_text())
+            self.assertEqual(contract["changed_files"], [{"path": "kept.txt", "status": "A"}])
+            patch = (rec / "artifact" / "changes.patch").read_text()
+            self.assertIn("kept.txt", patch)
+            self.assertNotIn(".jw-uv-cache", patch)
+            after = info_exclude.read_bytes() if info_exclude.exists() else None
+            self.assertEqual(after, before)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

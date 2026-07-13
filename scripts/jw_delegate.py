@@ -20,8 +20,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
+import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -52,7 +55,9 @@ _LOCKFILE_DETECT = (
 _PROFILE_EXAMPLE = (
     "schema: jw-profile-1\n"
     "bindings:\n"
-    "  implementer: {execution: external-runner, backend: \"codex:gpt-5.4-codex\"}\n"
+    "  implementer: {execution: external-runner, backend: \"codex:gpt-5.6-sol\"}\n"
+    "  verifier: {execution: codex-companion, backend: \"codex:gpt-5.6-sol\", "
+    "entry: adversarial-review}\n"
 )
 
 
@@ -118,7 +123,7 @@ def _check_snapshot_preconditions(root: Path) -> None:
             raise WorkflowError(f"a rebase is in progress ({name}) — finish or abort it before delegating")
 
 
-def _snapshot(cwd: Path, message: str) -> tuple[str, bool]:
+def _snapshot(cwd: Path, message: str, *, exclude_uv_cache: bool = False) -> tuple[str, bool]:
     """Fix cwd's current tracked+staged+untracked(non-ignored) state as an immutable commit object,
     seeded from HEAD via a throwaway index (§3 verified sequence — the live index/worktree are never
     touched). If the resulting tree equals HEAD's tree the state is clean: return (HEAD, False) and
@@ -131,7 +136,9 @@ def _snapshot(cwd: Path, message: str) -> tuple[str, bool]:
     try:
         env = {"GIT_INDEX_FILE": str(Path(tmpdir) / "index")}
         _git_out(cwd, "read-tree", "HEAD", env=env)          # seed (S1 — not an index copy)
-        _git_out(cwd, "add", "-A", env=env)                  # tracked mods + staged + untracked(non-ignored)
+        add_args = ("add", "-A", "--", ".", ":(exclude).jw-uv-cache") if exclude_uv_cache else (
+            "add", "-A")
+        _git_out(cwd, *add_args, env=env)                      # tracked mods + untracked(non-ignored)
         tree = _git_out(cwd, "write-tree", env=env)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -216,6 +223,28 @@ def _resolve_binding(profile: dict, role: str) -> dict:
     return {"role": role, "execution": execution, "backend": backend, "source": "profile"}
 
 
+def _resolve_verifier_binding(profile: dict) -> dict:
+    """M2 verifier binding: codex-companion + explicit codex model + adversarial-review only.
+    Every other accepted-looking value fails loud; no ignored profile axes (S14/R7)."""
+    bindings = profile.get("bindings")
+    b = bindings.get("verifier") if isinstance(bindings, dict) else None
+    if not isinstance(b, dict):
+        raise WorkflowError(
+            f"profile has no binding for role 'verifier' — add it to {_profile_path()}, e.g.:\n\n"
+            f"{_PROFILE_EXAMPLE}")
+    execution = b.get("execution")
+    backend = b.get("backend")
+    entry = b.get("entry")
+    if execution != "codex-companion":
+        raise WorkflowError(f"verifier execution {execution!r} not implemented in M2")
+    if not isinstance(backend, str) or not backend.startswith("codex:") or not backend[6:]:
+        raise WorkflowError(f"verifier backend must be 'codex:<model>', got {backend!r}")
+    if entry != "adversarial-review":
+        raise WorkflowError(f"entry {entry!r} not implemented in M2")
+    return {"role": "verifier", "execution": execution, "backend": backend, "entry": entry,
+            "source": "profile"}
+
+
 def _runner_model(backend: str) -> str:
     """Extract the model from a `codex:<model>` backend. Non-codex runners are schema-valid but not
     executable in M1 (§6) — fail loud rather than silently substitute."""
@@ -291,10 +320,11 @@ def _resolve_env_prep(worktree: Path, cfg: dict) -> tuple[str, list[str]]:
 def _run_env_prep(worktree: Path, commands: list[str]) -> tuple[int, str]:
     """Run each prep command in the worktree cwd (no shell, shlex.split, 600s each). Returns (rc,
     stderr_tail<=20 lines); rc 0 means every command succeeded."""
+    env = {**os.environ, "UV_CACHE_DIR": str(worktree / ".jw-uv-cache")}
     for cmd in commands:
         try:
             p = subprocess.run(shlex.split(cmd), cwd=str(worktree),
-                               capture_output=True, text=True, timeout=600)
+                               capture_output=True, text=True, timeout=600, env=env)
         except (OSError, subprocess.TimeoutExpired) as e:
             return 127, f"{cmd}: {e}"
         if p.returncode != 0:
@@ -309,11 +339,12 @@ def _run_codex(worktree: Path, model: str, prompt_path: Path, record_dir: Path) 
     cmd = ["codex", "exec", "-C", str(worktree), "-m", model, "-s", "workspace-write",
            "--color", "never", "--output-last-message", str(record_dir / "last_message.md"), "--json"]
     start = time.monotonic()
+    env = {**os.environ, "UV_CACHE_DIR": str(worktree / ".jw-uv-cache")}
     try:
         with open(prompt_path, encoding="utf-8") as pin, \
              open(record_dir / "runner.jsonl", "w", encoding="utf-8") as jout, \
              open(record_dir / "runner.stderr", "w", encoding="utf-8") as jerr:
-            p = subprocess.run(cmd, stdin=pin, stdout=jout, stderr=jerr, timeout=3600)
+            p = subprocess.run(cmd, stdin=pin, stdout=jout, stderr=jerr, timeout=3600, env=env)
         rc = p.returncode
     except subprocess.TimeoutExpired:
         rc = 124
@@ -559,7 +590,8 @@ def run_delegation(root: Path, task_id: str, role: str, accept_flags: list[str])
     # other failed-* states, discard clears it (H1).
     try:
         report = _read_report(worktree_path)
-        result_sha, _ = _snapshot(worktree_path, f"jw delegation result: {task_id} {did}")
+        result_sha, _ = _snapshot(
+            worktree_path, f"jw delegation result: {task_id} {did}", exclude_uv_cache=True)
         _git_out(root, "update-ref", f"{DELEG_REF_NS}/{did}-result", result_sha)
         changed = _changed_files(root, base_sha, result_sha)
         patch = _diff_patch(root, base_sha, result_sha)
@@ -598,6 +630,183 @@ def _warn_boundary(root: Path, boundary: str, context: dict) -> None:
         jw_overlay.evaluate_boundary(root, boundary, context)
     except Exception:  # noqa: BLE001
         pass
+
+
+# ---- independent verifier (§11 — same-base codex-companion transport) --------
+def _companion_script() -> Path:
+    registry = Path.home() / ".claude" / "plugins" / "installed_plugins.json"
+    try:
+        data = json.loads(registry.read_text(encoding="utf-8"))
+        entries = (data.get("plugins") or {}).get("codex@openai-codex")
+        install_path = entries[0].get("installPath") if isinstance(entries, list) and entries else None
+        script = Path(install_path) / "scripts" / "codex-companion.mjs" if install_path else None
+    except (OSError, json.JSONDecodeError, AttributeError, TypeError):
+        script = None
+    if script is None or not script.is_file():
+        raise WorkflowError(
+            "codex plugin not installed — install it or bind verifier to another transport")
+    return script
+
+
+def _run_companion(worktree: Path, args: list[str], record_dir: Path) -> tuple[int, str]:
+    """Single codex-companion invocation, isolated for tests. The command already contains the
+    dynamically resolved plugin script. stderr is retained as local diagnostic evidence."""
+    try:
+        p = subprocess.run(args, cwd=str(worktree), capture_output=True, text=True, timeout=1800)
+    except subprocess.TimeoutExpired:
+        return 124, ""
+    except OSError as e:
+        return 127, str(e)
+    try:
+        (record_dir / "verify.stderr").write_text(p.stderr, encoding="utf-8")
+    except OSError:
+        pass
+    return p.returncode, p.stdout
+
+
+def _normalize_verify_worktree(worktree: Path, rec: Path, contract: dict) -> None:
+    """Restore HEAD=delegation base and working tree=result, regardless of delegate commits (S21)."""
+    base_sha = contract.get("base_sha")
+    if not isinstance(base_sha, str) or not base_sha:
+        raise WorkflowError("delegation contract has no base_sha — cannot normalize verifier worktree")
+    for args in (("checkout", "--force", "--detach", base_sha), ("clean", "-fd")):
+        rc, out, err = _git(worktree, *args)
+        if rc != 0:
+            raise WorkflowError(
+                f"verify worktree normalization failed at git {args[0]}: {err or out or f'rc {rc}'}")
+    if not contract.get("empty"):
+        patch = rec / "artifact" / "changes.patch"
+        rc, out, err = _git(worktree, "apply", str(patch))
+        if rc != 0:
+            raise WorkflowError(
+                f"verify worktree normalization failed at git apply: {err or out or f'rc {rc}'}")
+
+
+def _verify_focus(rec: Path, contract: dict) -> str:
+    try:
+        packet = yaml.safe_load((rec / "packet.yaml").read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as e:
+        raise WorkflowError(f"cannot read delegation packet for verify: {e}")
+    if not isinstance(packet, dict):
+        raise WorkflowError("cannot read delegation packet for verify: packet is not a mapping")
+    acceptance = packet.get("acceptance") or []
+    changed = contract.get("changed_files") or []
+    text = (
+        "Adversarially challenge whether this worktree's working-tree changes (HEAD is the "
+        "delegation base) actually satisfy the acceptance criteria.\nAcceptance criteria:\n"
+        + "\n".join(f"- {item}" for item in acceptance)
+        + "\nChanged files:\n"
+        + "\n".join(f"- {item.get('status', '?')} {item.get('path', '?')}"
+                    for item in changed if isinstance(item, dict)))
+    raw = text.encode("utf-8")
+    return raw[:1024].decode("utf-8", errors="ignore") if len(raw) > 1024 else text
+
+
+def _companion_state_root() -> Path:
+    plugin_data = os.environ.get("CLAUDE_PLUGIN_DATA")
+    return Path(plugin_data) / "state" if plugin_data else Path(tempfile.gettempdir()) / "codex-companion"
+
+
+def _companion_state_dir(worktree: Path, *, state_root: Path | None = None) -> Path:
+    workspace = Path(_git_out(worktree, "rev-parse", "--show-toplevel"))
+    canonical = Path(os.path.realpath(workspace))
+    slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", workspace.name).strip("-") or "workspace"
+    key = f"{slug}-{hashlib.sha256(str(canonical).encode()).hexdigest()[:16]}"
+    return (state_root or _companion_state_root()) / key
+
+
+def _cleanup_companion_broker(worktree: Path, *, state_root: Path | None = None) -> str:
+    """Shutdown only this worktree's exactly keyed broker. RPC is self-identifying; SIGTERM is used
+    only after RPC failure and only when broker.json explicitly binds cwd to this worktree (S16)."""
+    try:
+        broker_path = _companion_state_dir(worktree, state_root=state_root) / "broker.json"
+        if not broker_path.is_file():
+            return "broker cleanup: no broker state"
+        broker = json.loads(broker_path.read_text(encoding="utf-8"))
+        if not isinstance(broker, dict):
+            raise ValueError("broker.json is not an object")
+    except Exception as e:  # noqa: BLE001 — cleanup is explicitly best-effort
+        print(f"jw delegate verify: broker cleanup unreadable; daemon may remain ({e})", file=sys.stderr)
+        return "broker cleanup: daemon may remain"
+
+    endpoint = broker.get("endpoint")
+    rpc_ok = False
+    if isinstance(endpoint, str) and endpoint.startswith("unix:") and endpoint[5:]:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(2)
+        try:
+            client.connect(endpoint[5:])
+            request = {"id": 1, "method": "broker/shutdown", "params": {}}
+            client.sendall((json.dumps(request, separators=(",", ":")) + "\n").encode())
+            client.recv(4096)
+            rpc_ok = True
+        except OSError:
+            rpc_ok = False
+        finally:
+            client.close()
+    if rpc_ok:
+        return "broker cleanup: shutdown RPC requested"
+
+    canonical = str(Path(os.path.realpath(worktree)))
+    pid = broker.get("pid")
+    if broker.get("cwd") == canonical and type(pid) is int and pid > 0:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            return "broker cleanup: SIGTERM sent after shutdown RPC failure"
+        except OSError:
+            pass
+    print("jw delegate verify: broker shutdown failed; daemon may remain", file=sys.stderr)
+    return "broker cleanup: daemon may remain"
+
+
+def _verify_paths(rec: Path) -> list[Path]:
+    def number(path: Path) -> int:
+        part = path.stem.removeprefix("verify-")
+        return int(part) if part.isdigit() else -1
+    return sorted((p for p in (rec / "artifact").glob("verify-*.json") if number(p) >= 0),
+                  key=number)
+
+
+def verify_delegation(root: Path, did: str) -> int:
+    rec = _load_delegation(root, did)
+    state = _read_status(rec).get("state")
+    if state != "needs-review":
+        raise WorkflowError(
+            f"delegation {did} is {state} — only a needs-review delegation can be verified")
+    profile, _fingerprint = _load_profile()
+    binding = _resolve_verifier_binding(profile)
+    script = _companion_script()
+    contract = _load_contract(rec)
+    worktree = _worktree_path(root, did)
+    _normalize_verify_worktree(worktree, rec, contract)
+    focus = _verify_focus(rec, contract)
+    model = binding["backend"].split(":", 1)[1]
+    args = ["node", str(script), "adversarial-review", "--json", "--wait", "--scope",
+            "working-tree", "-C", str(worktree), "-m", model, focus]
+    rc, stdout = _run_companion(worktree, args, rec)
+    cleanup = _cleanup_companion_broker(worktree)
+    print(cleanup)
+    if rc != 0:
+        raise WorkflowError(
+            f"independent verifier failed (rc {rc}) — delegation remains needs-review")
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError as e:
+        raise WorkflowError(
+            f"independent verifier returned invalid JSON ({e}) — delegation remains needs-review")
+    n = len(_verify_paths(rec)) + 1
+    artifact = {
+        "schema": "jw-verify-1", "at": _now_iso(),
+        "transport": "codex-companion:adversarial-review", "backend": binding["backend"],
+        "provenance": "independent-verifier", "payload": payload,
+    }
+    out = rec / "artifact" / f"verify-{n}.json"
+    try:
+        out.write_text(json.dumps(artifact, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except OSError as e:
+        raise _RefusedWrite(f"cannot write verifier artifact {out}: {e}")
+    print(f"verify_artifact: {out}")
+    return 0
 
 
 # ---- evaluation path (§12 — apply/discard/show/status) ------------------------
@@ -689,6 +898,12 @@ def show(root: Path, did: str, opt: str | None) -> int:
         _load_exposure(rec)  # validate before dumping — corrupt names the file
         print((rec / "exposure.json").read_text(encoding="utf-8").rstrip())
         return 0
+    if opt == "verify":
+        paths = _verify_paths(rec)
+        if not paths:
+            raise WorkflowError(f"delegation {did} has no independent verifier artifact")
+        print(paths[-1].read_text(encoding="utf-8").rstrip())
+        return 0
     if opt in ("patch", "report"):
         contract_p = rec / "artifact" / "contract.yaml"
         if not contract_p.exists():
@@ -716,6 +931,7 @@ def show(root: Path, did: str, opt: str | None) -> int:
         print(f"changed_files: {len(contract.get('changed_files', []))}")
         print("patch: " + ("empty" if contract.get("empty") else "changes.patch"))
         print(f"delegate_report: {rep_str}")
+    print(f"verify_artifacts: {len(_verify_paths(rec))}")
     return 0
 
 
@@ -770,12 +986,12 @@ def _cli_status(rest: list[str]) -> int:
 
 
 def _cli_show(rest: list[str]) -> int:
-    pos, opts = _parse_opts(rest, value=("root",), boolean=("patch", "report", "exposure"))
+    pos, opts = _parse_opts(rest, value=("root",), boolean=("patch", "report", "exposure", "verify"))
     if not pos:
         raise WorkflowError("show requires a <delegation-id>")
-    chosen = [o for o in ("patch", "report", "exposure") if opts.get(o)]
+    chosen = [o for o in ("patch", "report", "exposure", "verify") if opts.get(o)]
     if len(chosen) > 1:
-        raise WorkflowError("show takes at most one of --patch/--report/--exposure")
+        raise WorkflowError("show takes at most one of --patch/--report/--exposure/--verify")
     return show(_resolve_root(opts.get("root")), pos[0], chosen[0] if chosen else None)
 
 
@@ -793,13 +1009,20 @@ def _cli_discard(rest: list[str]) -> int:
     return discard_delegation(_resolve_root(opts.get("root")), pos[0])
 
 
+def _cli_verify(rest: list[str]) -> int:
+    pos, opts = _parse_opts(rest, value=("root",))
+    if not pos:
+        raise WorkflowError("verify requires a <delegation-id>")
+    return verify_delegation(_resolve_root(opts.get("root")), pos[0])
+
+
 _HANDLERS = {"run": _cli_run, "status": _cli_status, "show": _cli_show,
-             "apply": _cli_apply, "discard": _cli_discard}
+             "apply": _cli_apply, "discard": _cli_discard, "verify": _cli_verify}
 
 
 def main(argv: list[str]) -> int:
     if not argv or argv[0] not in _HANDLERS:
-        print("jw delegate: expected subcommand (run|status|show|apply|discard)", file=sys.stderr)
+        print("jw delegate: expected subcommand (run|status|show|apply|discard|verify)", file=sys.stderr)
         return 1
     try:
         return _HANDLERS[argv[0]](argv[1:])
