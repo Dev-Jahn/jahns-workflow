@@ -7,7 +7,9 @@ pre-organized `<server>/<project>/` mirror, whereas this reads the real live `~/
 layout. Adaptations to the ported core, all minimal and additive (documented inline):
   * parse_transcript_file distinguishes a truncated final line of an active session
     (`partial_tail_lines`) from a genuine mid-file `parse_error`.
-  * classify_record surfaces an `is_api_error` extra (isApiErrorMessage records).
+  * classify_record surfaces an `is_api_error` extra (isApiErrorMessage records AND
+    type=system/subtype=api_error records). errors.api counts error EVENTS, so retries count
+    individually.
   * _tool_call_row surfaces `model_requested`; _tool_result_rows surface the delegation
     `toolUseResult` fields (tur_agent_id/tur_resolved_model/tur_status/tur_is_async).
 Everything else preserves fable's verified behavior (uuid replay dedup, tool_result actor
@@ -22,7 +24,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-PARSER_VERSION = "jw-trace-1"
+PARSER_VERSION = "jw-trace-2"
 
 
 # --------------------------------------------------------------------------- util
@@ -119,6 +121,7 @@ SESSION_STATE_TYPES = {
     "permission-mode": "permission_mode",
     "bridge-session": "bridge_session",
     "ai-title": "ai_title",
+    "agent-name": "agent_name",
     "custom-title": "custom_title",
     "queue-operation": "queue_operation",
     "pr-link": "pr_link",
@@ -232,6 +235,10 @@ def classify_record(record: dict[str, Any], *, is_sidechain_file: bool, seen_use
     if raw_type == "system":
         ev["event_type"] = "system_event"
         ev["event_subtype"] = record.get("subtype") or "unknown"
+        # adaptation: an api_error system record is an API failure event (any level) — surface it so
+        # errors.api counts it, not just isApiErrorMessage-tagged records
+        if ev["event_subtype"] == "api_error":
+            ev["extras"]["is_api_error"] = True
         if isinstance(record.get("durationMs"), (int, float)):
             ev["extras"]["duration_ms"] = record["durationMs"]
         content = record.get("content")
@@ -662,6 +669,9 @@ def _tool_result_rows(ev: dict, event_row: dict) -> list[dict[str, Any]]:
         else:
             text = ""
         text_trunc, text_len = truncate_text(text or None, RESULT_TEXT_CAP)
+        # content_len is code-point count (truncation bookkeeping); content_bytes is the real UTF-8
+        # size the context_heavy byte threshold must use (multibyte/CJK results are ~3x chars)
+        content_bytes = len(text.encode("utf-8")) if text else 0
         stderr_head, stderr_len = truncate_text(stderr, 2000)
         rows.append(
             {
@@ -682,6 +692,7 @@ def _tool_result_rows(ev: dict, event_row: dict) -> list[dict[str, Any]]:
                 "is_image": is_image,
                 "content_text": text_trunc,
                 "content_len": text_len,
+                "content_bytes": content_bytes,
                 "stdout_len": len(stdout) if stdout is not None else None,
                 "stderr_len": stderr_len if stderr is not None else None,
                 "stderr_head": stderr_head,
@@ -759,7 +770,9 @@ def detect_kind(rel_parts: tuple[str, ...]) -> str:
         return "unknown_json"
     if name.endswith(".js") and len(parents) >= 1 and parents[-1] == "scripts" and in_workflows:
         return "workflow_script"
-    if len(parents) >= 1 and parents[-1] == "tool-results":
+    # tool-results artifacts nest one level deeper (tool-results/pdf-<uuid>/page-NN.png), so match
+    # when tool-results is ANY ancestor dir, not only the immediate parent
+    if "tool-results" in parents:
         return "tool_result"
     return "unknown_other"
 

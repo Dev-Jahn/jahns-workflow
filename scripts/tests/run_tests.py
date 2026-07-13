@@ -1784,6 +1784,45 @@ class CclogParseTests(unittest.TestCase):
             pe = [e for e in out["events"] if e["event_subtype"] == "parse_error"]
             self.assertEqual(len(pe), 1)
 
+    def test_agent_name_is_session_state(self):
+        # 'agent-name' is a benign session-state record (sibling of ai-title/mode) — it must NOT
+        # surface as an unknown_raw parse-degradation signal
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "s.jsonl"
+            _write_jsonl(f, [{"type": "agent-name", "agentName": "researcher"}])
+            e = _parse(f)["events"][0]
+            self.assertEqual(e["event_type"], "session_state")
+            self.assertEqual(e["event_subtype"], "agent_name")
+
+    def test_system_api_error_flagged(self):
+        # a type=system/subtype=api_error record is an API failure event (any level) — errors.api
+        # must see it, not just isApiErrorMessage-tagged records
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "s.jsonl"
+            _write_jsonl(f, [
+                {"type": "system", "subtype": "api_error", "level": "error", "content": "API Error 529"},
+                {"type": "system", "subtype": "info", "content": "benign"},
+            ])
+            out = _parse(f)
+            err = [e for e in out["events"] if e["event_subtype"] == "api_error"][0]
+            self.assertTrue(_json.loads(err["extras_json"]).get("is_api_error"))
+            benign = [e for e in out["events"] if e["event_subtype"] == "info"][0]
+            self.assertIsNone(benign["extras_json"])  # non-api_error system record carries no flag
+
+    def test_tool_result_content_bytes_is_utf8(self):
+        # content_bytes measures real UTF-8 bytes (context_heavy threshold), content_len stays chars
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "s.jsonl"
+            big = "가" * 60000  # 60k code points ~= 180k UTF-8 bytes
+            _write_jsonl(f, [{"type": "user", "uuid": "t1",
+                              "message": {"role": "user", "content": [
+                                  {"type": "tool_result", "tool_use_id": "toolu_1",
+                                   "content": big, "is_error": False}]}}])
+            tr = _parse(f)["tool_results"][0]
+            self.assertEqual(tr["content_len"], 60000)
+            self.assertEqual(tr["content_bytes"], len(big.encode("utf-8")))
+            self.assertGreater(tr["content_bytes"], 100 * 1024)  # counts toward context_heavy
+
 
 class CclogLayoutTests(unittest.TestCase):
     """New real-layout detectors: detect_kind + scope_of."""
@@ -1834,6 +1873,12 @@ class CclogLayoutTests(unittest.TestCase):
     def test_unknown(self):
         self.assertEqual(self._k("slug", "random.jsonl"), "unknown_jsonl")  # non-uuid stem
         self.assertEqual(self._k("slug", _UUID, "weird.bin"), "unknown_other")
+
+    def test_nested_tool_results(self):
+        # real logs nest artifacts one level deeper (tool-results/pdf-<uuid>/page-NN.png); tool-results
+        # is an ANCESTOR dir, not the immediate parent — must still classify as tool_result, not skip
+        self.assertEqual(self._k("slug", _UUID, "tool-results", "pdf-abc", "page1.png"), "tool_result")
+        self.assertEqual(self._k("slug", _UUID, "tool-results", "out.txt"), "tool_result")  # flat still
 
 
 class ImproveDiscoveryTests(unittest.TestCase):
@@ -2121,7 +2166,9 @@ class ImproveReviewsTests(unittest.TestCase):
             self.assertEqual(cov["projects_scanned"], ["proj-a"])
             self.assertEqual(cov["projects_total"], 3)
             self.assertEqual([s["project"] for s in cov["projects_skipped"]], ["gone", "remote-only"])
-            self.assertEqual(cov["row_totals"], {"reviews": 2, "findings": 5})
+            # a triage row that names its fix-task (task-id cell) is ONE finding, not two (dedup):
+            # JW-GPT-001 + JW-GPT-002 + JW-GPT-003 (triage) + fix/old (unreferenced task) = 4
+            self.assertEqual(cov["row_totals"], {"reviews": 2, "findings": 4})
 
             # rows sorted by (project, round_id)
             self.assertEqual([r["round_id"] for r in rows], ["2026-07-01-alpha", "2026-07-02-beta"])
@@ -2131,23 +2178,24 @@ class ImproveReviewsTests(unittest.TestCase):
             self.assertTrue(alpha["feedback_file"].endswith("2026-07-01-alpha-feedback.md"))
 
             byid = {f["id"]: f for f in alpha["findings"]}
-            # triage findings: severity read structurally from the table cell (explicit)
+            # triage findings: severity read structurally from the table cell (explicit). JW-GPT-001's
+            # task-id cell names fix/thing (a joined task) → merged into ONE triage finding carrying
+            # task_id; the separate fix/thing task finding is NOT emitted (dedup)
             self.assertEqual(byid["JW-GPT-001"],
                              {"id": "JW-GPT-001", "severity": "blocker", "status": "REAL",
-                              "source": "triage", "provenance": "explicit"})
+                              "source": "triage", "provenance": "explicit", "task_id": "fix/thing"})
+            self.assertNotIn("fix/thing", byid)  # deduped into JW-GPT-001, not a second finding
             self.assertEqual(byid["JW-GPT-002"]["status"], "REJECTED")
             self.assertEqual(byid["JW-GPT-002"]["severity"], "minor")
             # `?` severity is unparseable → provenance unknown, NOT keyword-guessed from prose
             self.assertEqual(byid["JW-GPT-003"]["severity"], None)
             self.assertEqual(byid["JW-GPT-003"]["provenance"], "unknown")
-            # finding-derived tasks joined by origin (live + archived); non-finding task excluded
-            self.assertEqual(byid["fix/thing"],
-                             {"id": "fix/thing", "severity": "major", "status": "pending",
-                              "source": "task", "provenance": "explicit"})
+            # a finding-derived task NOT referenced by any triage row remains source "task"
             self.assertEqual(byid["fix/old"]["source"], "task")
             self.assertNotIn("feat/unrelated", byid)
-            # counts across both sources
-            self.assertEqual(alpha["counts"], {"blocker": 2, "major": 1, "minor": 1, "unknown": 1})
+            # counts: blocker JW-GPT-001 + fix/old = 2; minor JW-GPT-002 = 1; unknown JW-GPT-003 = 1;
+            # the merged fix/thing is counted once (as its triage blocker), not doubled as a major
+            self.assertEqual(alpha["counts"], {"blocker": 2, "major": 0, "minor": 1, "unknown": 1})
 
             # beta: request only, no findings
             beta = rows[1]
@@ -2242,7 +2290,7 @@ class ImproveAuditTests(unittest.TestCase):
         ]
 
     def _coverage(self):
-        return {"parser_version": "jw-trace-1", "generated_from": ["/x"],
+        return {"parser_version": "jw-trace-2", "generated_from": ["/x"],
                 "files_by_kind": {"main_transcript": 2}, "files_skipped": 0,
                 "event_type_counts": {}, "unknown_raw_types": {"weird": 1},
                 "record_parse_errors": 0, "replayed_records_skipped": 1,
@@ -2270,7 +2318,7 @@ class ImproveAuditTests(unittest.TestCase):
                 "main_direct_work", "retry_loops", "review_association", "verification_debt"])
             # every fact carries a versioned rule + provenance
             for l in facts["lenses"]:
-                self.assertRegex(l["rule"], r"-v1$")
+                self.assertRegex(l["rule"], r"-v\d+$")
                 self.assertIn(l["provenance"], ("inferred", "explicit"))
                 self.assertLessEqual(len(l["examples"]), 5)
 
@@ -2425,6 +2473,220 @@ class ImproveDecideTests(unittest.TestCase):
             self.assertEqual(rc2, 0)
             self.assertTrue((explicit / "decisions.jsonl").is_file())  # override lands elsewhere
             self.assertEqual(len(self._lines(default_log)), 1)  # default log untouched by the override
+
+
+class ImproveM1DefectTests(unittest.TestCase):
+    """Regression tests for the 0.7.0 M1 adversarial-review defects (RED-turned-GREEN)."""
+
+    def _quiet(self, fn):
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            return fn()
+
+    # ---- finding 3: verify-cmd regex must require a runner/verb, not a bare tests/ path ----
+    def test_verify_cmd_requires_runner(self):
+        c = jw_improve.classify_verification
+        self.assertIsNone(c("cat tests/x.py"))
+        self.assertIsNone(c("git diff tests/"))
+        self.assertIsNone(c("ls tests/"))
+        self.assertIsNone(c("rm -rf tests/__pycache__"))
+        # real runners / a runner-led tests/ path still classify
+        self.assertEqual(c("uv run pytest tests/x.py"), "test")
+        self.assertEqual(c("pytest tests/"), "test")
+        self.assertEqual(c("python tests/run.py"), "test")
+
+    # ---- finding 2: a passing build is verification; build-only session is NOT debt ----
+    def test_build_only_session_not_debt(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            _write_jsonl(d / "sessions.jsonl", [
+                {"project": "-p", "kind": "main", "session_id": "s1", "file": "/x/s1.jsonl",
+                 "tools": {"by_category": {"file_write": 3, "shell": 1}},
+                 "verification": {"runs": 0}, "build": {"runs": 2}, "unclassified_shell": 0},
+                {"project": "-p", "kind": "main", "session_id": "s2", "file": "/x/s2.jsonl",
+                 "tools": {"by_category": {"file_write": 2}},
+                 "verification": {"runs": 0}, "build": {"runs": 0}, "unclassified_shell": 0},
+            ])
+            facts = jw_improve.run_audit(d)
+            vd = {l["lens"]: l for l in facts["lenses"]}["verification_debt"]
+            self.assertEqual(vd["rule"], "verification-debt-v2")
+            pp = vd["per_project"]["-p"]
+            self.assertEqual(pp["file_write_sessions"], 2)
+            self.assertEqual(pp["debt_sessions"], 1)        # only s2 (no build, no verify)
+            self.assertEqual(pp["build_only_sessions"], 1)  # s1 rescued from false debt
+            self.assertEqual(pp["debt_ratio"], 0.5)
+
+    # ---- finding 5: all-unknown is_async must yield null ratio, not a definite 0.0 ----
+    def test_async_unknown_ratio_is_null(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            _write_jsonl(d / "delegations.jsonl", [
+                {"project": "-p", "session_id": "s", "file": "/x/s.jsonl", "line": i, "tool": "Agent",
+                 "subagent_type": None, "model_requested": None,
+                 "resolved_model": {"provenance": "unknown"}, "status": {"provenance": "unknown"},
+                 "is_async": {"provenance": "unknown"}} for i in (1, 2, 3)])
+            facts = jw_improve.run_audit(d)
+            dp = {l["lens"]: l for l in facts["lenses"]}["delegation_pattern"]
+            self.assertEqual(dp["rule"], "delegation-pattern-v2")
+            pp = dp["per_project"]["-p"]
+            self.assertEqual(pp["async_count"], 0)
+            self.assertEqual(pp["async_unknown"], 3)
+            self.assertIsNone(pp["async_ratio"])  # NOT a fabricated 0.0
+
+    # ---- finding 6: a triage row + its registered task are ONE finding, not two ----
+    def test_review_dedup_single_finding(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            proj = d / "projA"
+            proj.mkdir()
+            (proj / ".jahns-workflow.yml").write_text("version: 1\nproject: a\n")
+            rdir = proj / "docs" / "reviews"
+            rdir.mkdir(parents=True)
+            (rdir / "2026-07-01-x-feedback.md").write_text(
+                "## Findings (triage skeleton — verify each)\n\n"
+                "| finding | severity | verdict | evidence | task id |\n"
+                "|---|---|---|---|---|\n"
+                "| JW-GPT-001 — the one bug | blocker | REAL | confirmed | fix/the-bug |\n")
+            (proj / "tasks.yaml").write_text(
+                "version: 1\nproject: a\ntasks:\n"
+                "  - id: fix/the-bug\n    title: 'fix'\n    status: pending\n"
+                "    severity: major\n    origin: review-2026-07-01-x\n")
+            registry = d / "projects.json"
+            registry.write_text(_json.dumps({"projects": [{"name": "proj-a", "path": str(proj)}]}))
+            out = d / "out"
+            jw_improve.run_reviews(registry, out)
+            rows = [_json.loads(ln) for ln in (out / "reviews.jsonl").read_text().splitlines() if ln]
+            self.assertEqual(len(rows), 1)
+            r = rows[0]
+            self.assertEqual(len(r["findings"]), 1)                     # ONE finding, not two
+            f = r["findings"][0]
+            self.assertEqual(f["source"], "triage")
+            self.assertEqual(f["severity"], "blocker")                  # triage severity kept
+            self.assertEqual(f["task_id"], "fix/the-bug")
+            self.assertEqual(r["counts"], {"blocker": 1, "major": 0, "minor": 0, "unknown": 0})
+
+    # ---- finding 7: a relative --out/--in is refused (exit 1) for every subcommand ----
+    def test_relative_out_in_refused(self):
+        self.assertEqual(self._quiet(lambda: jw_improve.main(
+            ["trace", "--source", "/tmp", "--out", "rel/out"])), 1)
+        self.assertEqual(self._quiet(lambda: jw_improve.main(["reviews", "--out", "rel/out"])), 1)
+        self.assertEqual(self._quiet(lambda: jw_improve.main(["audit", "--in", "rel/in"])), 1)
+        self.assertEqual(self._quiet(lambda: jw_improve.main(
+            ["decide", "lens/x", "accept", "--out", "rel/out"])), 1)
+
+    # ---- finding 8: registry MISSING is soft (exit 0); EXISTING but corrupt fails loud ----
+    def test_registry_fail_loud(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            out = d / "out"
+            cov = jw_improve.run_reviews(d / "nope.json", out)  # MISSING -> 0 projects, no raise
+            self.assertEqual(cov["projects_total"], 0)
+            bad = d / "bad.json"
+            bad.write_text("{ not json ")
+            with self.assertRaises(jw_common.WorkflowError):
+                jw_improve.run_reviews(bad, out)                # unparseable -> fail loud
+            wrong = d / "wrong.json"
+            wrong.write_text("[1, 2, 3]")
+            with self.assertRaises(jw_common.WorkflowError):
+                jw_improve.run_reviews(wrong, out)              # wrong shape -> fail loud
+            # exit-code contract via the CLI (corrupt registry under a fake HOME) -> rc 1, not 0
+            home = d / "home"
+            (home / ".claude" / "jahns-workflow").mkdir(parents=True)
+            (home / ".claude" / "jahns-workflow" / "projects.json").write_text("{ nope ")
+            rc = _run_with_home(home, lambda: self._quiet(
+                lambda: jw_improve.main(["reviews", "--out", str(d / "o2")])))
+            self.assertEqual(rc, 1)
+
+    # ---- finding 1: an unreadable INPUT transcript is recorded, not fatal, exit 0 ----
+    def test_unreadable_input_recorded_not_fatal(self):
+        import os
+        import stat
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            src = d / "projects"
+            good = src / "good-slug"
+            good.mkdir(parents=True)
+            _write_jsonl(good / f"{_UUID}.jsonl",
+                         [{"type": "user", "uuid": "u", "message": {"role": "user", "content": "hi"}}])
+            bad = src / "bad-slug"
+            bad.mkdir(parents=True)
+            badf = bad / f"{_UUID}.jsonl"
+            _write_jsonl(badf, [{"type": "user", "uuid": "v",
+                                 "message": {"role": "user", "content": "x"}}])
+            os.chmod(badf, 0)
+            out = d / "out"
+            try:
+                cov = jw_improve.run_trace([src], set(), out)
+            finally:
+                os.chmod(badf, stat.S_IRUSR | stat.S_IWUSR)
+            self.assertEqual(cov["row_totals"]["sessions"], 1)      # good session still projected
+            self.assertEqual(cov["files_unreadable_total"], 1)
+            self.assertEqual(list(cov["files_unreadable"]), [f"bad-slug/{_UUID}.jsonl"])
+            self.assertEqual((out / "sessions.jsonl").read_text().count("\n"), 1)
+
+    # ---- finding 1 (other half): a real OUTPUT write failure stays exit 2 ----
+    def test_unwritable_out_is_exit_2(self):
+        import os
+        import stat
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            src = d / "projects"
+            slug = src / "s"
+            slug.mkdir(parents=True)
+            _write_jsonl(slug / f"{_UUID}.jsonl",
+                         [{"type": "user", "uuid": "u", "message": {"role": "user", "content": "hi"}}])
+            locked = d / "locked"
+            locked.mkdir()
+            os.chmod(locked, stat.S_IRUSR | stat.S_IXUSR)  # no write bit
+            try:
+                rc = self._quiet(lambda: jw_improve.main(
+                    ["trace", "--source", str(src), "--out", str(locked / "sub")]))
+            finally:
+                os.chmod(locked, stat.S_IRWXU)
+            self.assertEqual(rc, 2)
+
+    # ---- finding 12: explicit non-dir --source exits 1; a missing source is soft in run_trace ----
+    def test_explicit_missing_source_exit_1(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            rc = self._quiet(lambda: jw_improve.main(
+                ["trace", "--source", str(d / "does-not-exist"), "--out", str(d / "out")]))
+            self.assertEqual(rc, 1)
+
+    def test_missing_source_recorded_soft(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            missing = d / "gone"
+            cov = jw_improve.run_trace([missing], set(), d / "out")
+            self.assertEqual(cov["sources_missing"], [str(missing)])
+            self.assertEqual(cov["row_totals"]["sessions"], 0)
+
+    # ---- finding 4 (end-to-end): a >100KiB-UTF-8 CJK tool_result counts as context_heavy ----
+    def test_context_heavy_counts_utf8_bytes(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            src = d / "projects"
+            slug = src / "-p"
+            slug.mkdir(parents=True)
+            big = "가" * 60000  # ~180KB UTF-8, only 60k code points
+            _write_jsonl(slug / f"{_UUID}.jsonl", [
+                {"type": "user", "uuid": "u", "message": {"role": "user", "content": "hi"}},
+                {"type": "assistant", "uuid": "a", "requestId": "r",
+                 "message": {"id": "m", "model": "claude-opus-4-8",
+                             "content": [{"type": "tool_use", "id": "toolu_1", "name": "Bash",
+                                          "input": {"command": "echo hi"}}]}},
+                {"type": "user", "uuid": "t", "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": big,
+                     "is_error": False}]}},
+            ])
+            out = d / "out"
+            jw_improve.run_trace([src], set(), out)
+            sess = [_json.loads(ln) for ln in
+                    (out / "sessions.jsonl").read_text().splitlines() if ln][0]
+            ch = sess["context_heavy"]
+            self.assertEqual(ch["tool_results_over_100kb"], 1)  # 180KB bytes > 100KiB
+            self.assertEqual(ch["max_result_bytes"], len(big.encode("utf-8")))
 
 
 if __name__ == "__main__":

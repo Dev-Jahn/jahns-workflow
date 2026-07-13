@@ -78,13 +78,19 @@ from jw_common import (  # noqa: E402
 HEAD_LEN = 120
 CONTEXT_HEAVY_BYTES = 100 * 1024
 
-# ------------------------------------------------------------------ verify-cmd-v1
+# ------------------------------------------------------------------ verify-cmd-v2
 # Conservative Bash-command classification. Order matters: TEST, then BUILD (so `tsc --build` is a
 # build, not a typecheck), then LINT/TYPECHECK. Non-matches are counted as unclassified_shell.
+# A test runner/verb is required — a bare `tests/` path mention (`cat tests/x.py`, `git diff tests/`,
+# `ls tests/`) is NOT verification. When only a tests/ path is named, the command must START with a
+# known test runner to count (so `python tests/run.py` / `pytest tests/` do, but `cat`/`git`/`ls`/`rm`
+# do not).
 _TEST_RE = re.compile(
-    r"\bpytest\b|\bunittest\b|\buv run\b[^\n]*\btest|\btests/|\bnpm (?:run )?test\b|\bnpx jest\b"
+    r"\bpytest\b|\bunittest\b|\buv run\b[^\n]*\btest|\bnpm (?:run )?test\b|\bnpx jest\b"
     r"|\bjest\b|\bvitest\b|\bcargo test\b|\bgo test\b|\bmake (?:test|check)\b"
 )
+_TEST_PATH_RE = re.compile(r"\btests/")
+_TEST_RUNNER_START_RE = re.compile(r"^\s*(?:pytest|py\.test|python3?|tox|nox|nosetests)\b")
 _BUILD_RE = re.compile(
     r"\bmake build\b|\bnpm run build\b|\byarn build\b|\bcargo build\b|\bgo build\b"
     r"|\btsc (?:-b\b|--build\b)"
@@ -94,8 +100,10 @@ _TYPECHECK_RE = re.compile(r"\bmypy\b|\btsc\b|\btypecheck\b|\bpyright\b|\bty che
 
 
 def classify_verification(command: str) -> str | None:
-    """verify-cmd-v1: 'test' | 'build' | 'lint' | 'typecheck' | None (unclassified shell)."""
+    """verify-cmd-v2: 'test' | 'build' | 'lint' | 'typecheck' | None (unclassified shell)."""
     if _TEST_RE.search(command):
+        return "test"
+    if _TEST_PATH_RE.search(command) and _TEST_RUNNER_START_RE.match(command):
         return "test"
     if _BUILD_RE.search(command):
         return "build"
@@ -293,9 +301,9 @@ def _build_session(path: Path, kind: str, session_kind: str, scope: dict, parsed
     over = 0
     max_bytes = 0
     for tr in tool_results:
-        cl = tr.get("content_len") or 0
-        max_bytes = max(max_bytes, cl)
-        if cl > CONTEXT_HEAVY_BYTES:
+        cb = tr.get("content_bytes") or 0
+        max_bytes = max(max_bytes, cb)
+        if cb > CONTEXT_HEAVY_BYTES:
             over += 1
 
     row = {
@@ -319,9 +327,9 @@ def _build_session(path: Path, kind: str, session_kind: str, scope: dict, parsed
         "errors": {"api": api_err, "tool": tool_err, "parse": parse_err},
         "delegations": len(spawn_calls),
         "verification": {"runs": verify_runs, "failed": verify_failed,
-                         "rule": "verify-cmd-v1", "provenance": "inferred", "examples": verify_examples},
+                         "rule": "verify-cmd-v2", "provenance": "inferred", "examples": verify_examples},
         "build": {"runs": build_runs, "failed": build_failed,
-                  "rule": "verify-cmd-v1", "provenance": "inferred", "examples": build_examples},
+                  "rule": "verify-cmd-v2", "provenance": "inferred", "examples": build_examples},
         "unclassified_shell": unclassified,
         "retry_loops": {"count": retry_count, "rule": "same-cmd-refail-v1",
                         "provenance": "inferred", "examples": retry_examples},
@@ -345,6 +353,7 @@ def run_trace(sources: list[Path], projects: set[str], out_dir: Path) -> dict:
     delegation_rows: list[dict] = []
     event_type_counts: Counter = Counter()
     unknown_raw_types: Counter = Counter()
+    files_unreadable: dict[str, str] = {}
     record_parse_errors = 0
     replayed_records_skipped = 0
     partial_tail_lines = 0
@@ -354,16 +363,22 @@ def run_trace(sources: list[Path], projects: set[str], out_dir: Path) -> dict:
             continue  # non-transcript kinds are manifested in files_by_kind only (M1)
         scope = scope_of(rel_parts)
         session_kind = TRANSCRIPT_KINDS[kind]
-        parsed = parse_transcript_file(
-            path,
-            file_id=stable_id("file", str(path)),
-            server=None,
-            project=scope["project"],
-            session_id=scope["session_id"],
-            agent_id=scope["agent_id"],
-            workflow_id=scope["workflow_id"],
-            is_sidechain_file=session_kind != "main",
-        )
+        try:
+            parsed = parse_transcript_file(
+                path,
+                file_id=stable_id("file", str(path)),
+                server=None,
+                project=scope["project"],
+                session_id=scope["session_id"],
+                agent_id=scope["agent_id"],
+                workflow_id=scope["workflow_id"],
+                is_sidechain_file=session_kind != "main",
+            )
+        except (OSError, UnicodeDecodeError) as e:
+            # an unreadable/vanished INPUT transcript must not abort the run nor be mislabeled as a
+            # write failure — record it in coverage (§3.8 evidence integrity) and keep going
+            files_unreadable["/".join(rel_parts)] = type(e).__name__
+            continue
         row, dels = _build_session(path, kind, session_kind, scope, parsed)
         session_rows.append(row)
         delegation_rows.extend(dels)
@@ -384,8 +399,11 @@ def run_trace(sources: list[Path], projects: set[str], out_dir: Path) -> dict:
     coverage = {
         "parser_version": PARSER_VERSION,
         "generated_from": sorted(str(s) for s in sources),
+        "sources_missing": sorted(str(s) for s in sources if not s.is_dir()),
         "files_by_kind": dict(sorted(files_by_kind.items())),
         "files_skipped": sum(v for k, v in files_by_kind.items() if k.startswith("unknown_")),
+        "files_unreadable": dict(sorted(files_unreadable.items())),
+        "files_unreadable_total": len(files_unreadable),
         "event_type_counts": dict(sorted(event_type_counts.items())),
         "unknown_raw_types": dict(sorted(unknown_raw_types.items())),
         "record_parse_errors": record_parse_errors,
@@ -420,7 +438,8 @@ _VERDICT_RE = re.compile(r"\b(REAL|REJECTED|NEEDS-RULING)\b", re.IGNORECASE)
 def _parse_triage(feedback_text: str) -> list[dict]:
     """Structured findings from the appended triage table only. Severity is read from the table
     cell (explicit) or left None (unknown) — never keyword-guessed from prose. Returns
-    [{id, severity, status}] where status is the triage verdict (REAL/REJECTED/NEEDS-RULING) or None."""
+    [{id, severity, status, task_id}] where status is the triage verdict (REAL/REJECTED/NEEDS-RULING)
+    or None, and task_id is the linked task-id cell (used to dedup against the finding-derived task)."""
     idx = feedback_text.rfind(_TRIAGE_HEADING)
     if idx < 0:
         return []
@@ -439,7 +458,9 @@ def _parse_triage(feedback_text: str) -> list[dict]:
         if len(cells) > 2:
             vm = _VERDICT_RE.search(cells[2])
             status = vm.group(1).upper() if vm else None
-        out.append({"id": m.group(0), "severity": severity, "status": status})
+        task_id = cells[4].strip().strip("`") if len(cells) > 4 else ""
+        out.append({"id": m.group(0), "severity": severity, "status": status,
+                    "task_id": task_id or None})
     return out
 
 
@@ -495,6 +516,9 @@ def _project_review_rows(name: str, root: Path, cfg: dict) -> list[dict]:
     rows: list[dict] = []
     for rid in round_ids:
         findings: list[dict] = []
+        round_tasks = tasks_by_round.get(rid, [])
+        tasks_by_id = {t["id"]: t for t in round_tasks if t.get("id")}
+        referenced_task_ids: set[str] = set()
         fb = feedback_files.get(rid)
         if fb is not None:
             try:
@@ -502,12 +526,21 @@ def _project_review_rows(name: str, root: Path, cfg: dict) -> list[dict]:
             except OSError:
                 text = ""
             for f in _parse_triage(text):
-                findings.append({
+                entry = {
                     "id": f["id"], "severity": f["severity"], "status": f["status"],
                     "source": "triage",
                     "provenance": "explicit" if f["severity"] else "unknown",
-                })
-        findings.extend(tasks_by_round.get(rid, []))
+                }
+                # dedup: a triage row whose task-id cell names a task that also joins via origin is
+                # ONE finding — keep the triage row (triage severity), annotate its task_id, and drop
+                # the separate task finding so it is not double-counted
+                tid = f["task_id"]
+                if tid and tid in tasks_by_id:
+                    entry["task_id"] = tid
+                    referenced_task_ids.add(tid)
+                findings.append(entry)
+        # finding-derived tasks not referenced by any triage row remain as source "task"
+        findings.extend(t for t in round_tasks if t.get("id") not in referenced_task_ids)
         findings.sort(key=lambda x: (x["source"], x["id"] or ""))
         counts = {"blocker": 0, "major": 0, "minor": 0, "unknown": 0}
         for f in findings:
@@ -534,12 +567,21 @@ def _registry_path() -> Path:
 def run_reviews(registry_path: Path, out_dir: Path) -> dict:
     entries: list = []
     if registry_path.is_file():
+        # a MISSING registry is a fresh install (0 projects, exit 0); an EXISTING but corrupt one is
+        # a degraded state that must fail loud (§3.8), not masquerade as "no registered projects"
         try:
             reg = json.loads(registry_path.read_text(encoding="utf-8"))
-            if isinstance(reg, dict):
-                entries = [e for e in reg.get("projects", []) if isinstance(e, dict)]
-        except (OSError, json.JSONDecodeError):
-            entries = []
+        except (OSError, json.JSONDecodeError) as e:
+            raise WorkflowError(
+                f"registry unreadable/unparseable: {registry_path} ({type(e).__name__})")
+        if not isinstance(reg, dict):
+            raise WorkflowError(
+                f"registry has wrong shape (expected a JSON object): {registry_path}")
+        projects = reg.get("projects", [])
+        if not isinstance(projects, list):
+            raise WorkflowError(
+                f"registry has wrong shape (`projects` must be a list): {registry_path}")
+        entries = [e for e in projects if isinstance(e, dict)]
 
     rows: list[dict] = []
     scanned: list[str] = []
@@ -649,22 +691,29 @@ def _lens_main_direct_work(sessions: list[dict]) -> dict:
 def _lens_verification_debt(sessions: list[dict]) -> dict:
     def runs(s: dict) -> int:
         return (s.get("verification") or {}).get("runs", 0)
+
+    def builds(s: dict) -> int:
+        return (s.get("build") or {}).get("runs", 0)
     per: dict[str, dict] = {}
     for proj, rows in _by_project(sessions).items():
         fw_rows = [s for s in rows if _cat(s, "file_write") > 0]
-        debt = [s for s in fw_rows if runs(s) == 0]
+        # a passing build IS a correctness check — a file-writing session that only compiled is NOT
+        # debt; count those separately as build_only_sessions so the signal isn't lost
+        debt = [s for s in fw_rows if runs(s) == 0 and builds(s) == 0]
+        build_only = [s for s in fw_rows if runs(s) == 0 and builds(s) > 0]
         per[proj] = {
             "sessions": len(rows),
             "file_write_sessions": len(fw_rows),
             "debt_sessions": len(debt),
             "debt_ratio": _ratio(len(debt), len(fw_rows)),
+            "build_only_sessions": len(build_only),
             "unclassified_shell_total": sum(s.get("unclassified_shell", 0) for s in rows),
         }
-    debt_all = [s for s in sessions if _cat(s, "file_write") > 0 and runs(s) == 0]
+    debt_all = [s for s in sessions if _cat(s, "file_write") > 0 and runs(s) == 0 and builds(s) == 0]
     top = sorted(debt_all, key=lambda s: (-_cat(s, "file_write"), s.get("file") or ""))[:5]
     examples = [{"file": s.get("file"), "session_id": s.get("session_id"),
                  "file_write": _cat(s, "file_write")} for s in top]
-    return _lens("verification_debt", "verification-debt-v1", "inferred", per, examples)
+    return _lens("verification_debt", "verification-debt-v2", "inferred", per, examples)
 
 
 def _lens_retry_loops(sessions: list[dict]) -> dict:
@@ -705,7 +754,7 @@ def _lens_context_heavy(sessions: list[dict]) -> dict:
                  "max_result_bytes": ch(s, "max_result_bytes"),
                  "tool_results_over_100kb": ch(s, "tool_results_over_100kb")}
                 for s in top if ch(s, "max_result_bytes") > 0]
-    return _lens("context_heavy", "context-heavy-v1", "explicit", per, examples)
+    return _lens("context_heavy", "context-heavy-v2", "explicit", per, examples)
 
 
 def _deleg_val(v) -> str:
@@ -720,7 +769,11 @@ def _lens_delegation_pattern(delegations: list[dict]) -> dict:
     per: dict[str, dict] = {}
     for proj, rows in _by_project(delegations).items():
         by_tool = Counter(_deleg_val(r.get("tool")) for r in rows)
-        async_count = sum(1 for r in rows if r.get("is_async") is True)
+        # is_async is only known (True/False) when a result record joined; unresolved delegations
+        # carry a provenance-unknown marker (invariant #11) and must NOT deflate the ratio to a
+        # definite 0.0 — compute the ratio only over the known subset, null when all unknown
+        async_known = [r for r in rows if isinstance(r.get("is_async"), bool)]
+        async_count = sum(1 for r in async_known if r.get("is_async") is True)
         per[proj] = {
             "delegations": len(rows),
             "by_tool": dict(sorted(by_tool.items())),
@@ -729,7 +782,8 @@ def _lens_delegation_pattern(delegations: list[dict]) -> dict:
             "by_resolved_model": dict(sorted(Counter(_deleg_val(r.get("resolved_model")) for r in rows).items())),
             "by_status": dict(sorted(Counter(_deleg_val(r.get("status")) for r in rows).items())),
             "async_count": async_count,
-            "async_ratio": _ratio(async_count, len(rows)),
+            "async_unknown": len(rows) - len(async_known),
+            "async_ratio": _ratio(async_count, len(async_known)) if async_known else None,
             "workflow_delegations": by_tool.get("Workflow", 0),
         }
     top = sorted(delegations,
@@ -738,7 +792,7 @@ def _lens_delegation_pattern(delegations: list[dict]) -> dict:
                  "subagent_type": r.get("subagent_type"), "model_requested": r.get("model_requested"),
                  "resolved_model": _deleg_val(r.get("resolved_model")),
                  "status": _deleg_val(r.get("status"))} for r in top]
-    return _lens("delegation_pattern", "delegation-pattern-v1", "explicit", per, examples)
+    return _lens("delegation_pattern", "delegation-pattern-v2", "explicit", per, examples)
 
 
 def _lens_error_landscape(sessions: list[dict]) -> dict:
@@ -790,7 +844,7 @@ def _lens_review_association(reviews: list[dict]) -> dict:
     examples = [{"file": r.get("feedback_file") or r.get("request_file"),
                  "round_id": r.get("round_id"), "session_id": {"provenance": "unknown"}}
                 for r in top]
-    return _lens("review_association", "review-association-v1", "explicit", per, examples)
+    return _lens("review_association", "review-association-v2", "explicit", per, examples)
 
 
 def _lens_coverage_caveats(coverage: dict) -> dict:
@@ -917,15 +971,37 @@ def _default_out() -> Path:
     return Path.home() / ".claude" / "jahns-workflow" / "improve"
 
 
+def _residence_checked(value: str | None, flag: str) -> Path:
+    """Resolve an --out/--in dir, refusing a RELATIVE path (design §14 residence rule): improve
+    outputs are plugin-local behavioral evidence and must never land in a cwd/shared repo. Absolute
+    paths (and the default when value is None) are fine."""
+    if value is None:
+        return _default_out()
+    p = Path(value).expanduser()
+    if not p.is_absolute():
+        raise WorkflowError(
+            f"{flag} must be an absolute path — a relative path would write behavioral evidence "
+            f"into the current directory (improve outputs are plugin-local): {value!r}")
+    return p
+
+
 def _cli_trace(argv: list[str]) -> int:
     try:
         raw_sources, projects, out = _parse_trace_args(argv)
+        out_dir = _residence_checked(out, "--out")
     except WorkflowError as e:
         print(f"jw improve trace: {e}", file=sys.stderr)
         return 1
 
     if raw_sources:
         sources = [Path(s).expanduser().resolve() for s in raw_sources]
+        # an EXPLICITLY-named source that is not a directory is a precondition failure (exit 1); the
+        # default source may legitimately be absent on a fresh machine (recorded in sources_missing)
+        missing = [s for s in sources if not s.is_dir()]
+        if missing:
+            print("jw improve trace: --source not a directory: "
+                  + ", ".join(str(m) for m in missing), file=sys.stderr)
+            return 1
     else:
         base = os.environ.get("CLAUDE_CONFIG_DIR")
         base_path = Path(base) if base else Path.home() / ".claude"
@@ -933,8 +1009,6 @@ def _cli_trace(argv: list[str]) -> int:
     # dedupe while preserving order (a source passed twice must not double-count)
     seen: set[str] = set()
     sources = [s for s in sources if not (str(s) in seen or seen.add(str(s)))]
-
-    out_dir = Path(out).expanduser() if out else _default_out()
 
     try:
         cov = run_trace(sources, projects, out_dir)
@@ -950,12 +1024,15 @@ def _cli_trace(argv: list[str]) -> int:
 def _cli_reviews(argv: list[str]) -> int:
     try:
         out = _parse_single_opt(argv, "--out")
+        out_dir = _residence_checked(out, "--out")
     except WorkflowError as e:
         print(f"jw improve reviews: {e}", file=sys.stderr)
         return 1
-    out_dir = Path(out).expanduser() if out else _default_out()
     try:
         cov = run_reviews(_registry_path(), out_dir)
+    except WorkflowError as e:
+        print(f"jw improve reviews: {e}", file=sys.stderr)
+        return 1
     except OSError as e:
         print(f"jw improve reviews: cannot write outputs — {e}", file=sys.stderr)
         return 2
@@ -969,10 +1046,10 @@ def _cli_reviews(argv: list[str]) -> int:
 def _cli_audit(argv: list[str]) -> int:
     try:
         inp = _parse_single_opt(argv, "--in")
+        in_dir = _residence_checked(inp, "--in")
     except WorkflowError as e:
         print(f"jw improve audit: {e}", file=sys.stderr)
         return 1
-    in_dir = Path(inp).expanduser() if inp else _default_out()
     if not in_dir.is_dir():
         print(f"jw improve audit: input dir does not exist: {in_dir} "
               f"(run `jw improve trace`/`reviews` first)", file=sys.stderr)
@@ -1022,10 +1099,10 @@ def _parse_decide_args(argv: list[str]) -> tuple[str, str, str | None, str | Non
 def _cli_decide(argv: list[str]) -> int:
     try:
         rec_id, decision, title, note, out = _parse_decide_args(argv)
+        out_dir = _residence_checked(out, "--out")
     except WorkflowError as e:
         print(f"jw improve decide: {e}", file=sys.stderr)
         return 1
-    out_dir = Path(out).expanduser() if out else _default_out()
     try:
         rec = run_decide(rec_id, decision, title, note, out_dir)
     except OSError as e:
