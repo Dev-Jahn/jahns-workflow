@@ -17,6 +17,7 @@ See dev_docs/0.8.0-m1-implementation-notes.md for the binding spec.
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -664,18 +665,42 @@ def _run_companion(worktree: Path, args: list[str], record_dir: Path) -> tuple[i
     return p.returncode, p.stdout
 
 
-def _normalize_verify_worktree(worktree: Path, rec: Path, contract: dict) -> None:
+def _validate_verify_contract(rec: Path, contract: dict, exposure: dict) -> Path | None:
+    """Validate every contract field trusted by worktree normalization before mutating the tree."""
+    if type(contract.get("empty")) is not bool:
+        raise WorkflowError("delegation contract field empty must be a bool")
+    for field in ("base_sha", "result_sha"):
+        value = contract.get(field)
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-fA-F]{40}", value) is None:
+            raise WorkflowError(f"delegation contract field {field} must be a 40-hex sha")
+    base = exposure.get("base")
+    snapshot_sha = base.get("snapshot_sha") if isinstance(base, dict) else None
+    if contract["base_sha"] != snapshot_sha:
+        raise WorkflowError(
+            "delegation contract field base_sha does not match exposure field base.snapshot_sha")
+    if contract["empty"]:
+        return None
+    patch_name = contract.get("patch_file")
+    if (not isinstance(patch_name, str) or not patch_name
+            or Path(patch_name).name != patch_name):
+        raise WorkflowError(
+            "delegation contract field patch_file must name an artifact file when empty is false")
+    patch = rec / "artifact" / patch_name
+    if not patch.is_file():
+        raise WorkflowError(
+            f"delegation contract field patch_file does not exist when empty is false: {patch}")
+    return patch
+
+
+def _normalize_verify_worktree(worktree: Path, contract: dict, patch: Path | None) -> None:
     """Restore HEAD=delegation base and working tree=result, regardless of delegate commits (S21)."""
-    base_sha = contract.get("base_sha")
-    if not isinstance(base_sha, str) or not base_sha:
-        raise WorkflowError("delegation contract has no base_sha — cannot normalize verifier worktree")
+    base_sha = contract["base_sha"]
     for args in (("checkout", "--force", "--detach", base_sha), ("clean", "-fd")):
         rc, out, err = _git(worktree, *args)
         if rc != 0:
             raise WorkflowError(
                 f"verify worktree normalization failed at git {args[0]}: {err or out or f'rc {rc}'}")
-    if not contract.get("empty"):
-        patch = rec / "artifact" / "changes.patch"
+    if patch is not None:
         rc, out, err = _git(worktree, "apply", str(patch))
         if rc != 0:
             raise WorkflowError(
@@ -767,46 +792,103 @@ def _verify_paths(rec: Path) -> list[Path]:
                   key=number)
 
 
+def _acquire_verify_lock(rec: Path):
+    """Serialize verify with an OS lock; an unlocked marker left by a dead process is stale."""
+    lock = rec / "verify.lock"
+    try:
+        stream = lock.open("a+", encoding="utf-8")
+    except OSError as e:
+        raise _RefusedWrite(f"cannot create delegation verify lock {lock}: {e}")
+    try:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        stream.close()
+        raise WorkflowError(f"delegation {rec.name} verify already in progress")
+    except OSError as e:
+        stream.close()
+        raise _RefusedWrite(f"cannot lock delegation verify marker {lock}: {e}")
+    try:
+        stream.seek(0)
+        stream.truncate()
+        stream.write(f"pid={os.getpid()} at={_now_iso()}\n")
+        stream.flush()
+    except OSError as e:
+        stream.close()
+        raise _RefusedWrite(f"cannot write delegation verify lock {lock}: {e}")
+    return lock, stream
+
+
+def _release_verify_lock(lock: Path, stream) -> None:
+    try:
+        lock.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        print(f"jw delegate verify: could not remove verify lock {lock} ({e})", file=sys.stderr)
+    finally:
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        finally:
+            stream.close()
+
+
+def _write_verify_artifact(rec: Path, artifact: dict) -> Path:
+    """Create the next verify artifact without overwriting a concurrently appearing filename."""
+    n = len(_verify_paths(rec)) + 1
+    content = json.dumps(artifact, ensure_ascii=False, indent=2) + "\n"
+    while True:
+        out = rec / "artifact" / f"verify-{n}.json"
+        try:
+            with out.open("x", encoding="utf-8") as f:
+                f.write(content)
+            return out
+        except FileExistsError:
+            n += 1
+        except OSError as e:
+            raise _RefusedWrite(f"cannot write verifier artifact {out}: {e}")
+
+
 def verify_delegation(root: Path, did: str) -> int:
     rec = _load_delegation(root, did)
     state = _read_status(rec).get("state")
     if state != "needs-review":
         raise WorkflowError(
             f"delegation {did} is {state} — only a needs-review delegation can be verified")
-    profile, _fingerprint = _load_profile()
-    binding = _resolve_verifier_binding(profile)
-    script = _companion_script()
-    contract = _load_contract(rec)
-    worktree = _worktree_path(root, did)
-    _normalize_verify_worktree(worktree, rec, contract)
-    focus = _verify_focus(rec, contract)
-    model = binding["backend"].split(":", 1)[1]
-    args = ["node", str(script), "adversarial-review", "--json", "--wait", "--scope",
-            "working-tree", "-C", str(worktree), "-m", model, focus]
-    rc, stdout = _run_companion(worktree, args, rec)
-    cleanup = _cleanup_companion_broker(worktree)
-    print(cleanup)
-    if rc != 0:
-        raise WorkflowError(
-            f"independent verifier failed (rc {rc}) — delegation remains needs-review")
+    lock, lock_stream = _acquire_verify_lock(rec)
     try:
-        payload = json.loads(stdout)
-    except json.JSONDecodeError as e:
-        raise WorkflowError(
-            f"independent verifier returned invalid JSON ({e}) — delegation remains needs-review")
-    n = len(_verify_paths(rec)) + 1
-    artifact = {
-        "schema": "jw-verify-1", "at": _now_iso(),
-        "transport": "codex-companion:adversarial-review", "backend": binding["backend"],
-        "provenance": "independent-verifier", "payload": payload,
-    }
-    out = rec / "artifact" / f"verify-{n}.json"
-    try:
-        out.write_text(json.dumps(artifact, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    except OSError as e:
-        raise _RefusedWrite(f"cannot write verifier artifact {out}: {e}")
-    print(f"verify_artifact: {out}")
-    return 0
+        profile, _fingerprint = _load_profile()
+        binding = _resolve_verifier_binding(profile)
+        script = _companion_script()
+        contract = _load_contract(rec)
+        exposure = _load_exposure(rec)
+        patch = _validate_verify_contract(rec, contract, exposure)
+        worktree = _worktree_path(root, did)
+        _normalize_verify_worktree(worktree, contract, patch)
+        focus = _verify_focus(rec, contract)
+        model = binding["backend"].split(":", 1)[1]
+        args = ["node", str(script), "adversarial-review", "--json", "--wait", "--scope",
+                "working-tree", "-C", str(worktree), "-m", model, focus]
+        rc, stdout = _run_companion(worktree, args, rec)
+        cleanup = _cleanup_companion_broker(worktree)
+        print(cleanup)
+        if rc != 0:
+            raise WorkflowError(
+                f"independent verifier failed (rc {rc}) — delegation remains needs-review")
+        try:
+            payload = json.loads(stdout)
+        except json.JSONDecodeError as e:
+            raise WorkflowError(
+                f"independent verifier returned invalid JSON ({e}) — delegation remains needs-review")
+        artifact = {
+            "schema": "jw-verify-1", "at": _now_iso(),
+            "transport": "codex-companion:adversarial-review", "backend": binding["backend"],
+            "provenance": "independent-verifier", "payload": payload,
+        }
+        out = _write_verify_artifact(rec, artifact)
+        print(f"verify_artifact: {out}")
+        return 0
+    finally:
+        _release_verify_lock(lock, lock_stream)
 
 
 # ---- evaluation path (§12 — apply/discard/show/status) ------------------------

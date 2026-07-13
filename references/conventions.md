@@ -157,7 +157,8 @@ brought back through an explicit artifact contract. The invariants:
 - **Role sandboxes are fixed, not user knobs.** The implementer runs `workspace-write`; the verifier
   runs `read-only` through codex-companion. `jw delegate verify` records its payload as
   *independent-verifier* evidence and leaves the delegation `needs-review` — only the user chooses
-  apply or discard.
+  apply or discard. A per-record `verify.lock` admits only one verifier at a time. The OS releases
+  the lock if its process dies; an unlocked leftover marker is stale and reclaimed on the next try.
 - **You accept or discard.** A finished delegation is `needs-review`, its worktree preserved so a
   verifier can run the acceptance criteria against the same base. `jw delegate apply` lands the
   patch on the live tree with plain `git apply` (it fails atomically if the tree has drifted from

@@ -4611,6 +4611,155 @@ class DelegateVerifyTests(unittest.TestCase):
             self.assertEqual(artifact["provenance"], "independent-verifier")
             self.assertEqual(artifact["payload"]["verdict"], "challenge")
 
+    def test_contract_empty_must_be_bool_before_normalization(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home, rec, worktree, plugin = self._setup(d, committed=False)
+            contract_path = rec / "artifact" / "contract.yaml"
+            contract = yaml.safe_load(contract_path.read_text())
+            contract["empty"] = "false"
+            contract_path.write_text(yaml.safe_dump(contract, sort_keys=False))
+            called = {"n": 0}
+
+            def fake(*args):
+                called["n"] += 1
+                return (0, "{}")
+
+            with self.assertRaises(jw_delegate.WorkflowError) as cm:
+                _run_with_home(home, lambda: self._with_companion(
+                    fake, lambda: jw_delegate.verify_delegation(root, rec.name)))
+            self.assertIn("empty", str(cm.exception))
+            self.assertEqual(called["n"], 0)
+
+    def test_contract_shas_are_strict_and_base_matches_exposure(self):
+        cases = (
+            ("base_sha", "short", "base_sha"),
+            ("result_sha", "not-a-sha", "result_sha"),
+            ("base_sha", "result", "exposure"),
+        )
+        for field, value, needle in cases:
+            with self.subTest(field=field, value=value), tempfile.TemporaryDirectory() as d:
+                root, home, rec, worktree, plugin = self._setup(d, committed=False)
+                contract_path = rec / "artifact" / "contract.yaml"
+                contract = yaml.safe_load(contract_path.read_text())
+                contract[field] = contract["result_sha"] if value == "result" else value
+                contract_path.write_text(yaml.safe_dump(contract, sort_keys=False))
+                called = {"n": 0}
+
+                def fake(*args):
+                    called["n"] += 1
+                    return (0, "{}")
+
+                with self.assertRaises(jw_delegate.WorkflowError) as cm:
+                    _run_with_home(home, lambda: self._with_companion(
+                        fake, lambda: jw_delegate.verify_delegation(root, rec.name)))
+                self.assertIn(needle, str(cm.exception))
+                self.assertEqual(called["n"], 0)
+
+    def test_contract_nonempty_requires_named_patch_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home, rec, worktree, plugin = self._setup(d, committed=False)
+            (rec / "artifact" / "changes.patch").unlink()
+            called = {"n": 0}
+
+            def fake(*args):
+                called["n"] += 1
+                return (0, "{}")
+
+            with self.assertRaises(jw_delegate.WorkflowError) as cm:
+                _run_with_home(home, lambda: self._with_companion(
+                    fake, lambda: jw_delegate.verify_delegation(root, rec.name)))
+            self.assertIn("patch_file", str(cm.exception))
+            self.assertEqual(called["n"], 0)
+
+    def test_concurrent_verify_is_refused_by_record_lock(self):
+        import threading
+        with tempfile.TemporaryDirectory() as d:
+            root, home, rec, worktree, plugin = self._setup(d, committed=False)
+            entered = threading.Event()
+            release = threading.Event()
+            calls_lock = threading.Lock()
+            calls = {"n": 0}
+            first_errors = []
+
+            def fake(*args):
+                with calls_lock:
+                    calls["n"] += 1
+                    number = calls["n"]
+                if number == 1:
+                    entered.set()
+                    release.wait(5)
+                return (0, _json.dumps({"run": number}))
+
+            def exercise():
+                def first():
+                    try:
+                        jw_delegate.verify_delegation(root, rec.name)
+                    except Exception as e:  # captured for assertion in the main test thread
+                        first_errors.append(e)
+
+                orig = jw_delegate._run_companion
+                jw_delegate._run_companion = fake
+                thread = threading.Thread(target=first)
+                try:
+                    thread.start()
+                    self.assertTrue(entered.wait(5))
+                    with self.assertRaises(jw_delegate.WorkflowError) as cm:
+                        jw_delegate.verify_delegation(root, rec.name)
+                    self.assertIn("verify already in progress", str(cm.exception))
+                finally:
+                    release.set()
+                    thread.join(5)
+                    jw_delegate._run_companion = orig
+                self.assertFalse(thread.is_alive())
+
+            _run_with_home(home, exercise)
+            self.assertEqual(first_errors, [])
+            self.assertEqual(calls["n"], 1)
+
+    def test_stale_verify_lock_is_reclaimed(self):
+        import os
+        with tempfile.TemporaryDirectory() as d:
+            root, home, rec, worktree, plugin = self._setup(d, committed=False)
+            lock = rec / "verify.lock"
+            lock.write_text("stale fixture\n")
+            os.utime(lock, (0, 0))
+
+            def fake(*args):
+                return (0, "{}")
+
+            _run_with_home(home, lambda: self._with_companion(
+                fake, lambda: jw_delegate.verify_delegation(root, rec.name)))
+            self.assertFalse(lock.exists())
+
+    def test_verify_artifact_name_collision_never_overwrites(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home, rec, worktree, plugin = self._setup(d, committed=False)
+            sentinel = {"sentinel": True}
+            injected = {"done": False}
+            orig_paths = jw_delegate._verify_paths
+
+            def raced_paths(record_dir):
+                paths = orig_paths(record_dir)
+                if not injected["done"]:
+                    injected["done"] = True
+                    (record_dir / "artifact" / "verify-1.json").write_text(
+                        _json.dumps(sentinel) + "\n")
+                return paths
+
+            def fake(*args):
+                return (0, _json.dumps({"run": "new"}))
+
+            jw_delegate._verify_paths = raced_paths
+            try:
+                _run_with_home(home, lambda: self._with_companion(
+                    fake, lambda: jw_delegate.verify_delegation(root, rec.name)))
+            finally:
+                jw_delegate._verify_paths = orig_paths
+            self.assertEqual(_json.loads((rec / "artifact" / "verify-1.json").read_text()), sentinel)
+            self.assertEqual(
+                _json.loads((rec / "artifact" / "verify-2.json").read_text())["payload"]["run"],
+                "new")
+
     def test_repeated_verify_increments_and_show_surfaces_latest(self):
         with tempfile.TemporaryDirectory() as d:
             root, home, rec, worktree, plugin = self._setup(d, committed=False)
