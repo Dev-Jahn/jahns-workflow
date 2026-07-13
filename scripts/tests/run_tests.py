@@ -23,6 +23,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 import jw_cclog  # noqa: E402
 import jw_common  # noqa: E402
+import jw_delegate  # noqa: E402
 import jw_improve  # noqa: E402
 import jw_lanes  # noqa: E402
 import jw_merge  # noqa: E402
@@ -2953,6 +2954,105 @@ class AcceptFieldTests(unittest.TestCase):
             rc = jw_tasks.main(["set", "feat/alpha", "accept", "some criterion", str(root)])
             self.assertEqual(rc, 1)
             self.assertEqual((root / "tasks.yaml").read_text(), before)
+
+
+class DelegateSnapshotTests(unittest.TestCase):
+    """0.8.0 M1 §3 — snapshot primitive (temp-index read-tree-HEAD seeding). Real temp git repos."""
+
+    def _repo(self, d) -> Path:
+        root = Path(d)
+        init_repo(root)
+        return root
+
+    def test_clean_tree_shortcut(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self._repo(d)
+            head = git(root, "rev-parse", "HEAD").stdout.strip()
+            before = git(root, "rev-list", "--count", "HEAD").stdout.strip()
+            sha, dirty = jw_delegate._snapshot(root, "snap")
+            self.assertFalse(dirty)
+            self.assertEqual(sha, head)  # no snapshot commit created
+            self.assertEqual(git(root, "rev-list", "--count", "HEAD").stdout.strip(), before)
+
+    def test_dirty_includes_untracked_and_staged_excludes_ignored(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self._repo(d)
+            (root / "f.txt").write_text("MODIFIED")           # tracked modification
+            (root / "new_untracked.txt").write_text("wip")    # untracked, non-ignored
+            (root / ".gitignore").write_text("secret.txt\n")
+            (root / "secret.txt").write_text("nope")          # ignored
+            (root / "staged.txt").write_text("stg")
+            git(root, "add", "staged.txt")                    # staged addition
+            sha, dirty = jw_delegate._snapshot(root, "snap")
+            self.assertTrue(dirty)
+            tree = git(root, "ls-tree", "-r", "--name-only", sha).stdout.split()
+            self.assertIn("new_untracked.txt", tree)
+            self.assertIn("staged.txt", tree)
+            self.assertNotIn("secret.txt", tree)
+            self.assertEqual(git(root, "show", f"{sha}:f.txt").stdout, "MODIFIED")
+
+    def test_live_tree_and_index_unchanged(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self._repo(d)
+            (root / "f.txt").write_text("MODIFIED")
+            (root / "new.txt").write_text("wip")
+            git(root, "add", "new.txt")
+            status_before = git(root, "status", "--porcelain").stdout
+            head_before = git(root, "rev-parse", "HEAD").stdout
+            jw_delegate._snapshot(root, "snap")
+            self.assertEqual(git(root, "status", "--porcelain").stdout, status_before)
+            self.assertEqual(git(root, "rev-parse", "HEAD").stdout, head_before)
+
+    def test_precondition_unborn_head(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            git(root, "init", "-q", "-b", "main")
+            with self.assertRaises(jw_delegate.WorkflowError):
+                jw_delegate._check_snapshot_preconditions(root)
+
+    def test_precondition_submodule(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self._repo(d)
+            (root / ".gitmodules").write_text("[submodule \"x\"]\n")
+            with self.assertRaises(jw_delegate.WorkflowError):
+                jw_delegate._check_snapshot_preconditions(root)
+
+    def test_precondition_unmerged_index(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self._repo(d)
+            git(root, "checkout", "-q", "-b", "other")
+            (root / "f.txt").write_text("other-side")
+            git(root, "commit", "-qam", "other")
+            git(root, "checkout", "-q", "main")
+            (root / "f.txt").write_text("main-side")
+            git(root, "commit", "-qam", "main")
+            git(root, "merge", "other")  # conflicts -> unmerged entries
+            self.assertTrue(git(root, "ls-files", "-u").stdout.strip())
+            with self.assertRaises(jw_delegate.WorkflowError):
+                jw_delegate._check_snapshot_preconditions(root)
+
+    def test_precondition_rebase_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self._repo(d)
+            (root / ".git" / "rebase-merge").mkdir()
+            with self.assertRaises(jw_delegate.WorkflowError):
+                jw_delegate._check_snapshot_preconditions(root)
+
+    def test_precondition_cherry_pick_head(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self._repo(d)
+            (root / ".git" / "CHERRY_PICK_HEAD").write_text("deadbeef\n")
+            with self.assertRaises(jw_delegate.WorkflowError):
+                jw_delegate._check_snapshot_preconditions(root)
+
+    def test_preconditions_pass_on_clean_repo(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self._repo(d)
+            jw_delegate._check_snapshot_preconditions(root)  # no raise
+
+    def test_make_did_shape(self):
+        did = jw_delegate._make_did("feat/xyz")
+        self.assertRegex(did, r"^\d{8}T\d{6}Z-feat-xyz$")
 
 
 if __name__ == "__main__":
