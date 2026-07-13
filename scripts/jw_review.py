@@ -643,8 +643,9 @@ def ingest(root: Path, round_id: str | None, src: Path = INBOX, reviewer: str | 
     try:
         import jw_overlay
         jw_overlay.evaluate_boundary(root, "review-ingest", {"round_id": round_id})
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as e:  # noqa: BLE001
+        print(f"jw_review ingest: overlay warning unavailable ({e}) — ingest still succeeded",
+              file=sys.stderr)
     return 0
 
 

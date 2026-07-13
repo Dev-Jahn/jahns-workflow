@@ -495,16 +495,14 @@ def _diff_patch(cwd: Path, base: str, result: str) -> bytes:
 
 
 def _active_overlays(root: Path) -> list[dict]:
-    """Active (observing/warning) overlay deltas at run time, recorded in exposure (§9). Best-effort:
-    a broken overlay store must not fail the delegation — record an empty list."""
-    try:
-        import jw_overlay
-        return [{"id": d["id"], "status": d["status"]} for d in jw_overlay.active_deltas(root)]
-    except Exception:  # noqa: BLE001
-        return []
+    """Active overlay deltas at run time; corrupt records fail immutable exposure capture loud."""
+    import jw_overlay
+    return [{"id": d["id"], "status": d["status"]}
+            for d in jw_overlay.active_deltas_for_exposure(root)]
 
 
-def _write_exposure(record_dir, did, root, packet, task_id, head_sha, base_sha, dirty, binding, fingerprint):
+def _write_exposure(record_dir, did, root, packet, task_id, head_sha, base_sha, dirty, binding,
+                    fingerprint, overlays):
     exposure = {
         "schema": "jw-exposure-1", "delegation_id": did, "at": _now_iso(),
         "project": {"pslug": _project_slug(root), "root": str(root.resolve()), "name": packet["project"]["name"]},
@@ -514,7 +512,7 @@ def _write_exposure(record_dir, did, root, packet, task_id, head_sha, base_sha, 
         "binding": binding,
         "profile_fingerprint": fingerprint,
         "sandbox": "workspace-write",
-        "overlays": _active_overlays(root), "guards": None, "waivers": [],
+        "overlays": overlays, "guards": None, "waivers": [],
     }
     (record_dir / "exposure.json").write_text(
         json.dumps(exposure, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -544,6 +542,7 @@ def run_delegation(root: Path, task_id: str, role: str, accept_flags: list[str])
         raise WorkflowError(
             f"task {task_id} already has active delegation {active[0]} (state {active[1]}) — "
             f"apply or discard it first")
+    overlays = _active_overlays(root)
 
     did = _make_did(task_id)
     base_did, n = did, 2
@@ -566,7 +565,8 @@ def run_delegation(root: Path, task_id: str, role: str, accept_flags: list[str])
 
     (record_dir / "packet.yaml").write_text(
         yaml.safe_dump(packet, sort_keys=False, allow_unicode=True), encoding="utf-8")
-    _write_exposure(record_dir, did, root, packet, task_id, head_sha, base_sha, dirty, binding, fingerprint)
+    _write_exposure(record_dir, did, root, packet, task_id, head_sha, base_sha, dirty, binding,
+                    fingerprint, overlays)
     _set_state(record_dir, "running")
 
     env_kind, env_commands = _resolve_env_prep(worktree_path, cfg)
@@ -629,8 +629,9 @@ def _warn_boundary(root: Path, boundary: str, context: dict) -> None:
     try:
         import jw_overlay
         jw_overlay.evaluate_boundary(root, boundary, context)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as e:  # noqa: BLE001
+        print(f"jw delegate: overlay warning unavailable at {boundary} ({e}) — host command continued",
+              file=sys.stderr)
 
 
 # ---- independent verifier (§11 — same-base codex-companion transport) --------

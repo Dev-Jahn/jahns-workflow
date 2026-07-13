@@ -204,6 +204,28 @@ def active_deltas(root: Path) -> list[dict]:
     return [d for d in list_deltas(root) if not d.get("corrupt") and d.get("status") in ACTIVE_STATUSES]
 
 
+def active_deltas_for_exposure(root: Path) -> list[dict]:
+    """Strict active-delta scan for immutable exposure capture; one corrupt record fails the run."""
+    ddir = _deltas_dir(root)
+    out: list[dict] = []
+    if not ddir.is_dir():
+        return out
+    for p in sorted(ddir.glob("*.json")):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            raise WorkflowError(f"corrupt delta file {p} ({e})")
+        if (not isinstance(data, dict) or data.get("schema") != "jw-delta-1"
+                or not isinstance(data.get("id"), str)
+                or DELTA_ID_RE.fullmatch(data["id"]) is None
+                or data.get("status") not in DELTA_STATUSES
+                or not isinstance(data.get("rule"), str)):
+            raise WorkflowError(f"corrupt delta file {p}")
+        if data["status"] in ACTIVE_STATUSES:
+            out.append(data)
+    return out
+
+
 def add_delta(root: Path, delta_id: str, *, rule: str, summary: str, pointers=None,
               expected_effect: str = "", risk: str = "", candidate_scope: str = "unresolved",
               observed_in=None, from_rec: str | None = None, title: str = "") -> dict:
@@ -456,15 +478,24 @@ def evaluate_boundary(root: Path, boundary: str, context: dict) -> list[dict]:
 
 
 def _evaluate_boundary(root: Path, boundary: str, context: dict) -> list[dict]:
-    relevant = [d for d in active_deltas(root)
+    active = active_deltas(root)
+    events: list[dict] = []
+    for d in sorted((d for d in active if d.get("rule") not in RULES),
+                    key=lambda d: d.get("id", "")):
+        rule_id = d.get("rule")
+        message = f"active delta references unknown rule {rule_id!r} and could not be evaluated"
+        events.append(_emit(root, boundary, d.get("id", "(missing-id)"), rule_id,
+                            d["status"], "evaluation-error", message, {}))
+        print(f"jw warn [{d.get('id', '(missing-id)')}]: {message}", file=sys.stderr)
+
+    relevant = [d for d in active
                 if boundary in RULES.get(d.get("rule"), {}).get("boundaries", set())]
     if not relevant:
-        return []
+        return events
     by_rule: dict[str, list[dict]] = {}
     for d in relevant:
         by_rule.setdefault(d["rule"], []).append(d)
 
-    events: list[dict] = []
     for rule_id, group in sorted(by_rule.items()):
         # S9 least-restrictive: observing overrides warning; a representative delta carries the fire id
         observing = sorted((d for d in group if d["status"] == "observing"), key=lambda d: d["id"])

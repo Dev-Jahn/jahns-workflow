@@ -267,13 +267,19 @@ def close(root: Path, round_id: str, done: list[str], touched: list[str], commit
     # M2 §9/§6: record the round exposure and evaluate overlay warns at the round-close boundary.
     # Both are best-effort — an exposure/warn failure must NOT roll back an already-completed close
     # (S11/S5). The exposure guard names its failure so it stays visible.
-    import jw_overlay
     try:
+        import jw_overlay
         jw_overlay.write_round_exposure(root, round_id, git_full_sha(root, "HEAD"), full)
     except Exception as e:  # noqa: BLE001
         print(f"jw_round close: round exposure not recorded ({e}) — close still succeeded",
               file=sys.stderr)
-    jw_overlay.evaluate_boundary(root, "round-close", {"round_id": round_id, "closing_task_ids": done})
+    try:
+        import jw_overlay
+        jw_overlay.evaluate_boundary(
+            root, "round-close", {"round_id": round_id, "closing_task_ids": done})
+    except Exception as e:  # noqa: BLE001
+        print(f"jw_round close: overlay warning unavailable ({e}) — close still succeeded",
+              file=sys.stderr)
     return 0
 
 

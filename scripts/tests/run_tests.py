@@ -1103,6 +1103,26 @@ class IngestTests(unittest.TestCase):
             self.assertEqual(jw_review.ingest(root, None, src=src), 0)
             self.assertTrue((rdir / "2026-06-20-a-feedback.md").is_file())
 
+    def test_warn_failure_is_noticed_without_changing_ingest_exit(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root(d)
+            src = root / "inbox.md"
+            src.write_bytes(b"review body")
+            orig = jw_overlay.evaluate_boundary
+            jw_overlay.evaluate_boundary = lambda *a, **k: (_ for _ in ()).throw(
+                RuntimeError("synthetic warn crash"))
+            err = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                    rc = jw_review.ingest(root, "2026-06-22-x", src=src)
+            finally:
+                jw_overlay.evaluate_boundary = orig
+            self.assertEqual(rc, 0)
+            self.assertIn("overlay warning", err.getvalue())
+            self.assertIn("synthetic warn crash", err.getvalue())
+
 
 class FrozenAcceptanceTests(unittest.TestCase):
     """The frozen v0.2 acceptance boundaries (GPT 6th review) — A: PR reducer, B: YAML mutation,
@@ -4159,6 +4179,29 @@ class BoundaryWarnTests(unittest.TestCase):
                 jw_overlay.active_deltas = orig
             self.assertEqual(events, [])  # swallowed, host flow protected
 
+    def test_unknown_active_rule_logs_evaluation_error_and_notice(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _deleg_project(d)
+            _run_with_home(home, lambda: jw_overlay.add_delta(
+                root, "verification_debt/future", rule="delegation-verification-evidence-v1",
+                summary="s"))
+            delta = _run_with_home(
+                home, lambda: jw_overlay.load_delta(root, "verification_debt/future"))
+            delta["rule"] = "future-rule-v9"
+            _run_with_home(home, lambda: jw_overlay._write_delta(root, delta))
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                rc = _run_with_home(
+                    home, lambda: jw_overlay.main(["check", "--root", str(root)]))
+            self.assertEqual(rc, 0)
+            rows = _read_warnings(root, home)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["event"], "evaluation-error")
+            self.assertEqual(rows[0]["rule"], "future-rule-v9")
+            self.assertIn("future-rule-v9", err.getvalue())
+
     def test_conflict_least_restrictive(self):
         with tempfile.TemporaryDirectory() as d:
             root, home, did = self._deleg_needs_review(d, report=None)
@@ -4225,6 +4268,75 @@ class BoundaryWarnTests(unittest.TestCase):
             rows = _read_warnings(root, home)
             self.assertTrue(any(r["boundary"] == "round-close" and r["event"] == "fire" for r in rows))
 
+    def test_round_close_warn_engine_failure_keeps_committed_close_success(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _round_review_project(d)
+            orig = jw_overlay.evaluate_boundary
+            jw_overlay.evaluate_boundary = lambda *a, **k: (_ for _ in ()).throw(
+                RuntimeError("synthetic warn crash"))
+            err = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                    rc = _run_with_home(home, lambda: jw_round.close(
+                        root, "2026-01-02-close", done=["chore/close-me"], touched=[], commit="HEAD"))
+            finally:
+                jw_overlay.evaluate_boundary = orig
+            self.assertEqual(rc, 0)
+            self.assertEqual(jw_common.load_tasks(root)["tasks"][0]["status"], "done")
+            self.assertIn("overlay warning", err.getvalue())
+            self.assertIn("synthetic warn crash", err.getvalue())
+
+    def test_round_close_warn_import_failure_keeps_committed_close_success(self):
+        import builtins
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _round_review_project(d)
+            orig_import = builtins.__import__
+
+            def fake_import(name, *args, **kwargs):
+                if name == "jw_overlay":
+                    raise ImportError("synthetic overlay import failure")
+                return orig_import(name, *args, **kwargs)
+
+            err = io.StringIO()
+            builtins.__import__ = fake_import
+            try:
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                    rc = _run_with_home(home, lambda: jw_round.close(
+                        root, "2026-01-02-close", done=["chore/close-me"], touched=[], commit="HEAD"))
+            finally:
+                builtins.__import__ = orig_import
+            self.assertEqual(rc, 0)
+            self.assertEqual(jw_common.load_tasks(root)["tasks"][0]["status"], "done")
+            self.assertIn("overlay warning", err.getvalue())
+            self.assertIn("synthetic overlay import failure", err.getvalue())
+
+    def test_delegate_warn_failures_are_noticed_without_changing_host_exit(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _deleg_project(d)
+            orig = jw_overlay.evaluate_boundary
+            jw_overlay.evaluate_boundary = lambda *a, **k: (_ for _ in ()).throw(
+                RuntimeError("synthetic warn crash"))
+            err = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                    self.assertEqual(
+                        _deleg_run(root, home, _deleg_fake({"impl.py": "x\n"})), 0)
+                    rec = _latest_rec(root, home)
+                    self.assertEqual(
+                        _run_with_home(
+                            home, lambda: jw_delegate.apply_delegation(root, rec.name)), 0)
+            finally:
+                jw_overlay.evaluate_boundary = orig
+            self.assertIn("delegate-run", err.getvalue())
+            self.assertIn("delegate-apply", err.getvalue())
+            self.assertEqual(err.getvalue().count("synthetic warn crash"), 2)
+
     def test_review_ingest_boundary(self):
         with tempfile.TemporaryDirectory() as d:
             root, home = _round_review_project(d)
@@ -4249,6 +4361,25 @@ class DelegateExposureOverlayTests(unittest.TestCase):
             rec = _latest_rec(root, home)
             exp = _json.loads((rec / "exposure.json").read_text())
             self.assertEqual(exp["overlays"], [{"id": "verification_debt/skip", "status": "observing"}])
+
+    def test_corrupt_delta_refuses_exposure_capture_and_names_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _deleg_project(d)
+            _run_with_home(home, lambda: jw_overlay.add_delta(
+                root, "verification_debt/healthy", rule="delegation-verification-evidence-v1",
+                summary="s"))
+            corrupt = _run_with_home(home, lambda: jw_overlay._deltas_dir(root) / "corrupt.json")
+            corrupt.write_text("{not-json")
+            called = {"n": 0}
+
+            def fake(*args):
+                called["n"] += 1
+                return (0, 0.1)
+
+            with self.assertRaises(jw_delegate.WorkflowError) as cm:
+                _deleg_run(root, home, fake)
+            self.assertIn(str(corrupt), str(cm.exception))
+            self.assertEqual(called["n"], 0)
 
 
 class RoundExposureTests(unittest.TestCase):
