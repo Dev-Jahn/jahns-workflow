@@ -76,6 +76,13 @@ def normalize_config(cfg: dict | None) -> dict:
         raise ValueError("review.approvers must be a list of strings")
     if not (isinstance(rv["operators"], list) and all(isinstance(o, str) for o in rv["operators"])):
         raise ValueError("review.operators must be a list of strings")
+    dl = cfg.setdefault("delegation", {})
+    if not isinstance(dl, dict):
+        raise ValueError("delegation: must be a mapping (env_prep)")
+    dl.setdefault("env_prep", None)  # None -> lockfile auto-detection at delegation time (no sandbox knob, R7)
+    ep = dl["env_prep"]
+    if ep is not None and not (isinstance(ep, list) and all(isinstance(x, str) for x in ep)):
+        raise ValueError("delegation.env_prep must be a list of shell command strings")
     return cfg
 
 

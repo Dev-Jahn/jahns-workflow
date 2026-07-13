@@ -138,3 +138,66 @@ The gate therefore guarantees *who is authorised*, not *that a human personally 
 solo developer driving agents, treat approval as a provenance record and merge speed-bump, not a
 hard human-in-the-loop control. A true human gate requires running the agent under a separate bot
 identity and reserving the approver credential for interactive use.
+
+## 8. Delegation (`jw delegate`)
+
+A single implementation task can be handed to an external runner in an isolated git worktree, then
+brought back through an explicit artifact contract. The invariants:
+
+- **Snapshot base = what you see now.** The delegation base is an immutable snapshot commit of your
+  current working tree — tracked modifications, staged changes, and untracked (non-`.gitignore`d)
+  files included. A dirty tree is delegated without polluting history: the snapshot is a detached
+  commit object under `refs/jw/delegations/<id>` (never pushed), not a commit on your branch. A
+  clean tree uses HEAD directly. Submodules, an unborn HEAD, or an in-progress merge/rebase/
+  cherry-pick are refused (they would bake a partial or conflicted state into the base).
+- **Harness computes; the runner claims.** The patch, changed-files list, and base/result SHAs are
+  computed by the harness from git directly (explicit provenance). The runner's own report —
+  verification it ran, limitations, risks, escalations (written to `JW_REPORT.yaml`) — is carried
+  through the contract labeled *delegate-claimed* and is never promoted to fact.
+- **Role sandboxes are fixed, not user knobs.** The implementer runs `workspace-write`; the verifier
+  runs `read-only` through codex-companion. `jw delegate verify` records its payload as
+  *independent-verifier* evidence and leaves the delegation `needs-review` — only the user chooses
+  apply or discard. A per-record `verify.lock` admits only one verifier at a time. The OS releases
+  the lock if its process dies; an unlocked leftover marker is stale and reclaimed on the next try.
+- **You accept or discard.** A finished delegation is `needs-review`, its worktree preserved so a
+  verifier can run the acceptance criteria against the same base. `jw delegate apply` lands the
+  patch on the live tree with plain `git apply` (it fails atomically if the tree has drifted from
+  the base — nothing is partially applied); `jw delegate discard` throws it away. Both keep the
+  record directory as history. Until one of them runs, that task is locked against a second
+  delegation (single mutation owner) — a failed env/runner leaves the worktree as evidence and
+  holds the lock too, so `discard` is how you clear it.
+- **Acceptance criteria are required, never invented.** A delegated task must carry an `accept:`
+  field (a YAML list of free-text criteria, edited in `tasks.yaml` directly) or be given
+  `--accept` at delegation time. With neither, delegation is refused — the harness does not make up
+  the bar. `accept` is deliberately not settable through `jw task add/set` (comma-splitting free
+  text would distort it).
+
+Artifacts live plugin-local (`~/.claude/jahns-workflow/delegations/…`, worktrees under
+`~/.claude/jahns-workflow/worktrees/…`), never committed to the repo. The runner backend (model)
+is bound per role in `~/.claude/jahns-workflow/profile.yml`; a missing binding fails loud rather
+than guessing a default. A binding may set `effort` to `none`, `minimal`, `low`, `medium`, `high`,
+or `xhigh`; when omitted, the Codex configuration default is left untouched.
+
+## 9. Adaptive overlays, warnings, and evidence
+
+Adaptive policy is project-local and evidence-bearing:
+
+- **Exposure is recorded at execution time.** Delegation and round exposure records capture the
+  active profile binding and overlays that governed that event; they do not infer retrospective
+  policy.
+- **Evidence does not become a causal claim.** `jw improve evidence` joins review findings and
+  delegation records only through their explicit `task-id`. Unlinked findings remain reported as
+  provenance unknown. Shadow replay reports only how often a rule *would have fired*; the
+  **estimated nuisance rate** stays null until examples are labeled, and replay never claims a
+  prevented defect or benefit.
+- **Warnings are non-blocking.** `observing` records rule fires without stderr; `warning` records and
+  prints them. Neither a fire nor an evaluation error changes the host command's exit code. Promotion
+  to warning requires replay; enforcement is not part of this lifecycle.
+- **Relaxation is always open.** A delta may be demoted, suspended, or retired without a promotion
+  gate. If active deltas conflict on the same rule, the effective stage is **least-restrictive** and
+  the conflict is recorded as evidence for the next improve cycle.
+
+All artifacts remain plugin-local and are never committed: deltas and warning events under
+`~/.claude/jahns-workflow/overlay/`, per-event policy exposure under
+`~/.claude/jahns-workflow/exposure/`, and the deterministic join projection at
+`~/.claude/jahns-workflow/improve/evidence.jsonl`.
