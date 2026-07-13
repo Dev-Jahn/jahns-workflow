@@ -705,6 +705,136 @@ def run_reviews(registry_path: Path, out_dir: Path) -> dict:
     return coverage
 
 
+# ================================================================= evidence (§8)
+def _registry_entries(registry_path: Path) -> list[dict]:
+    if not registry_path.is_file():
+        return []
+    try:
+        reg = json.loads(registry_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        raise WorkflowError(
+            f"registry unreadable/unparseable: {registry_path} ({type(e).__name__})")
+    if not isinstance(reg, dict) or not isinstance(reg.get("projects", []), list):
+        raise WorkflowError(f"registry has wrong shape: {registry_path}")
+    return [e for e in reg.get("projects", []) if isinstance(e, dict)]
+
+
+def _project_delegation_rows(root: Path) -> tuple[list[dict], int]:
+    """Task-linked delegation evidence for one project. A missing contract is a definite absence of
+    delegate-side verification evidence; corrupt exposure/status records are skipped and counted."""
+    import jw_delegate
+
+    rows: list[dict] = []
+    skipped = 0
+    for did, rec in jw_delegate._iter_delegations(root):
+        try:
+            exposure = jw_delegate._load_exposure(rec)
+            status = jw_delegate._read_status_raw(rec)
+        except WorkflowError:
+            skipped += 1
+            continue
+        if not isinstance(status, dict) or not exposure.get("task_id"):
+            skipped += 1
+            continue
+        verification_present = False
+        if (rec / "artifact" / "contract.yaml").is_file():
+            try:
+                contract = jw_delegate._load_contract(rec)
+            except WorkflowError:
+                skipped += 1
+                continue
+            report = contract.get("delegate_report") or {}
+            verification_present = report.get("present") is True and bool(report.get("verification"))
+        rows.append({
+            "task_id": exposure["task_id"], "did": did, "state": status.get("state"),
+            "verification_present": verification_present,
+        })
+    rows.sort(key=lambda r: r["did"])
+    return rows, skipped
+
+
+def run_evidence(registry_path: Path, out_dir: Path, projects: set[str]) -> dict:
+    """Project task-id projection joining review findings to delegation evidence. No timestamps:
+    identical registry/files yield byte-identical evidence.jsonl (S10)."""
+    entries = _registry_entries(registry_path)
+    if projects:
+        entries = [e for e in entries if e.get("name") in projects]
+    task_rows: list[dict] = []
+    scanned: list[str] = []
+    skipped: list[dict] = []
+    unlinked = delegation_skipped = 0
+    finding_total = delegation_total = 0
+
+    for entry in entries:
+        name = entry.get("name") or "(unnamed)"
+        path = entry.get("path")
+        if not path:
+            skipped.append({"project": name, "reason": "no local path (remote-only registry entry)"})
+            continue
+        root = Path(path).expanduser()
+        if not (root / CONFIG_NAME).is_file():
+            skipped.append({"project": name, "reason": "project root or .jahns-workflow.yml inaccessible"})
+            continue
+        try:
+            cfg = load_config(root)
+            reviews = _project_review_rows(name, root, cfg)
+        except (OSError, yaml.YAMLError, ValueError) as e:
+            skipped.append({"project": name, "reason": f"project unreadable: {type(e).__name__}"})
+            continue
+
+        by_task: dict[str, dict] = {}
+        for review in reviews:
+            for finding in review.get("findings") or []:
+                task_id = (finding.get("id") if finding.get("source") == "task"
+                           else finding.get("task_id"))
+                if not task_id:
+                    unlinked += 1
+                    continue
+                row = by_task.setdefault(task_id, {
+                    "task_id": task_id, "project": name, "findings": [], "delegations": [],
+                    "join_key": "task-id", "provenance": "explicit",
+                })
+                row["findings"].append({
+                    "round": review.get("round_id"), "severity": finding.get("severity"),
+                    "status": finding.get("status"),
+                })
+                finding_total += 1
+
+        delegations, n_skipped = _project_delegation_rows(root)
+        delegation_skipped += n_skipped
+        for delegation in delegations:
+            task_id = delegation.pop("task_id")
+            row = by_task.setdefault(task_id, {
+                "task_id": task_id, "project": name, "findings": [], "delegations": [],
+                "join_key": "task-id", "provenance": "explicit",
+            })
+            row["delegations"].append(delegation)
+            delegation_total += 1
+        for row in by_task.values():
+            row["findings"].sort(
+                key=lambda f: (str(f.get("round")), str(f.get("severity")), str(f.get("status"))))
+            row["delegations"].sort(key=lambda x: x["did"])
+            task_rows.append(row)
+        scanned.append(name)
+
+    task_rows.sort(key=lambda r: (r["project"], r["task_id"]))
+    coverage = {
+        "generated_from": str(registry_path),
+        "projects_total": len(entries),
+        "projects_scanned": sorted(scanned),
+        "projects_skipped": sorted(skipped, key=lambda s: s["project"]),
+        "unlinked_findings": unlinked,
+        "delegations_skipped": delegation_skipped,
+        "row_totals": {"tasks": len(task_rows), "findings": finding_total,
+                       "delegations": delegation_total},
+    }
+    out_dir.mkdir(parents=True, exist_ok=True)
+    lines = [_dumps(row) + "\n" for row in task_rows]
+    lines.append(_dumps({"coverage": coverage}) + "\n")
+    (out_dir / "evidence.jsonl").write_text("".join(lines), encoding="utf-8")
+    return coverage
+
+
 # ================================================================== audit (§9)
 # Deterministic facts over the four projection artifacts ONLY (never raw logs — layer separation).
 # Each lens carries a versioned rule id + provenance; <=5 examples with evidence pointers. No model
@@ -949,6 +1079,37 @@ def _lens_coverage_caveats(coverage: dict) -> dict:
     return _lens("coverage_caveats", "coverage-caveats-v1", "explicit", {}, [], summary=summary)
 
 
+def _lens_evidence_link(rows: list[dict]) -> dict:
+    task_rows = [r for r in rows if isinstance(r, dict) and r.get("task_id")]
+    per: dict[str, dict] = {}
+    examples: list[dict] = []
+    for proj, prows in _by_project(task_rows).items():
+        joined = [r for r in prows if r.get("findings") and r.get("delegations")]
+        unverified_with_open_severe = 0
+        for row in joined:
+            open_severe = any(
+                f.get("severity") in ("blocker", "major")
+                and f.get("status") not in ("done", "dropped", "REJECTED")
+                for f in row.get("findings") or [])
+            if not open_severe:
+                continue
+            count = sum(1 for d in row.get("delegations") or []
+                        if d.get("verification_present") is False)
+            unverified_with_open_severe += count
+            if count and len(examples) < 5:
+                examples.append({"project": proj, "task_id": row["task_id"],
+                                 "unverified_delegations": count})
+        per[proj] = {
+            "tasks_with_findings": sum(1 for r in prows if r.get("findings")),
+            "tasks_with_delegations": sum(1 for r in prows if r.get("delegations")),
+            "tasks_joined": len(joined),
+            "unverified_delegations_with_open_severe_findings": unverified_with_open_severe,
+        }
+    return _lens(
+        "evidence_link", "evidence-link-v1", "explicit", per, examples,
+        round_session_mapping={"provenance": "unknown"})
+
+
 def run_audit(in_dir: Path) -> dict:
     present: dict[str, bool] = {}
     data: dict[str, object] = {}
@@ -980,12 +1141,22 @@ def run_audit(in_dir: Path) -> dict:
             lenses.append(builder())
         else:
             skipped.append({"lens": name, "reason": f"missing {_AUDIT_INPUTS[req]}"})
+    evidence_path = in_dir / "evidence.jsonl"
+    if evidence_path.is_file():
+        try:
+            evidence_rows = _load_jsonl(evidence_path)
+        except (OSError, json.JSONDecodeError):
+            evidence_rows = None
+        if evidence_rows is not None:
+            lenses.append(_lens_evidence_link(evidence_rows))
+            present["evidence"] = True
     lenses.sort(key=lambda x: x["lens"])
     skipped.sort(key=lambda x: x["lens"])
 
     facts = {
         "generated_from": str(in_dir),
-        "inputs": {k: present.get(k, False) for k in _AUDIT_INPUTS},
+        "inputs": {k: present.get(k, False) for k in (*_AUDIT_INPUTS, *(["evidence"] if
+                   present.get("evidence") else []))},
         "skipped_lenses": skipped,
         "lenses": lenses,
     }
@@ -1132,6 +1303,29 @@ def _cli_reviews(argv: list[str]) -> int:
     return 0
 
 
+def _cli_evidence(argv: list[str]) -> int:
+    try:
+        _sources, projects, out = _parse_trace_args(argv)
+        if _sources:
+            raise WorkflowError("--source is not valid for evidence")
+        out_dir = _residence_checked(out, "--out")
+    except WorkflowError as e:
+        print(f"jw improve evidence: {e}", file=sys.stderr)
+        return 1
+    try:
+        coverage = run_evidence(_registry_path(), out_dir, projects)
+    except WorkflowError as e:
+        print(f"jw improve evidence: {e}", file=sys.stderr)
+        return 1
+    except OSError as e:
+        print(f"jw improve evidence: cannot write outputs — {e}", file=sys.stderr)
+        return 2
+    print(f"jw improve evidence: {coverage['row_totals']['tasks']} task(s), "
+          f"{len(coverage['projects_scanned'])} project(s) scanned, "
+          f"{len(coverage['projects_skipped'])} skipped -> {out_dir / 'evidence.jsonl'}")
+    return 0
+
+
 def _cli_audit(argv: list[str]) -> int:
     try:
         inp = _parse_single_opt(argv, "--in")
@@ -1211,6 +1405,8 @@ def main(argv: list[str]) -> int:
         return _cli_trace(rest)
     if sub == "reviews":
         return _cli_reviews(rest)
+    if sub == "evidence":
+        return _cli_evidence(rest)
     if sub == "audit":
         return _cli_audit(rest)
     if sub == "decide":

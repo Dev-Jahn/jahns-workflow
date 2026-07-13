@@ -4413,5 +4413,120 @@ class ReplayTests(unittest.TestCase):
             self.assertEqual(promoted["status"], "warning")
 
 
+class EvidenceTests(unittest.TestCase):
+    """0.8.0 M2 §8 — task-id evidence projection and the evidence_link audit lens."""
+
+    def _fixture(self, d):
+        d = Path(d)
+        root = d / "repo"
+        root.mkdir()
+        init_repo(root)
+        (root / ".jahns-workflow.yml").write_text(
+            "version: 1\nproject: demo\nreviews_dir: docs/reviews\n")
+        (root / "tasks.yaml").write_text(
+            "version: 1\nproject: demo\ntasks:\n"
+            "  - id: fix/open\n    title: open severe finding task\n    status: active\n"
+            "    severity: blocker\n    origin: review-2026-01-01-r1\n"
+            "  - id: fix/task-only\n    title: task source finding here\n    status: done\n"
+            "    severity: major\n    origin: review-2026-01-01-r1\n"
+            "  - id: feat/deleg-only\n    title: delegation only task here\n    status: active\n")
+        rdir = root / "docs" / "reviews"
+        rdir.mkdir(parents=True)
+        (rdir / "2026-01-01-r1-feedback.md").write_text(
+            "meta\n\n## Findings (triage skeleton v1)\n"
+            "| Finding | Severity | Verdict | Evidence | Task |\n"
+            "| --- | --- | --- | --- | --- |\n"
+            "| JW-GPT-001 — linked | `blocker` | REAL | ev | `fix/open` |\n"
+            "| JW-GPT-002 — unknown link | `major` | NEEDS-RULING | ev | |\n")
+        home = d / "home"
+        home.mkdir()
+        ddir = _run_with_home(home, lambda: jw_delegate._delegations_dir(root))
+        self._delegation(ddir / "did-unverified", "fix/open", "needs-review", verified=False)
+        self._delegation(ddir / "did-verified", "feat/deleg-only", "applied", verified=True)
+        registry = d / "projects.json"
+        registry.write_text(_json.dumps({"projects": [
+            {"name": "proj-a", "path": str(root)},
+            {"name": "remote-only", "repo": "owner/repo"},
+            {"name": "gone", "path": str(d / "missing")},
+        ]}))
+        default_registry = home / ".claude" / "jahns-workflow" / "projects.json"
+        default_registry.parent.mkdir(parents=True, exist_ok=True)
+        default_registry.write_bytes(registry.read_bytes())
+        return root, home, registry
+
+    def _delegation(self, rec, task_id, state, *, verified):
+        (rec / "artifact").mkdir(parents=True)
+        (rec / "exposure.json").write_text(_json.dumps({"task_id": task_id}))
+        (rec / "status.json").write_text(_json.dumps({"state": state}))
+        verification = [{"cmd": "pytest", "rc": 0}] if verified else []
+        (rec / "artifact" / "contract.yaml").write_text(yaml.safe_dump({
+            "delegate_report": {"present": True, "verification": verification}}))
+
+    def _rows(self, out):
+        return [_json.loads(ln) for ln in (out / "evidence.jsonl").read_text().splitlines() if ln]
+
+    def test_projection_normalizes_both_review_sources_and_delegations(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home, registry = self._fixture(d)
+            out = Path(d) / "out"
+            coverage = _run_with_home(
+                home, lambda: jw_improve.run_evidence(registry, out, set()))
+            rows = self._rows(out)
+            task_rows = {r["task_id"]: r for r in rows if "task_id" in r}
+            self.assertEqual(sorted(task_rows), ["feat/deleg-only", "fix/open", "fix/task-only"])
+            # source=triage uses task_id; source=task uses id. Both become the same task_id field.
+            self.assertEqual(task_rows["fix/open"]["findings"], [
+                {"round": "2026-01-01-r1", "severity": "blocker", "status": "REAL"}])
+            self.assertEqual(task_rows["fix/task-only"]["findings"], [
+                {"round": "2026-01-01-r1", "severity": "major", "status": "done"}])
+            self.assertEqual(task_rows["fix/open"]["delegations"], [
+                {"did": "did-unverified", "state": "needs-review", "verification_present": False}])
+            self.assertTrue(task_rows["feat/deleg-only"]["delegations"][0]["verification_present"])
+            for row in task_rows.values():
+                self.assertEqual(row["join_key"], "task-id")
+                self.assertEqual(row["provenance"], "explicit")
+            self.assertEqual(coverage["unlinked_findings"], 1)
+            self.assertEqual(coverage["projects_scanned"], ["proj-a"])
+            self.assertEqual([x["project"] for x in coverage["projects_skipped"]],
+                             ["gone", "remote-only"])
+            self.assertEqual(rows[-1]["coverage"], coverage)
+
+    def test_evidence_link_lens_counts_join_candidates_without_causality_claim(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home, registry = self._fixture(d)
+            out = Path(d) / "out"
+            _run_with_home(home, lambda: jw_improve.run_evidence(registry, out, set()))
+            facts = jw_improve.run_audit(out)
+            lens = next(x for x in facts["lenses"] if x["lens"] == "evidence_link")
+            self.assertEqual(lens["rule"], "evidence-link-v1")
+            self.assertEqual(lens["provenance"], "explicit")
+            self.assertEqual(lens["per_project"]["proj-a"], {
+                "tasks_with_findings": 2,
+                "tasks_with_delegations": 2,
+                "tasks_joined": 1,
+                "unverified_delegations_with_open_severe_findings": 1,
+            })
+            self.assertLessEqual(len(lens["examples"]), 5)
+            self.assertEqual(lens["round_session_mapping"], {"provenance": "unknown"})
+
+    def test_byte_identical_reruns_and_cli_project_filter(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home, registry = self._fixture(d)
+            o1, o2 = Path(d) / "o1", Path(d) / "o2"
+            _run_with_home(home, lambda: jw_improve.run_evidence(registry, o1, {"proj-a"}))
+            _run_with_home(home, lambda: jw_improve.run_evidence(registry, o2, {"proj-a"}))
+            self.assertEqual((o1 / "evidence.jsonl").read_bytes(),
+                             (o2 / "evidence.jsonl").read_bytes())
+            import contextlib
+            import io
+            out = Path(d) / "cli"
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = _run_with_home(home, lambda: jw_improve.main(
+                    ["evidence", "--out", str(out), "--project", "proj-a"]))
+            self.assertEqual(rc, 0)
+            self.assertEqual([r for r in self._rows(o1) if "task_id" in r],
+                             [r for r in self._rows(out) if "task_id" in r])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
