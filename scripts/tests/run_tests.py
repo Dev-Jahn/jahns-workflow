@@ -26,6 +26,7 @@ import jw_common  # noqa: E402
 import jw_delegate  # noqa: E402
 import jw_improve  # noqa: E402
 import jw_lanes  # noqa: E402
+import jw_overlay  # noqa: E402
 import jw_merge  # noqa: E402
 import jw_resume  # noqa: E402
 import jw_review  # noqa: E402
@@ -3774,6 +3775,238 @@ class DelegateCliTests(unittest.TestCase):
                     ["show", rec.name, "--exposure", "--root", str(root)])), 0)
                 self.assertEqual(_run_with_home(home, lambda: jw_delegate.main(
                     ["show", rec.name, "--root", str(root)])), 0)
+
+
+# ============================================================ v0.8.0 M2: jw_overlay (C1 store+rules)
+def _overlay_project(d):
+    root = Path(d) / "proj"
+    root.mkdir()
+    home = Path(d) / "home"
+    home.mkdir()
+    return root, home
+
+
+def _add_delta(root, home, delta_id="verification_debt/skip", rule="delegation-verification-evidence-v1",
+               **kw):
+    kw.setdefault("summary", "observed 3/5 delegations without verification")
+    return _run_with_home(home, lambda: jw_overlay.add_delta(root, delta_id, rule=rule, **kw))
+
+
+class OverlayStoreTests(unittest.TestCase):
+    """0.8.0 M2 §3 — delta store, id grammar, lifecycle transitions, corrupt handling."""
+
+    def test_add_creates_observing_delta(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _overlay_project(d)
+            delta = _add_delta(root, home)
+            self.assertEqual(delta["status"], "observing")
+            self.assertEqual(delta["schema"], "jw-delta-1")
+            self.assertEqual(delta["candidate_scope"], "unresolved")
+            self.assertEqual(delta["evidence"]["source"], "manual")
+            self.assertIsNone(delta["evidence"]["rec_id"])
+            self.assertEqual(delta["evidence"]["summary"], "observed 3/5 delegations without verification")
+            # proposed -> observing recorded as a transition (add IS the acceptance)
+            self.assertEqual([t["to"] for t in delta["transitions"]], ["observing"])
+            self.assertEqual(delta["observed_in"], [jw_common._project_slug(root)])
+            # persisted, slash -> double-dash filename
+            p = _run_with_home(home, lambda: jw_overlay._delta_path(root, "verification_debt/skip"))
+            self.assertTrue(p.exists())
+            self.assertEqual(p.name, "verification_debt--skip.json")
+
+    def test_add_from_rec_sets_provenance(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _overlay_project(d)
+            delta = _add_delta(root, home, from_rec="verification_debt/heavy-solo",
+                               pointers=["a.py:1", "b.py:2"], candidate_scope="project_candidate",
+                               observed_in=["proj-a", "proj-b"])
+            self.assertEqual(delta["evidence"]["source"], "improve-rec")
+            self.assertEqual(delta["evidence"]["rec_id"], "verification_debt/heavy-solo")
+            self.assertEqual(delta["evidence"]["pointers"], ["a.py:1", "b.py:2"])
+            self.assertEqual(delta["candidate_scope"], "project_candidate")
+            self.assertEqual(delta["observed_in"], ["proj-a", "proj-b"])
+
+    def test_add_invalid_delta_id_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _overlay_project(d)
+            with self.assertRaises(jw_delegate.WorkflowError):
+                _add_delta(root, home, delta_id="Bad Id/Nope")
+
+    def test_add_unknown_rule_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _overlay_project(d)
+            with self.assertRaises(jw_delegate.WorkflowError):
+                _add_delta(root, home, rule="nonexistent-rule-v9")
+
+    def test_add_missing_flags_exit1(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _overlay_project(d)
+            import contextlib
+            import io
+            with contextlib.redirect_stderr(io.StringIO()):
+                # missing --summary
+                self.assertEqual(_run_with_home(home, lambda: jw_overlay.main(
+                    ["add", "verification_debt/x", "--rule", "delegation-verification-evidence-v1",
+                     "--root", str(root)])), 1)
+                # missing --rule
+                self.assertEqual(_run_with_home(home, lambda: jw_overlay.main(
+                    ["add", "verification_debt/x", "--summary", "s", "--root", str(root)])), 1)
+
+    def test_add_bad_candidate_scope_exit1(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _overlay_project(d)
+            import contextlib
+            import io
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(_run_with_home(home, lambda: jw_overlay.main(
+                    ["add", "verification_debt/x", "--rule", "delegation-verification-evidence-v1",
+                     "--summary", "s", "--candidate-scope", "bogus", "--root", str(root)])), 1)
+
+    def test_promote_requires_replay(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _overlay_project(d)
+            _add_delta(root, home)
+            with self.assertRaises(jw_delegate.WorkflowError) as cm:
+                _run_with_home(home, lambda: jw_overlay.promote(root, "verification_debt/skip"))
+            self.assertIn("replay", str(cm.exception))
+            # inject a replay result then promote succeeds observing -> warning
+            p = _run_with_home(home, lambda: jw_overlay._delta_path(root, "verification_debt/skip"))
+            import json as _j
+            delta = _j.loads(p.read_text())
+            delta["replay"] = {"fires": 2, "opportunities": 5, "replayed_at": "2026-07-14T00:00:00+00:00"}
+            p.write_text(_j.dumps(delta))
+            out = _run_with_home(home, lambda: jw_overlay.promote(root, "verification_debt/skip"))
+            self.assertEqual(out["status"], "warning")
+
+    def test_demote_warning_to_observing(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _overlay_project(d)
+            _add_delta(root, home)
+            p = _run_with_home(home, lambda: jw_overlay._delta_path(root, "verification_debt/skip"))
+            import json as _j
+            delta = _j.loads(p.read_text())
+            delta["status"] = "warning"
+            p.write_text(_j.dumps(delta))
+            out = _run_with_home(home, lambda: jw_overlay.demote(root, "verification_debt/skip"))
+            self.assertEqual(out["status"], "observing")
+
+    def test_suspend_and_retire_unconditional_and_terminal(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _overlay_project(d)
+            _add_delta(root, home)
+            out = _run_with_home(home, lambda: jw_overlay.suspend(root, "verification_debt/skip", note="pause"))
+            self.assertEqual(out["status"], "suspended")
+            # retire from suspended is fine (#9 — teardown always open)
+            out = _run_with_home(home, lambda: jw_overlay.retire(root, "verification_debt/skip"))
+            self.assertEqual(out["status"], "retired")
+            # retired is terminal — any further transition refused
+            for verb in (jw_overlay.promote, jw_overlay.demote, jw_overlay.suspend, jw_overlay.retire):
+                with self.assertRaises(jw_delegate.WorkflowError):
+                    _run_with_home(home, lambda v=verb: v(root, "verification_debt/skip"))
+
+    def test_add_leaves_no_tmp_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _overlay_project(d)
+            _add_delta(root, home)
+            ddir = _run_with_home(home, lambda: jw_overlay._deltas_dir(root))
+            self.assertEqual(sorted(p.name for p in ddir.iterdir()), ["verification_debt--skip.json"])
+
+    def test_corrupt_delta_marked_in_list_strict_in_show(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _overlay_project(d)
+            _add_delta(root, home)
+            _add_delta(root, home, delta_id="verification_debt/other")
+            ddir = _run_with_home(home, lambda: jw_overlay._deltas_dir(root))
+            (ddir / "verification_debt--skip.json").write_text("{ corrupt")
+            listed = _run_with_home(home, lambda: jw_overlay.list_deltas(root))
+            corrupt = [x for x in listed if x.get("corrupt")]
+            healthy = [x for x in listed if not x.get("corrupt")]
+            self.assertEqual(len(corrupt), 1)
+            self.assertTrue(any(h["id"] == "verification_debt/other" for h in healthy))
+            # single-record path fails loud, naming the file
+            with self.assertRaises(jw_delegate.WorkflowError) as cm:
+                _run_with_home(home, lambda: jw_overlay.load_delta(root, "verification_debt/skip"))
+            self.assertIn("verification_debt--skip.json", str(cm.exception))
+
+    def test_unknown_delta_id_exit1(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _overlay_project(d)
+            with self.assertRaises(jw_delegate.WorkflowError):
+                _run_with_home(home, lambda: jw_overlay.load_delta(root, "verification_debt/nope"))
+
+    def test_jw_dispatcher_routes_overlay(self):
+        import jw
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _overlay_project(d)
+            import contextlib
+            import io
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = _run_with_home(home, lambda: jw.main(["overlay", "list", "--root", str(root)]))
+            self.assertEqual(rc, 0)
+
+
+def _rule2_project(d):
+    root = Path(d) / "repo"
+    root.mkdir()
+    init_repo(root)
+    (root / ".jahns-workflow.yml").write_text("version: 1\nproject: demo\nreviews_dir: docs/reviews\n")
+    (root / "tasks.yaml").write_text(
+        "version: 1\nproject: demo\ntasks:\n"
+        "  - id: fix/finding-a\n    title: open severe finding task\n    status: active\n"
+        "    severity: blocker\n    origin: review-2026-01-01-r1\n"
+        "  - id: fix/finding-b\n    title: closed finding task\n    status: done\n"
+        "    severity: major\n    origin: review-2026-01-01-r1\n"
+        "  - id: fix/finding-c\n    title: rejected but open finding\n    status: active\n"
+        "    severity: blocker\n    origin: review-2026-01-01-r1\n"
+        "  - id: fix/finding-d\n    title: open minor finding\n    status: active\n"
+        "    severity: minor\n    origin: review-2026-01-01-r1\n")
+    rdir = root / "docs" / "reviews"
+    rdir.mkdir(parents=True)
+    (rdir / "2026-01-01-r1-feedback.md").write_text(
+        "meta\n\n## Findings (triage skeleton v1)\n"
+        "| Finding | Severity | Verdict | Evidence | Task |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "| JW-GPT-001 — a | `blocker` | REAL | ev | `fix/finding-a` |\n"
+        "| JW-GPT-002 — b | `major` | REAL | ev | `fix/finding-b` |\n"
+        "| JW-GPT-003 — c | `blocker` | REJECTED | ev | `fix/finding-c` |\n"
+        "| JW-GPT-004 — u | `major` | NEEDS-RULING | ev | |\n")
+    home = Path(d) / "home"
+    home.mkdir()
+    return root, home
+
+
+class OverlayRuleTests(unittest.TestCase):
+    """0.8.0 M2 §4 — rule vocabulary v1 fire predicates (both status axes pinned, R3)."""
+
+    def test_rule1_fire_predicate(self):
+        # present True + non-empty verification -> no fire
+        self.assertFalse(jw_overlay.rule1_fires(
+            {"delegate_report": {"present": True, "verification": [{"cmd": "pytest", "rc": 0}]}}))
+        # present True but empty verification -> fire
+        self.assertTrue(jw_overlay.rule1_fires(
+            {"delegate_report": {"present": True, "verification": []}}))
+        # report absent -> fire
+        self.assertTrue(jw_overlay.rule1_fires({"delegate_report": {"present": False}}))
+        # invalid report -> fire
+        self.assertTrue(jw_overlay.rule1_fires({"delegate_report": {"present": "invalid"}}))
+
+    def test_rule2_open_severe_fires_excludes_done_rejected_minor(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _rule2_project(d)
+            cfg = jw_common.load_config(root)
+            out = jw_overlay.evaluate_rule2(root, cfg, ["blocker", "major"])
+            fired_ids = sorted(f["task_id"] for f in out["fires"])
+            # fix/finding-a fires (open blocker, REAL); b is done; c is REJECTED; d is minor
+            self.assertEqual(fired_ids, ["fix/finding-a"])
+            # JW-GPT-004 has no linked task -> unlinked, not a fire
+            self.assertEqual(out["unlinked"], 1)
+
+    def test_rule2_closing_done_override_suppresses_fire(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _rule2_project(d)
+            cfg = jw_common.load_config(root)
+            out = jw_overlay.evaluate_rule2(root, cfg, ["blocker", "major"],
+                                            closing_done={"fix/finding-a"})
+            self.assertEqual(out["fires"], [])  # a is being closed in this round
 
 
 if __name__ == "__main__":
