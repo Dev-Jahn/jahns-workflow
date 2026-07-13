@@ -17,19 +17,47 @@ See dev_docs/0.8.0-m1-implementation-notes.md for the binding spec.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import yaml  # noqa: E402
 
-from jw_common import WorkflowError, git_full_sha  # noqa: E402
+from jw_common import (  # noqa: E402
+    WorkflowError, _project_slug, git_full_sha, load_config, load_tasks,
+)
 
 DELEG_REF_NS = "refs/jw/delegations"
+TERMINAL_STATES = ("applied", "discarded")
+_TEMPLATE_PATH = Path(__file__).resolve().parent.parent / "templates" / "delegate-prompt.md"
+
+# lockfile -> (prep command, kind), first match wins (S7). None env_prep in config falls through here.
+_LOCKFILE_DETECT = (
+    ("uv.lock", "uv sync --frozen", "uv"),
+    ("pnpm-lock.yaml", "pnpm install --frozen-lockfile", "pnpm"),
+    ("package-lock.json", "npm ci", "npm"),
+    ("Cargo.toml", "cargo fetch", "cargo"),
+    ("go.mod", "go mod download", "go"),
+)
+
+_PROFILE_EXAMPLE = (
+    "schema: jw-profile-1\n"
+    "bindings:\n"
+    "  implementer: {execution: external-runner, backend: \"codex:gpt-5.4-codex\"}\n"
+)
+
+
+class _RefusedWrite(WorkflowError):
+    """A plugin-local directory could not be created — maps to exit 2 (refused write, §2)."""
 
 
 # ---- git plumbing (private; jw_common.git_rc has no env/cwd-index support) ----
@@ -111,3 +139,364 @@ def _make_did(task_id: str) -> str:
     an execution event, so a timestamp is intentional (the 0.7 decisions.jsonl precedent)."""
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return f"{ts}-{task_id.replace('/', '-')}"
+
+
+# ---- residence (§9 — everything plugin-local, keyed by project slug) ----------
+def _plugin_base() -> Path:
+    return Path.home() / ".claude" / "jahns-workflow"
+
+
+def _delegations_dir(root: Path) -> Path:
+    return _plugin_base() / "delegations" / _project_slug(root)
+
+
+def _worktrees_dir(root: Path) -> Path:
+    return _plugin_base() / "worktrees" / _project_slug(root)
+
+
+def _record_dir(root: Path, did: str) -> Path:
+    return _delegations_dir(root) / did
+
+
+def _worktree_path(root: Path, did: str) -> Path:
+    return _worktrees_dir(root) / did
+
+
+def _profile_path() -> Path:
+    return _plugin_base() / "profile.yml"
+
+
+def _mkdir_or_refuse(path: Path) -> None:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise _RefusedWrite(f"cannot create plugin-local directory {path}: {e}")
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ---- profile / binding (§11 — fail-loud, no default-model guessing) -----------
+def _load_profile() -> tuple[dict, str]:
+    """Load ~/.claude/jahns-workflow/profile.yml and its byte fingerprint. Raises WorkflowError with a
+    creation guide if the file is absent (the harness never guesses a default model)."""
+    path = _profile_path()
+    if not path.is_file():
+        raise WorkflowError(
+            f"no delegation profile at {path} — create it with a role binding, e.g.:\n\n{_PROFILE_EXAMPLE}")
+    raw = path.read_bytes()
+    fingerprint = "sha256:" + hashlib.sha256(raw).hexdigest()[:12]
+    data = yaml.safe_load(raw.decode("utf-8")) or {}
+    if not isinstance(data, dict):
+        raise WorkflowError(f"profile {path} is not a mapping")
+    return data, fingerprint
+
+
+def _resolve_binding(profile: dict, role: str) -> dict:
+    """Resolve the binding for `role`; validate execution axis and backend shape (S13/§11)."""
+    bindings = profile.get("bindings")
+    b = bindings.get(role) if isinstance(bindings, dict) else None
+    if not isinstance(b, dict):
+        raise WorkflowError(
+            f"profile has no binding for role {role!r} — add it to {_profile_path()}, e.g.:\n\n{_PROFILE_EXAMPLE}")
+    execution = b.get("execution")
+    backend = b.get("backend")
+    if execution != "external-runner":
+        raise WorkflowError(f"binding execution {execution!r} not implemented in M1 (only 'external-runner')")
+    if not isinstance(backend, str) or ":" not in backend or not backend.split(":", 1)[1]:
+        raise WorkflowError(f"binding backend must be '<runner>:<model>', got {backend!r}")
+    return {"role": role, "execution": execution, "backend": backend, "source": "profile"}
+
+
+def _runner_model(backend: str) -> str:
+    """Extract the model from a `codex:<model>` backend. Non-codex runners are schema-valid but not
+    executable in M1 (§6) — fail loud rather than silently substitute."""
+    runner, _, model = backend.partition(":")
+    if runner != "codex":
+        raise WorkflowError(f"backend {backend!r} not implemented in M1 (only 'codex:<model>')")
+    return model
+
+
+# ---- task packet (§7 — assemble the fields a delegate needs, not a raw copy) --
+def _build_packet(data: dict, task_id: str, accept_flags: list[str], root: Path) -> tuple[dict, list[str]]:
+    """Assemble packet.yaml from the registry + --accept flags. Fail loud on non-delegable status or an
+    empty acceptance set (#3 — the harness never invents criteria)."""
+    tasks = [t for t in (data.get("tasks") or []) if isinstance(t, dict)]
+    by_id = {t.get("id"): t for t in tasks}
+    task = by_id.get(task_id)
+    if task is None:
+        raise WorkflowError(f"task {task_id} is not in the registry")
+    status = task.get("status", "pending")
+    if status == "blocked":
+        raise WorkflowError(f"task {task_id} is blocked — if its deps are now satisfied, set it active and retry")
+    if status not in ("pending", "active"):
+        raise WorkflowError(f"task {task_id} is {status} — only pending/active tasks can be delegated")
+    acceptance: list[str] = []
+    for a in list(task.get("accept") or []) + list(accept_flags):
+        if a not in acceptance:
+            acceptance.append(a)
+    if not acceptance:
+        raise WorkflowError(
+            f"task {task_id} has no acceptance criteria — add `accept:` (YAML list) to the task or pass --accept")
+    deps = [{"id": d, "status": by_id.get(d, {}).get("status", "unknown")} for d in (task.get("deps") or [])]
+    packet = {
+        "schema": "jw-packet-1",
+        "task": {
+            "id": task_id, "title": task.get("title"), "status": status,
+            "milestone": task.get("milestone"), "round": task.get("round"),
+            "deps": deps, "anchor": task.get("anchor"), "notes": task.get("notes"),
+        },
+        "acceptance": acceptance,
+        "project": {"name": data.get("project"), "root": str(root.resolve())},
+    }
+    return packet, acceptance
+
+
+def _render_prompt(packet: dict, base_sha: str) -> str:
+    task = packet["task"]
+    lines = [f"- id: {task['id']}", f"- title: {task.get('title')}", f"- status: {task['status']}"]
+    for field in ("milestone", "round", "anchor", "notes"):
+        if task.get(field):
+            lines.append(f"- {field}: {task[field]}")
+    if task.get("deps"):
+        lines.append("- deps: " + ", ".join(f"{d['id']} ({d['status']})" for d in task["deps"]))
+    acceptance = "\n".join(f"{i}. {c}" for i, c in enumerate(packet["acceptance"], 1))
+    return (_TEMPLATE_PATH.read_text(encoding="utf-8")
+            .replace("{{TASK_BLOCK}}", "\n".join(lines))
+            .replace("{{ACCEPTANCE}}", acceptance)
+            .replace("{{BASE_SHA}}", base_sha))
+
+
+# ---- env prep (§5 — explicit config first, lockfile detection second) ---------
+def _resolve_env_prep(worktree: Path, cfg: dict) -> tuple[str, list[str]]:
+    """(kind, commands): explicit config, else first-matching lockfile, else none-detected (a
+    document project is a normal case — recorded and proceeded)."""
+    explicit = (cfg.get("delegation") or {}).get("env_prep")
+    if explicit:
+        return "explicit", list(explicit)
+    for fname, cmd, kind in _LOCKFILE_DETECT:
+        if (worktree / fname).exists():
+            return f"detected:{kind}", [cmd]
+    return "none-detected", []
+
+
+def _run_env_prep(worktree: Path, commands: list[str]) -> tuple[int, str]:
+    """Run each prep command in the worktree cwd (no shell, shlex.split, 600s each). Returns (rc,
+    stderr_tail<=20 lines); rc 0 means every command succeeded."""
+    for cmd in commands:
+        try:
+            p = subprocess.run(shlex.split(cmd), cwd=str(worktree),
+                               capture_output=True, text=True, timeout=600)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return 127, f"{cmd}: {e}"
+        if p.returncode != 0:
+            return p.returncode, "\n".join(p.stderr.strip().splitlines()[-20:])
+    return 0, ""
+
+
+# ---- runner (§6 — codex exec; isolated for monkeypatching in tests) -----------
+def _run_codex(worktree: Path, model: str, prompt_path: Path, record_dir: Path) -> tuple[int, float]:
+    """Invoke `codex exec` in the worktree (workspace-write sandbox hardcoded, S8). Returns (rc,
+    duration_s). The full --json stream and last message are preserved as local evidence."""
+    cmd = ["codex", "exec", "-C", str(worktree), "-m", model, "-s", "workspace-write",
+           "--color", "never", "--output-last-message", str(record_dir / "last_message.md"), "--json"]
+    start = time.monotonic()
+    try:
+        with open(prompt_path, encoding="utf-8") as pin, \
+             open(record_dir / "runner.jsonl", "w", encoding="utf-8") as jout, \
+             open(record_dir / "runner.stderr", "w", encoding="utf-8") as jerr:
+            p = subprocess.run(cmd, stdin=pin, stdout=jout, stderr=jerr, timeout=3600)
+        rc = p.returncode
+    except subprocess.TimeoutExpired:
+        rc = 124
+    except OSError as e:
+        (record_dir / "runner.stderr").write_text(str(e), encoding="utf-8")
+        rc = 127
+    return rc, round(time.monotonic() - start, 3)
+
+
+# ---- status.json (mutable lifecycle) ------------------------------------------
+def _read_status(record_dir: Path) -> dict:
+    p = record_dir / "status.json"
+    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+
+
+def _set_state(record_dir: Path, state: str, *, env: dict | None = None, error: str | None = None) -> dict:
+    st = _read_status(record_dir)
+    st.setdefault("at_transitions", []).append({"state": state, "at": _now_iso()})
+    st["state"] = state
+    if env is not None:
+        st["env"] = env
+    if error is not None:
+        st["error"] = error
+    (record_dir / "status.json").write_text(json.dumps(st, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return st
+
+
+# ---- owner lock (§4 — single mutation owner; terminal = {applied, discarded}) -
+def _iter_delegations(root: Path):
+    ddir = _delegations_dir(root)
+    if not ddir.is_dir():
+        return
+    for sub in sorted(ddir.iterdir()):
+        if sub.is_dir() and (sub / "exposure.json").exists():
+            yield sub.name, sub
+
+
+def _active_delegation_for_task(root: Path, task_id: str) -> tuple[str, str] | None:
+    for did, sub in _iter_delegations(root):
+        exposure = json.loads((sub / "exposure.json").read_text(encoding="utf-8"))
+        state = _read_status(sub).get("state")
+        if exposure.get("task_id") == task_id and state not in TERMINAL_STATES:
+            return did, state
+    return None
+
+
+# ---- artifact contract (§8 — harness-computed vs delegate-claimed provenance) -
+def _read_report(worktree: Path) -> dict:
+    """Read + remove JW_REPORT.yaml from the worktree BEFORE the result snapshot (so it never pollutes
+    the patch, S4). present ∈ {True, False, 'invalid'} — a missing/unparseable report is named, not
+    silently passed."""
+    p = worktree / "JW_REPORT.yaml"
+    if not p.exists():
+        return {"present": False}
+    raw = p.read_text(encoding="utf-8")
+    p.unlink()
+    try:
+        data = yaml.safe_load(raw)
+    except yaml.YAMLError:
+        data = None
+    if not isinstance(data, dict):
+        return {"present": "invalid"}
+    return {
+        "present": True,
+        "verification": data.get("verification", []),
+        "limitations": data.get("limitations", []),
+        "risks": data.get("risks", []),
+        "escalations": data.get("escalations", []),
+    }
+
+
+def _changed_files(root: Path, base: str, result: str) -> list[dict]:
+    out = _git_out(root, "diff", "--name-status", "--no-renames", base, result)
+    rows = []
+    for ln in out.splitlines():
+        parts = ln.split("\t")
+        if len(parts) >= 2:
+            rows.append({"path": parts[-1], "status": parts[0][:1]})
+    return rows
+
+
+def _diff_patch(cwd: Path, base: str, result: str) -> str:
+    """Exact (unstripped) `git diff --binary --no-renames` output — trailing bytes matter for apply."""
+    p = subprocess.run(["git", "-C", str(cwd), "diff", "--binary", "--no-renames", base, result],
+                       capture_output=True, text=True, timeout=60)
+    if p.returncode != 0:
+        raise WorkflowError(f"git diff failed: {p.stderr.strip()}")
+    return p.stdout
+
+
+def _write_exposure(record_dir, did, root, packet, task_id, head_sha, base_sha, dirty, binding, fingerprint):
+    exposure = {
+        "schema": "jw-exposure-1", "delegation_id": did, "at": _now_iso(),
+        "project": {"pslug": _project_slug(root), "root": str(root.resolve()), "name": packet["project"]["name"]},
+        "task_id": task_id, "packet": "packet.yaml",
+        "base": {"head_sha": head_sha, "snapshot_sha": base_sha, "dirty": dirty,
+                 "dirty_state_policy": "snapshot-commit-v1"},
+        "binding": binding,
+        "profile_fingerprint": fingerprint,
+        "sandbox": "workspace-write",
+        "overlays": [], "guards": None, "waivers": [],
+    }
+    (record_dir / "exposure.json").write_text(
+        json.dumps(exposure, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return exposure
+
+
+def _add_worktree(root: Path, worktree_path: Path, base_sha: str) -> None:
+    _git_out(root, "worktree", "add", "--detach", str(worktree_path), base_sha)
+
+
+# ---- run (§§3-10 — the delegation vertical slice) -----------------------------
+def run_delegation(root: Path, task_id: str, role: str, accept_flags: list[str]) -> int:
+    """Snapshot -> worktree -> env prep -> runner -> artifact. Prints `key: value` progress to stdout;
+    raises WorkflowError (exit 1) on any precondition/env/runner failure, _RefusedWrite (exit 2) on a
+    plugin-local mkdir failure. Returns 0 on a produced artifact (state=needs-review)."""
+    _check_snapshot_preconditions(root)
+    profile, fingerprint = _load_profile()
+    if role != "implementer":
+        raise WorkflowError(f"role {role} not consumed in M1")
+    binding = _resolve_binding(profile, role)
+    model = _runner_model(binding["backend"])
+    cfg = load_config(root)
+    packet, _acceptance = _build_packet(load_tasks(root), task_id, accept_flags, root)
+
+    active = _active_delegation_for_task(root, task_id)
+    if active:
+        raise WorkflowError(
+            f"task {task_id} already has active delegation {active[0]} (state {active[1]}) — "
+            f"apply or discard it first")
+
+    did = _make_did(task_id)
+    record_dir = _record_dir(root, did)
+    artifact_dir = record_dir / "artifact"
+    worktree_path = _worktree_path(root, did)
+    _mkdir_or_refuse(artifact_dir)
+    _mkdir_or_refuse(worktree_path.parent)
+
+    head_sha = git_full_sha(root, "HEAD")
+    base_sha, dirty = _snapshot(root, f"jw delegation snapshot: {task_id} {did}")
+    _git_out(root, "update-ref", f"{DELEG_REF_NS}/{did}", base_sha)
+    _add_worktree(root, worktree_path, base_sha)
+    print(f"base_sha: {base_sha}")
+    print(f"dirty: {str(dirty).lower()}")
+    print(f"worktree: {worktree_path}")
+
+    (record_dir / "packet.yaml").write_text(
+        yaml.safe_dump(packet, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    _write_exposure(record_dir, did, root, packet, task_id, head_sha, base_sha, dirty, binding, fingerprint)
+    _set_state(record_dir, "running")
+
+    env_kind, env_commands = _resolve_env_prep(worktree_path, cfg)
+    env_rc, env_tail = _run_env_prep(worktree_path, env_commands)
+    env_rec = {"prep": env_kind, "commands": env_commands, "rc": env_rc}
+    print(f"env_prep: {env_kind} rc={env_rc}")
+    if env_rc != 0:
+        _set_state(record_dir, "failed-env", env=env_rec, error=env_tail)
+        raise WorkflowError(
+            f"env prep failed (rc {env_rc}) — worktree preserved at {worktree_path}\n{env_tail}")
+
+    (record_dir / "prompt.txt").write_text(_render_prompt(packet, base_sha), encoding="utf-8")
+    runner_rc, duration = _run_codex(worktree_path, model, record_dir / "prompt.txt", record_dir)
+    print(f"runner: backend={binding['backend']} rc={runner_rc}")
+    if runner_rc != 0:
+        _set_state(record_dir, "failed-runner", env=env_rec, error=f"runner rc {runner_rc}")
+        raise WorkflowError(
+            f"runner exited non-zero (rc {runner_rc}) — see {record_dir / 'runner.stderr'}; worktree preserved")
+
+    report = _read_report(worktree_path)
+    result_sha, _ = _snapshot(worktree_path, f"jw delegation result: {task_id} {did}")
+    _git_out(root, "update-ref", f"{DELEG_REF_NS}/{did}-result", result_sha)
+    changed = _changed_files(root, base_sha, result_sha)
+    patch = _diff_patch(root, base_sha, result_sha)
+    empty = patch.strip() == ""
+    if not empty:
+        (artifact_dir / "changes.patch").write_text(patch, encoding="utf-8")
+    contract = {
+        "schema": "jw-artifact-1",
+        "delegation_id": did, "task_id": task_id,
+        "base_sha": base_sha, "result_sha": result_sha,
+        "changed_files": changed,
+        "patch_file": "changes.patch" if not empty else None,
+        "empty": empty,
+        "delegate_report": report,
+        "env": env_rec,
+        "runner": {"backend": binding["backend"], "rc": runner_rc,
+                   "duration_s": duration, "last_message": "last_message.md"},
+    }
+    (artifact_dir / "contract.yaml").write_text(
+        yaml.safe_dump(contract, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    _set_state(record_dir, "needs-review", env=env_rec)
+    print(f"artifact: {artifact_dir / 'contract.yaml'}")
+    return 0

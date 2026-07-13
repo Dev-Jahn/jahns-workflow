@@ -726,6 +726,21 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._cfg("version: 1\nproject: x\nreview:\n  operators: notalist\n")
 
+    def test_delegation_default_env_prep_none_no_sandbox_knob(self):
+        cfg = self._cfg("version: 1\nproject: x\n")
+        self.assertIsNone(cfg["delegation"]["env_prep"])
+        self.assertNotIn("sandbox", cfg["delegation"])  # R7: no sandbox config knob in M1
+
+    def test_delegation_env_prep_list_ok(self):
+        cfg = self._cfg("version: 1\nproject: x\ndelegation:\n  env_prep:\n    - uv sync --frozen\n")
+        self.assertEqual(cfg["delegation"]["env_prep"], ["uv sync --frozen"])
+
+    def test_delegation_env_prep_must_be_str_list(self):
+        with self.assertRaises(ValueError):
+            self._cfg("version: 1\nproject: x\ndelegation:\n  env_prep: notalist\n")
+        with self.assertRaises(ValueError):
+            self._cfg("version: 1\nproject: x\ndelegation:\n  env_prep:\n    - 42\n")
+
 
 
 TASKS_FIXTURE = """# registry — comments must be preserved
@@ -3053,6 +3068,271 @@ class DelegateSnapshotTests(unittest.TestCase):
     def test_make_did_shape(self):
         did = jw_delegate._make_did("feat/xyz")
         self.assertRegex(did, r"^\d{8}T\d{6}Z-feat-xyz$")
+
+
+_PROFILE_BODY = ('schema: jw-profile-1\nbindings:\n'
+                 '  implementer: {execution: external-runner, backend: "codex:gpt-5.4-codex"}\n')
+
+
+def _write_profile(home: Path, body: str = _PROFILE_BODY):
+    pdir = home / ".claude" / "jahns-workflow"
+    pdir.mkdir(parents=True, exist_ok=True)
+    (pdir / "profile.yml").write_text(body, encoding="utf-8")
+
+
+class DelegateProfileTests(unittest.TestCase):
+    """0.8.0 M1 §11 — profile binding resolution (fail-loud, no default-model guessing)."""
+
+    def test_missing_profile_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d) / "home"
+            home.mkdir()
+            with self.assertRaises(jw_delegate.WorkflowError):
+                _run_with_home(home, jw_delegate._load_profile)
+
+    def test_resolve_binding_ok_and_fingerprint(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d) / "home"
+            _write_profile(home)
+            profile, fp = _run_with_home(home, jw_delegate._load_profile)
+            self.assertTrue(fp.startswith("sha256:"))
+            b = jw_delegate._resolve_binding(profile, "implementer")
+            self.assertEqual(b["backend"], "codex:gpt-5.4-codex")
+            self.assertEqual(b["execution"], "external-runner")
+            self.assertEqual(b["source"], "profile")
+
+    def test_missing_role_binding_raises(self):
+        profile = yaml.safe_load(_PROFILE_BODY)
+        with self.assertRaises(jw_delegate.WorkflowError):
+            jw_delegate._resolve_binding(profile, "verifier")
+
+    def test_unsupported_execution_raises(self):
+        profile = {"bindings": {"implementer": {"execution": "in-process", "backend": "codex:x"}}}
+        with self.assertRaises(jw_delegate.WorkflowError):
+            jw_delegate._resolve_binding(profile, "implementer")
+
+    def test_bad_backend_format_raises(self):
+        profile = {"bindings": {"implementer": {"execution": "external-runner", "backend": "codexonly"}}}
+        with self.assertRaises(jw_delegate.WorkflowError):
+            jw_delegate._resolve_binding(profile, "implementer")
+
+    def test_non_codex_backend_not_implemented(self):
+        with self.assertRaises(jw_delegate.WorkflowError):
+            jw_delegate._runner_model("claude:sonnet")
+        self.assertEqual(jw_delegate._runner_model("codex:gpt-5.4-codex"), "gpt-5.4-codex")
+
+
+def _packet_registry():
+    return {"project": "demo", "tasks": [
+        {"id": "feat/xyz", "title": "implement the xyz feature", "status": "active",
+         "milestone": None, "deps": ["feat/dep"], "anchor": "SSOT §2", "notes": "do the thing",
+         "accept": ["registry criterion one"]},
+        {"id": "feat/dep", "title": "a dependency task", "status": "done"},
+        {"id": "feat/blk", "title": "a blocked task here", "status": "blocked"},
+        {"id": "feat/dn", "title": "an already done task", "status": "done"},
+    ]}
+
+
+class DelegatePacketTests(unittest.TestCase):
+    """0.8.0 M1 §7 — task packet assembly + acceptance merge (fail-loud on empty)."""
+
+    def test_packet_merges_accept_and_flags_dedup_order(self):
+        data = _packet_registry()
+        packet, acceptance = jw_delegate._build_packet(data, "feat/xyz",
+                                                       ["flag criterion", "registry criterion one"], Path("/x"))
+        self.assertEqual(packet["schema"], "jw-packet-1")
+        self.assertEqual(acceptance, ["registry criterion one", "flag criterion"])  # order + dedup
+        self.assertEqual(packet["task"]["deps"], [{"id": "feat/dep", "status": "done"}])
+        self.assertEqual(packet["project"]["name"], "demo")
+
+    def test_empty_acceptance_raises(self):
+        data = {"project": "d", "tasks": [{"id": "feat/na", "title": "no acceptance here", "status": "active"}]}
+        with self.assertRaises(jw_delegate.WorkflowError) as cm:
+            jw_delegate._build_packet(data, "feat/na", [], Path("/x"))
+        self.assertIn("no acceptance criteria", str(cm.exception))
+
+    def test_blocked_task_message(self):
+        with self.assertRaises(jw_delegate.WorkflowError) as cm:
+            jw_delegate._build_packet(_packet_registry(), "feat/blk", ["c"], Path("/x"))
+        msg = str(cm.exception)
+        self.assertIn("blocked", msg)
+        # R10: must NOT assert deps are unmet (stale-blocked exists) — offer the conditional path
+        self.assertIn("if its deps are now satisfied", msg)
+        self.assertNotIn("unmet", msg.lower())
+
+    def test_done_task_rejected(self):
+        with self.assertRaises(jw_delegate.WorkflowError):
+            jw_delegate._build_packet(_packet_registry(), "feat/dn", ["c"], Path("/x"))
+
+    def test_unknown_task_rejected(self):
+        with self.assertRaises(jw_delegate.WorkflowError):
+            jw_delegate._build_packet(_packet_registry(), "feat/nope", ["c"], Path("/x"))
+
+
+class DelegateRunTests(unittest.TestCase):
+    """0.8.0 M1 §§4-10 — full run flow with a fake (monkeypatched) codex runner. Never invokes codex."""
+
+    def _project(self, d) -> tuple[Path, Path]:
+        root = Path(d) / "repo"
+        root.mkdir()
+        init_repo(root)
+        (root / ".jahns-workflow.yml").write_text("version: 1\nproject: demo\n")
+        (root / "tasks.yaml").write_text(
+            "version: 1\nproject: demo\ntasks:\n"
+            '  - id: feat/xyz\n    title: "implement xyz feature"\n    status: active\n'
+            '    accept:\n      - "criterion alpha here"\n')
+        git(root, "add", "-A")
+        git(root, "commit", "-qm", "setup")
+        home = Path(d) / "home"
+        _write_profile(home)
+        return root, home
+
+    def _fake_runner(self, changes, report=None, rc=0):
+        def fake(worktree, model, prompt_path, record_dir):
+            for name, content in changes.items():
+                (worktree / name).write_text(content)
+            (record_dir / "last_message.md").write_text("delegate summary", encoding="utf-8")
+            (record_dir / "runner.jsonl").write_text("{}\n", encoding="utf-8")
+            if report is not None:
+                (worktree / "JW_REPORT.yaml").write_text(report, encoding="utf-8")
+            return (rc, 0.42)
+        return fake
+
+    def _run(self, root, home, fake, task="feat/xyz", accept=None):
+        orig = jw_delegate._run_codex
+        jw_delegate._run_codex = fake
+        try:
+            return _run_with_home(home, lambda: jw_delegate.run_delegation(root, task, "implementer", accept or []))
+        finally:
+            jw_delegate._run_codex = orig
+
+    def _record_dir(self, root, home):
+        return _run_with_home(home, lambda: sorted(jw_delegate._delegations_dir(root).iterdir())[-1])
+
+    def test_success_path_contract_and_exposure(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = self._project(d)
+            report = ("verification:\n  - {cmd: \"pytest\", rc: 0, summary: \"passed\"}\n"
+                      "limitations: [\"none\"]\nrisks: []\nescalations: []\n")
+            fake = self._fake_runner({"impl.py": "print('hi')\n"}, report=report)
+            import contextlib
+            import io
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = self._run(root, home, fake)
+            self.assertEqual(rc, 0)
+            rec = self._record_dir(root, home)
+            self.assertEqual(jw_delegate._read_status(rec)["state"], "needs-review")
+            # prompt carries acceptance criterion text
+            self.assertIn("criterion alpha here", (rec / "prompt.txt").read_text())
+            # JW_REPORT consumed from the worktree (not left to pollute the patch)
+            wt = _run_with_home(home, lambda: jw_delegate._worktree_path(root, rec.name))
+            self.assertFalse((wt / "JW_REPORT.yaml").exists())
+            contract = yaml.safe_load((rec / "artifact" / "contract.yaml").read_text())
+            self.assertEqual(contract["schema"], "jw-artifact-1")
+            self.assertFalse(contract["empty"])
+            self.assertEqual([c["path"] for c in contract["changed_files"]], ["impl.py"])
+            self.assertEqual(contract["changed_files"][0]["status"], "A")
+            self.assertEqual(contract["delegate_report"]["present"], True)
+            self.assertEqual(contract["delegate_report"]["verification"][0]["rc"], 0)
+            self.assertEqual(contract["runner"]["backend"], "codex:gpt-5.4-codex")
+            self.assertTrue((rec / "artifact" / "changes.patch").exists())
+            # exposure immutable fields
+            import json as _json
+            exp = _json.loads((rec / "exposure.json").read_text())
+            self.assertEqual(exp["schema"], "jw-exposure-1")
+            self.assertEqual(exp["sandbox"], "workspace-write")
+            self.assertEqual(exp["binding"]["backend"], "codex:gpt-5.4-codex")
+            self.assertEqual(exp["overlays"], [])
+            # result ref exists
+            self.assertTrue(git(root, "rev-parse", "--verify",
+                                f"refs/jw/delegations/{rec.name}-result").returncode == 0)
+
+    def test_missing_report_marked_absent(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = self._project(d)
+            fake = self._fake_runner({"impl.py": "x\n"}, report=None)
+            import contextlib
+            import io
+            with contextlib.redirect_stdout(io.StringIO()):
+                self._run(root, home, fake)
+            rec = self._record_dir(root, home)
+            contract = yaml.safe_load((rec / "artifact" / "contract.yaml").read_text())
+            self.assertEqual(contract["delegate_report"]["present"], False)
+
+    def test_empty_diff_marks_empty(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = self._project(d)
+            fake = self._fake_runner({}, report=None)  # no changes
+            import contextlib
+            import io
+            with contextlib.redirect_stdout(io.StringIO()):
+                self._run(root, home, fake)
+            rec = self._record_dir(root, home)
+            contract = yaml.safe_load((rec / "artifact" / "contract.yaml").read_text())
+            self.assertTrue(contract["empty"])
+            self.assertFalse((rec / "artifact" / "changes.patch").exists())
+            self.assertEqual(jw_delegate._read_status(rec)["state"], "needs-review")
+
+    def test_binary_change_preserved_in_patch(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = self._project(d)
+
+            def fake(worktree, model, prompt_path, record_dir):
+                (worktree / "blob.bin").write_bytes(bytes(range(256)))
+                (record_dir / "last_message.md").write_text("x")
+                return (0, 0.1)
+            import contextlib
+            import io
+            with contextlib.redirect_stdout(io.StringIO()):
+                self._run(root, home, fake)
+            rec = self._record_dir(root, home)
+            patch = (rec / "artifact" / "changes.patch").read_text()
+            self.assertIn("GIT binary patch", patch)
+
+    def test_env_prep_failure_is_failed_env_no_runner(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = self._project(d)
+            (root / ".jahns-workflow.yml").write_text(
+                "version: 1\nproject: demo\ndelegation:\n  env_prep:\n    - \"false\"\n")
+            called = {"n": 0}
+
+            def fake(*a, **k):
+                called["n"] += 1
+                return (0, 0.1)
+            import contextlib
+            import io
+            with contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(jw_delegate.WorkflowError):
+                    self._run(root, home, fake)
+            self.assertEqual(called["n"], 0)  # runner never invoked
+            rec = self._record_dir(root, home)
+            self.assertEqual(jw_delegate._read_status(rec)["state"], "failed-env")
+
+    def test_runner_failure_is_failed_runner_with_exposure(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = self._project(d)
+            fake = self._fake_runner({"impl.py": "x\n"}, rc=3)
+            import contextlib
+            import io
+            with contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(jw_delegate.WorkflowError):
+                    self._run(root, home, fake)
+            rec = self._record_dir(root, home)
+            self.assertEqual(jw_delegate._read_status(rec)["state"], "failed-runner")
+            self.assertTrue((rec / "exposure.json").exists())  # exposure recorded before runner
+
+    def test_owner_lock_refuses_second_delegation_from_failed_state(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = self._project(d)
+            fake_fail = self._fake_runner({"impl.py": "x\n"}, rc=3)
+            import contextlib
+            import io
+            with contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(jw_delegate.WorkflowError):
+                    self._run(root, home, fake_fail)  # -> failed-runner (non-terminal, holds lock)
+                with self.assertRaises(jw_delegate.WorkflowError) as cm:
+                    self._run(root, home, self._fake_runner({"impl.py": "y\n"}))
+            self.assertIn("already has active delegation", str(cm.exception))
 
 
 if __name__ == "__main__":
