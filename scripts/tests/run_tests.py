@@ -1794,6 +1794,19 @@ class CclogParseTests(unittest.TestCase):
             self.assertEqual(e["event_type"], "session_state")
             self.assertEqual(e["event_subtype"], "agent_name")
 
+    def test_frame_link_is_session_state(self):
+        # 'frame-link' (an Artifact publish: local path -> claude.ai URL) is a structural session-state
+        # record, NOT a conversational event or an unknown_raw parse-degradation signal
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "s.jsonl"
+            _write_jsonl(f, [{"type": "frame-link", "sessionId": "56fe5235-x",
+                              "path": "/tmp/claude-1001/s/scratchpad/foo.html",
+                              "frameUrl": "https://claude.ai/code/artifact/uuid",
+                              "timestamp": "2026-07-10T12:31:59.069Z"}])
+            e = _parse(f)["events"][0]
+            self.assertEqual(e["event_type"], "session_state")
+            self.assertEqual(e["event_subtype"], "frame_link")
+
     def test_system_api_error_flagged(self):
         # a type=system/subtype=api_error record is an API failure event (any level) — errors.api
         # must see it, not just isApiErrorMessage-tagged records

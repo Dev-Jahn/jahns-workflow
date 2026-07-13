@@ -24,7 +24,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-PARSER_VERSION = "jw-trace-2"
+PARSER_VERSION = "jw-trace-3"
 
 
 # --------------------------------------------------------------------------- util
@@ -125,6 +125,7 @@ SESSION_STATE_TYPES = {
     "custom-title": "custom_title",
     "queue-operation": "queue_operation",
     "pr-link": "pr_link",
+    "frame-link": "frame_link",
     "agent-setting": "agent_setting",
     "summary": "summary",
 }
