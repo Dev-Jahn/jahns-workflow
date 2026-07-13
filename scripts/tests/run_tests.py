@@ -3321,6 +3321,73 @@ class DelegateRunTests(unittest.TestCase):
             self.assertEqual(jw_delegate._read_status(rec)["state"], "failed-runner")
             self.assertTrue((rec / "exposure.json").exists())  # exposure recorded before runner
 
+    def test_non_utf8_text_change_roundtrip(self):
+        # H1 repro: latin-1 content (0xE9, no NUL -> git classifies it as text) must not crash the
+        # harness — the patch is bytes and must never round-trip through strict UTF-8.
+        with tempfile.TemporaryDirectory() as d:
+            root, home = self._project(d)
+
+            def fake(worktree, model, prompt_path, record_dir):
+                (worktree / "cafe.txt").write_bytes(b"caf\xe9 au lait\n")
+                (record_dir / "last_message.md").write_text("x")
+                return (0, 0.1)
+            import contextlib
+            import io
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = self._run(root, home, fake)
+            self.assertEqual(rc, 0)
+            rec = self._record_dir(root, home)
+            self.assertEqual(jw_delegate._read_status(rec)["state"], "needs-review")
+            self.assertTrue((rec / "artifact" / "contract.yaml").exists())
+            patch = (rec / "artifact" / "changes.patch").read_bytes()
+            self.assertIn(b"caf\xe9 au lait", patch)  # original bytes preserved, not mangled
+
+    def test_non_utf8_report_marked_invalid(self):
+        # H1: a non-UTF-8 JW_REPORT.yaml must surface as delegate_report invalid, not crash the run
+        with tempfile.TemporaryDirectory() as d:
+            root, home = self._project(d)
+
+            def fake(worktree, model, prompt_path, record_dir):
+                (worktree / "impl.py").write_text("x\n")
+                (worktree / "JW_REPORT.yaml").write_bytes(b"verification: caf\xe9\n")
+                (record_dir / "last_message.md").write_text("x")
+                return (0, 0.1)
+            import contextlib
+            import io
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = self._run(root, home, fake)
+            self.assertEqual(rc, 0)
+            rec = self._record_dir(root, home)
+            contract = yaml.safe_load((rec / "artifact" / "contract.yaml").read_text())
+            self.assertEqual(contract["delegate_report"]["present"], "invalid")
+
+    def test_artifact_failure_is_failed_artifact_lock_held(self):
+        # H1: a post-runner artifact-computation failure must not strand the record as `running`
+        # (permanent owner-lock) — it transitions to failed-artifact, preserves the worktree as
+        # evidence, keeps the lock, and discard clears it.
+        with tempfile.TemporaryDirectory() as d:
+            root, home = self._project(d)
+
+            def fake(worktree, model, prompt_path, record_dir):
+                (record_dir / "last_message.md").write_text("x")
+                (worktree / ".git").unlink()  # breaks the result snapshot
+                return (0, 0.1)
+            import contextlib
+            import io
+            with contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(jw_delegate.WorkflowError):
+                    self._run(root, home, fake)
+            rec = self._record_dir(root, home)
+            self.assertEqual(jw_delegate._read_status(rec)["state"], "failed-artifact")
+            wt = _run_with_home(home, lambda: jw_delegate._worktree_path(root, rec.name))
+            self.assertTrue(wt.exists())  # evidence preserved
+            with contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(jw_delegate.WorkflowError) as cm:
+                    self._run(root, home, self._fake_runner({"impl.py": "y\n"}))
+                self.assertIn("already has active delegation", str(cm.exception))
+                rc = _run_with_home(home, lambda: jw_delegate.discard_delegation(root, rec.name))
+            self.assertEqual(rc, 0)
+
     def test_owner_lock_refuses_second_delegation_from_failed_state(self):
         with tempfile.TemporaryDirectory() as d:
             root, home = self._project(d)
@@ -3381,6 +3448,24 @@ def _latest_rec(root, home):
 
 class DelegateApplyTests(unittest.TestCase):
     """0.8.0 M1 §12 — plain `git apply`, atomic drift failure, discard cleanup, re-apply refusal."""
+
+    def test_apply_non_utf8_patch_preserves_bytes(self):
+        # H1: a latin-1 text patch must apply byte-exact to the live tree
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _deleg_project(d)
+
+            def fake(worktree, model, prompt_path, record_dir):
+                (worktree / "cafe.txt").write_bytes(b"caf\xe9 au lait\n")
+                (record_dir / "last_message.md").write_text("x")
+                return (0, 0.1)
+            _deleg_run(root, home, fake)
+            rec = _latest_rec(root, home)
+            import contextlib
+            import io
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = _run_with_home(home, lambda: jw_delegate.apply_delegation(root, rec.name))
+            self.assertEqual(rc, 0)
+            self.assertEqual((root / "cafe.txt").read_bytes(), b"caf\xe9 au lait\n")
 
     def test_apply_success_and_cleanup(self):
         with tempfile.TemporaryDirectory() as d:

@@ -62,11 +62,13 @@ class _RefusedWrite(WorkflowError):
 
 # ---- git plumbing (private; jw_common.git_rc has no env/cwd-index support) ----
 def _git(cwd: Path, *args: str, env: dict | None = None, timeout: int = 30) -> tuple[int, str, str]:
-    """Run git in `cwd`; return (rc, stdout, stderr). `env` overlays os.environ (for GIT_INDEX_FILE)."""
+    """Run git in `cwd`; return (rc, stdout, stderr). `env` overlays os.environ (for GIT_INDEX_FILE).
+    Output decodes with surrogateescape — git output is not guaranteed UTF-8 (H1) and a status/scan
+    path must never crash on it."""
     full = {**os.environ, **env} if env else None
     try:
         p = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True,
-                           env=full, timeout=timeout)
+                           errors="surrogateescape", env=full, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as e:
         return (127, "", str(e))
     return (p.returncode, p.stdout.strip(), p.stderr.strip())
@@ -361,10 +363,10 @@ def _read_report(worktree: Path) -> dict:
     p = worktree / "JW_REPORT.yaml"
     if not p.exists():
         return {"present": False}
-    raw = p.read_text(encoding="utf-8")
+    raw = p.read_bytes()  # bytes: a non-UTF-8 report must surface as invalid, never crash (H1)
     p.unlink()
     try:
-        data = yaml.safe_load(raw)
+        data = yaml.safe_load(raw)  # PyYAML decodes bytes itself; bad UTF-8 -> ReaderError (a YAMLError)
     except yaml.YAMLError:
         data = None
     if not isinstance(data, dict):
@@ -388,12 +390,13 @@ def _changed_files(root: Path, base: str, result: str) -> list[dict]:
     return rows
 
 
-def _diff_patch(cwd: Path, base: str, result: str) -> str:
-    """Exact (unstripped) `git diff --binary --no-renames` output — trailing bytes matter for apply."""
+def _diff_patch(cwd: Path, base: str, result: str) -> bytes:
+    """Exact `git diff --binary --no-renames` output as BYTES — a patch is not UTF-8 in general (any
+    latin-1 text file), so it must never round-trip through a strict str decode (H1)."""
     p = subprocess.run(["git", "-C", str(cwd), "diff", "--binary", "--no-renames", base, result],
-                       capture_output=True, text=True, timeout=60)
+                       capture_output=True, timeout=60)
     if p.returncode != 0:
-        raise WorkflowError(f"git diff failed: {p.stderr.strip()}")
+        raise WorkflowError(f"git diff failed: {p.stderr.decode('utf-8', 'replace').strip()}")
     return p.stdout
 
 
@@ -475,28 +478,36 @@ def run_delegation(root: Path, task_id: str, role: str, accept_flags: list[str])
         raise WorkflowError(
             f"runner exited non-zero (rc {runner_rc}) — see {record_dir / 'runner.stderr'}; worktree preserved")
 
-    report = _read_report(worktree_path)
-    result_sha, _ = _snapshot(worktree_path, f"jw delegation result: {task_id} {did}")
-    _git_out(root, "update-ref", f"{DELEG_REF_NS}/{did}-result", result_sha)
-    changed = _changed_files(root, base_sha, result_sha)
-    patch = _diff_patch(root, base_sha, result_sha)
-    empty = patch.strip() == ""
-    if not empty:
-        (artifact_dir / "changes.patch").write_text(patch, encoding="utf-8")
-    contract = {
-        "schema": "jw-artifact-1",
-        "delegation_id": did, "task_id": task_id,
-        "base_sha": base_sha, "result_sha": result_sha,
-        "changed_files": changed,
-        "patch_file": "changes.patch" if not empty else None,
-        "empty": empty,
-        "delegate_report": report,
-        "env": env_rec,
-        "runner": {"backend": binding["backend"], "rc": runner_rc,
-                   "duration_s": duration, "last_message": "last_message.md"},
-    }
-    (artifact_dir / "contract.yaml").write_text(
-        yaml.safe_dump(contract, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    # Any artifact-computation failure must not strand the record as `running` (a permanently held
+    # owner lock): transition to failed-artifact — worktree preserved as evidence, lock held like the
+    # other failed-* states, discard clears it (H1).
+    try:
+        report = _read_report(worktree_path)
+        result_sha, _ = _snapshot(worktree_path, f"jw delegation result: {task_id} {did}")
+        _git_out(root, "update-ref", f"{DELEG_REF_NS}/{did}-result", result_sha)
+        changed = _changed_files(root, base_sha, result_sha)
+        patch = _diff_patch(root, base_sha, result_sha)
+        empty = patch.strip() == b""
+        if not empty:
+            (artifact_dir / "changes.patch").write_bytes(patch)
+        contract = {
+            "schema": "jw-artifact-1",
+            "delegation_id": did, "task_id": task_id,
+            "base_sha": base_sha, "result_sha": result_sha,
+            "changed_files": changed,
+            "patch_file": "changes.patch" if not empty else None,
+            "empty": empty,
+            "delegate_report": report,
+            "env": env_rec,
+            "runner": {"backend": binding["backend"], "rc": runner_rc,
+                       "duration_s": duration, "last_message": "last_message.md"},
+        }
+        (artifact_dir / "contract.yaml").write_text(
+            yaml.safe_dump(contract, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    except Exception as e:
+        _set_state(record_dir, "failed-artifact", env=env_rec, error=str(e))
+        raise WorkflowError(
+            f"artifact computation failed after the runner — worktree preserved at {worktree_path}: {e}")
     _set_state(record_dir, "needs-review", env=env_rec)
     print(f"artifact: {artifact_dir / 'contract.yaml'}")
     return 0
@@ -589,7 +600,12 @@ def show(root: Path, did: str, opt: str | None) -> int:
             return 0
         patch_p = rec / "artifact" / "changes.patch"
         if patch_p.exists():
-            sys.stdout.write(patch_p.read_text(encoding="utf-8"))
+            data = patch_p.read_bytes()  # the patch is bytes, not UTF-8 in general (H1)
+            buf = getattr(sys.stdout, "buffer", None)
+            if buf is not None:
+                buf.write(data)
+            else:  # a captured/StringIO stdout has no binary buffer
+                sys.stdout.write(data.decode("utf-8", errors="replace"))
         return 0
     # summary
     print(_status_row(root, did, rec))
