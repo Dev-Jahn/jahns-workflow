@@ -621,8 +621,8 @@ def _project_review_rows(name: str, root: Path, cfg: dict) -> list[dict]:
                 # ONE finding — keep the triage row (triage severity), annotate its task_id, and drop
                 # the separate task finding so it is not double-counted
                 tid = f["task_id"]
+                entry["task_id"] = tid or None
                 if tid and tid in tasks_by_id:
-                    entry["task_id"] = tid
                     referenced_task_ids.add(tid)
                 findings.append(entry)
         # finding-derived tasks not referenced by any triage row remain as source "task"
@@ -778,6 +778,11 @@ def run_evidence(registry_path: Path, out_dir: Path, projects: set[str]) -> dict
         try:
             cfg = load_config(root)
             reviews = _project_review_rows(name, root, cfg)
+            task_statuses = {
+                t.get("id"): t.get("status")
+                for t in (load_tasks(root).get("tasks") or [])
+                if isinstance(t, dict) and t.get("id")
+            }
         except (OSError, yaml.YAMLError, ValueError) as e:
             skipped.append({"project": name, "reason": f"project unreadable: {type(e).__name__}"})
             continue
@@ -793,6 +798,7 @@ def run_evidence(registry_path: Path, out_dir: Path, projects: set[str]) -> dict
                 row = by_task.setdefault(task_id, {
                     "task_id": task_id, "project": name, "findings": [], "delegations": [],
                     "join_key": "task-id", "provenance": "explicit",
+                    "task_status": task_statuses.get(task_id),
                 })
                 row["findings"].append({
                     "round": review.get("round_id"), "severity": finding.get("severity"),
@@ -807,6 +813,7 @@ def run_evidence(registry_path: Path, out_dir: Path, projects: set[str]) -> dict
             row = by_task.setdefault(task_id, {
                 "task_id": task_id, "project": name, "findings": [], "delegations": [],
                 "join_key": "task-id", "provenance": "explicit",
+                "task_status": task_statuses.get(task_id),
             })
             row["delegations"].append(delegation)
             delegation_total += 1
@@ -1087,10 +1094,12 @@ def _lens_evidence_link(rows: list[dict]) -> dict:
         joined = [r for r in prows if r.get("findings") and r.get("delegations")]
         unverified_with_open_severe = 0
         for row in joined:
-            open_severe = any(
-                f.get("severity") in ("blocker", "major")
-                and f.get("status") not in ("done", "dropped", "REJECTED")
-                for f in row.get("findings") or [])
+            open_severe = (
+                row.get("task_status") is not None
+                and row["task_status"] not in ("done", "dropped")
+                and any(f.get("severity") in ("blocker", "major")
+                        and f.get("status") != "REJECTED"
+                        for f in row.get("findings") or []))
             if not open_severe:
                 continue
             count = sum(1 for d in row.get("delegations") or []

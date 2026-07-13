@@ -4640,6 +4640,47 @@ class EvidenceTests(unittest.TestCase):
             self.assertLessEqual(len(lens["examples"]), 5)
             self.assertEqual(lens["round_session_mapping"], {"provenance": "unknown"})
 
+    def test_evidence_link_uses_joined_registry_status_for_openness(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home, registry = self._fixture(d)
+            tasks = yaml.safe_load((root / "tasks.yaml").read_text())
+            next(t for t in tasks["tasks"] if t["id"] == "fix/open")["status"] = "done"
+            (root / "tasks.yaml").write_text(yaml.safe_dump(tasks, sort_keys=False))
+            out = Path(d) / "out"
+            _run_with_home(home, lambda: jw_improve.run_evidence(registry, out, set()))
+            rows = {r["task_id"]: r for r in self._rows(out) if "task_id" in r}
+            facts = jw_improve.run_audit(out)
+            lens = next(x for x in facts["lenses"] if x["lens"] == "evidence_link")
+            self.assertEqual(rows["fix/open"]["findings"][0]["status"], "REAL")
+            self.assertEqual(rows["fix/open"]["task_status"], "done")
+            self.assertEqual(
+                lens["per_project"]["proj-a"]
+                    ["unverified_delegations_with_open_severe_findings"],
+                0)
+
+    def test_non_review_task_raw_triage_link_projects_and_joins(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home, registry = self._fixture(d)
+            feedback = root / "docs" / "reviews" / "2026-01-01-r1-feedback.md"
+            feedback.write_text(feedback.read_text().replace(
+                "| JW-GPT-002 — unknown link | `major` | NEEDS-RULING | ev | |",
+                "| JW-GPT-002 — external task | `major` | NEEDS-RULING | ev | `feat/deleg-only` |"))
+            ddir = _run_with_home(home, lambda: jw_delegate._delegations_dir(root))
+            self._delegation(
+                ddir / "did-unverified-external", "feat/deleg-only", "needs-review", verified=False)
+            out = Path(d) / "out"
+            _run_with_home(home, lambda: jw_improve.run_evidence(registry, out, set()))
+            rows = {r["task_id"]: r for r in self._rows(out) if "task_id" in r}
+            self.assertEqual(rows["feat/deleg-only"]["findings"], [{
+                "round": "2026-01-01-r1", "severity": "major", "status": "NEEDS-RULING"}])
+            facts = jw_improve.run_audit(out)
+            lens = next(x for x in facts["lenses"] if x["lens"] == "evidence_link")
+            self.assertEqual(lens["per_project"]["proj-a"]["tasks_joined"], 2)
+            self.assertEqual(
+                lens["per_project"]["proj-a"]
+                    ["unverified_delegations_with_open_severe_findings"],
+                2)
+
     def test_byte_identical_reruns_and_cli_project_filter(self):
         with tempfile.TemporaryDirectory() as d:
             root, home, registry = self._fixture(d)
