@@ -345,9 +345,83 @@ def _dumps(obj) -> str:
     return json.dumps(obj, ensure_ascii=False, sort_keys=True)
 
 
+# self-session truncation: when `jw improve trace` runs inside a live CC session, that session's own
+# main transcript is mid-write and includes this very invocation. We stop parsing it at the improve
+# invocation so the trace does not pollute itself. Anchor detection re-scans ONLY the one matched file
+# (main transcript whose stem == CLAUDE_CODE_SESSION_ID) and copies no content into outputs.
+_SELF_CMD_NAME_RE = re.compile(r"<command-name>([^<]*)</command-name>")
+
+
+def _user_message_text(message: dict) -> str:
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(b.get("text", "") for b in content
+                         if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
+def _self_session_anchor(path: Path) -> tuple[int | None, str | None, int]:
+    """Pre-scan the one matched main transcript for the truncation anchor. Returns
+    (anchor_line_no, anchor_kind, lines_excluded); anchor_line_no is 1-based (parsing stops before
+    it). Priority: LAST command-tag (a real `/jahns-workflow:improve` skill invocation — the tag must
+    LEAD the message, distinguishing it from a user pasting the tag mid-text); else, if none, the LAST
+    `jw ... improve trace` Bash tool_use. lines_excluded counts raw lines from the anchor to EOF."""
+    cmd_tag_line: int | None = None
+    tool_use_line: int | None = None
+    total = 0
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line_no, raw in enumerate(f, start=1):
+                total = line_no
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                rtype = rec.get("type")
+                if rtype == "user":
+                    stripped = _user_message_text(rec.get("message") or {}).lstrip()
+                    if stripped.startswith("<command-name>"):
+                        m = _SELF_CMD_NAME_RE.search(stripped)
+                        if m and "/jahns-workflow:improve" in m.group(1):
+                            cmd_tag_line = line_no
+                elif rtype == "assistant":
+                    content = (rec.get("message") or {}).get("content")
+                    if isinstance(content, list):
+                        for b in content:
+                            if not (isinstance(b, dict) and b.get("type") == "tool_use"
+                                    and b.get("name") == "Bash"):
+                                continue
+                            cmd = (b.get("input") or {}).get("command")
+                            if isinstance(cmd, str) and "improve trace" in cmd and "jw" in cmd:
+                                tool_use_line = line_no
+                                break
+    except OSError:
+        return None, None, 0
+    if cmd_tag_line is not None:
+        return cmd_tag_line, "command-tag", total - cmd_tag_line + 1
+    if tool_use_line is not None:
+        return tool_use_line, "tool-use", total - tool_use_line + 1
+    return None, None, 0
+
+
 def run_trace(sources: list[Path], projects: set[str], out_dir: Path) -> dict:
     files = discover(sources, projects)
     files_by_kind: Counter = Counter(kind for _, _, kind in files)
+
+    # when running inside a live CC session, truncate that session's own mid-write transcript at the
+    # improve invocation (env set by the harness); unset/empty -> byte-identical to a plain run
+    self_sid = os.environ.get("CLAUDE_CODE_SESSION_ID") or None
+    self_session: dict | None = None
+    if self_sid:
+        self_session = {"session_id": self_sid, "file_found": False,
+                        "anchor": None, "lines_excluded": 0}
 
     session_rows: list[dict] = []
     delegation_rows: list[dict] = []
@@ -363,6 +437,14 @@ def run_trace(sources: list[Path], projects: set[str], out_dir: Path) -> dict:
             continue  # non-transcript kinds are manifested in files_by_kind only (M1)
         scope = scope_of(rel_parts)
         session_kind = TRANSCRIPT_KINDS[kind]
+        stop_before: int | None = None
+        if self_sid and kind == "main_transcript" and scope["session_id"] == self_sid:
+            self_session["file_found"] = True
+            anchor_line, anchor_kind, excluded = _self_session_anchor(path)
+            if anchor_line is not None:
+                stop_before = anchor_line
+                self_session["anchor"] = anchor_kind
+                self_session["lines_excluded"] = excluded
         try:
             parsed = parse_transcript_file(
                 path,
@@ -373,6 +455,7 @@ def run_trace(sources: list[Path], projects: set[str], out_dir: Path) -> dict:
                 agent_id=scope["agent_id"],
                 workflow_id=scope["workflow_id"],
                 is_sidechain_file=session_kind != "main",
+                stop_before_line=stop_before,
             )
         except (OSError, UnicodeDecodeError) as e:
             # an unreadable/vanished INPUT transcript must not abort the run nor be mislabeled as a
@@ -411,6 +494,9 @@ def run_trace(sources: list[Path], projects: set[str], out_dir: Path) -> dict:
         "partial_tail_lines": partial_tail_lines,
         "row_totals": {"sessions": len(session_rows), "delegations": len(delegation_rows)},
     }
+    # only present when running inside a live CC session (env set) — absent otherwise (byte-identical)
+    if self_session is not None:
+        coverage["self_session"] = self_session
 
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "sessions.jsonl").write_text(
@@ -857,6 +943,9 @@ def _lens_coverage_caveats(coverage: dict) -> dict:
         "unknown_raw_types": coverage.get("unknown_raw_types", {}),
         "row_totals": coverage.get("row_totals", {}),
     }
+    # self-session truncation caveat is only present when trace ran inside a live CC session
+    if "self_session" in coverage:
+        summary["self_session"] = coverage["self_session"]
     return _lens("coverage_caveats", "coverage-caveats-v1", "explicit", {}, [], summary=summary)
 
 

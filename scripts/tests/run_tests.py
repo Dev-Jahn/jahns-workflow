@@ -2102,6 +2102,213 @@ class ImproveTraceTests(unittest.TestCase):
                                  f"{name} not byte-identical across re-runs")
 
 
+class ImproveSelfSessionTests(unittest.TestCase):
+    """Self-session truncation: a live `improve trace` must not ingest its own mid-write transcript.
+    The current session's main transcript is cut at the improve invocation; everything else is intact."""
+
+    @staticmethod
+    def _u(uuid, text):
+        return {"type": "user", "uuid": uuid, "message": {"role": "user", "content": text}}
+
+    @staticmethod
+    def _bash(uuid, tuid, cmd):
+        return {"type": "assistant", "uuid": uuid, "requestId": uuid,
+                "message": {"id": "m" + uuid, "model": "claude-opus-4-8",
+                            "content": [{"type": "tool_use", "id": tuid, "name": "Bash",
+                                         "input": {"command": cmd}}]}}
+
+    @staticmethod
+    def _result(uuid, tuid):
+        return {"type": "user", "uuid": uuid, "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": tuid, "content": "out", "is_error": False}]}}
+
+    @staticmethod
+    def _cmd_tag(uuid):
+        return {"type": "user", "uuid": uuid, "message": {"role": "user",
+                "content": "<command-name>/jahns-workflow:improve</command-name>\n<command-args></command-args>"}}
+
+    @staticmethod
+    def _agent(uuid, tuid):
+        return {"type": "assistant", "uuid": uuid, "requestId": uuid,
+                "message": {"id": "m" + uuid, "model": "claude-opus-4-8",
+                            "content": [{"type": "tool_use", "id": tuid, "name": "Agent",
+                                         "input": {"subagent_type": "Explore", "prompt": "go"}}]}}
+
+    def _trace(self, sources, out, sid):
+        from unittest.mock import patch
+        import os
+        with patch.dict(os.environ, {}, clear=False):
+            if sid is None:
+                os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+            else:
+                os.environ["CLAUDE_CODE_SESSION_ID"] = sid
+            return jw_improve.run_trace(list(sources), set(), out)
+
+    def _sessions(self, out):
+        return [_json.loads(ln) for ln in (out / "sessions.jsonl").read_text().splitlines() if ln]
+
+    @staticmethod
+    def _shell(session):
+        return session["tools"]["by_category"].get("shell", 0)
+
+    def _main_src(self, d, stem, records) -> Path:
+        src = Path(d) / "projects"
+        slug = src / "-Users-jahn-demo"
+        slug.mkdir(parents=True, exist_ok=True)
+        _write_jsonl(slug / f"{stem}.jsonl", records)
+        return src
+
+    def test_env_unset_or_empty_no_self_session_key(self):
+        # env unset AND empty-string both mean "not a live self-run": no truncation, no coverage key,
+        # byte-identical outputs (a command-tag in the file must be ignored)
+        with tempfile.TemporaryDirectory() as d:
+            src = self._main_src(d, _UUID, [
+                self._u("u1", "implement"), self._cmd_tag("c1"),
+                self._bash("a1", "t1", "echo tail")])
+            out_unset, out_empty = Path(d) / "unset", Path(d) / "empty"
+            cov = self._trace([src], out_unset, None)
+            self.assertNotIn("self_session", cov)
+            self._trace([src], out_empty, "")
+            for name in ("sessions.jsonl", "delegations.jsonl", "parse_coverage.json"):
+                self.assertEqual((out_unset / name).read_bytes(), (out_empty / name).read_bytes())
+            main = [s for s in self._sessions(out_unset) if s["kind"] == "main"][0]
+            self.assertEqual(self._shell(main), 1)  # tail bash processed (no truncation)
+
+    def test_command_tag_anchor_mid_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = self._main_src(d, _UUID, [
+                self._u("u1", "implement"),                          # 1 turn
+                self._bash("a2", "t2", "echo hi"),                   # 2 pre-anchor shell
+                self._result("r2", "t2"),                            # 3
+                self._cmd_tag("c1"),                                 # 4 ANCHOR
+                self._bash("a5", "t5", "uv run jw.py improve trace"),  # 5 excluded
+                self._result("r5", "t5"),                            # 6 excluded
+                self._agent("a7", "t7"),                             # 7 excluded delegation
+            ])
+            out = Path(d) / "out"
+            cov = self._trace([src], out, _UUID)
+            self.assertEqual(cov["self_session"], {"session_id": _UUID, "file_found": True,
+                                                   "anchor": "command-tag", "lines_excluded": 4})
+            main = [s for s in self._sessions(out) if s["kind"] == "main"][0]
+            self.assertEqual(main["turns"]["value"], 1)
+            self.assertEqual(self._shell(main), 1)      # pre-anchor bash only
+            self.assertEqual(main["delegations"], 0)    # post-anchor Agent excluded
+            self.assertEqual((out / "delegations.jsonl").read_text().splitlines(), [])
+
+    def test_tool_use_anchor_when_no_command_tag(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = self._main_src(d, _UUID, [
+                self._u("u1", "implement"),                          # 1 turn
+                self._bash("a2", "t2", "echo hi"),                   # 2 pre-anchor shell
+                self._result("r2", "t2"),                            # 3
+                self._bash("a4", "t4", "uv run /x/jw.py improve trace --out /tmp/o"),  # 4 ANCHOR
+                self._result("r4", "t4"),                            # 5 excluded
+            ])
+            out = Path(d) / "out"
+            cov = self._trace([src], out, _UUID)
+            self.assertEqual(cov["self_session"], {"session_id": _UUID, "file_found": True,
+                                                   "anchor": "tool-use", "lines_excluded": 2})
+            main = [s for s in self._sessions(out) if s["kind"] == "main"][0]
+            self.assertEqual(self._shell(main), 1)      # anchor bash itself excluded
+
+    def test_no_anchor_processes_whole_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = self._main_src(d, _UUID, [
+                self._u("u1", "implement"), self._bash("a2", "t2", "echo hi"),
+                self._result("r2", "t2")])
+            out = Path(d) / "out"
+            cov = self._trace([src], out, _UUID)
+            self.assertEqual(cov["self_session"], {"session_id": _UUID, "file_found": True,
+                                                   "anchor": None, "lines_excluded": 0})
+            main = [s for s in self._sessions(out) if s["kind"] == "main"][0]
+            self.assertEqual(main["turns"]["value"], 1)
+            self.assertEqual(self._shell(main), 1)
+
+    def test_only_matching_main_session_truncated(self):
+        sid_b = "0123abcd-1234-1234-1234-0123456789ff"
+        aid = "a1b2c3d4e5f6"
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "projects"
+            slug = src / "-Users-jahn-demo"
+            (slug / _UUID / "subagents").mkdir(parents=True)
+            # session A (matches env) — truncated at its command-tag
+            _write_jsonl(slug / f"{_UUID}.jsonl", [
+                self._u("ua", "implement"),                 # 1
+                self._bash("aa", "ta", "echo preA"),        # 2 kept
+                self._cmd_tag("ca"),                        # 3 ANCHOR
+                self._bash("ab", "tb", "echo postA"),       # 4 excluded
+            ])
+            # A's subagent — NOT a main transcript, so its command-tag is NOT an anchor
+            _write_jsonl(slug / _UUID / "subagents" / f"agent-{aid}.jsonl", [
+                {"type": "user", "uuid": "s1", "isSidechain": True,
+                 "message": {"role": "user", "content": "do work"}},
+                self._cmd_tag("s2"),
+                self._bash("s3", "ts3", "echo subpost"),    # must still be counted
+            ])
+            # session B (different id) — not the self session, so it is left intact
+            _write_jsonl(slug / f"{sid_b}.jsonl", [
+                self._u("ub", "implement"),
+                self._cmd_tag("cb"),
+                self._bash("bb", "tbb", "echo postB"),      # must still be counted
+            ])
+            out = Path(d) / "out"
+            cov = self._trace([src], out, _UUID)
+            self.assertEqual(cov["self_session"], {"session_id": _UUID, "file_found": True,
+                                                   "anchor": "command-tag", "lines_excluded": 2})
+            sess = self._sessions(out)
+            a_main = [s for s in sess if s["kind"] == "main" and s["session_id"] == _UUID][0]
+            b_main = [s for s in sess if s["kind"] == "main" and s["session_id"] == sid_b][0]
+            subagent = [s for s in sess if s["kind"] == "subagent"][0]
+            self.assertEqual(self._shell(a_main), 1)    # preA only (truncated)
+            self.assertEqual(self._shell(b_main), 1)    # postB kept (untruncated)
+            self.assertEqual(self._shell(subagent), 1)  # subpost kept (untruncated)
+
+    def test_last_command_tag_is_anchor(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = self._main_src(d, _UUID, [
+                self._u("u1", "implement"),                 # 1 turn
+                self._cmd_tag("c1"),                        # 2 first invocation
+                self._bash("a3", "t3", "echo between"),     # 3 BETWEEN the two -> included
+                self._cmd_tag("c2"),                        # 4 LAST -> ANCHOR
+                self._bash("a5", "t5", "echo after"),       # 5 excluded
+            ])
+            out = Path(d) / "out"
+            cov = self._trace([src], out, _UUID)
+            self.assertEqual(cov["self_session"], {"session_id": _UUID, "file_found": True,
+                                                   "anchor": "command-tag", "lines_excluded": 2})
+            main = [s for s in self._sessions(out) if s["kind"] == "main"][0]
+            self.assertEqual(self._shell(main), 1)      # 'between' kept, 'after' cut
+
+    def test_quoted_command_tag_is_not_anchor(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = self._main_src(d, _UUID, [
+                self._u("u1", "implement"),                                                # 1 turn
+                self._u("u2", "I ran <command-name>/jahns-workflow:improve</command-name> earlier"),  # 2
+                self._bash("a3", "t3", "echo tail"),                                       # 3 included
+            ])
+            out = Path(d) / "out"
+            cov = self._trace([src], out, _UUID)
+            self.assertEqual(cov["self_session"], {"session_id": _UUID, "file_found": True,
+                                                   "anchor": None, "lines_excluded": 0})
+            main = [s for s in self._sessions(out) if s["kind"] == "main"][0]
+            self.assertEqual(self._shell(main), 1)      # tail processed (a quoted tag is not a cut)
+
+    def test_audit_coverage_caveats_carries_self_session(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            cov = {"parser_version": jw_cclog.PARSER_VERSION, "files_skipped": 0,
+                   "record_parse_errors": 0, "replayed_records_skipped": 0, "partial_tail_lines": 0,
+                   "unknown_raw_types": {}, "row_totals": {"sessions": 0, "delegations": 0},
+                   "self_session": {"session_id": _UUID, "file_found": True,
+                                    "anchor": "command-tag", "lines_excluded": 3}}
+            (d / "parse_coverage.json").write_text(_json.dumps(cov))
+            facts = jw_improve.run_audit(d)
+            cc = [l for l in facts["lenses"] if l["lens"] == "coverage_caveats"][0]
+            self.assertEqual(cc["summary"]["self_session"],
+                             {"session_id": _UUID, "file_found": True,
+                              "anchor": "command-tag", "lines_excluded": 3})
+
+
 # feedback file exactly as jw_review.ingest writes it: metadata header, byte-exact reviewer body
 # (which itself contains `### JW-GPT-NNN` blocks + `- Severity:` lines we must NOT parse), then an
 # APPENDED triage table under `## Findings (triage skeleton …)` — the only thing improve reviews reads.
