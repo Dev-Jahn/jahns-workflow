@@ -1,17 +1,27 @@
 ---
 name: round
-description: This skill should be used when the user runs "/waystone:round", says to "close the round", "wrap up this round", "finish the work cycle", or when an autonomous work round (implement → verify → push) reaches its end and the project CLAUDE.md mandates round closeout. Updates the task registry, PROGRESS, roadmap, SSOT views, and writes the round's markdown review request.
+description: This skill should be used when the user runs "/waystone:round" in Claude Code or "$waystone:round" in Codex, says to "close the round", "wrap up this round", "finish the work cycle", or when an autonomous work round (implement → verify → push) reaches its end and the project's host instruction file mandates round closeout. Updates the task registry, PROGRESS, roadmap, SSOT views, and writes the round's markdown review request.
 argument-hint: "[round-slug] e.g. lstream-seams"
 ---
 
 # waystone: round
+
+## Host contract
+
+- Claude Code: invoke `/waystone:round`; assign `$CLAUDE_PLUGIN_ROOT` to
+  `WAYSTONE_PLUGIN_ROOT`, then run command examples with `waystone` from `PATH`.
+- Codex: invoke `$waystone:round`; from this skill's directory walk up two parents, assign that
+  absolute path to `WAYSTONE_PLUGIN_ROOT`, then run command examples with
+  `$WAYSTONE_PLUGIN_ROOT/bin/waystone-codex`.
+- Resolve plugin resources from `$WAYSTONE_PLUGIN_ROOT`. Ask required choices through the host's native
+  user-interaction mechanism; never require a specifically named question tool.
 
 Close the current work round: bring the task registry up to date, record the round in
 PROGRESS, refresh generated views, and write the round's external review request (one markdown
 file; the reviewer reads the repo over git).
 
 Requires an initialized project (`.waystone.yml`). If missing, stop and point the user
-at `/waystone:init`.
+at `/waystone:init` in Claude Code or `$waystone:init` in Codex.
 
 ## Step 1 — Determine the round id
 
@@ -52,7 +62,7 @@ It is a safe no-op below the threshold, so run it every round.
 
 ## Step 3 — PROGRESS entry + archive
 
-Append an entry from `${CLAUDE_PLUGIN_ROOT}/templates/progress-entry.md` (content in the user's
+Append an entry from `$WAYSTONE_PLUGIN_ROOT/templates/progress-entry.md` (content in the user's
 configured language). Then archive: move dated sections from months before the current one
 into `docs/progress/<YYYY-MM>.md` (mechanical cut-paste, newest-first preserved), leaving
 PROGRESS.md with the current month + the header pointers.
@@ -64,7 +74,7 @@ must point at a pushed commit; if it exits non-zero, STOP and have the user push
 If your conventions end a round in a commit, commit the closeout (`docs(round): close <round-id>`)
 and push it FIRST so `tasks.yaml` / PROGRESS carry the round's final state.
 
-Write `<reviews_dir>/<round-id>-request.md` from `${CLAUDE_PLUGIN_ROOT}/templates/review-request.md`: what
+Write `<reviews_dir>/<round-id>-request.md` from `$WAYSTONE_PLUGIN_ROOT/templates/review-request.md`: what
 changed and *why*, the files to read first, falsifiable "claims to attack", evidence pointers (to
 where logs/PROGRESS already live — do **not** copy them), known weak spots, and the domain lens. Fill
 `Reviewing` with `git rev-parse HEAD` and the diff base with the **`review diff base`** value
@@ -98,8 +108,9 @@ End with the **next-step reminder** (so the reply is preserved byte-exact, not r
 
 > Give the reviewer the round request (`<reviews_dir>/<round-id>-request.md`) and the prompt; the
 > reviewer reads the repo over git. To ingest the reply, save it **in a separate shell**:
-> `cat > /tmp/review.md` → paste → `Ctrl-D`. Then run `/waystone:review <round-id>`, which
-> copies `/tmp/review.md` verbatim into the reviews dir (no model retyping) and triages it.
+> `cat > /tmp/review.md` → paste → `Ctrl-D`. Then run `/waystone:review <round-id>` in Claude
+> Code or `$waystone:review <round-id>` in Codex; it copies `/tmp/review.md` verbatim into the
+> reviews dir (no model retyping) and triages it.
 
 ## Step 6 — Refresh the re-entry pointer
 
@@ -110,7 +121,7 @@ resume — picks up the live frontier without you re-explaining "where were we".
 waystone resume --start-here-path .
 ```
 
-Then **Write** that file (overwrite — never append), **≤ ~35 lines / ~2.5KB**:
+Then overwrite that file — never append — with **≤ ~35 lines / ~2.5KB**:
 
 - first line: `# re-entry @ <round-id> / HEAD <short-sha>`
 - then the live frontier: what just landed, the open decision / next probe and **why**, the active

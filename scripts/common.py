@@ -17,8 +17,13 @@ TASKS_NAME = "tasks.yaml"
 
 
 def data_dir(home: Path | None = None) -> Path:
-    """Waystone's user-local data root, optionally resolved under an injected home for tests."""
-    return (Path.home() if home is None else Path(home)) / ".claude" / "waystone"
+    """Waystone's host-local data root, optionally resolved under an injected home for tests."""
+    base_home = Path.home() if home is None else Path(home)
+    if os.environ.get("WAYSTONE_HOST") == "codex":
+        codex_home = (Path(os.environ["CODEX_HOME"]).expanduser()
+                      if os.environ.get("CODEX_HOME") else base_home / ".codex")
+        return codex_home / "waystone"
+    return base_home / ".claude" / "waystone"
 
 
 def _legacy_data_dir(home: Path | None = None) -> Path:
@@ -27,8 +32,12 @@ def _legacy_data_dir(home: Path | None = None) -> Path:
 
 def migrate_home_data(home: Path | None = None) -> Path:
     """Move the legacy data root once. A conflict is preserved and reported, never merged."""
-    old = _legacy_data_dir(home)
     new = data_dir(home)
+    # The legacy jahns-workflow home only existed on Claude. A Codex launch must never move Claude
+    # state into the Codex-local data root.
+    if os.environ.get("WAYSTONE_HOST") == "codex":
+        return new
+    old = _legacy_data_dir(home)
     if new.exists():
         if old.exists():
             print(

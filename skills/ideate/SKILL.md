@@ -1,10 +1,20 @@
 ---
 name: ideate
-description: This skill should be used when the user runs "/waystone:ideate", has a new or half-formed project idea, says things like "I want to build X but haven't thought it through", "help me figure out what I'm actually building", "let's scope/shape this project", "brainstorm the direction", or asks to "write a design doc / SSOT" — especially at the very start, before any design document exists. It draws a project's north-star out of the user through Socratic questioning and writes it as a ready-to-adopt SSOT.md that the rest of the workflow anchors to.
+description: This skill should be used when the user runs "/waystone:ideate" in Claude Code or "$waystone:ideate" in Codex, has a new or half-formed project idea, says things like "I want to build X but haven't thought it through", "help me figure out what I'm actually building", "let's scope/shape this project", "brainstorm the direction", or asks to "write a design doc / SSOT" — especially at the very start, before any design document exists. It draws a project's north-star out of the user through Socratic questioning and writes it as a ready-to-adopt SSOT.md that the rest of the workflow anchors to.
 argument-hint: "[one-line project idea] (optional — I'll ask if omitted)"
 ---
 
 # waystone: ideate
+
+## Host contract
+
+- Claude Code: invoke `/waystone:ideate`; assign `$CLAUDE_PLUGIN_ROOT` to
+  `WAYSTONE_PLUGIN_ROOT`, then run command examples with `waystone` from `PATH`.
+- Codex: invoke `$waystone:ideate`; from this skill's directory walk up two parents, assign that
+  absolute path to `WAYSTONE_PLUGIN_ROOT`, then run command examples with
+  `$WAYSTONE_PLUGIN_ROOT/bin/waystone-codex`.
+- Resolve plugin resources from `$WAYSTONE_PLUGIN_ROOT`. Ask required choices through the host's native
+  user-interaction mechanism; never require a specifically named question tool.
 
 The ideation front door. Turn a one-line, half-formed idea into a **north-star `SSOT.md`** by
 questioning it: sharpen the vision, surface the decisions the user hasn't made yet, decide the
@@ -12,11 +22,12 @@ obvious things yourself, and ground the rest with research. The whole workflow i
 so this is where the anchor is forged.
 
 Runs before everything else — **no git, no `.waystone.yml`, no prior structure required**.
-It closes a real gap: without it, `/waystone:init` faced with no design doc can only scaffold
+It closes a real gap: without it, `/waystone:init` (Claude Code) or `$waystone:init` (Codex)
+faced with no design doc can only scaffold
 an *empty* SSOT.md, leaving an SSOT-anchored project with a hollow anchor. You fill it.
 
 The authority on what an SSOT is and how it is consumed:
-`${CLAUDE_PLUGIN_ROOT}/references/conventions.md` §4.
+`$WAYSTONE_PLUGIN_ROOT/references/conventions.md` §4.
 
 ## The one thing you're producing
 
@@ -66,10 +77,10 @@ You are having a conversation, not administering a form. Keep it short and sharp
 
 ## Asking maieutic questions
 
-`AskUserQuestion` is normally a picker: you hand over answers and the user chooses one. Invert it.
-Your options are not answers — they are **framings**, three sharply different ways of seeing what
-this project *is*, each with a consequence. Laid side by side they force the user to notice where
-they actually stand, and that noticing is the point.
+When the host-native question mechanism offers a picker, invert it: the options are not answers —
+they are **framings**, three sharply different ways of seeing what this project *is*, each with a
+consequence. Laid side by side they force the user to notice where they actually stand, and that
+noticing is the point. When no picker is available, present the same framings in a plain question.
 
 The signal you are after is **not which chip they click**. It is which framing they lean toward *and
 what they say in their own words* about why. So:
@@ -154,7 +165,8 @@ downstream decision, not the anchor. Climb back up.
 Leave `SSOT.md` **uncommitted** for the user to read. Show a tight summary — the vision line, the
 section map, and any open questions you recorded — then point them at the next step:
 
-> `/waystone:init` — it detects `SSOT.md` as the SSOT and scaffolds the harness around it.
+> Next run `/waystone:init` in Claude Code or `$waystone:init` in Codex — it detects `SSOT.md` as
+> the SSOT and scaffolds the harness around it.
 
 Don't run init yourself; it has its own decisions to walk through (review mode, existing structure).
 Respond in the user's configured language throughout.

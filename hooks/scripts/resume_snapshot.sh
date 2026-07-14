@@ -2,6 +2,10 @@
 # PreCompact / SessionEnd fast-path: snapshot a re-entry pointer only in initialized projects.
 set -uo pipefail
 
+if [ -n "${PLUGIN_ROOT:-}" ]; then
+  export WAYSTONE_HOST=codex
+fi
+
 input=$(cat)
 
 find_root() {

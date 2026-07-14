@@ -2,6 +2,12 @@
 # SessionStart fast-path: only spin up Python in waystone-initialized projects.
 set -uo pipefail
 
+# Codex injects PLUGIN_ROOT (and a CLAUDE_PLUGIN_ROOT compatibility alias); Claude injects only
+# CLAUDE_PLUGIN_ROOT. Select the host before Python imports the host-local data helpers.
+if [ -n "${PLUGIN_ROOT:-}" ]; then
+  export WAYSTONE_HOST=codex
+fi
+
 input=$(cat)
 
 find_root() {

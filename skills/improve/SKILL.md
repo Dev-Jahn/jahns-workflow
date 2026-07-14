@@ -1,12 +1,22 @@
 ---
 name: improve
-description: This skill should be used when the user runs "/waystone:improve", asks for workflow-improvement suggestions, wants to analyze their Claude Code 작업 이력 (work history), requests 개선 제안 grounded in past sessions, or asks "how can I work better / where am I wasting effort across my projects". It mines the user's existing Claude Code logs plus round/review evidence into deterministic facts, then presents evidence-grounded, provenance-labeled recommendations for the user to accept or reject — recording each decision without applying anything automatically.
-argument-hint: "[--source DIR] [--project SLUG] (optional — defaults to all your Claude Code logs)"
+description: This skill should be used when the user runs "/waystone:improve" in Claude Code or "$waystone:improve" in Codex, asks for workflow-improvement suggestions, wants to analyze their Claude Code or Codex 작업 이력 (work history), requests 개선 제안 grounded in past sessions, or asks "how can I work better / where am I wasting effort across my projects". It mines the user's existing host session logs plus round/review evidence into deterministic facts, then presents evidence-grounded, provenance-labeled recommendations for the user to accept or reject — recording each decision without applying anything automatically.
+argument-hint: "[--source DIR] [--project SLUG] (optional — defaults to all your host session logs)"
 ---
 
 # waystone: improve
 
-Produce an **advisory** workflow-improvement report grounded in the user's actual Claude Code
+## Host contract
+
+- Claude Code: invoke `/waystone:improve`; assign `$CLAUDE_PLUGIN_ROOT` to
+  `WAYSTONE_PLUGIN_ROOT`, then run command examples with `waystone` from `PATH`.
+- Codex: invoke `$waystone:improve`; from this skill's directory walk up two parents, assign that
+  absolute path to `WAYSTONE_PLUGIN_ROOT`, then run command examples with
+  `$WAYSTONE_PLUGIN_ROOT/bin/waystone-codex`.
+- Resolve plugin resources from `$WAYSTONE_PLUGIN_ROOT`. Ask required choices through the host's native
+  user-interaction mechanism; never require a specifically named question tool.
+
+Produce an **advisory** workflow-improvement report grounded in the user's actual host session
 history and review evidence. Record each accept/reject. For the small finite set of mapped
 recommendations, separately offer an observation-only overlay; never materialize one without a
 second explicit consent.
@@ -16,17 +26,22 @@ directory to be an initialized project.
 
 ## Step 1 — Collect the evidence (deterministic)
 
-Run the four deterministic projections in order (each writes into the improve out dir, default
-`~/.claude/waystone/improve/`):
+Run exactly one host-specific trace, then the other three deterministic projections in order with
+the current host's launcher. They write into the host data root by default:
+`~/.claude/waystone/improve/` for Claude Code or `~/.codex/waystone/improve/` for Codex.
 
 ```bash
-waystone improve trace
+waystone improve trace                 # Claude Code
+waystone improve trace --host codex    # Codex
+
+# Then, on either host:
 waystone improve reviews
 waystone improve evidence
 waystone improve audit
 ```
 
-- Default source is every Claude Code log (`$CLAUDE_CONFIG_DIR/projects`, else `~/.claude/projects`).
+- The default source is host-specific: Claude Code uses `$CLAUDE_CONFIG_DIR/projects`, else
+  `~/.claude/projects`; Codex uses `$CODEX_HOME/sessions`, else `~/.codex/sessions`.
   When the user names targets, pass them through unchanged:
   `improve trace --source <DIR> --project <SLUG>` (both repeatable), and pass each selected project
   to `improve evidence --project <SLUG>`. `reviews` scans the registry; `audit` reads the shared out dir.
@@ -68,9 +83,9 @@ Read `facts.json` and derive recommendations. HARD rules (invariant #11):
 
 ## Step 3 — Present and record (approval = RECORDING only)
 
-For each recommendation, use **AskUserQuestion** to get an explicit accept/reject — one question per
-recommendation, never a generic wizard and never a batched "apply this plan". Then record the
-decision deterministically:
+For each recommendation, use the host-native interaction mechanism to get an explicit
+accept/reject — one question per recommendation, never a generic wizard and never a batched
+"apply this plan". Then record the decision deterministically:
 
 ```bash
 waystone improve decide <rec-id> accept|reject [--title "..."] [--note "..."]
@@ -82,7 +97,7 @@ the finite mapping below.
 
 ## Step 3.5 — Separately offer observation-only materialization
 
-For each accepted recommendation that matches this table, use a separate **AskUserQuestion**:
+For each accepted recommendation that matches this table, ask a separate host-native question:
 "Store this as an overlay delta? It starts in observing (records only, no warning)." Ask once per
 recommendation. A no does nothing; the Step 3 decision is already recorded.
 
@@ -123,11 +138,11 @@ Report in the user's configured language. Lead with the per-project maturity fra
 ordered by evidence strength and impact — each with its lens, numbers, evidence pointer, and
 strength label — and note any coverage caveats. Close by summarizing what was accepted vs rejected,
 which observation-only deltas (if any) were separately created, and where the decision log lives
-(`~/.claude/waystone/improve/decisions.jsonl`).
+(`<host-data-root>/improve/decisions.jsonl`).
 
 End with the **next-step reminder**:
 
 > Recommendations were recorded, not applied. Any separately accepted overlay starts in observing
 > (records only, no warning); replay is required before warning promotion. Re-run
-> `/waystone:improve` after a few more rounds; decisions are remembered, so the next report
-> focuses on what's new.
+> `/waystone:improve` in Claude Code or `$waystone:improve` in Codex after a few more rounds;
+> decisions are remembered, so the next report focuses on what's new.
