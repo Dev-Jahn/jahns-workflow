@@ -11,9 +11,8 @@ Set up (or repair) the waystone harness in the current project. Greenfield proje
 the full structure; in-progress projects are retrofitted **non-destructively**: existing docs,
 codenames, and commit history are never rewritten — the convention applies from now on only.
 
-Plugin root = two directories above this skill's base directory. Shared resources:
-`<plugin-root>/references/conventions.md`, `<plugin-root>/templates/*`, `<plugin-root>/scripts/*.py`
-(run scripts with `uv run`).
+Shared resources: `${CLAUDE_PLUGIN_ROOT}/references/conventions.md` and
+`${CLAUDE_PLUGIN_ROOT}/templates/*`.
 
 ## Step 0 — Preconditions and mode
 
@@ -26,7 +25,7 @@ Scan before creating anything:
 
 - **SSOT candidates**: argument if given; else root-level and `docs/` markdown whose name suggests design/theory/spec/SSOT, plus any root .md over ~200 lines that is not README/PROGRESS/CLAUDE/ROADMAP. Note size and headings of each candidate.
 - **Existing homes**: PROGRESS-like log files, ADR directories (any naming), review/feedback files, docs layout, CLAUDE.md.
-- Read `<plugin-root>/references/conventions.md` to have the target model in mind.
+- Read `${CLAUDE_PLUGIN_ROOT}/references/conventions.md` to have the target model in mind.
 
 ## Step 2 — Confirm the one decision that matters
 
@@ -75,7 +74,7 @@ guard the merge; suits repos that already work through PRs with a `@codex` bot).
    `origin`, `branch`, `notes`, `ruling` — the user's decision on a `decision/...` task,
    `result` — a recorded measurement/outcome, `lane` — `{branch, base_sha, depends_on}` for
    parallel worktree lanes, verified by `waystone lanes verify`).
-3. Missing directories for adr/reviews/progress-archive; `docs/CONVENTIONS.md` as a verbatim copy of `<plugin-root>/references/conventions.md`; an ADR-0000 from `<plugin-root>/templates/adr.md` recording "adopted waystone" (so the numbering and format are established by example).
+3. Missing directories for adr/reviews/progress-archive; `docs/CONVENTIONS.md` as a verbatim copy of `${CLAUDE_PLUGIN_ROOT}/references/conventions.md`; an ADR-0000 from `${CLAUDE_PLUGIN_ROOT}/templates/adr.md` recording "adopted waystone" (so the numbering and format are established by example).
 4. If no PROGRESS file exists, create one with a one-line header pointing at tasks.yaml/ROADMAP.
 
 ## Step 4 — Seed the task registry (brownfield only)
@@ -89,15 +88,15 @@ If a PROGRESS/TODO registry with open items exists, offer to convert open items 
 Run (always safe, idempotent):
 
 ```bash
-uv run <plugin-root>/scripts/ssot.py split .   # only if config has ssot:
-uv run <plugin-root>/scripts/ssot.py digest .
-uv run <plugin-root>/scripts/roadmap.py .
-uv run <plugin-root>/scripts/validate.py tasks.yaml
+waystone ssot split .   # only if config has ssot:
+waystone ssot digest .
+waystone roadmap .
+waystone validate tasks.yaml
 ```
 
 ## Step 6 — CLAUDE.md stanza
 
-Insert `<plugin-root>/templates/claude-md-stanza.md` into the project CLAUDE.md (create the
+Insert `${CLAUDE_PLUGIN_ROOT}/templates/claude-md-stanza.md` into the project CLAUDE.md (create the
 file if absent), substituting `{SSOT_PATH}`/`{GENERATED_DIR}`. The block is delimited by
 `<!-- waystone:begin/end -->` markers — replace an existing block instead of duplicating
 it. Do not touch anything outside the markers. If CLAUDE.md currently carries a running

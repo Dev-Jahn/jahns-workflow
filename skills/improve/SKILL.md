@@ -11,8 +11,8 @@ history and review evidence. Record each accept/reject. For the small finite set
 recommendations, separately offer an observation-only overlay; never materialize one without a
 second explicit consent.
 
-Plugin root = two directories above this skill's base directory. `improve` reads global logs and
-the project registry, so it does **not** require the current directory to be an initialized project.
+`improve` reads global logs and the project registry, so it does **not** require the current
+directory to be an initialized project.
 
 ## Step 1 — Collect the evidence (deterministic)
 
@@ -20,10 +20,10 @@ Run the four deterministic projections in order (each writes into the improve ou
 `~/.claude/waystone/improve/`):
 
 ```bash
-uv run <plugin-root>/scripts/waystone.py improve trace
-uv run <plugin-root>/scripts/waystone.py improve reviews
-uv run <plugin-root>/scripts/waystone.py improve evidence
-uv run <plugin-root>/scripts/waystone.py improve audit
+waystone improve trace
+waystone improve reviews
+waystone improve evidence
+waystone improve audit
 ```
 
 - Default source is every Claude Code log (`$CLAUDE_CONFIG_DIR/projects`, else `~/.claude/projects`).
@@ -73,7 +73,7 @@ recommendation, never a generic wizard and never a batched "apply this plan". Th
 decision deterministically:
 
 ```bash
-uv run <plugin-root>/scripts/waystone.py improve decide <rec-id> accept|reject [--title "..."] [--note "..."]
+waystone improve decide <rec-id> accept|reject [--title "..."] [--note "..."]
 ```
 
 **Approval is recording.** It does not itself materialize or apply anything. When the user accepts a
@@ -95,7 +95,7 @@ This mapping is exhaustive. HARD: never map another lens or infer a new rule. On
 flag from facts already read and use the CLI only:
 
 ```bash
-uv run <plugin-root>/scripts/waystone.py overlay add <rec-id> --rule <mapped-rule> \
+waystone overlay add <rec-id> --rule <mapped-rule> \
   --summary "<observed numbers>" --pointers "<evidence pointer>" --from-rec <rec-id> \
   --expected-effect "<bounded expectation>" --risk "<known friction>" \
   --candidate-scope <project_candidate|user_candidate|unresolved> --observed-in <project-slug>

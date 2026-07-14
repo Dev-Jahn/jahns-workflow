@@ -5342,7 +5342,7 @@ class M2DocsTests(unittest.TestCase):
         self.assertIn("rounds_with_feedback >= 5", text)
         self.assertIn("findings_total >= 20", text)
         self.assertIn("Tune", text)
-        self.assertIn("waystone.py overlay add", text)
+        self.assertIn("waystone overlay add", text)
         self.assertIn("Never write delta JSON", text)
         self.assertIn("prevented", text)
         self.assertIn("improved", text)
@@ -5355,6 +5355,16 @@ class M2DocsTests(unittest.TestCase):
         import waystone
         for surface in ("improve", "evidence", "delegate", "verify", "overlay", "check"):
             self.assertIn(surface, waystone.__doc__)
+
+    def test_waystone_bin_front_door(self):
+        wrapper = SCRIPTS.parent / "bin" / "waystone"
+        self.assertTrue(wrapper.is_file())
+        self.assertTrue(wrapper.stat().st_mode & 0o111)
+        self.assertIn('exec uv run "$here/../scripts/waystone.py" "$@"', wrapper.read_text())
+        for skill in (SCRIPTS.parent / "skills").glob("*/SKILL.md"):
+            text = skill.read_text()
+            self.assertNotIn("<plugin-root>", text)
+            self.assertNotIn("scripts/waystone.py", text)
 
     def test_conventions_state_overlay_evidence_invariants_and_residence(self):
         text = (SCRIPTS.parent / "references" / "conventions.md").read_text()

@@ -15,8 +15,8 @@ Runs before everything else — **no git, no `.waystone.yml`, no prior structure
 It closes a real gap: without it, `/waystone:init` faced with no design doc can only scaffold
 an *empty* SSOT.md, leaving an SSOT-anchored project with a hollow anchor. You fill it.
 
-Plugin root = two directories above this skill's base directory. The authority on what an SSOT is
-and how it is consumed: `<plugin-root>/references/conventions.md` §4.
+The authority on what an SSOT is and how it is consumed:
+`${CLAUDE_PLUGIN_ROOT}/references/conventions.md` §4.
 
 ## The one thing you're producing
 
