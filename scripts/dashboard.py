@@ -3,10 +3,10 @@
 # requires-python = ">=3.10"
 # dependencies = ["pyyaml"]
 # ///
-"""Cross-project terminal dashboard for all jahns-workflow projects.
+"""Cross-project terminal dashboard for all waystone projects.
 
-Usage: jw_dashboard.py [--project NAME]
-Reads the global registry (~/.claude/jahns-workflow/projects.json). Entry forms:
+Usage: dashboard.py [--project NAME]
+Reads the global registry (~/.claude/waystone/projects.json). Entry forms:
   { "name": "...", "path": "/abs/local/clone" }   — local: git state + tasks.yaml from disk
   { "name": "...", "repo": "owner/name" }          — remote: tasks.yaml fetched via `gh api`
   both                                             — local preferred while the path exists
@@ -23,7 +23,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import yaml  # noqa: E402
 
-from jw_common import REGISTRY_PATH, git_branch_info, load_tasks  # noqa: E402
+from common import REGISTRY_PATH, git_branch_info, load_tasks  # noqa: E402
 
 BOLD, DIM, RESET = "\033[1m", "\033[2m", "\033[0m"
 BLUE, RED, GREEN, YELLOW = "\033[34m", "\033[31m", "\033[32m", "\033[33m"
@@ -114,7 +114,7 @@ def main() -> int:
     idx = sys.argv.index("--project") if "--project" in sys.argv else -1
     only = sys.argv[idx + 1] if 0 <= idx < len(sys.argv) - 1 else None
     if not REGISTRY_PATH.is_file():
-        print("no projects registered yet — run /jahns-workflow:init in a project first")
+        print("no projects registered yet — run /waystone:init in a project first")
         return 0
     reg = json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
     projects = reg.get("projects", [])

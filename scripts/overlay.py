@@ -3,7 +3,7 @@
 # requires-python = ">=3.10"
 # dependencies = ["pyyaml"]
 # ///
-"""Adaptive overlay store + boundary warn engine — `jw overlay` / `jw check` (0.8.0 M2).
+"""Adaptive overlay store + boundary warn engine — `waystone overlay` / `waystone check` (0.8.0 M2).
 
 A project-local overlay is a small set of *deltas*: machine-evaluable rules (from a fixed
 vocabulary) that the harness can check at workflow boundaries (a delegation reaching needs-review,
@@ -26,8 +26,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from jw_common import (  # noqa: E402
-    WorkflowError, _project_slug, find_project_root, load_config,
+from common import (  # noqa: E402
+    WorkflowError, _project_slug, data_dir, find_project_root, load_config,
 )
 
 # delta-id grammar mirrors the improve rec_id (`<lens>/<kebab-gist>`, S2) so a rec materialises to a
@@ -36,6 +36,7 @@ DELTA_ID_RE = re.compile(r"^[a-z][a-z0-9_]*/[a-z0-9]+(?:-[a-z0-9]+)*$")
 DELTA_STATUSES = ("proposed", "observing", "warning", "suspended", "retired")
 ACTIVE_STATUSES = ("observing", "warning")
 CANDIDATE_SCOPES = ("project_candidate", "user_candidate", "unresolved")
+DELTA_SCHEMAS = ("waystone-delta-1", "jw-delta-1")
 
 
 class _RefusedWrite(WorkflowError):
@@ -51,7 +52,7 @@ RULES: dict[str, dict] = {
     },
     "round-close-open-findings-v1": {
         # §6 boundary table (R4, "the single definition of evaluation targets") lists review-ingest as
-        # a rule-2 target too; §4's "round-close, check" under-lists it — include it so the jw_review
+        # a rule-2 target too; §4's "round-close, check" under-lists it — include it so the review
         # ingest warn hook (§1) actually evaluates. Faithful minimal resolution of that inconsistency.
         "boundaries": {"round-close", "review-ingest", "check"},
         "corpus": "reviews",
@@ -80,10 +81,10 @@ def evaluate_rule2(root: Path, cfg: dict, severities, *, closing_done=frozenset(
     status decides open/closed. Triage rows with no linked task are provenance-unknown — reported as
     `unlinked`, never fired (invariant #11). `closing_done` overrides the status of tasks being closed
     in the same round to `done` (evaluate against the final state). Reuses the 0.7 reviews parser."""
-    import jw_improve
+    import improve
     severities = set(severities or [])
     closed_states = {"done", "dropped"}
-    by_round = jw_improve._finding_tasks_by_round(root)
+    by_round = improve._finding_tasks_by_round(root)
 
     rejected_ids: set[str] = set()
     unlinked = 0
@@ -99,7 +100,7 @@ def evaluate_rule2(root: Path, cfg: dict, severities, *, closing_done=frozenset(
             except OSError:
                 errors += 1
                 continue
-            for f in jw_improve._parse_triage(text):
+            for f in improve._parse_triage(text):
                 tid = f.get("task_id")
                 if not tid:
                     unlinked += 1
@@ -121,7 +122,7 @@ def evaluate_rule2(root: Path, cfg: dict, severities, *, closing_done=frozenset(
 
 # ---- residence (§2 — plugin-local, keyed by project slug; never committed) -----
 def _plugin_base() -> Path:
-    return Path.home() / ".claude" / "jahns-workflow"
+    return data_dir()
 
 
 def _overlay_dir(root: Path) -> Path:
@@ -215,7 +216,7 @@ def active_deltas_for_exposure(root: Path) -> list[dict]:
             data = json.loads(p.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as e:
             raise WorkflowError(f"corrupt delta file {p} ({e})")
-        if (not isinstance(data, dict) or data.get("schema") != "jw-delta-1"
+        if (not isinstance(data, dict) or data.get("schema") not in DELTA_SCHEMAS
                 or not isinstance(data.get("id"), str)
                 or DELTA_ID_RE.fullmatch(data["id"]) is None
                 or data.get("status") not in DELTA_STATUSES
@@ -246,7 +247,7 @@ def add_delta(root: Path, delta_id: str, *, rule: str, summary: str, pointers=No
     source, rec_id = ("improve-rec", from_rec) if from_rec is not None else ("manual", None)
     now = _now_iso()
     delta = {
-        "schema": "jw-delta-1",
+        "schema": "waystone-delta-1",
         "id": delta_id,
         "title": title or delta_id,
         "rule": rule,
@@ -277,7 +278,7 @@ def _transition(root: Path, delta_id: str, to: str, *, require_from: str | None 
         raise WorkflowError(f"delta {delta_id} is {cur} — {to} requires it to be {require_from}")
     if replay_gate and not delta.get("replay"):
         raise WorkflowError(
-            f"delta {delta_id} has no replay result — run `jw overlay replay {delta_id}` first")
+            f"delta {delta_id} has no replay result — run `waystone overlay replay {delta_id}` first")
     delta["status"] = to
     entry = {"to": to, "at": _now_iso()}
     if note:
@@ -310,9 +311,9 @@ def retire(root: Path, delta_id: str, note: str | None = None) -> dict:
 
 # ---- shadow replay (§5 — deterministic projection; timestamp only in the delta event) ----
 def _replay_delegations(root: Path) -> dict:
-    import jw_delegate
+    import delegate
 
-    base = jw_delegate._delegations_dir(root)
+    base = delegate._delegations_dir(root)
     candidates = []
     if base.is_dir():
         candidates = [p.parent.parent for p in sorted(base.glob("*/artifact/contract.yaml"))]
@@ -321,7 +322,7 @@ def _replay_delegations(root: Path) -> dict:
     opportunities = 0
     for rec in candidates:
         try:
-            contract = jw_delegate._load_contract(rec)
+            contract = delegate._load_contract(rec)
         except WorkflowError:
             errors += 1
             continue
@@ -339,10 +340,10 @@ def _replay_delegations(root: Path) -> dict:
 
 
 def _replay_reviews(root: Path, params: dict) -> dict:
-    import jw_improve
+    import improve
 
     cfg = load_config(root)
-    rows = jw_improve._project_review_rows(_project_slug(root), root, cfg)
+    rows = improve._project_review_rows(_project_slug(root), root, cfg)
     opportunities = 0
     fired_rounds: list[str] = []
     errors = 0
@@ -414,31 +415,31 @@ def _emit(root: Path, boundary: str, delta_id: str, rule: str, delta_status: str
            "delta_status": delta_status, "event": event, "message": message, "context": context}
     _append_warning(root, row)
     if event == "fire" and delta_status == "warning":
-        print(f"jw warn [{delta_id}]: {message}", file=sys.stderr)
+        print(f"waystone warn [{delta_id}]: {message}", file=sys.stderr)
     return row
 
 
 def _rule1_targets(root: Path, boundary: str, context: dict) -> tuple[list[str], list[str]]:
     """(fired_dids, error_dids) for delegation-verification-evidence-v1 at this boundary. Records
     without a contract (failed-env/-runner/-artifact) are excluded — they are not evaluable (R8)."""
-    import jw_delegate
+    import delegate
     targets: list[tuple[str, Path]] = []
     if boundary in ("delegate-run", "delegate-apply"):
         did = context.get("delegation_id")
         if did:
-            rec = jw_delegate._record_dir(root, did)
+            rec = delegate._record_dir(root, did)
             if (rec / "artifact" / "contract.yaml").exists():
                 targets.append((did, rec))
     elif boundary == "check":
-        for did, rec in jw_delegate._iter_delegations(root):
-            st = jw_delegate._read_status_raw(rec)
+        for did, rec in delegate._iter_delegations(root):
+            st = delegate._read_status_raw(rec)
             if st and st.get("state") == "needs-review" and (rec / "artifact" / "contract.yaml").exists():
                 targets.append((did, rec))
     fired: list[str] = []
     errors: list[str] = []
     for did, rec in targets:
         try:
-            contract = jw_delegate._load_contract(rec)
+            contract = delegate._load_contract(rec)
         except WorkflowError:
             errors.append(did)  # corrupt/unparseable = evaluation-error, never a fire (no invention)
             continue
@@ -473,7 +474,7 @@ def evaluate_boundary(root: Path, boundary: str, context: dict) -> list[dict]:
     try:
         return _evaluate_boundary(root, boundary, context)
     except Exception as e:  # noqa: BLE001 — never propagate into the host flow
-        print(f"jw warn: overlay evaluation error at {boundary}: {e}", file=sys.stderr)
+        print(f"waystone warn: overlay evaluation error at {boundary}: {e}", file=sys.stderr)
         return []
 
 
@@ -486,7 +487,7 @@ def _evaluate_boundary(root: Path, boundary: str, context: dict) -> list[dict]:
         message = f"active delta references unknown rule {rule_id!r} and could not be evaluated"
         events.append(_emit(root, boundary, d.get("id", "(missing-id)"), rule_id,
                             d["status"], "evaluation-error", message, {}))
-        print(f"jw warn [{d.get('id', '(missing-id)')}]: {message}", file=sys.stderr)
+        print(f"waystone warn [{d.get('id', '(missing-id)')}]: {message}", file=sys.stderr)
 
     relevant = [d for d in active
                 if boundary in RULES.get(d.get("rule"), {}).get("boundaries", set())]
@@ -538,7 +539,7 @@ def _evaluate_boundary(root: Path, boundary: str, context: dict) -> list[dict]:
     return events
 
 
-# ---- exposure (§9 — round exposure record; delegation exposure lives in jw_delegate) ----
+# ---- exposure (§9 — round exposure record; delegation exposure lives in delegate) ----
 def _exposure_dir(root: Path) -> Path:
     return _plugin_base() / "exposure" / _project_slug(root)
 
@@ -546,9 +547,9 @@ def _exposure_dir(root: Path) -> Path:
 def _profile_summary() -> tuple[str | None, dict | None]:
     """(profile_fingerprint, {role: backend}) from the delegation profile, or (None, None) when it is
     absent — a round closes without any delegation, so the harness never guesses bindings."""
-    import jw_delegate
+    import delegate
     try:
-        profile, fp = jw_delegate._load_profile()
+        profile, fp = delegate._load_profile()
     except WorkflowError:
         return None, None
     bindings: dict[str, str] = {}
@@ -563,7 +564,7 @@ def write_round_exposure(root: Path, round_id: str, head_sha: str | None, waterm
     gets a `-2`/`-3` suffix (H4 precedent — existing records are never overwritten)."""
     fp, bindings = _profile_summary()
     exposure = {
-        "schema": "jw-round-exposure-1", "round_id": round_id, "at": _now_iso(),
+        "schema": "waystone-round-exposure-1", "round_id": round_id, "at": _now_iso(),
         "project": {"pslug": _project_slug(root), "root": str(Path(root).resolve())},
         "head_sha": head_sha, "config_watermark": watermark,
         "profile_fingerprint": fp, "bindings": bindings,
@@ -715,7 +716,7 @@ def _cli_check(rest: list[str]) -> int:
     events = evaluate_boundary(root, "check", {})
     fires = [e for e in events if e["event"] == "fire"]
     if not fires:
-        print("jw check: no active-delta warnings")
+        print("waystone check: no active-delta warnings")
     for e in fires:
         marker = "warn" if e["delta_status"] == "warning" else "observe"
         print(f"[{marker}] {e['rule']} [{e['delta_id']}]: {e['message']}")
@@ -731,16 +732,16 @@ _HANDLERS = {"add": _cli_add, "list": _cli_list, "show": _cli_show, "promote": _
 
 def main(argv: list[str]) -> int:
     if not argv or argv[0] not in _HANDLERS:
-        print("jw overlay: expected subcommand "
+        print("waystone overlay: expected subcommand "
               "(add|list|show|promote|demote|suspend|retire|replay)", file=sys.stderr)
         return 1
     try:
         return _HANDLERS[argv[0]](argv[1:])
     except _RefusedWrite as e:
-        print(f"jw overlay: {e}", file=sys.stderr)
+        print(f"waystone overlay: {e}", file=sys.stderr)
         return 2
     except WorkflowError as e:
-        print(f"jw overlay: {e}", file=sys.stderr)
+        print(f"waystone overlay: {e}", file=sys.stderr)
         return 1
 
 

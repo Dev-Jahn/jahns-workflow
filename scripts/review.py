@@ -18,12 +18,12 @@ SHA the Codex bot names in its own review comment (timing is irrelevant once the
 Markers in fenced code blocks are ignored.
 
 Markers (HTML comments embedded in PR comment bodies):
-  jw-review-cycle  : a freeze — {round_id, cycle, target_sha, base_sha, reviewers}
-  jw-review-result : an external reviewer reply footer — {reviewer, review_cycle, reviewed_sha, verdict, decision_required}
-  jw-findings      : adjudication outcome for a cycle — {cycle, resolved}
-  jw-approval      : SHA-bound human approval — {sha, by}
+  waystone-review-cycle  : a freeze — {round_id, cycle, target_sha, base_sha, reviewers}
+  waystone-review-result : an external reviewer reply footer — {reviewer, review_cycle, reviewed_sha, verdict, decision_required}
+  waystone-findings      : adjudication outcome for a cycle — {cycle, resolved}
+  waystone-approval      : SHA-bound human approval — {sha, by}
 
-Subcommands (also `jw review <sub>`):
+Subcommands (also `waystone review <sub>`):
   freeze --pr N [--round ID] [root]   stamp the current PR head as a new review cycle + post request
   status [--pr N] [root]              show per-cycle review status (PR mode) or packet pairs (packet mode)
   ingest [--round ID] [--reviewer M]  byte-exact copy /tmp/review.md → <id>-feedback.md,
@@ -41,7 +41,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import yaml  # noqa: E402
 
-from jw_common import (  # noqa: E402
+from common import (  # noqa: E402
     CONFIG_NAME, find_project_root, git_full_sha, load_config, normalize_config,
 )
 
@@ -55,7 +55,7 @@ def is_codex(login: str | None) -> bool:
     return (login or "").removesuffix("[bot]") == "chatgpt-codex-connector"
 
 
-MARKER_RE = re.compile(r"<!--\s*jw-([a-z-]+):v1\s*\n(.*?)\n\s*-->", re.DOTALL)
+MARKER_RE = re.compile(r"<!--\s*(?:waystone|jw)-([a-z-]+):v1\s*\n(.*?)\n\s*-->", re.DOTALL)
 FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
 MERGE_OK_VERDICTS = {"shipped", "shipped-with-risk", "approved", "approve", "lgtm"}
 # output-contract finding blocks: `### JW-GPT-NNN — <title>` then a `- Severity: <x>` line.
@@ -69,7 +69,7 @@ def emit_marker(kind: str, fields: dict) -> str:
     so the round-trip is a typed protocol, not a string blob."""
     body = yaml.safe_dump(dict(fields), sort_keys=False, default_flow_style=False,
                           allow_unicode=True).strip()
-    return f"<!-- jw-{kind}:v1\n{body}\n-->"
+    return f"<!-- waystone-{kind}:v1\n{body}\n-->"
 
 
 # ---- strict marker schema (a marker is BELIEVED only if every field is the exact type) --------
@@ -110,7 +110,7 @@ def marker_valid(m: dict) -> bool:
 
 
 def parse_markers(text: str, kind: str | None = None) -> list[dict]:
-    """Extract jw-*:v1 markers from a blob. Markers inside ``` fenced blocks are ignored
+    """Extract waystone-*:v1 markers from a blob. Markers inside ``` fenced blocks are ignored
     (a quoted example must not be read as live state)."""
     out = []
     clean = FENCE_RE.sub("", text or "")
@@ -345,7 +345,7 @@ def pr_bundle(root: Path, pr: int, repo: str | None = None) -> dict | None:
     rc, out = _gh(root, "pr", "view", str(pr), "--json",
                   "headRefOid,baseRefOid,statusCheckRollup,mergeStateStatus,state,isDraft,baseRefName,headRefName")
     if rc != 0:
-        print(f"jw_review: gh pr view {pr} failed: {out}", file=sys.stderr)
+        print(f"review: gh pr view {pr} failed: {out}", file=sys.stderr)
         return None
     j = json.loads(out)
     if repo is None:
@@ -501,11 +501,11 @@ def freeze(root: Path, pr: int, round_id: str | None) -> int:
         return 1
     policy = ctx["policy"]
     if policy is None:
-        print("jw_review freeze: cannot read the base-branch policy (.jahns-workflow.yml at the PR "
+        print("review freeze: cannot read the base-branch policy (.waystone.yml at the PR "
               "base SHA) — pr-mode review is gated on the protected base config.", file=sys.stderr)
         return 1
     if policy["review"]["mode"] != "pr":
-        print("jw_review freeze: the base branch's review.mode is not 'pr'. PR-mode review applies "
+        print("review freeze: the base branch's review.mode is not 'pr'. PR-mode review applies "
               "only once the base policy is pr — review the packet→pr transition PR in packet mode "
               "first, merge it, then pr-mode applies from the next PR.", file=sys.stderr)
         return 1
@@ -525,12 +525,12 @@ def freeze(root: Path, pr: int, round_id: str | None) -> int:
             f"cycle stale.\n\n"
             + ("@codex review\n\n" if "codex" in reviewers else "")
             + (f"Macro reviewer(s) — {', '.join(macro)}: review at the SHA above; end your reply with "
-               f"a `jw-review-result` footer carrying `reviewed_sha: {head}` and `review_cycle: {n}`.\n\n"
+               f"a `waystone-review-result` footer carrying `reviewed_sha: {head}` and `review_cycle: {n}`.\n\n"
                if macro else "")
             + marker + "\n")
     rc, out = _gh(root, "pr", "comment", str(pr), "--body", body)
     if rc != 0:
-        print(f"jw_review freeze: gh pr comment failed: {out}", file=sys.stderr)
+        print(f"review freeze: gh pr comment failed: {out}", file=sys.stderr)
         return 1
     print(f"review cycle {n} frozen at {head[:12]} on PR #{pr} (reviewers: {', '.join(reviewers)})")
     return 0
@@ -542,7 +542,7 @@ def status(root: Path, pr: int | None) -> int:
         if ctx is None:
             return 1
         if ctx["policy"] is None:
-            print("jw_review status: cannot read the base-branch policy at the PR base SHA.", file=sys.stderr)
+            print("review status: cannot read the base-branch policy at the PR base SHA.", file=sys.stderr)
             return 1
         facts = facts_from_bundle(ctx["bundle"], ctx["policy"], ctx["repo"])
         print(f"PR #{pr} review status ({facts['pr_state']}{', DRAFT' if facts['is_draft'] else ''}):")
@@ -592,12 +592,12 @@ def ingest(root: Path, round_id: str | None, src: Path = INBOX, reviewer: str | 
     import datetime
     cfg = load_config(root)
     if not src.is_file():
-        print(f"jw_review ingest: no review at {src}. In a SEPARATE shell run `cat > {src}`, paste "
+        print(f"review ingest: no review at {src}. In a SEPARATE shell run `cat > {src}`, paste "
               f"the reviewer's reply, press Ctrl-D, then re-run.", file=sys.stderr)
         return 1
     body = src.read_bytes()
     if not body.strip():
-        print(f"jw_review ingest: {src} is empty — save the reply there first.", file=sys.stderr)
+        print(f"review ingest: {src} is empty — save the reply there first.", file=sys.stderr)
         return 1
     rdir = root / cfg["reviews_dir"]
     if round_id is None:
@@ -605,7 +605,7 @@ def ingest(root: Path, round_id: str | None, src: Path = INBOX, reviewer: str | 
         if reqs:
             round_id = reqs[-1]
         else:
-            print("jw_review ingest: no --round given and no *-request.md to infer it from.",
+            print("review ingest: no --round given and no *-request.md to infer it from.",
                   file=sys.stderr)
             return 1
     rdir.mkdir(parents=True, exist_ok=True)
@@ -625,8 +625,8 @@ def ingest(root: Path, round_id: str | None, src: Path = INBOX, reviewer: str | 
     appended = ("\n".join(lines) + "\n").encode("utf-8")
 
     header = (
-        "<!-- jahns-workflow feedback: the body below is the reviewer reply VERBATIM (byte-exact "
-        "copy via `jw review ingest`) — do not edit it; a triage skeleton is appended beneath it. -->\n"
+        "<!-- waystone feedback: the body below is the reviewer reply VERBATIM (byte-exact "
+        "copy via `waystone review ingest`) — do not edit it; a triage skeleton is appended beneath it. -->\n"
         f"round: {round_id}\n"
         f"reviewer: {reviewer or '(unknown)'}\n"
         f"ingested: {datetime.date.today().isoformat()}\n"
@@ -641,10 +641,10 @@ def ingest(root: Path, round_id: str | None, src: Path = INBOX, reviewer: str | 
     print(f"  {len(findings)} finding(s) parsed — verify each before registering")
     # M2 §6: evaluate overlay warns at the review-ingest boundary (best-effort; never blocks).
     try:
-        import jw_overlay
-        jw_overlay.evaluate_boundary(root, "review-ingest", {"round_id": round_id})
+        import overlay
+        overlay.evaluate_boundary(root, "review-ingest", {"round_id": round_id})
     except Exception as e:  # noqa: BLE001
-        print(f"jw_review ingest: overlay warning unavailable ({e}) — ingest still succeeded",
+        print(f"review ingest: overlay warning unavailable ({e}) — ingest still succeeded",
               file=sys.stderr)
     return 0
 
@@ -656,14 +656,14 @@ def main(argv: list[str]) -> int:
     sub, rest = argv[0], argv[1:]
     root = _root(rest)
     if root is None:
-        print("jw_review: no initialized project (missing .jahns-workflow.yml)", file=sys.stderr)
+        print("review: no initialized project (missing .waystone.yml)", file=sys.stderr)
         return 1
     if sub == "ingest":
         return ingest(root, _opt(rest, "--round"), reviewer=_opt(rest, "--reviewer"))
     pr_s = _opt(rest, "--pr")
     if sub == "freeze":
         if not pr_s:
-            print("jw_review freeze: --pr N is required", file=sys.stderr)
+            print("review freeze: --pr N is required", file=sys.stderr)
             return 1
         return freeze(root, int(pr_s), _opt(rest, "--round"))
     return status(root, int(pr_s) if pr_s else None)

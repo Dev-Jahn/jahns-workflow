@@ -17,9 +17,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 import yaml  # noqa: E402
 
-import jw_roadmap  # noqa: E402
-from jw_common import find_project_root  # noqa: E402
-from jw_validate import validate  # noqa: E402
+import roadmap  # noqa: E402
+from common import find_project_root  # noqa: E402
+from validate import validate  # noqa: E402
 
 
 def main() -> int:
@@ -39,18 +39,18 @@ def main() -> int:
         with open(p, encoding="utf-8") as f:
             data = yaml.safe_load(f)
     except (OSError, yaml.YAMLError) as e:
-        print(f"[jahns-workflow] tasks.yaml is not parseable YAML: {e}", file=sys.stderr)
+        print(f"[waystone] tasks.yaml is not parseable YAML: {e}", file=sys.stderr)
         return 2
 
     errs = validate(data)
     if errs:
-        print(f"[jahns-workflow] tasks.yaml violates the workflow convention ({len(errs)} issue(s)) — fix now:",
+        print(f"[waystone] tasks.yaml violates the workflow convention ({len(errs)} issue(s)) — fix now:",
               file=sys.stderr)
         for e in errs[:20]:
             print(f"  - {e}", file=sys.stderr)
         return 2
 
-    (root / "ROADMAP.md").write_text(jw_roadmap.render(root), encoding="utf-8")
+    (root / "ROADMAP.md").write_text(roadmap.render(root), encoding="utf-8")
     return 0
 
 

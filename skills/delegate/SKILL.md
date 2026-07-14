@@ -1,37 +1,37 @@
 ---
 name: delegate
-description: Use when the user runs "/jahns-workflow:delegate", asks to delegate an implementation task, wants to inspect or independently verify a delegation result, or needs to apply or discard a reviewable delegated patch.
+description: Use when the user runs "/waystone:delegate", asks to delegate an implementation task, wants to inspect or independently verify a delegation result, or needs to apply or discard a reviewable delegated patch.
 ---
 
-# jahns-workflow: delegate
+# waystone: delegate
 
 Run one task in an isolated worktree, preserve provenance labels, and leave acceptance to the user.
-Require an initialized project. Plugin root = two directories above this skill's base directory.
+Require an initialized project.
 
 ## Step 1 — Select a delegable task
 
 Use the task ID from the argument. Otherwise present the injected next-actionable tasks (or run
-`uv run <plugin-root>/scripts/jw.py task list .`) and ask the user to select one.
+`waystone task list .`) and ask the user to select one.
 
-Do not invent acceptance criteria. `jw delegate run` refuses a task without an `accept:` YAML list
+Do not invent acceptance criteria. `waystone delegate run` refuses a task without an `accept:` YAML list
 or explicit `--accept`. If criteria are missing, explain that the user must add them to the task in
 `tasks.yaml`; do not synthesize a bar merely to make the command pass.
 
 ## Step 2 — Run the delegation
 
 ```bash
-uv run <plugin-root>/scripts/jw.py delegate run <task-id> --root <project-root>
+waystone delegate run <task-id> --root <project-root>
 ```
 
 Relay the stdout summary: immutable base, dirty-snapshot flag, worktree, env prep, runner binding,
-and artifact path. Relay every `jw warn` line from stderr unchanged; never hide a warning.
+and artifact path. Relay every `waystone warn` line from stderr unchanged; never hide a warning.
 
 ## Step 3 — Summarize the contract without judging it
 
 Read the bounded contract surface only:
 
 ```bash
-uv run <plugin-root>/scripts/jw.py delegate show <delegation-id> --report --root <project-root>
+waystone delegate show <delegation-id> --report --root <project-root>
 ```
 
 Present harness-computed changed files/base/result as explicit evidence. Keep verification,
@@ -46,12 +46,12 @@ HARD rules:
 
 ## Step 4 — Offer independent verification
 
-If `~/.claude/jahns-workflow/profile.yml` has a verifier binding, use one **AskUserQuestion** to ask
+If `~/.claude/waystone/profile.yml` has a verifier binding, use one **AskUserQuestion** to ask
 whether to run it. If accepted:
 
 ```bash
-uv run <plugin-root>/scripts/jw.py delegate verify <delegation-id> --root <project-root>
-uv run <plugin-root>/scripts/jw.py delegate show <delegation-id> --verify --root <project-root>
+waystone delegate verify <delegation-id> --root <project-root>
+waystone delegate show <delegation-id> --verify --root <project-root>
 ```
 
 Summarize the latest payload as **independent-verifier** evidence. Preserve that label and do not
@@ -63,8 +63,8 @@ Use one **AskUserQuestion** for the user's decision: `apply` or `discard`. Do no
 behalf. Run exactly the selected command and report the result:
 
 ```bash
-uv run <plugin-root>/scripts/jw.py delegate apply <delegation-id> --root <project-root>
-uv run <plugin-root>/scripts/jw.py delegate discard <delegation-id> --root <project-root>
+waystone delegate apply <delegation-id> --root <project-root>
+waystone delegate discard <delegation-id> --root <project-root>
 ```
 
 Again relay any stderr warning unchanged.

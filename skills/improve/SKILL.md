@@ -1,29 +1,29 @@
 ---
 name: improve
-description: This skill should be used when the user runs "/jahns-workflow:improve", asks for workflow-improvement suggestions, wants to analyze their Claude Code 작업 이력 (work history), requests 개선 제안 grounded in past sessions, or asks "how can I work better / where am I wasting effort across my projects". It mines the user's existing Claude Code logs plus round/review evidence into deterministic facts, then presents evidence-grounded, provenance-labeled recommendations for the user to accept or reject — recording each decision without applying anything automatically.
+description: This skill should be used when the user runs "/waystone:improve", asks for workflow-improvement suggestions, wants to analyze their Claude Code 작업 이력 (work history), requests 개선 제안 grounded in past sessions, or asks "how can I work better / where am I wasting effort across my projects". It mines the user's existing Claude Code logs plus round/review evidence into deterministic facts, then presents evidence-grounded, provenance-labeled recommendations for the user to accept or reject — recording each decision without applying anything automatically.
 argument-hint: "[--source DIR] [--project SLUG] (optional — defaults to all your Claude Code logs)"
 ---
 
-# jahns-workflow: improve
+# waystone: improve
 
 Produce an **advisory** workflow-improvement report grounded in the user's actual Claude Code
 history and review evidence. Record each accept/reject. For the small finite set of mapped
 recommendations, separately offer an observation-only overlay; never materialize one without a
 second explicit consent.
 
-Plugin root = two directories above this skill's base directory. `improve` reads global logs and
-the project registry, so it does **not** require the current directory to be an initialized project.
+`improve` reads global logs and the project registry, so it does **not** require the current
+directory to be an initialized project.
 
 ## Step 1 — Collect the evidence (deterministic)
 
 Run the four deterministic projections in order (each writes into the improve out dir, default
-`~/.claude/jahns-workflow/improve/`):
+`~/.claude/waystone/improve/`):
 
 ```bash
-uv run <plugin-root>/scripts/jw.py improve trace
-uv run <plugin-root>/scripts/jw.py improve reviews
-uv run <plugin-root>/scripts/jw.py improve evidence
-uv run <plugin-root>/scripts/jw.py improve audit
+waystone improve trace
+waystone improve reviews
+waystone improve evidence
+waystone improve audit
 ```
 
 - Default source is every Claude Code log (`$CLAUDE_CONFIG_DIR/projects`, else `~/.claude/projects`).
@@ -73,7 +73,7 @@ recommendation, never a generic wizard and never a batched "apply this plan". Th
 decision deterministically:
 
 ```bash
-uv run <plugin-root>/scripts/jw.py improve decide <rec-id> accept|reject [--title "..."] [--note "..."]
+waystone improve decide <rec-id> accept|reject [--title "..."] [--note "..."]
 ```
 
 **Approval is recording.** It does not itself materialize or apply anything. When the user accepts a
@@ -95,14 +95,14 @@ This mapping is exhaustive. HARD: never map another lens or infer a new rule. On
 flag from facts already read and use the CLI only:
 
 ```bash
-uv run <plugin-root>/scripts/jw.py overlay add <rec-id> --rule <mapped-rule> \
+waystone overlay add <rec-id> --rule <mapped-rule> \
   --summary "<observed numbers>" --pointers "<evidence pointer>" --from-rec <rec-id> \
   --expected-effect "<bounded expectation>" --risk "<known friction>" \
   --candidate-scope <project_candidate|user_candidate|unresolved> --observed-in <project-slug>
 ```
 
 Never write delta JSON directly. After creation, explain that the delta can be considered for warning
-only after `jw overlay replay <rec-id>` and then `jw overlay promote <rec-id>`; do not run promotion
+only after `waystone overlay replay <rec-id>` and then `waystone overlay promote <rec-id>`; do not run promotion
 as part of improve.
 
 When citing replay, report only that it "would have fired" and the estimated nuisance rate (which is
@@ -123,11 +123,11 @@ Report in the user's configured language. Lead with the per-project maturity fra
 ordered by evidence strength and impact — each with its lens, numbers, evidence pointer, and
 strength label — and note any coverage caveats. Close by summarizing what was accepted vs rejected,
 which observation-only deltas (if any) were separately created, and where the decision log lives
-(`~/.claude/jahns-workflow/improve/decisions.jsonl`).
+(`~/.claude/waystone/improve/decisions.jsonl`).
 
 End with the **next-step reminder**:
 
 > Recommendations were recorded, not applied. Any separately accepted overlay starts in observing
 > (records only, no warning); replay is required before warning promotion. Re-run
-> `/jahns-workflow:improve` after a few more rounds; decisions are remembered, so the next report
+> `/waystone:improve` after a few more rounds; decisions are remembered, so the next report
 > focuses on what's new.
