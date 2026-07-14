@@ -87,7 +87,7 @@ def _paths_main(argv: list[str]) -> int:
 
         paths.update({
             "project_root": _resolved(root),
-            "project_state": _resolved(common.project_state_dir(root)),
+            "project_state": _resolved(common.project_state_path(root)),
             "resume": _resolved(common.resume_path(root)),
             "start_here": _resolved(common.start_here_path(root)),
             "delegations": _resolved(delegate._delegations_dir(root)),

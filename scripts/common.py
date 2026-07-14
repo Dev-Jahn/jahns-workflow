@@ -24,9 +24,14 @@ def machine_dir(home: Path | None = None) -> Path:
     return (Path.home() if home is None else Path(home)) / ".waystone"
 
 
-def project_state_dir(root: Path) -> Path:
-    """Project-local state root. Its own ignore file keeps the directory out of repository state."""
-    state = Path(root) / ".waystone"
+def project_state_path(root: Path) -> Path:
+    """Return the project-local state root without touching the filesystem."""
+    return Path(root) / ".waystone"
+
+
+def ensure_project_state_dir(root: Path) -> Path:
+    """Create the project-local state root and restore its self-ignore file when needed."""
+    state = project_state_path(root)
     state.mkdir(parents=True, exist_ok=True)
     ignore = state / ".gitignore"
     if not ignore.is_file() or ignore.read_text(encoding="utf-8") != "*\n":
@@ -270,7 +275,7 @@ def resume_path(root: Path) -> Path:
     """Project-local EPHEMERAL re-entry snapshot (NOT committed to the repo). Written
     deterministically by the PreCompact/SessionEnd hook (structured: HEAD/round/tasks) and CONSUMED
     by the next SessionStart."""
-    return project_state_dir(root) / "resume.md"
+    return project_state_path(root) / "resume.md"
 
 
 def start_here_path(root: Path) -> Path:
@@ -278,7 +283,7 @@ def start_here_path(root: Path) -> Path:
     MODEL overwrites it at round close / after review with a bounded live-frontier narrative; the
     SessionStart hook injects it so a new/resumed session picks up without a manual 'pick up where
     we left off'. Complements the ephemeral structured resume_path — narrative vs. structured."""
-    return project_state_dir(root) / "start-here.md"
+    return project_state_path(root) / "start-here.md"
 
 
 def slugify(text: str, max_len: int = 40) -> str:

@@ -724,15 +724,17 @@ class StoragePathTests(unittest.TestCase):
                 else:
                     os.environ["WAYSTONE_HOME"] = old_override
 
-    def test_project_state_dir_creates_and_restores_self_gitignore(self):
+    def test_project_state_path_is_pure_and_ensure_restores_self_gitignore(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d) / "repo"
             root.mkdir()
-            state = common.project_state_dir(root)
+            state = common.project_state_path(root)
             self.assertEqual(state, root / ".waystone")
+            self.assertFalse(state.exists())
+            self.assertEqual(common.ensure_project_state_dir(root), state)
             self.assertEqual((state / ".gitignore").read_text(), "*\n")
             (state / ".gitignore").unlink()
-            self.assertEqual(common.project_state_dir(root), state)
+            self.assertEqual(common.ensure_project_state_dir(root), state)
             self.assertEqual((state / ".gitignore").read_text(), "*\n")
 
     def test_consumers_use_project_state_and_machine_worktree_cache(self):
@@ -806,11 +808,27 @@ class WaystoneStorageCliTests(unittest.TestCase):
             self.assertEqual(paths["overlay"], str(state / "overlay"))
             self.assertEqual(paths["exposure"], str(state / "exposure"))
             self.assertEqual(paths["profile"], str(state / "profile.yml"))
-            self.assertEqual((state / ".gitignore").read_text(), "*\n")
+            self.assertFalse(state.exists())
             rc, human, err = self._capture(
                 home, Path(d), ["paths", "--root", str(root)])
             self.assertEqual((rc, err), (0, ""))
             self.assertIn(f"project_state: {state}", human)
+            self.assertFalse(state.exists())
+
+    def test_empty_state_readers_do_not_create_project_state(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "repo"
+            root.mkdir()
+            (root / ".waystone.yml").write_text("version: 1\nproject: demo\n")
+            (root / "tasks.yaml").write_text("version: 1\nproject: demo\ntasks: []\n")
+            state = root / ".waystone"
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(delegate.main(["status", "--root", str(root)]), 0)
+                self.assertEqual(overlay.main(["list", "--root", str(root)]), 0)
+            self.assertFalse(state.exists())
 
     def test_project_register_list_unregister_roundtrip_is_atomic(self):
         import json as _json
@@ -3274,7 +3292,7 @@ _PROFILE_BODY = ('schema: waystone-profile-1\nbindings:\n'
 
 
 def _write_profile(root: Path, body: str = _PROFILE_BODY):
-    (common.project_state_dir(root) / "profile.yml").write_text(body, encoding="utf-8")
+    (common.ensure_project_state_dir(root) / "profile.yml").write_text(body, encoding="utf-8")
 
 
 class DelegateProfileTests(unittest.TestCase):
@@ -5498,6 +5516,7 @@ class ContractInjectTests(unittest.TestCase):
             rc, ctx = self._context(module, root, home)
             self.assertEqual(rc, 0)
             self.assertIn("no profile", ctx)
+            self.assertFalse((root / ".waystone").exists())
             original = module.CONTRACT_PATH
             module.CONTRACT_PATH = Path(d) / "missing-contract.md"
             try:
@@ -5507,11 +5526,22 @@ class ContractInjectTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertNotIn("◆ OPERATING CONTRACT", missing)
 
+    def test_unwritable_project_state_never_breaks_session_start_json(self):
+        module = self._module()
+        with tempfile.TemporaryDirectory() as d:
+            root, home = self._project(d)
+            state = root / ".waystone"
+            state.write_text("not a directory")
+            rc, ctx = self._context(module, root, home)
+            self.assertEqual(rc, 0)
+            self.assertIn("[waystone] project: demo", ctx)
+            self.assertTrue(state.is_file())
+
     def test_corrupt_inputs_are_field_local_and_never_break_session_start(self):
         module = self._module()
         with tempfile.TemporaryDirectory() as d:
             root, home = self._project(d)
-            profile = common.project_state_dir(root) / "profile.yml"
+            profile = common.ensure_project_state_dir(root) / "profile.yml"
             profile.write_text("bindings: [\n")
             delta = _run_with_home(home, lambda: overlay._deltas_dir(root)) / "bad.json"
             delta.parent.mkdir(parents=True)
@@ -5876,7 +5906,7 @@ class CodexVerifierTests(unittest.TestCase):
             os.environ["WAYSTONE_HOST"] = "codex"
             try:
                 root, home = _deleg_project(d)
-                profile = common.project_state_dir(root) / "profile.yml"
+                profile = common.ensure_project_state_dir(root) / "profile.yml"
                 profile.write_text(
                     "schema: waystone-profile-1\nbindings:\n"
                     "  implementer: {execution: external-runner, backend: \"codex:gpt-test\"}\n"

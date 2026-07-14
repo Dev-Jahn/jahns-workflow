@@ -27,7 +27,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from common import (  # noqa: E402
-    WorkflowError, _project_slug, find_project_root, load_config, project_state_dir,
+    WorkflowError, _project_slug, ensure_project_state_dir, find_project_root, load_config,
+    project_state_path,
 )
 
 # delta-id grammar mirrors the improve rec_id (`<lens>/<kebab-gist>`, S2) so a rec materialises to a
@@ -122,7 +123,7 @@ def evaluate_rule2(root: Path, cfg: dict, severities, *, closing_done=frozenset(
 
 # ---- residence (§2 — project-local, never committed) --------------------------
 def _overlay_dir(root: Path) -> Path:
-    return project_state_dir(root) / "overlay"
+    return project_state_path(root) / "overlay"
 
 
 def _deltas_dir(root: Path) -> Path:
@@ -148,12 +149,20 @@ def _mkdir_or_refuse(path: Path) -> None:
         raise _RefusedWrite(f"cannot create plugin-local directory {path}: {e}")
 
 
+def _ensure_project_state_or_refuse(root: Path) -> None:
+    try:
+        ensure_project_state_dir(root)
+    except OSError as e:
+        raise _RefusedWrite(f"cannot create project state directory {project_state_path(root)}: {e}")
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
 # ---- delta store (§3 — atomic per-delta JSON; strict single-record reads) ------
 def _write_delta(root: Path, delta: dict) -> None:
+    _ensure_project_state_or_refuse(root)
     ddir = _deltas_dir(root)
     _mkdir_or_refuse(ddir)
     p = _delta_path(root, delta["id"])
@@ -397,6 +406,7 @@ def replay(root: Path, delta_id: str) -> dict:
 
 # ---- boundary warn engine (§6 — S5/S6/S9; never blocks the host, never changes exit) ----
 def _append_warning(root: Path, row: dict) -> None:
+    _ensure_project_state_or_refuse(root)
     p = _warnings_path(root)
     _mkdir_or_refuse(p.parent)
     with p.open("a", encoding="utf-8") as fh:
@@ -537,7 +547,7 @@ def _evaluate_boundary(root: Path, boundary: str, context: dict) -> list[dict]:
 
 # ---- exposure (§9 — round exposure record; delegation exposure lives in delegate) ----
 def _exposure_dir(root: Path) -> Path:
-    return project_state_dir(root) / "exposure"
+    return project_state_path(root) / "exposure"
 
 
 def _profile_summary(root: Path) -> tuple[str | None, dict | None]:
@@ -558,6 +568,7 @@ def _profile_summary(root: Path) -> tuple[str | None, dict | None]:
 def write_round_exposure(root: Path, round_id: str, head_sha: str | None, watermark: str | None):
     """Immutable per-round exposure record written at close (§9/#4). A re-close of the same round-id
     gets a `-2`/`-3` suffix (H4 precedent — existing records are never overwritten)."""
+    _ensure_project_state_or_refuse(root)
     fp, bindings = _profile_summary(root)
     exposure = {
         "schema": "waystone-round-exposure-1", "round_id": round_id, "at": _now_iso(),

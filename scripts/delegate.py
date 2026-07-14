@@ -37,8 +37,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import yaml  # noqa: E402
 
 from common import (  # noqa: E402
-    WorkflowError, _project_slug, find_project_root, git_full_sha, load_config, load_tasks,
-    project_state_dir, worktrees_cache_dir,
+    WorkflowError, _project_slug, ensure_project_state_dir, find_project_root, git_full_sha,
+    load_config, load_tasks, project_state_path, worktrees_cache_dir,
 )
 
 DELEG_REF_NS = "refs/waystone/delegations"
@@ -167,7 +167,7 @@ def _make_did(task_id: str) -> str:
 
 # ---- residence (§9 — project state + machine worktree cache) -----------------
 def _delegations_dir(root: Path) -> Path:
-    return project_state_dir(root) / "delegations"
+    return project_state_path(root) / "delegations"
 
 
 def _worktrees_dir(root: Path) -> Path:
@@ -183,7 +183,7 @@ def _worktree_path(root: Path, did: str) -> Path:
 
 
 def _profile_path(root: Path) -> Path:
-    return project_state_dir(root) / "profile.yml"
+    return project_state_path(root) / "profile.yml"
 
 
 def _mkdir_or_refuse(path: Path) -> None:
@@ -191,6 +191,13 @@ def _mkdir_or_refuse(path: Path) -> None:
         path.mkdir(parents=True, exist_ok=True)
     except OSError as e:
         raise _RefusedWrite(f"cannot create plugin-local directory {path}: {e}")
+
+
+def _ensure_project_state_or_refuse(root: Path) -> None:
+    try:
+        ensure_project_state_dir(root)
+    except OSError as e:
+        raise _RefusedWrite(f"cannot create project state directory {project_state_path(root)}: {e}")
 
 
 def _now_iso() -> str:
@@ -556,6 +563,7 @@ def run_delegation(root: Path, task_id: str, role: str, accept_flags: list[str])
     """Snapshot -> worktree -> env prep -> runner -> artifact. Prints `key: value` progress to stdout;
     raises WorkflowError (exit 1) on any precondition/env/runner failure, _RefusedWrite (exit 2) on a
     plugin-local mkdir failure. Returns 0 on a produced artifact (state=needs-review)."""
+    _ensure_project_state_or_refuse(root)
     _check_snapshot_preconditions(root)
     profile, fingerprint = _load_profile(root)
     if role != "implementer":
@@ -917,6 +925,7 @@ def _write_verify_artifact(rec: Path, artifact: dict) -> Path:
 
 
 def verify_delegation(root: Path, did: str) -> int:
+    _ensure_project_state_or_refuse(root)
     rec = _load_delegation(root, did)
     state = _read_status(rec).get("state")
     if state != "needs-review":
@@ -987,6 +996,7 @@ def apply_delegation(root: Path, did: str) -> int:
     """Accept a delegation onto the live tree with plain `git apply` (§12/R2 — not 3-way). An empty
     patch is a no-op success. On drift the apply fails atomically (no partial write) and state stays
     needs-review; the raw git rc never leaks (exit 1)."""
+    _ensure_project_state_or_refuse(root)
     rec = _load_delegation(root, did)
     state = _read_status(rec).get("state")
     if state != "needs-review":
@@ -1009,6 +1019,7 @@ def discard_delegation(root: Path, did: str) -> int:
     """Reject a delegation: state=discarded + worktree/ref cleanup (record dir kept). Accepts any
     non-terminal state, including a crash-remnant `running` (§4/R1) and a corrupt record — the
     cleanup path must not block itself on the corruption it clears (H3)."""
+    _ensure_project_state_or_refuse(root)
     rec = _load_delegation(root, did)
     st = _read_status_raw(rec)
     state = st.get("state") if st is not None else None
