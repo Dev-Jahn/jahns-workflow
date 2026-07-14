@@ -881,11 +881,82 @@ class WaystoneStorageCliTests(unittest.TestCase):
 
             registry = home / ".waystone" / "projects.json"
             self.assertEqual(_json.loads(registry.read_text()), {"projects": []})
-            self.assertEqual(calls, [
-                (registry.with_name("projects.json.tmp"), registry),
-                (registry.with_name("projects.json.tmp"), registry),
+            self.assertEqual(len(calls), 2)
+            self.assertTrue(all(dst == registry for _src, dst in calls))
+            self.assertTrue(all(src.parent == registry.parent for src, _dst in calls))
+            self.assertEqual(len({src for src, _dst in calls}), 2)
+            self.assertTrue(all(src.name.startswith(".projects.json.") and src.suffix == ".tmp"
+                                for src, _dst in calls))
+            self.assertTrue(all(not src.exists() for src, _dst in calls))
+
+    def test_project_register_replace_failure_preserves_registry_and_cleans_temp(self):
+        import json as _json
+        import waystone
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "repo"
+            root.mkdir()
+            (root / ".waystone.yml").write_text("version: 1\nproject: demo\n")
+            (root / "tasks.yaml").write_text("version: 1\nproject: demo\ntasks: []\n")
+            home = Path(d) / "home"
+            registry = home / ".waystone" / "projects.json"
+            registry.parent.mkdir(parents=True)
+            original = _json.dumps({"projects": [{"name": "existing", "repo": "org/repo"}]})
+            registry.write_text(original)
+            original_replace = waystone.os.replace
+            waystone.os.replace = lambda *_args: (_ for _ in ()).throw(OSError("replace failed"))
+            try:
+                rc, _out, err = self._capture(home, root, ["project", "register", str(root)])
+            finally:
+                waystone.os.replace = original_replace
+            self.assertEqual(rc, 2)
+            self.assertIn("replace failed", err)
+            self.assertEqual(registry.read_bytes(), original.encode())
+            self.assertEqual([p.name for p in registry.parent.iterdir()], ["projects.json"])
+
+    def test_project_register_preserves_existing_union(self):
+        import json as _json
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "new"
+            root.mkdir()
+            (root / ".waystone.yml").write_text("version: 1\nproject: new\n")
+            (root / "tasks.yaml").write_text("version: 1\nproject: new\ntasks: []\n")
+            home = Path(d) / "home"
+            registry = home / ".waystone" / "projects.json"
+            registry.parent.mkdir(parents=True)
+            existing = [
+                {"name": "local", "path": str(Path(d) / "local")},
+                {"name": "remote", "repo": "org/remote"},
+            ]
+            registry.write_text(_json.dumps({"projects": existing}))
+            rc, _out, err = self._capture(home, root, ["project", "register", str(root)])
+            self.assertEqual((rc, err), (0, ""))
+            self.assertEqual(_json.loads(registry.read_text())["projects"], [
+                *existing, {"name": "new", "path": str(root.resolve())},
             ])
-            self.assertFalse(registry.with_name("projects.json.tmp").exists())
+
+    def test_project_register_duplicate_is_idempotent(self):
+        import json as _json
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "repo"
+            root.mkdir()
+            (root / ".waystone.yml").write_text("version: 1\nproject: demo\n")
+            (root / "tasks.yaml").write_text("version: 1\nproject: demo\ntasks: []\n")
+            home = Path(d) / "home"
+            first_rc, _out, first_err = self._capture(
+                home, root, ["project", "register", str(root)])
+            registry = home / ".waystone" / "projects.json"
+            first_bytes = registry.read_bytes()
+            second_rc, second_out, second_err = self._capture(
+                home, root, ["project", "register", str(root)])
+            self.assertEqual((first_rc, first_err, second_rc, second_err), (0, "", 0, ""))
+            self.assertIn("already registered", second_out)
+            self.assertEqual(registry.read_bytes(), first_bytes)
+            self.assertEqual(_json.loads(first_bytes)["projects"], [
+                {"name": "demo", "path": str(root.resolve())},
+            ])
 
 
 class ConfigTests(unittest.TestCase):

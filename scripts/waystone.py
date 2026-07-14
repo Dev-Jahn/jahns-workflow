@@ -31,6 +31,7 @@ import json
 import os
 import runpy
 import sys
+import tempfile
 from pathlib import Path
 
 import yaml
@@ -122,9 +123,21 @@ def _load_registry(path: Path) -> dict:
 
 def _write_registry(path: Path, registry: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(registry, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    tmp: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", dir=path.parent,
+                prefix=f".{path.name}.", suffix=".tmp", delete=False) as stream:
+            tmp = Path(stream.name)
+            stream.write(json.dumps(registry, ensure_ascii=False, indent=2) + "\n")
+        os.replace(tmp, path)
+    except BaseException:
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
+        raise
 
 
 def _entry_path(entry: object) -> Path | None:
