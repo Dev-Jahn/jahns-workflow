@@ -1,6 +1,9 @@
 <div align="center">
 
-# waystone
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.png">
+  <img alt="waystone" src="assets/logo-light.png" width="440">
+</picture>
 
 ### Agents forget. Projects shouldn't.
 
