@@ -132,7 +132,7 @@ Reviewer comments are treated as claims, not facts. `/waystone:review` checks th
 3. sends the bounded task to the configured external implementer;
 4. computes the resulting patch and changed-file list directly from Git;
 5. keeps the worker's own verification and risk report clearly labeled as a claim;
-6. optionally runs a separate read-only verifier;
+6. optionally runs a separate read-only verifier (`waystone delegate verify`);
 7. asks you to apply or discard the patch.
 
 The worker and verifier never own final approval — the main session and the user retain that decision.
@@ -143,7 +143,7 @@ The current v0.8 runner is Codex-backed, but Waystone stores bindings by respons
 
 ## Improve the workflow from real usage
 
-`/waystone:improve` reads Claude Code logs from `$CLAUDE_CONFIG_DIR/projects`, or `~/.claude/projects` when that variable is unset (extra log directories and project filters are supported). It combines session history with review and delegation records, then looks for patterns such as:
+`/waystone:improve` reads Claude Code logs from `$CLAUDE_CONFIG_DIR/projects`, or `~/.claude/projects` when that variable is unset (extra log directories and project filters are supported). It combines session history with review and delegation records (joined deterministically by task ID via `waystone improve evidence`), then looks for patterns such as:
 
 - the main session doing large amounts of implementation directly;
 - changes with little or no visible verification;
@@ -154,7 +154,7 @@ The current v0.8 runner is Codex-backed, but Waystone stores bindings by respons
 
 Scripts produce repeatable facts first; the model only interprets them. Each recommendation states where it came from and whether it is directly observed or inferred. Analysis stays under `~/.claude/waystone/` by default — raw prompts and source files are not copied into the report — and accept/reject decisions are remembered so later runs focus on new evidence.
 
-For a small, predefined set of recommendations, v0.8 can separately store a project-specific check in **observation mode**: it records when the check would have fired but does not warn or block. Promoting it to a warning requires a deterministic replay over past evidence and another explicit command. v0.8 warnings remain non-blocking.
+For a small, predefined set of recommendations, v0.8 can separately store a project-specific check in **observation mode** (`waystone overlay`): it records when the check would have fired but does not warn or block. Promoting it to a warning requires a deterministic replay over past evidence and another explicit command. `waystone check` evaluates the active rules against the current project state; v0.8 warnings remain visible but never block.
 
 <br>
 
