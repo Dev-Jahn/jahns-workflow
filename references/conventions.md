@@ -172,9 +172,9 @@ brought back through an explicit artifact contract. The invariants:
   the bar. `accept` is deliberately not settable through `waystone task add/set` (comma-splitting free
   text would distort it).
 
-Artifacts live plugin-local (`~/.claude/waystone/delegations/…`, worktrees under
-`~/.claude/waystone/worktrees/…`), never committed to the repo. The runner backend (model)
-is bound per role in `~/.claude/waystone/profile.yml`; a missing binding fails loud rather
+Artifacts live plugin-local (`{project_root}/.waystone/delegations/…`, worktrees under
+`~/.waystone/cache/worktrees/…`), never committed to the repo. The runner backend (model)
+is bound per role in `{project_root}/.waystone/profile.yml`; a missing binding fails loud rather
 than guessing a default. A binding may set `effort` to `none`, `minimal`, `low`, `medium`, `high`,
 or `xhigh`; when omitted, the Codex configuration default is left untouched.
 
@@ -198,6 +198,6 @@ Adaptive policy is project-local and evidence-bearing:
   the conflict is recorded as evidence for the next improve cycle.
 
 All artifacts remain plugin-local and are never committed: deltas and warning events under
-`~/.claude/waystone/overlay/`, per-event policy exposure under
-`~/.claude/waystone/exposure/`, and the deterministic join projection at
-`~/.claude/waystone/improve/evidence.jsonl`.
+`{project_root}/.waystone/overlay/`, per-event policy exposure under
+`{project_root}/.waystone/exposure/`, and the deterministic join projection at
+`~/.waystone/improve/evidence.jsonl`.

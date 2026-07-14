@@ -37,7 +37,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import yaml  # noqa: E402
 
 from common import (  # noqa: E402
-    WorkflowError, _project_slug, data_dir, find_project_root, git_full_sha, load_config, load_tasks,
+    WorkflowError, _project_slug, find_project_root, git_full_sha, load_config, load_tasks,
+    project_state_dir, worktrees_cache_dir,
 )
 
 DELEG_REF_NS = "refs/waystone/delegations"
@@ -164,17 +165,13 @@ def _make_did(task_id: str) -> str:
     return f"{ts}-{task_id.replace('/', '-')}"
 
 
-# ---- residence (§9 — everything plugin-local, keyed by project slug) ----------
-def _plugin_base() -> Path:
-    return data_dir()
-
-
+# ---- residence (§9 — project state + machine worktree cache) -----------------
 def _delegations_dir(root: Path) -> Path:
-    return _plugin_base() / "delegations" / _project_slug(root)
+    return project_state_dir(root) / "delegations"
 
 
 def _worktrees_dir(root: Path) -> Path:
-    return _plugin_base() / "worktrees" / _project_slug(root)
+    return worktrees_cache_dir() / _project_slug(root)
 
 
 def _record_dir(root: Path, did: str) -> Path:
@@ -185,8 +182,8 @@ def _worktree_path(root: Path, did: str) -> Path:
     return _worktrees_dir(root) / did
 
 
-def _profile_path() -> Path:
-    return _plugin_base() / "profile.yml"
+def _profile_path(root: Path) -> Path:
+    return project_state_dir(root) / "profile.yml"
 
 
 def _mkdir_or_refuse(path: Path) -> None:
@@ -201,10 +198,10 @@ def _now_iso() -> str:
 
 
 # ---- profile / binding (§11 — fail-loud, no default-model guessing) -----------
-def _load_profile() -> tuple[dict, str]:
-    """Load ~/.claude/waystone/profile.yml and its byte fingerprint. Raises WorkflowError with a
+def _load_profile(root: Path) -> tuple[dict, str]:
+    """Load the project's profile.yml and its byte fingerprint. Raises WorkflowError with a
     creation guide if the file is absent (the harness never guesses a default model)."""
-    path = _profile_path()
+    path = _profile_path(root)
     if not path.is_file():
         raise WorkflowError(
             f"no delegation profile at {path} — create it with a role binding, e.g.:\n\n"
@@ -217,13 +214,13 @@ def _load_profile() -> tuple[dict, str]:
     return data, fingerprint
 
 
-def _resolve_binding(profile: dict, role: str) -> dict:
+def _resolve_binding(profile: dict, role: str, root: Path) -> dict:
     """Resolve the binding for `role`; validate execution axis and backend shape (S13/§11)."""
     bindings = profile.get("bindings")
     b = bindings.get(role) if isinstance(bindings, dict) else None
     if not isinstance(b, dict):
         raise WorkflowError(
-            f"profile has no binding for role {role!r} — add it to {_profile_path()}, e.g.:\n\n"
+            f"profile has no binding for role {role!r} — add it to {_profile_path(root)}, e.g.:\n\n"
             f"{_profile_example()}")
     execution = b.get("execution")
     backend = b.get("backend")
@@ -241,21 +238,30 @@ def _resolve_binding(profile: dict, role: str) -> dict:
     return binding
 
 
-def _resolve_verifier_binding(profile: dict) -> dict:
+def _resolve_verifier_binding(profile: dict, root: Path) -> dict:
     """Resolve one explicit Claude-companion or native Codex verifier transport."""
     bindings = profile.get("bindings")
     b = bindings.get("verifier") if isinstance(bindings, dict) else None
     if not isinstance(b, dict):
         raise WorkflowError(
-            f"profile has no binding for role 'verifier' — add it to {_profile_path()}, e.g.:\n\n"
+            f"profile has no binding for role 'verifier' — add it to {_profile_path(root)}, e.g.:\n\n"
             f"{_profile_example()}")
     execution = b.get("execution")
+    derived = "codex-cli" if os.environ.get("WAYSTONE_HOST") == "codex" else "codex-companion"
+    if execution is None:
+        execution = derived
+    elif execution == derived:
+        print(
+            f"waystone delegate: verifier execution {execution!r} is deprecated in profile — "
+            "remove the execution key to let waystone derive it",
+            file=sys.stderr,
+        )
+    else:
+        raise WorkflowError(
+            f"verifier execution {execution!r} conflicts with WAYSTONE_HOST-derived {derived!r} — "
+            "remove the execution key to let waystone derive it")
     backend = b.get("backend")
     entry = b.get("entry")
-    if execution not in ("codex-companion", "codex-cli"):
-        raise WorkflowError(
-            f"verifier execution {execution!r} not implemented in M2 "
-            "(expected 'codex-companion' or 'codex-cli')")
     if not isinstance(backend, str) or not backend.startswith("codex:") or not backend[6:]:
         raise WorkflowError(f"verifier backend must be 'codex:<model>', got {backend!r}")
     if entry != "adversarial-review":
@@ -551,10 +557,10 @@ def run_delegation(root: Path, task_id: str, role: str, accept_flags: list[str])
     raises WorkflowError (exit 1) on any precondition/env/runner failure, _RefusedWrite (exit 2) on a
     plugin-local mkdir failure. Returns 0 on a produced artifact (state=needs-review)."""
     _check_snapshot_preconditions(root)
-    profile, fingerprint = _load_profile()
+    profile, fingerprint = _load_profile(root)
     if role != "implementer":
         raise WorkflowError(f"role {role} not consumed in M1")
-    binding = _resolve_binding(profile, role)
+    binding = _resolve_binding(profile, role, root)
     model = _runner_model(binding["backend"])
     cfg = load_config(root)
     packet, _acceptance = _build_packet(load_tasks(root), task_id, accept_flags, root)
@@ -918,8 +924,8 @@ def verify_delegation(root: Path, did: str) -> int:
             f"delegation {did} is {state} — only a needs-review delegation can be verified")
     lock, lock_stream = _acquire_verify_lock(rec)
     try:
-        profile, _fingerprint = _load_profile()
-        binding = _resolve_verifier_binding(profile)
+        profile, _fingerprint = _load_profile(root)
+        binding = _resolve_verifier_binding(profile, root)
         script = _companion_script() if binding["execution"] == "codex-companion" else None
         contract = _load_contract(rec)
         exposure = _load_exposure(rec)

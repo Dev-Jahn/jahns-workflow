@@ -53,25 +53,15 @@ def _legacy_codex_root(home: Path | None = None) -> Path:
     return codex_home / "waystone"
 
 
-def data_dir(home: Path | None = None) -> Path:
-    """Waystone's host-local data root, optionally resolved under an injected home for tests."""
-    base_home = Path.home() if home is None else Path(home)
-    if os.environ.get("WAYSTONE_HOST") == "codex":
-        codex_home = (Path(os.environ["CODEX_HOME"]).expanduser()
-                      if os.environ.get("CODEX_HOME") else base_home / ".codex")
-        return codex_home / "waystone"
-    return base_home / ".claude" / "waystone"
-
-
 def _legacy_data_dir(home: Path | None = None) -> Path:
     return (Path.home() if home is None else Path(home)) / ".claude" / "jahns-workflow"
 
 
 def migrate_home_data(home: Path | None = None) -> Path:
     """Move the legacy data root once. A conflict is preserved and reported, never merged."""
-    new = data_dir(home)
-    # The legacy jahns-workflow home only existed on Claude. A Codex launch must never move Claude
-    # state into the Codex-local data root.
+    new = machine_dir(home)
+    # The legacy jahns-workflow home only existed on Claude. Preserve the existing Codex-launch
+    # no-move behavior until C2 replaces this migration.
     if os.environ.get("WAYSTONE_HOST") == "codex":
         return new
     old = _legacy_data_dir(home)
@@ -93,8 +83,6 @@ class WorkflowError(Exception):
     ordinary Exception, catchable by rollback logic) rather than calling sys.exit() — only CLI
     main() converts it to an exit code. (sys.exit raises SystemExit/BaseException, which slips past
     `except Exception` rollbacks.)"""
-REGISTRY_PATH = data_dir() / "projects.json"
-
 TASK_TYPES = ("feat", "fix", "perf", "gate", "spike", "decision", "docs", "chore")
 TASK_STATUSES = ("pending", "active", "blocked", "done", "dropped")
 MILESTONE_STATUSES = ("pending", "active", "done")
@@ -280,18 +268,18 @@ def _project_slug(root: Path) -> str:
 
 
 def resume_path(root: Path) -> Path:
-    """Plugin-local EPHEMERAL re-entry snapshot for a project (NOT committed to the repo). Written
+    """Project-local EPHEMERAL re-entry snapshot (NOT committed to the repo). Written
     deterministically by the PreCompact/SessionEnd hook (structured: HEAD/round/tasks) and CONSUMED
-    by the next SessionStart. Hashed path so different repos can't collide on a truncated slug."""
-    return data_dir() / "resume" / f"{_project_slug(root)}.md"
+    by the next SessionStart."""
+    return project_state_dir(root) / "resume.md"
 
 
 def start_here_path(root: Path) -> Path:
-    """Plugin-local PERSISTENT re-entry pointer for a project (NOT committed, NOT consumed). The
+    """Project-local PERSISTENT re-entry pointer (NOT committed, NOT consumed). The
     MODEL overwrites it at round close / after review with a bounded live-frontier narrative; the
     SessionStart hook injects it so a new/resumed session picks up without a manual 'pick up where
     we left off'. Complements the ephemeral structured resume_path — narrative vs. structured."""
-    return data_dir() / "start_here" / f"{_project_slug(root)}.md"
+    return project_state_dir(root) / "start-here.md"
 
 
 def slugify(text: str, max_len: int = 40) -> str:

@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
-from common import data_dir, git_branch_info, git_full_sha, load_config, load_tasks, next_actionable, resume_path, start_here_path  # noqa: E402
+from common import git_branch_info, git_full_sha, load_config, load_tasks, machine_dir, next_actionable, registry_path, resume_path, start_here_path  # noqa: E402
 
 MAX_CHARS = 8000
 MAX_TASK_LINES = 8
@@ -25,14 +25,14 @@ MAX_CONTRACT = 1200
 CONTRACT_PATH = Path(__file__).resolve().parents[2] / "references" / "main-contract.md"
 
 
-def _routing_line() -> str:
+def _routing_line(root: Path) -> str:
     import delegate
 
-    path = delegate._profile_path()
+    path = delegate._profile_path(root)
     if not path.is_file():
         return "routing: no profile — waystone delegate will guide setup"
     try:
-        profile, _fingerprint = delegate._load_profile()
+        profile, _fingerprint = delegate._load_profile(root)
         bindings = profile.get("bindings")
         if not isinstance(bindings, dict):
             raise ValueError("bindings is not a mapping")
@@ -89,7 +89,7 @@ def _delegation_summary(root: Path) -> str:
 
 
 def _evidence_summary(root: Path) -> str | None:
-    path = data_dir() / "improve" / "evidence.jsonl"
+    path = machine_dir() / "improve" / "evidence.jsonl"
     if not path.is_file():
         return None
     try:
@@ -97,7 +97,7 @@ def _evidence_summary(root: Path) -> str | None:
         data = load_tasks(root)
         if isinstance(data.get("project"), str):
             aliases.add(data["project"])
-        registry = data_dir() / "projects.json"
+        registry = registry_path()
         if registry.is_file():
             reg = json.loads(registry.read_text(encoding="utf-8"))
             for entry in reg.get("projects", []):
@@ -131,7 +131,7 @@ def _operating_contract(root: Path) -> list[str]:
         if not constitution:
             return []
         lines = ["◆ OPERATING CONTRACT (waystone)", *constitution.splitlines(),
-                 _routing_line(), _overlay_line(root)]
+                 _routing_line(root), _overlay_line(root)]
         live = "live: " + _delegation_summary(root)
         evidence = _evidence_summary(root)
         if evidence:

@@ -618,11 +618,12 @@ class ResumeStartHereTests(unittest.TestCase):
 
     def test_start_here_path_distinct_and_deterministic(self):
         with tempfile.TemporaryDirectory() as d:
-            root = Path(d)
+            root = Path(d) / "repo"
+            root.mkdir()
             self.assertEqual(common.start_here_path(root), common.start_here_path(root))  # per-repo stable
             self.assertNotEqual(common.start_here_path(root), common.resume_path(root))   # vs ephemeral
-            self.assertIn("start_here", str(common.start_here_path(root)))
-            self.assertNotEqual(common.start_here_path(root), common.start_here_path(root / "sub"))
+            self.assertEqual(common.start_here_path(root), root / ".waystone" / "start-here.md")
+            self.assertEqual(common.resume_path(root), root / ".waystone" / "resume.md")
 
     def _with_home(self, home: Path, fn):
         import os
@@ -657,8 +658,7 @@ class ResumeStartHereTests(unittest.TestCase):
 
             rc, printed = self._with_home(home, run)
             self.assertEqual(rc, 0)
-            self.assertTrue(printed.startswith(str(home)))   # under the (temp) home, not the real ~/.claude
-            self.assertIn("start_here", printed)
+            self.assertEqual(Path(printed), root.resolve() / ".waystone" / "start-here.md")
             self.assertTrue(Path(printed).parent.is_dir())   # parent created so the model can Write to it
 
     def test_session_context_injects_and_caps_start_here(self):
@@ -734,6 +734,22 @@ class StoragePathTests(unittest.TestCase):
             (state / ".gitignore").unlink()
             self.assertEqual(common.project_state_dir(root), state)
             self.assertEqual((state / ".gitignore").read_text(), "*\n")
+
+    def test_consumers_use_project_state_and_machine_worktree_cache(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "repo"
+            root.mkdir()
+            home = Path(d) / "home"
+            home.mkdir()
+            self.assertEqual(delegate._delegations_dir(root),
+                             root / ".waystone" / "delegations")
+            self.assertEqual(delegate._profile_path(root), root / ".waystone" / "profile.yml")
+            self.assertEqual(overlay._overlay_dir(root), root / ".waystone" / "overlay")
+            self.assertEqual(overlay._exposure_dir(root), root / ".waystone" / "exposure")
+            self.assertEqual(
+                _run_with_home(home, lambda: delegate._worktrees_dir(root)),
+                home / ".waystone" / "cache" / "worktrees" / common._project_slug(root),
+            )
 
 
 class ConfigTests(unittest.TestCase):
@@ -2021,7 +2037,7 @@ class ImproveDiscoveryTests(unittest.TestCase):
 
             rc = _run_with_home(home, run)
             self.assertEqual(rc, 0)
-            out_dir = home / ".claude" / "waystone" / "improve"
+            out_dir = home / ".waystone" / "improve"
             self.assertTrue((out_dir / "sessions.jsonl").is_file())
             self.assertTrue((out_dir / "parse_coverage.json").is_file())
 
@@ -2533,10 +2549,10 @@ class ImproveReviewsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)
             home = d / "home"
-            (home / ".claude" / "waystone").mkdir(parents=True)
+            (home / ".waystone").mkdir(parents=True)
             # place the registry where the runtime path resolves it under the fake HOME
             reg = self._fixture(d)
-            (home / ".claude" / "waystone" / "projects.json").write_text(reg.read_text())
+            (home / ".waystone" / "projects.json").write_text(reg.read_text())
 
             def run():
                 buf = io.StringIO()
@@ -2546,7 +2562,7 @@ class ImproveReviewsTests(unittest.TestCase):
 
             rc = _run_with_home(home, run)
             self.assertEqual(rc, 0)
-            out_dir = home / ".claude" / "waystone" / "improve"
+            out_dir = home / ".waystone" / "improve"
             self.assertTrue((out_dir / "reviews.jsonl").is_file())
             self.assertTrue((out_dir / "reviews_coverage.json").is_file())
 
@@ -2762,7 +2778,7 @@ class ImproveDecideTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)
             home = d / "home"
-            (home / ".claude" / "waystone").mkdir(parents=True)
+            (home / ".waystone").mkdir(parents=True)
 
             def run():
                 buf = io.StringIO()
@@ -2770,7 +2786,7 @@ class ImproveDecideTests(unittest.TestCase):
                     return improve.main(["decide", "context_heavy/trim", "accept"])
             rc = _run_with_home(home, run)
             self.assertEqual(rc, 0)
-            default_log = home / ".claude" / "waystone" / "improve" / "decisions.jsonl"
+            default_log = home / ".waystone" / "improve" / "decisions.jsonl"
             self.assertTrue(default_log.is_file())  # default --out honors HOME
 
             explicit = d / "elsewhere"
@@ -2898,8 +2914,8 @@ class ImproveM1DefectTests(unittest.TestCase):
                 improve.run_reviews(wrong, out)              # wrong shape -> fail loud
             # exit-code contract via the CLI (corrupt registry under a fake HOME) -> rc 1, not 0
             home = d / "home"
-            (home / ".claude" / "waystone").mkdir(parents=True)
-            (home / ".claude" / "waystone" / "projects.json").write_text("{ nope ")
+            (home / ".waystone").mkdir(parents=True)
+            (home / ".waystone" / "projects.json").write_text("{ nope ")
             rc = _run_with_home(home, lambda: self._quiet(
                 lambda: improve.main(["reviews", "--out", str(d / "o2")])))
             self.assertEqual(rc, 1)
@@ -3154,10 +3170,8 @@ _PROFILE_BODY = ('schema: waystone-profile-1\nbindings:\n'
                  '  implementer: {execution: external-runner, backend: "codex:gpt-5.4-codex"}\n')
 
 
-def _write_profile(home: Path, body: str = _PROFILE_BODY):
-    pdir = home / ".claude" / "waystone"
-    pdir.mkdir(parents=True, exist_ok=True)
-    (pdir / "profile.yml").write_text(body, encoding="utf-8")
+def _write_profile(root: Path, body: str = _PROFILE_BODY):
+    (common.project_state_dir(root) / "profile.yml").write_text(body, encoding="utf-8")
 
 
 class DelegateProfileTests(unittest.TestCase):
@@ -3167,34 +3181,42 @@ class DelegateProfileTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             home = Path(d) / "home"
             home.mkdir()
-            with self.assertRaises(delegate.WorkflowError):
-                _run_with_home(home, delegate._load_profile)
+            root = Path(d) / "repo"
+            root.mkdir()
+            with self.assertRaises(delegate.WorkflowError) as cm:
+                _run_with_home(home, lambda: delegate._load_profile(root))
+            self.assertIn(str(root / ".waystone" / "profile.yml"), str(cm.exception))
 
     def test_resolve_binding_ok_and_fingerprint(self):
         with tempfile.TemporaryDirectory() as d:
             home = Path(d) / "home"
-            _write_profile(home)
-            profile, fp = _run_with_home(home, delegate._load_profile)
+            root = Path(d) / "repo"
+            root.mkdir()
+            _write_profile(root)
+            profile, fp = _run_with_home(home, lambda: delegate._load_profile(root))
             self.assertTrue(fp.startswith("sha256:"))
-            b = delegate._resolve_binding(profile, "implementer")
+            b = delegate._resolve_binding(profile, "implementer", root)
             self.assertEqual(b["backend"], "codex:gpt-5.4-codex")
             self.assertEqual(b["execution"], "external-runner")
             self.assertEqual(b["source"], "profile")
 
     def test_missing_role_binding_raises(self):
-        profile = yaml.safe_load(_PROFILE_BODY)
-        with self.assertRaises(delegate.WorkflowError):
-            delegate._resolve_binding(profile, "verifier")
+        with tempfile.TemporaryDirectory() as d:
+            profile = yaml.safe_load(_PROFILE_BODY)
+            root = Path(d) / "repo"
+            root.mkdir()
+            with self.assertRaises(delegate.WorkflowError):
+                delegate._resolve_binding(profile, "verifier", root)
 
     def test_unsupported_execution_raises(self):
         profile = {"bindings": {"implementer": {"execution": "in-process", "backend": "codex:x"}}}
         with self.assertRaises(delegate.WorkflowError):
-            delegate._resolve_binding(profile, "implementer")
+            delegate._resolve_binding(profile, "implementer", Path("/project"))
 
     def test_bad_backend_format_raises(self):
         profile = {"bindings": {"implementer": {"execution": "external-runner", "backend": "codexonly"}}}
         with self.assertRaises(delegate.WorkflowError):
-            delegate._resolve_binding(profile, "implementer")
+            delegate._resolve_binding(profile, "implementer", Path("/project"))
 
     def test_non_codex_backend_not_implemented(self):
         with self.assertRaises(delegate.WorkflowError):
@@ -3205,8 +3227,60 @@ class DelegateProfileTests(unittest.TestCase):
         profile = {"bindings": {"implementer": {
             "execution": "external-runner", "backend": "codex:x", "effort": "extreme"}}}
         with self.assertRaises(delegate.WorkflowError) as cm:
-            delegate._resolve_binding(profile, "implementer")
+            delegate._resolve_binding(profile, "implementer", Path("/project"))
         self.assertIn("effort", str(cm.exception))
+
+    def test_verifier_execution_absent_is_derived_from_host(self):
+        import os
+
+        profile = {"bindings": {"verifier": {
+            "backend": "codex:x", "entry": "adversarial-review"}}}
+        old_host = os.environ.pop("WAYSTONE_HOST", None)
+        try:
+            binding = delegate._resolve_verifier_binding(profile, Path("/project"))
+        finally:
+            if old_host is not None:
+                os.environ["WAYSTONE_HOST"] = old_host
+        self.assertEqual(binding["execution"], "codex-companion")
+
+    def test_matching_verifier_execution_warns_and_is_accepted(self):
+        import contextlib
+        import io
+        import os
+
+        profile = {"bindings": {"verifier": {
+            "execution": "codex-cli", "backend": "codex:x", "entry": "adversarial-review"}}}
+        old_host = os.environ.get("WAYSTONE_HOST")
+        os.environ["WAYSTONE_HOST"] = "codex"
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                binding = delegate._resolve_verifier_binding(profile, Path("/project"))
+        finally:
+            if old_host is None:
+                os.environ.pop("WAYSTONE_HOST", None)
+            else:
+                os.environ["WAYSTONE_HOST"] = old_host
+        self.assertEqual(binding["execution"], "codex-cli")
+        self.assertIn("deprecated", err.getvalue())
+
+    def test_conflicting_verifier_execution_is_rejected(self):
+        import os
+
+        profile = {"bindings": {"verifier": {
+            "execution": "codex-companion", "backend": "codex:x",
+            "entry": "adversarial-review"}}}
+        old_host = os.environ.get("WAYSTONE_HOST")
+        os.environ["WAYSTONE_HOST"] = "codex"
+        try:
+            with self.assertRaises(delegate.WorkflowError) as cm:
+                delegate._resolve_verifier_binding(profile, Path("/project"))
+        finally:
+            if old_host is None:
+                os.environ.pop("WAYSTONE_HOST", None)
+            else:
+                os.environ["WAYSTONE_HOST"] = old_host
+        self.assertIn("remove the execution key", str(cm.exception))
 
 
 def _packet_registry():
@@ -3271,7 +3345,7 @@ class DelegateRunTests(unittest.TestCase):
         git(root, "add", "-A")
         git(root, "commit", "-qm", "setup")
         home = Path(d) / "home"
-        _write_profile(home)
+        _write_profile(root)
         return root, home
 
     def _fake_runner(self, changes, report=None, rc=0):
@@ -3544,7 +3618,7 @@ def _deleg_project(d) -> tuple[Path, Path]:
     git(root, "add", "-A")
     git(root, "commit", "-qm", "setup")
     home = Path(d) / "home"
-    _write_profile(home)
+    _write_profile(root)
     return root, home
 
 
@@ -3582,7 +3656,7 @@ class DelegateEffortTests(unittest.TestCase):
     def test_set_effort_reaches_fake_runner_and_exposure(self):
         with tempfile.TemporaryDirectory() as d:
             root, home = _deleg_project(d)
-            _write_profile(home, (
+            _write_profile(root, (
                 "schema: waystone-profile-1\nbindings:\n"
                 "  implementer: {execution: external-runner, backend: \"codex:gpt-test\", "
                 "effort: high}\n"))
@@ -4150,7 +4224,7 @@ def _check_project(d):
     git(root, "add", "-A")
     git(root, "commit", "-qm", "setup")
     home = Path(d) / "home"
-    _write_profile(home)
+    _write_profile(root)
     return root, home
 
 
@@ -4473,7 +4547,7 @@ class RoundExposureTests(unittest.TestCase):
     def test_close_records_round_exposure(self):
         with tempfile.TemporaryDirectory() as d:
             root, home = _round_review_project(d)
-            _write_profile(home)  # profile present -> bindings/fingerprint non-null
+            _write_profile(root)  # profile present -> bindings/fingerprint non-null
             import contextlib
             import io
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
@@ -4661,7 +4735,7 @@ class EvidenceTests(unittest.TestCase):
             {"name": "remote-only", "repo": "owner/repo"},
             {"name": "gone", "path": str(d / "missing")},
         ]}))
-        default_registry = home / ".claude" / "waystone" / "projects.json"
+        default_registry = home / ".waystone" / "projects.json"
         default_registry.parent.mkdir(parents=True, exist_ok=True)
         default_registry.write_bytes(registry.read_bytes())
         return root, home, registry
@@ -4787,12 +4861,12 @@ class DelegateVerifyTests(unittest.TestCase):
     _PROFILE = (
         "schema: waystone-profile-1\nbindings:\n"
         "  implementer: {execution: external-runner, backend: \"codex:gpt-5.6-sol\"}\n"
-        "  verifier: {execution: codex-companion, backend: \"codex:gpt-5.6-sol\", "
+        "  verifier: {backend: \"codex:gpt-5.6-sol\", "
         "entry: adversarial-review}\n")
 
     def _setup(self, d, *, committed=True):
         root, home = _deleg_project(d)
-        _write_profile(home, self._PROFILE)
+        _write_profile(root, self._PROFILE)
         (root / ".gitignore").write_text(".ignored-cache/\n")
         git(root, "add", ".gitignore")
         git(root, "commit", "-qm", "ignore fixture")
@@ -5065,14 +5139,14 @@ class DelegateVerifyTests(unittest.TestCase):
             root, home, rec, worktree, plugin = self._setup(d)
             for verifier, needle in (
                 ("{execution: external-runner, backend: \"codex:x\", entry: adversarial-review}",
-                 "not implemented in M2"),
+                 "conflicts with WAYSTONE_HOST-derived"),
                 ("{execution: codex-companion, backend: \"codex:x\", entry: review}",
                  "entry 'review' not implemented in M2"),
             ):
                 body = ("schema: waystone-profile-1\nbindings:\n"
                         "  implementer: {execution: external-runner, backend: \"codex:x\"}\n"
                         f"  verifier: {verifier}\n")
-                _write_profile(home, body)
+                _write_profile(root, body)
                 with self.assertRaises(delegate.WorkflowError) as cm:
                     _run_with_home(home, lambda: delegate.verify_delegation(root, rec.name))
                 self.assertIn(needle, str(cm.exception))
@@ -5282,7 +5356,7 @@ class ContractInjectTests(unittest.TestCase):
         module = self._module()
         with tempfile.TemporaryDirectory() as d:
             root, home = self._project(d)
-            _write_profile(home, DelegateVerifyTests._PROFILE)
+            _write_profile(root, DelegateVerifyTests._PROFILE)
             _run_with_home(home, lambda: overlay.add_delta(
                 root, "verification_debt/warn", rule="delegation-verification-evidence-v1",
                 summary="s"))
@@ -5293,7 +5367,7 @@ class ContractInjectTests(unittest.TestCase):
             self._delegation(root, home, "did-one", "needs-review")
             self._delegation(root, home, "did-two", "needs-review")
             self._delegation(root, home, "did-done", "applied")
-            evidence = home / ".claude" / "waystone" / "improve" / "evidence.jsonl"
+            evidence = home / ".waystone" / "improve" / "evidence.jsonl"
             evidence.parent.mkdir(parents=True)
             _write_jsonl(evidence, [
                 {"task_id": "feat/active", "project": "demo", "findings": [{"severity": "major"}],
@@ -5334,15 +5408,14 @@ class ContractInjectTests(unittest.TestCase):
         module = self._module()
         with tempfile.TemporaryDirectory() as d:
             root, home = self._project(d)
-            profile = home / ".claude" / "waystone" / "profile.yml"
-            profile.parent.mkdir(parents=True)
+            profile = common.project_state_dir(root) / "profile.yml"
             profile.write_text("bindings: [\n")
             delta = _run_with_home(home, lambda: overlay._deltas_dir(root)) / "bad.json"
             delta.parent.mkdir(parents=True)
             delta.write_text("{bad")
             rec = self._delegation(root, home, "did-corrupt", "needs-review")
             (rec / "status.json").write_text("{bad")
-            evidence = home / ".claude" / "waystone" / "improve" / "evidence.jsonl"
+            evidence = home / ".waystone" / "improve" / "evidence.jsonl"
             evidence.parent.mkdir(parents=True)
             evidence.write_text("{bad\n")
             rc, ctx = self._context(module, root, home)
@@ -5379,8 +5452,8 @@ class MigrationTests(unittest.TestCase):
             (old / "sentinel").write_text("kept")
             with contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(_run_with_home(home, lambda: waystone.main([])), 1)
-            new = home / ".claude" / "waystone"
-            self.assertEqual(common.data_dir(home), new)
+            new = home / ".waystone"
+            self.assertEqual(common.machine_dir(home), new)
             self.assertFalse(old.exists())
             self.assertEqual((new / "sentinel").read_text(), "kept")
 
@@ -5391,7 +5464,7 @@ class MigrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             home = Path(d) / "home"
             old = home / ".claude" / "jahns-workflow"
-            new = home / ".claude" / "waystone"
+            new = home / ".waystone"
             old.mkdir(parents=True)
             new.mkdir(parents=True)
             (old / "legacy").write_text("old")
@@ -5438,8 +5511,8 @@ class MigrationTests(unittest.TestCase):
     def test_legacy_profile_and_delta_schema_load(self):
         with tempfile.TemporaryDirectory() as d:
             root, home = _overlay_project(d)
-            _write_profile(home, _PROFILE_BODY.replace("waystone-profile-1", "jw-profile-1"))
-            profile, _ = _run_with_home(home, delegate._load_profile)
+            _write_profile(root, _PROFILE_BODY.replace("waystone-profile-1", "jw-profile-1"))
+            profile, _ = _run_with_home(home, lambda: delegate._load_profile(root))
             self.assertEqual(profile["schema"], "jw-profile-1")
             delta = _add_delta(root, home, "verification_debt/legacy")
             path = _run_with_home(home, lambda: overlay._delta_path(root, delta["id"]))
@@ -5520,8 +5593,8 @@ class M2DocsTests(unittest.TestCase):
         for phrase in (
             "non-blocking", "least-restrictive", "task-id", "estimated nuisance rate",
             "workspace-write", "read-only", "independent-verifier",
-            "~/.claude/waystone/overlay/", "~/.claude/waystone/exposure/",
-            "~/.claude/waystone/improve/evidence.jsonl",
+            "{project_root}/.waystone/overlay/", "{project_root}/.waystone/exposure/",
+            "~/.waystone/improve/evidence.jsonl",
         ):
             self.assertIn(phrase, text)
 
@@ -5699,12 +5772,11 @@ class CodexVerifierTests(unittest.TestCase):
             os.environ["WAYSTONE_HOST"] = "codex"
             try:
                 root, home = _deleg_project(d)
-                profile = home / ".codex" / "waystone" / "profile.yml"
-                profile.parent.mkdir(parents=True)
+                profile = common.project_state_dir(root) / "profile.yml"
                 profile.write_text(
                     "schema: waystone-profile-1\nbindings:\n"
                     "  implementer: {execution: external-runner, backend: \"codex:gpt-test\"}\n"
-                    "  verifier: {execution: codex-cli, backend: \"codex:gpt-test\", "
+                    "  verifier: {backend: \"codex:gpt-test\", "
                     "entry: adversarial-review}\n"
                 )
                 _deleg_run(root, home, _deleg_fake({"f.txt": "changed\n"}))
@@ -5759,7 +5831,7 @@ class CodexPluginContractTests(unittest.TestCase):
                          {"PreToolUse", "SessionStart", "PreCompact", "SessionEnd", "PostToolUse"})
         self.assertTrue((root / "bin" / "waystone-codex").stat().st_mode & 0o111)
 
-    def test_codex_data_root_is_explicit(self):
+    def test_machine_data_root_is_host_neutral(self):
         import os
 
         with tempfile.TemporaryDirectory() as d:
@@ -5769,16 +5841,16 @@ class CodexPluginContractTests(unittest.TestCase):
             try:
                 os.environ["WAYSTONE_HOST"] = "codex"
                 os.environ.pop("CODEX_HOME", None)
-                self.assertEqual(_run_with_home(home, common.data_dir), home / ".codex" / "waystone")
+                self.assertEqual(_run_with_home(home, common.machine_dir), home / ".waystone")
                 legacy = home / ".claude" / "jahns-workflow"
                 legacy.mkdir(parents=True)
                 (legacy / "sentinel").write_text("keep")
                 self.assertEqual(_run_with_home(home, common.migrate_home_data),
-                                 home / ".codex" / "waystone")
+                                 home / ".waystone")
                 self.assertTrue((legacy / "sentinel").is_file())
-                self.assertFalse((home / ".codex" / "waystone").exists())
+                self.assertFalse((home / ".waystone").exists())
                 os.environ["CODEX_HOME"] = str(home / "custom-codex")
-                self.assertEqual(common.data_dir(), home / "custom-codex" / "waystone")
+                self.assertEqual(_run_with_home(home, common.machine_dir), home / ".waystone")
             finally:
                 if old_host is None:
                     os.environ.pop("WAYSTONE_HOST", None)

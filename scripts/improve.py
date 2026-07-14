@@ -12,12 +12,12 @@
 
 `trace` walks each source (default `$CLAUDE_CONFIG_DIR/projects`, else `~/.claude/projects`),
 streams every transcript file line-by-line through cclog, and emits three regenerable artifacts
-into --out (default `~/.claude/waystone/improve/`):
+into --out (default `~/.waystone/improve/`):
   sessions.jsonl        one row per transcript (main/subagent/workflow-subagent)
   delegations.jsonl     one row per agent_spawn tool_use
   parse_coverage.json   files-by-kind, event-type counts, unknown/skip/error tallies
 
-`reviews` reads the registered projects (`~/.claude/waystone/projects.json`), resolves each
+`reviews` reads the registered projects (`~/.waystone/projects.json`), resolves each
 `reviews_dir` via `.waystone.yml`, and projects the review evidence already on disk (it never
 re-implements review ingest) into --out:
   reviews.jsonl         one row per review round (findings from the feedback triage table + the
@@ -71,11 +71,12 @@ from cclog import (  # noqa: E402
 from common import (  # noqa: E402
     SEVERITIES,
     WorkflowError,
-    data_dir,
     has_project_config,
     load_config,
     load_tasks,
     load_yaml,
+    machine_dir,
+    registry_path,
 )
 
 HEAD_LEN = 120
@@ -744,9 +745,8 @@ def _project_review_rows(name: str, root: Path, cfg: dict) -> list[dict]:
 
 
 def _registry_path() -> Path:
-    """Runtime-resolved global registry (honours HOME so tests can override it), matching
-    common.REGISTRY_PATH's location without freezing it at import time."""
-    return data_dir() / "projects.json"
+    """Runtime-resolved global registry (honours HOME so tests can override it)."""
+    return registry_path()
 
 
 def run_reviews(registry_path: Path, out_dir: Path) -> dict:
@@ -1342,7 +1342,7 @@ def _parse_single_opt(argv: list[str], flag: str) -> str | None:
 
 
 def _default_out() -> Path:
-    return data_dir() / "improve"
+    return machine_dir() / "improve"
 
 
 def _residence_checked(value: str | None, flag: str) -> Path:

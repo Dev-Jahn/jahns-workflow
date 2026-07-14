@@ -27,7 +27,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from common import (  # noqa: E402
-    WorkflowError, _project_slug, data_dir, find_project_root, load_config,
+    WorkflowError, _project_slug, find_project_root, load_config, project_state_dir,
 )
 
 # delta-id grammar mirrors the improve rec_id (`<lens>/<kebab-gist>`, S2) so a rec materialises to a
@@ -120,13 +120,9 @@ def evaluate_rule2(root: Path, cfg: dict, severities, *, closing_done=frozenset(
     return {"fires": fires, "unlinked": unlinked, "evaluation_errors": errors}
 
 
-# ---- residence (§2 — plugin-local, keyed by project slug; never committed) -----
-def _plugin_base() -> Path:
-    return data_dir()
-
-
+# ---- residence (§2 — project-local, never committed) --------------------------
 def _overlay_dir(root: Path) -> Path:
-    return _plugin_base() / "overlay" / _project_slug(root)
+    return project_state_dir(root) / "overlay"
 
 
 def _deltas_dir(root: Path) -> Path:
@@ -541,15 +537,15 @@ def _evaluate_boundary(root: Path, boundary: str, context: dict) -> list[dict]:
 
 # ---- exposure (§9 — round exposure record; delegation exposure lives in delegate) ----
 def _exposure_dir(root: Path) -> Path:
-    return _plugin_base() / "exposure" / _project_slug(root)
+    return project_state_dir(root) / "exposure"
 
 
-def _profile_summary() -> tuple[str | None, dict | None]:
+def _profile_summary(root: Path) -> tuple[str | None, dict | None]:
     """(profile_fingerprint, {role: backend}) from the delegation profile, or (None, None) when it is
     absent — a round closes without any delegation, so the harness never guesses bindings."""
     import delegate
     try:
-        profile, fp = delegate._load_profile()
+        profile, fp = delegate._load_profile(root)
     except WorkflowError:
         return None, None
     bindings: dict[str, str] = {}
@@ -562,7 +558,7 @@ def _profile_summary() -> tuple[str | None, dict | None]:
 def write_round_exposure(root: Path, round_id: str, head_sha: str | None, watermark: str | None):
     """Immutable per-round exposure record written at close (§9/#4). A re-close of the same round-id
     gets a `-2`/`-3` suffix (H4 precedent — existing records are never overwritten)."""
-    fp, bindings = _profile_summary()
+    fp, bindings = _profile_summary(root)
     exposure = {
         "schema": "waystone-round-exposure-1", "round_id": round_id, "at": _now_iso(),
         "project": {"pslug": _project_slug(root), "root": str(Path(root).resolve())},
