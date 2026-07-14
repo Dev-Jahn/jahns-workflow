@@ -11,6 +11,7 @@ beyond what the wrapper extracted). Output is capped to keep per-session token c
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -146,6 +147,7 @@ def _operating_contract(root: Path) -> list[str]:
 
 def main() -> int:
     root = Path(sys.argv[1]).resolve()
+    codex_host = os.environ.get("WAYSTONE_HOST") == "codex"
     try:
         cfg = load_config(root)
         data = load_tasks(root)
@@ -195,7 +197,8 @@ def main() -> int:
         lines.append("next actionable (deps satisfied):")
         for tid, title in nxt:
             lines.append(f"  → {tid} — {title}")
-    lines.append(f"Task registry: tasks.yaml | Roadmap: ROADMAP.md | Conventions: see CLAUDE.md workflow section")
+    instructions = "AGENTS.md" if codex_host else "CLAUDE.md"
+    lines.append(f"Task registry: tasks.yaml | Roadmap: ROADMAP.md | Conventions: see {instructions} workflow section")
 
     # consume a PreCompact/SessionEnd resume pointer if one was left, flagging staleness
     rp = resume_path(root)
@@ -218,7 +221,8 @@ def main() -> int:
         lines.append("")
         lines.append(digest.read_text(encoding="utf-8").rstrip())
     elif cfg.get("ssot"):
-        lines.append(f"SSOT: {cfg['ssot']} (no digest generated yet — run /waystone:round or ssot.py digest)")
+        round_command = "$waystone:round" if codex_host else "/waystone:round"
+        lines.append(f"SSOT: {cfg['ssot']} (no digest generated yet — run {round_command} or ssot.py digest)")
 
     ctx = "\n".join(lines)
     if len(ctx) > MAX_CHARS:

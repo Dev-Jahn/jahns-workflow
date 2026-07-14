@@ -12,15 +12,16 @@
 <p align="center">
 <img alt="version" src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2FDev-Jahn%2Fwaystone%2Fmain%2F.claude-plugin%2Fplugin.json&query=%24.version&prefix=v&label=version&style=flat-square">
 <img alt="Claude Code plugin" src="https://img.shields.io/badge/Claude%20Code-plugin-8A5CF6?style=flat-square">
-<img alt="tests" src="https://img.shields.io/badge/tests-310-success?style=flat-square">
+<img alt="Codex plugin" src="https://img.shields.io/badge/Codex-plugin-111111?style=flat-square">
+<img alt="tests" src="https://img.shields.io/badge/tests-317-success?style=flat-square">
 <img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square">
 </p>
 
 </div>
 
-Waystone is a Claude Code plugin that gives a project a durable source of direction, a validated task list, bounded work cycles, independent review, and a way to learn from past Claude Code sessions. It is built for research and software projects that span many sessions or agents — where context, decisions, and verification evidence would otherwise scatter across chats and memory files.
+Waystone is a Claude Code and Codex plugin that gives a project a durable source of direction, a validated task list, bounded work cycles, independent review, and a way to learn from past agent sessions. It is built for research and software projects that span many sessions or agents — where context, decisions, and verification evidence would otherwise scatter across chats and memory files.
 
-> **Status:** v0.8.2 is implemented. v0.9 is the planned step toward user- and project-specific enforcement and larger-scale multi-agent orchestration.
+> **Status:** v0.8.3 is implemented. v0.9 is the planned step toward user- and project-specific enforcement and larger-scale multi-agent orchestration.
 
 <br>
 
@@ -37,12 +38,24 @@ Waystone is a Claude Code plugin that gives a project a durable source of direct
 
 Requirements: `git`, `bash`, and [`uv`](https://docs.astral.sh/uv/).
 
-```bash
+Claude Code:
+
+```text
 /plugin marketplace add Dev-Jahn/jahns-cc-marketplace
 /plugin install waystone
 ```
 
 Restart Claude Code afterward so the hooks load.
+
+Codex:
+
+```bash
+codex plugin marketplace add Dev-Jahn/jahns-codex-marketplace
+codex plugin add waystone@jahns-codex-marketplace
+```
+
+Restart Codex, then review and trust the installed hooks with `/hooks`. Codex intentionally does not
+run untrusted plugin hooks until their exact hash is approved.
 
 <details>
 <summary>Local development</summary>
@@ -53,6 +66,9 @@ Restart Claude Code afterward so the hooks load.
 claude --plugin-dir ~/workspace/waystone
 ```
 
+For Codex development, add a local marketplace containing the checkout and install its `waystone`
+entry; the repository CI performs this same install smoke test.
+
 </details>
 
 <br>
@@ -62,11 +78,13 @@ claude --plugin-dir ~/workspace/waystone
 For a new or half-formed project:
 
 ```text
-/waystone:ideate "one-line project idea"   # optional
-/waystone:init
+Claude Code: /waystone:ideate "one-line project idea"   # optional
+Claude Code: /waystone:init
+Codex:      $waystone:ideate "one-line project idea"    # optional
+Codex:      $waystone:init
 ```
 
-`ideate` turns the idea into `SSOT.md`, a concise project-direction document. `init` then builds the working structure around it. For an existing project, run `/waystone:init` alone — setup is non-destructive: Waystone adapts to existing files, leaves changes uncommitted for review, and applies its conventions only from that point forward.
+`ideate` turns the idea into `SSOT.md`, a concise project-direction document. `init` then builds the working structure around it. For an existing project, run `/waystone:init` (Claude Code) or `$waystone:init` (Codex) alone — setup is non-destructive: Waystone adapts to existing files, leaves changes uncommitted for review, and applies its conventions only from that point forward.
 
 A normal cycle:
 
@@ -82,26 +100,27 @@ flowchart LR
 ```
 
 ```text
-/waystone:round          # close the cycle and generate a review request
-cat > /tmp/review.md     # paste the external reviewer's reply, then Ctrl-D
-/waystone:review         # verify each finding, register confirmed issues
+Claude Code: /waystone:round    Codex: $waystone:round
+cat > /tmp/review.md             # paste the external reviewer's reply, then Ctrl-D
+Claude Code: /waystone:review   Codex: $waystone:review
 ```
 
-Fix confirmed issues and start the next round. Run `/waystone:improve` periodically to analyze past sessions and review results.
+Fix confirmed issues and start the next round. Run `/waystone:improve` or `$waystone:improve`
+periodically to analyze past sessions and review results.
 
 <br>
 
 ## Available commands
 
-| Command | Purpose |
-|---|---|
-| `/waystone:ideate` | Turns a rough idea into `SSOT.md`, a concise project-direction document. No repository required. |
-| `/waystone:init` | Sets up a new project or adds Waystone to an existing one without rewriting its history. |
-| `/waystone:round` | Closes a bounded work cycle, updates progress, refreshes generated views, and creates a review request. |
-| `/waystone:review` | Preserves a reviewer reply exactly, verifies each issue, and turns confirmed issues into tasks. |
-| `/waystone:delegate` | Runs one task in an isolated worktree, optionally verifies it independently, then asks you to apply or discard. |
-| `/waystone:status` | Shows active, blocked, and pending work across registered local or remote projects. |
-| `/waystone:improve` | Analyzes Claude Code history and review evidence, then proposes evidence-backed workflow improvements. |
+| Claude Code | Codex | Purpose |
+|---|---|---|
+| `/waystone:ideate` | `$waystone:ideate` | Turns a rough idea into `SSOT.md`, a concise project-direction document. No repository required. |
+| `/waystone:init` | `$waystone:init` | Sets up a new project or adds Waystone to an existing one without rewriting its history. |
+| `/waystone:round` | `$waystone:round` | Closes a bounded work cycle, updates progress, refreshes generated views, and creates a review request. |
+| `/waystone:review` | `$waystone:review` | Preserves a reviewer reply exactly, verifies each issue, and turns confirmed issues into tasks. |
+| `/waystone:delegate` | `$waystone:delegate` | Runs one task in an isolated worktree, optionally verifies it independently, then asks you to apply or discard. |
+| `/waystone:status` | `$waystone:status` | Shows active, blocked, and pending work across registered local or remote projects. |
+| `/waystone:improve` | `$waystone:improve` | Analyzes host session history and review evidence, then proposes evidence-backed workflow improvements. |
 
 <details>
 <summary>What an initialized project remembers, and how a session re-enters it</summary>
@@ -110,7 +129,7 @@ Fix confirmed issues and start the next round. Run `/waystone:improve` periodica
 
 An initialized project keeps the main project direction in one document (when it has one), active work and dependencies in `tasks.yaml`, a generated visual roadmap in `ROADMAP.md`, recent work-cycle history in `PROGRESS.md`, decisions in `docs/adr/`, and review requests and feedback in `docs/reviews/`.
 
-On session start or resume, Claude Code receives a short operating summary, the project digest, active tasks, and the next useful action. Before compaction or exit, Waystone stores a small re-entry note so a later session can continue without reconstructing the whole context.
+On session start or resume, the host receives a short operating summary, the project digest, active tasks, and the next useful action. Waystone stores a small re-entry note before compaction on both hosts and before Claude Code exits, so a later session can continue without reconstructing the whole context.
 
 Most validation, rendering, bookkeeping, log parsing, and policy checks are plain scripts and spend no model tokens.
 
@@ -144,13 +163,13 @@ The project chooses one review mode during setup:
 - **Packet mode** (default) — give the generated Markdown request to any capable external reviewer.
 - **PR mode** — for pull-request workflows. Review, CI, issue resolution, and final approval are tied to the exact commit being merged, so an old review cannot approve a newer push.
 
-Reviewer comments are treated as claims, not facts. `/waystone:review` checks them against the code before confirmed issues become tracked work.
+Reviewer comments are treated as claims, not facts. The `review` skill checks them against the code before confirmed issues become tracked work.
 
 <br>
 
 ## Delegate a task without losing control
 
-`/waystone:delegate` is for a task with explicit success criteria. Waystone then:
+The `delegate` skill is for a task with explicit success criteria. Waystone then:
 
 1. fixes the current repository state as an immutable snapshot, including uncommitted work;
 2. creates a separate Git worktree and prepares the environment from the project's lockfiles or configured setup command;
@@ -162,13 +181,13 @@ Reviewer comments are treated as claims, not facts. `/waystone:review` checks th
 
 The worker and verifier never own final approval — the main session and the user retain that decision.
 
-The current v0.8 runner is Codex-backed, but Waystone stores bindings by responsibility (`implementer`, `verifier`) rather than baking model names into the workflow. Bindings live in `~/.claude/waystone/profile.yml`; Waystone refuses to guess a model when the profile is missing.
+The current v0.8 runner is Codex-backed, but Waystone stores bindings by responsibility (`implementer`, `verifier`) rather than baking model names into the workflow. Bindings live in the host data root: `~/.claude/waystone/profile.yml` for Claude Code or `~/.codex/waystone/profile.yml` for Codex. Claude Code can use the `codex-companion` verifier transport; Codex uses a native, ephemeral `codex exec` verifier in a read-only sandbox. Waystone refuses to guess a model when the profile is missing.
 
 <br>
 
 ## Improve the workflow from real usage
 
-`/waystone:improve` reads Claude Code logs from `$CLAUDE_CONFIG_DIR/projects`, or `~/.claude/projects` when that variable is unset (extra log directories and project filters are supported). It combines session history with review and delegation records (joined deterministically by task ID via `waystone improve evidence`), then looks for patterns such as:
+The `improve` skill reads Claude Code logs from `$CLAUDE_CONFIG_DIR/projects` (or `~/.claude/projects`) and Codex rollouts from `$CODEX_HOME/sessions` (or `~/.codex/sessions`). Extra log directories and project filters are supported. It combines session history with review and delegation records (joined deterministically by task ID via `waystone improve evidence`), then looks for patterns such as:
 
 - the main session doing large amounts of implementation directly;
 - changes with little or no visible verification;
@@ -177,7 +196,7 @@ The current v0.8 runner is Codex-backed, but Waystone stores bindings by respons
 - how work is delegated;
 - recurring review issues and gaps in the available evidence.
 
-Scripts produce repeatable facts first; the model only interprets them. Each recommendation states where it came from and whether it is directly observed or inferred. Analysis stays under `~/.claude/waystone/` by default — raw prompts and source files are not copied into the report — and accept/reject decisions are remembered so later runs focus on new evidence.
+Scripts produce repeatable facts first; the model only interprets them. Each recommendation states where it came from and whether it is directly observed or inferred. Analysis stays under the host data root (`~/.claude/waystone/` or `~/.codex/waystone/`) — raw prompts and source files are not copied into the report — and accept/reject decisions are remembered so later runs focus on new evidence.
 
 For a small, predefined set of recommendations, v0.8 can separately store a project-specific check in **observation mode** (`waystone overlay`): it records when the check would have fired but does not warn or block. Promoting it to a warning requires a deterministic replay over past evidence and another explicit command. `waystone check` evaluates the active rules against the current project state; v0.8 warnings remain visible but never block.
 
@@ -239,14 +258,14 @@ docs/CONVENTIONS.md     shared task and review conventions
 docs/ssot/              generated design-document index, sections, and digest
 docs/adr/               recorded decisions
 docs/reviews/           review requests and feedback
-CLAUDE.md               a managed Waystone section
+CLAUDE.md or AGENTS.md  a host-specific managed Waystone section
 ```
 
-Personal analysis, delegation records, worktrees, model bindings, and adaptive-rule state live under `~/.claude/waystone/` rather than in the project repository. See [references/conventions.md](references/conventions.md) for the full task, decision, and review conventions.
+Personal analysis, delegation records, worktrees, model bindings, and adaptive-rule state live under the host data root (`~/.claude/waystone/` or `~/.codex/waystone/`) rather than in the project repository. See [references/conventions.md](references/conventions.md) for the full task, decision, and review conventions.
 
 </details>
 
-## Recommended global CLAUDE.md
+## Recommended global CLAUDE.md or AGENTS.md
 
 Pair the plugin with this global constitution:
 

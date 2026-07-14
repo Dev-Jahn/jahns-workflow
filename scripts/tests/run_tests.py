@@ -22,6 +22,7 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS))
 
 import cclog  # noqa: E402
+import codexlog  # noqa: E402
 import common  # noqa: E402
 import delegate  # noqa: E402
 import improve  # noqa: E402
@@ -5485,6 +5486,270 @@ class M2DocsTests(unittest.TestCase):
             "~/.claude/waystone/improve/evidence.jsonl",
         ):
             self.assertIn(phrase, text)
+
+
+# ============================================================ v0.8.3: Codex host compatibility
+class CodexHookTests(unittest.TestCase):
+    def _project(self, directory: str) -> Path:
+        root = Path(directory) / "repo"
+        root.mkdir()
+        init_repo(root)
+        (root / ".waystone.yml").write_text("version: 1\nproject: x\n")
+        (root / "tasks.yaml").write_text(TASKS_FIXTURE)
+        (root / "ROADMAP.md").write_text("stale\n")
+        return root
+
+    def _guard(self, root: Path, payload: dict):
+        import os
+
+        script = SCRIPTS.parent / "hooks" / "scripts" / "tasks_guard.sh"
+        return subprocess.run(
+            ["bash", str(script)], input=_json.dumps(payload), cwd=root,
+            capture_output=True, text=True,
+            env={**os.environ, "HOME": str(root.parent / "home")},
+        )
+
+    def test_claude_and_codex_payloads_regenerate_roadmap(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self._project(d)
+            claude = {
+                "tool_name": "Edit", "cwd": str(root),
+                "tool_input": {"file_path": str(root / "tasks.yaml")},
+            }
+            result = self._guard(root, claude)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotEqual((root / "ROADMAP.md").read_text(), "stale\n")
+
+            (root / "ROADMAP.md").write_text("stale-again\n")
+            codex = {
+                "tool_name": "apply_patch", "cwd": str(root),
+                "tool_input": {"command": "*** Begin Patch\n*** Update File: tasks.yaml\n@@\n*** End Patch"},
+            }
+            result = self._guard(root, codex)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotEqual((root / "ROADMAP.md").read_text(), "stale-again\n")
+
+    def test_codex_invalid_tasks_patch_fails_without_refresh(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self._project(d)
+            (root / "tasks.yaml").write_text(TASKS_FIXTURE.replace("status: active", "status: bogus"))
+            before = (root / "ROADMAP.md").read_bytes()
+            payload = {
+                "tool_name": "apply_patch", "cwd": str(root),
+                "tool_input": {"command": "*** Begin Patch\n*** Update File: tasks.yaml\n@@\n*** End Patch"},
+            }
+            result = self._guard(root, payload)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("violates the workflow convention", result.stderr)
+            self.assertEqual((root / "ROADMAP.md").read_bytes(), before)
+
+    def test_session_context_names_host_instruction_file(self):
+        import contextlib
+        import io
+        import os
+
+        sys.path.insert(0, str(SCRIPTS.parent / "hooks" / "scripts"))
+        import session_context
+
+        with tempfile.TemporaryDirectory() as d:
+            root = self._project(d)
+            home = Path(d) / "home"
+
+            def capture(host: str) -> str:
+                old_host = os.environ.get("WAYSTONE_HOST")
+                old_argv = sys.argv
+                try:
+                    if host == "codex":
+                        os.environ["WAYSTONE_HOST"] = "codex"
+                    else:
+                        os.environ.pop("WAYSTONE_HOST", None)
+                    sys.argv = ["session_context.py", str(root)]
+                    output = io.StringIO()
+                    with contextlib.redirect_stdout(output):
+                        _run_with_home(home, session_context.main)
+                    return _json.loads(output.getvalue())["hookSpecificOutput"]["additionalContext"]
+                finally:
+                    sys.argv = old_argv
+                    if old_host is None:
+                        os.environ.pop("WAYSTONE_HOST", None)
+                    else:
+                        os.environ["WAYSTONE_HOST"] = old_host
+
+            self.assertIn("see CLAUDE.md workflow section", capture("claude"))
+            codex_context = capture("codex")
+            self.assertIn("see AGENTS.md workflow section", codex_context)
+            self.assertNotIn("see CLAUDE.md workflow section", codex_context)
+
+
+class CodexTraceTests(unittest.TestCase):
+    def _fixture(self, source: Path) -> Path:
+        session_id = "11111111-2222-3333-4444-555555555555"
+        path = source / f"rollout-2026-07-14T00-00-00-{session_id}.jsonl"
+        records = [
+            {"timestamp": "2026-07-14T00:00:00Z", "type": "session_meta", "payload": {
+                "id": session_id, "cwd": "/tmp/proj", "cli_version": "0.144.4",
+                "thread_source": "user"}},
+            {"timestamp": "2026-07-14T00:00:01Z", "type": "turn_context", "payload": {
+                "turn_id": "turn-1", "cwd": "/tmp/proj", "model": "gpt-test"}},
+            {"timestamp": "2026-07-14T00:00:02Z", "type": "response_item", "payload": {
+                "type": "message", "role": "user", "content": [{"type": "input_text", "text": "run it"}]}},
+            {"timestamp": "2026-07-14T00:00:03Z", "type": "response_item", "payload": {
+                "type": "message", "role": "assistant", "id": "m1",
+                "content": [{"type": "output_text", "text": "checking"}]}},
+            {"timestamp": "2026-07-14T00:00:04Z", "type": "response_item", "payload": {
+                "type": "function_call", "name": "exec_command", "call_id": "call-1",
+                "arguments": _json.dumps({"cmd": "uv run tests"})}},
+            {"timestamp": "2026-07-14T00:00:05Z", "type": "response_item", "payload": {
+                "type": "function_call_output", "call_id": "call-1",
+                "output": _json.dumps({"exit_code": 0, "output": "ok"})}},
+            {"timestamp": "2026-07-14T00:00:06Z", "type": "response_item", "payload": {
+                "type": "function_call", "namespace": "collaboration", "name": "spawn_agent",
+                "call_id": "call-2", "arguments": _json.dumps({
+                    "task_name": "audit", "message": "inspect"})}},
+            {"timestamp": "2026-07-14T00:00:07Z", "type": "response_item", "payload": {
+                "type": "function_call_output", "call_id": "call-2",
+                "output": _json.dumps({"status": "completed", "agent_id": "child-1"})}},
+            {"timestamp": "2026-07-14T00:00:08Z", "type": "event_msg", "payload": {
+                "type": "token_count", "info": {"total_token_usage": {
+                    "input_tokens": 10, "cached_input_tokens": 4, "output_tokens": 3,
+                    "reasoning_output_tokens": 1, "total_tokens": 13}}}},
+            {"timestamp": "2026-07-14T00:00:09Z", "type": "session_meta", "payload": {
+                "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "cwd": "/wrong-parent"}},
+        ]
+        _write_jsonl(path, records)
+        return path
+
+    def test_codex_rollout_projects_deterministically(self):
+        import os
+
+        with tempfile.TemporaryDirectory() as d:
+            source = Path(d) / "sessions"
+            source.mkdir()
+            self._fixture(source)
+            first, second = Path(d) / "first", Path(d) / "second"
+            old_thread = os.environ.pop("CODEX_THREAD_ID", None)
+            try:
+                coverage = improve.run_trace([source], set(), first, host="codex")
+                improve.run_trace([source], set(), second, host="codex")
+            finally:
+                if old_thread is not None:
+                    os.environ["CODEX_THREAD_ID"] = old_thread
+            self.assertEqual((first / "sessions.jsonl").read_bytes(),
+                             (second / "sessions.jsonl").read_bytes())
+            self.assertEqual((first / "delegations.jsonl").read_bytes(),
+                             (second / "delegations.jsonl").read_bytes())
+            row = _json.loads((first / "sessions.jsonl").read_text())
+            self.assertEqual(row["project"], "proj")
+            self.assertEqual(row["kind"], "main")
+            self.assertEqual(row["turns"]["value"], 1)
+            self.assertEqual(row["verification"]["runs"], 1)
+            self.assertEqual(row["delegations"], 1)
+            self.assertEqual(row["errors"]["tool"], 0)
+            self.assertEqual(row["parser_version"], codexlog.PARSER_VERSION)
+            self.assertEqual(coverage["files_by_kind"], {"codex_main_transcript": 1})
+            self.assertEqual(coverage["unknown_tool_result_status"], 0)
+
+
+class CodexVerifierTests(unittest.TestCase):
+    def test_native_verifier_never_resolves_claude_companion(self):
+        import contextlib
+        import io
+        import os
+
+        with tempfile.TemporaryDirectory() as d:
+            old_host = os.environ.get("WAYSTONE_HOST")
+            os.environ["WAYSTONE_HOST"] = "codex"
+            try:
+                root, home = _deleg_project(d)
+                profile = home / ".codex" / "waystone" / "profile.yml"
+                profile.parent.mkdir(parents=True)
+                profile.write_text(
+                    "schema: waystone-profile-1\nbindings:\n"
+                    "  implementer: {execution: external-runner, backend: \"codex:gpt-test\"}\n"
+                    "  verifier: {execution: codex-cli, backend: \"codex:gpt-test\", "
+                    "entry: adversarial-review}\n"
+                )
+                _deleg_run(root, home, _deleg_fake({"f.txt": "changed\n"}))
+                rec = _latest_rec(root, home)
+                calls = []
+                original_native = delegate._run_codex_verifier
+                original_companion = delegate._companion_script
+
+                def fake_native(worktree, model, focus, record_dir):
+                    calls.append((worktree, model, focus, record_dir))
+                    return 0, _json.dumps({
+                        "summary": "reviewed", "findings": [], "limitations": [],
+                    })
+
+                def companion_must_not_run():
+                    raise AssertionError("Codex native verification touched the Claude registry")
+
+                delegate._run_codex_verifier = fake_native
+                delegate._companion_script = companion_must_not_run
+                try:
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        rc = _run_with_home(home, lambda: delegate.verify_delegation(root, rec.name))
+                finally:
+                    delegate._run_codex_verifier = original_native
+                    delegate._companion_script = original_companion
+                self.assertEqual(rc, 0)
+                self.assertEqual(len(calls), 1)
+                artifact = _json.loads((rec / "artifact" / "verify-1.json").read_text())
+                self.assertEqual(artifact["transport"], "codex-exec:read-only")
+                self.assertEqual(artifact["provenance"], "independent-verifier")
+            finally:
+                if old_host is None:
+                    os.environ.pop("WAYSTONE_HOST", None)
+                else:
+                    os.environ["WAYSTONE_HOST"] = old_host
+
+
+class CodexPluginContractTests(unittest.TestCase):
+    def test_dual_manifests_and_host_surfaces(self):
+        root = SCRIPTS.parent
+        claude = _json.loads((root / ".claude-plugin" / "plugin.json").read_text())
+        codex = _json.loads((root / ".codex-plugin" / "plugin.json").read_text())
+        self.assertEqual((claude["name"], claude["version"]),
+                         (codex["name"], codex["version"]))
+        self.assertEqual(codex["version"], "0.8.3")
+        self.assertEqual(codex["skills"], "./skills/")
+        self.assertNotIn("hooks", codex)
+        for field in ("logo", "logoDark"):
+            self.assertTrue((root / codex["interface"][field]).is_file())
+        claude_hooks = _json.loads((root / "hooks" / "hooks.json").read_text())["hooks"]
+        self.assertEqual(set(claude_hooks),
+                         {"PreToolUse", "SessionStart", "PreCompact", "SessionEnd", "PostToolUse"})
+        self.assertTrue((root / "bin" / "waystone-codex").stat().st_mode & 0o111)
+
+    def test_codex_data_root_is_explicit(self):
+        import os
+
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d) / "home"
+            old_host = os.environ.get("WAYSTONE_HOST")
+            old_codex_home = os.environ.get("CODEX_HOME")
+            try:
+                os.environ["WAYSTONE_HOST"] = "codex"
+                os.environ.pop("CODEX_HOME", None)
+                self.assertEqual(_run_with_home(home, common.data_dir), home / ".codex" / "waystone")
+                legacy = home / ".claude" / "jahns-workflow"
+                legacy.mkdir(parents=True)
+                (legacy / "sentinel").write_text("keep")
+                self.assertEqual(_run_with_home(home, common.migrate_home_data),
+                                 home / ".codex" / "waystone")
+                self.assertTrue((legacy / "sentinel").is_file())
+                self.assertFalse((home / ".codex" / "waystone").exists())
+                os.environ["CODEX_HOME"] = str(home / "custom-codex")
+                self.assertEqual(common.data_dir(), home / "custom-codex" / "waystone")
+            finally:
+                if old_host is None:
+                    os.environ.pop("WAYSTONE_HOST", None)
+                else:
+                    os.environ["WAYSTONE_HOST"] = old_host
+                if old_codex_home is None:
+                    os.environ.pop("CODEX_HOME", None)
+                else:
+                    os.environ["CODEX_HOME"] = old_codex_home
 
 
 if __name__ == "__main__":

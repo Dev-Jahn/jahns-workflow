@@ -1,12 +1,23 @@
 ---
 name: delegate
-description: Use when the user runs "/waystone:delegate", asks to delegate an implementation task, wants to inspect or independently verify a delegation result, or needs to apply or discard a reviewable delegated patch.
+description: Use when the user runs "/waystone:delegate" in Claude Code or "$waystone:delegate" in Codex, asks to delegate an implementation task, wants to inspect or independently verify a delegation result, or needs to apply or discard a reviewable delegated patch.
 ---
 
 # waystone: delegate
 
 Run one task in an isolated worktree, preserve provenance labels, and leave acceptance to the user.
 Require an initialized project.
+
+## Host contract
+
+- Claude Code: invoke `/waystone:delegate`; assign `$CLAUDE_PLUGIN_ROOT` to
+  `WAYSTONE_PLUGIN_ROOT`, then run command examples with `waystone` from `PATH`.
+- Codex: invoke `$waystone:delegate`; from this skill's directory walk up two parents, assign that
+  absolute path to `WAYSTONE_PLUGIN_ROOT`, then run command examples with
+  `$WAYSTONE_PLUGIN_ROOT/bin/waystone-codex`.
+- Resolve plugin resources from `$WAYSTONE_PLUGIN_ROOT`. Ask required choices through the host's
+  native user-interaction mechanism (`AskUserQuestion` on Claude Code, or Codex's native mechanism);
+  never require one named tool across both hosts.
 
 ## Step 1 — Select a delegable task
 
@@ -46,8 +57,10 @@ HARD rules:
 
 ## Step 4 — Offer independent verification
 
-If `~/.claude/waystone/profile.yml` has a verifier binding, use one **AskUserQuestion** to ask
-whether to run it. If accepted:
+Use the current host's data root (`~/.claude/waystone` for Claude Code,
+`~/.codex/waystone` for Codex). If its `profile.yml` has a verifier binding, ask once through
+the host-native interaction mechanism whether to run it. The binding's `execution` must be
+`codex-companion` for Claude Code and `codex-cli` for Codex. If accepted:
 
 ```bash
 waystone delegate verify <delegation-id> --root <project-root>
@@ -59,8 +72,8 @@ turn the payload into an acceptance verdict. Verification leaves the state `need
 
 ## Step 5 — Ask the user to accept or discard
 
-Use one **AskUserQuestion** for the user's decision: `apply` or `discard`. Do not choose on their
-behalf. Run exactly the selected command and report the result:
+Ask once through the host-native interaction mechanism for the user's decision: `apply` or
+`discard`. Do not choose on their behalf. Run exactly the selected command and report the result:
 
 ```bash
 waystone delegate apply <delegation-id> --root <project-root>

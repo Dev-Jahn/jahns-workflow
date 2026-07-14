@@ -1,10 +1,20 @@
 ---
 name: review
-description: This skill should be used when the user runs "/waystone:review", pastes an external review reply (e.g. from web ChatGPT / GPT reviewer) to be processed, or asks to "ingest the review", "process the reviewer feedback", "record the external review". Preserves the review verbatim and triages findings into the task registry.
+description: This skill should be used when the user runs "/waystone:review" in Claude Code or "$waystone:review" in Codex, pastes an external review reply (e.g. from web ChatGPT / GPT reviewer) to be processed, or asks to "ingest the review", "process the reviewer feedback", "record the external review". Preserves the review verbatim and triages findings into the task registry.
 argument-hint: "[round-slug] — first save the reply: cat > /tmp/review.md, paste, Ctrl-D"
 ---
 
 # waystone: review
+
+## Host contract
+
+- Claude Code: invoke `/waystone:review`; assign `$CLAUDE_PLUGIN_ROOT` to
+  `WAYSTONE_PLUGIN_ROOT`, then run command examples with `waystone` from `PATH`.
+- Codex: invoke `$waystone:review`; from this skill's directory walk up two parents, assign that
+  absolute path to `WAYSTONE_PLUGIN_ROOT`, then run command examples with
+  `$WAYSTONE_PLUGIN_ROOT/bin/waystone-codex`.
+- Resolve plugin resources from `$WAYSTONE_PLUGIN_ROOT`. Ask required choices through the host's native
+  user-interaction mechanism; never require a specifically named question tool.
 
 Ingest an external review reply: preserve it verbatim (reviews are otherwise ephemeral chat
 text), verify each finding, and register real findings as tracked tasks.
@@ -61,7 +71,7 @@ consumes downstream work; offer to start on them. Suggested commit message:
 `docs(review): ingest <round-id> feedback`.
 
 Then **refresh the re-entry pointer** (the review moved the frontier): get its path with
-`waystone resume --start-here-path .` and **Write** (overwrite, ≤ ~35
+`waystone resume --start-here-path .` and overwrite it (≤ ~35
 lines) the post-review frontier — open blockers/decisions and what to pick up next, detail linked
 to the feedback/PROGRESS files. The SessionStart hook injects this so the next session resumes
 without re-explaining. (Same file the round skill writes; see round Step 6.)

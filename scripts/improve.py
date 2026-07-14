@@ -56,6 +56,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import yaml  # noqa: E402
 
+import codexlog  # noqa: E402
+
 from cclog import (  # noqa: E402
     PARSER_VERSION,
     SKIP_DIRS,
@@ -247,7 +249,7 @@ def _build_session(path: Path, kind: str, session_kind: str, scope: dict, parsed
     turns = sum(1 for ev in events if ev["event_type"] == "user_instruction")
     tool_counts = Counter(tc["tool_category"] for tc in tool_calls)
 
-    tool_err = sum(1 for tr in tool_results if tr.get("is_error"))
+    tool_err = sum(1 for tr in tool_results if tr.get("is_error") is True)
     parse_err = sum(1 for ev in events if ev.get("event_subtype") == "parse_error")
     api_err = 0
     cli_versions: set[str] = set()
@@ -314,7 +316,7 @@ def _build_session(path: Path, kind: str, session_kind: str, scope: dict, parsed
         "agent_id": scope["agent_id"],
         "workflow_id": scope["workflow_id"],
         "file": str(path),
-        "agent_meta": _read_agent_meta(path, kind),
+        "agent_meta": parsed.get("agent_meta") or _read_agent_meta(path, kind),
         "cwd": _mode(cwds),
         "git_branch": _mode(branches),
         "started_at": min(timestamps) if timestamps else {"provenance": "unknown"},
@@ -335,7 +337,7 @@ def _build_session(path: Path, kind: str, session_kind: str, scope: dict, parsed
         "retry_loops": {"count": retry_count, "rule": "same-cmd-refail-v1",
                         "provenance": "inferred", "examples": retry_examples},
         "context_heavy": {"tool_results_over_100kb": over, "max_result_bytes": max_bytes},
-        "parser_version": PARSER_VERSION,
+        "parser_version": parsed.get("parser_version", PARSER_VERSION),
     }
     delegations = [_build_delegation(tc, result_by_tuid, scope, path, kind) for tc in spawn_calls]
     return row, delegations
@@ -412,7 +414,12 @@ def _self_session_anchor(path: Path) -> tuple[int | None, str | None, int]:
     return None, None, 0
 
 
-def run_trace(sources: list[Path], projects: set[str], out_dir: Path) -> dict:
+def run_trace(sources: list[Path], projects: set[str], out_dir: Path,
+              host: str = "claude") -> dict:
+    if host == "codex":
+        return _run_codex_trace(sources, projects, out_dir)
+    if host != "claude":
+        raise WorkflowError(f"trace host must be claude|codex, got {host!r}")
     files = discover(sources, projects)
     files_by_kind: Counter = Counter(kind for _, _, kind in files)
 
@@ -505,6 +512,97 @@ def run_trace(sources: list[Path], projects: set[str], out_dir: Path) -> dict:
     (out_dir / "delegations.jsonl").write_text(
         "".join(_dumps(r) + "\n" for r in delegation_rows), encoding="utf-8")
     (out_dir / "parse_coverage.json").write_text(_dumps(coverage) + "\n", encoding="utf-8")
+    return coverage
+
+
+def _run_codex_trace(sources: list[Path], projects: set[str], out_dir: Path) -> dict:
+    """Project Codex rollouts through the same session/delegation schema as Claude trace."""
+    files = codexlog.discover(sources)
+    files_by_kind: Counter = Counter()
+    session_rows: list[dict] = []
+    delegation_rows: list[dict] = []
+    event_type_counts: Counter = Counter()
+    unknown_raw_types: Counter = Counter()
+    files_unreadable: dict[str, str] = {}
+    record_parse_errors = 0
+    partial_tail_lines = 0
+    unknown_tool_result_status = 0
+
+    self_sid = os.environ.get("CODEX_THREAD_ID") or None
+    self_session = ({"session_id": self_sid, "file_found": False,
+                     "anchor": None, "lines_excluded": 0}
+                    if self_sid else None)
+
+    for path, rel_parts in files:
+        stop_before = None
+        if self_sid and codexlog.rollout_id(path) == self_sid:
+            self_session["file_found"] = True
+            anchor, excluded = codexlog.self_session_anchor(path)
+            if anchor is not None:
+                stop_before = anchor
+                self_session["anchor"] = "tool-use"
+                self_session["lines_excluded"] = excluded
+        try:
+            parsed = codexlog.parse_transcript_file(
+                path, file_id=stable_id("file", str(path)), stop_before_line=stop_before,
+            )
+        except (OSError, UnicodeDecodeError) as e:
+            files_unreadable["/".join(rel_parts)] = type(e).__name__
+            continue
+        scope = parsed["scope"]
+        if projects and scope.get("project") not in projects:
+            continue
+        session_kind = parsed["session_kind"]
+        kind = f"codex_{session_kind}_transcript"
+        files_by_kind[kind] += 1
+        row, delegations = _build_session(path, kind, session_kind, scope, parsed)
+        session_rows.append(row)
+        delegation_rows.extend(delegations)
+
+        for ev in parsed["events"]:
+            event_type_counts[ev["event_type"]] += 1
+            if ev["event_type"] == "unknown_raw":
+                if ev.get("event_subtype") == "parse_error":
+                    record_parse_errors += 1
+                else:
+                    unknown_raw_types[ev.get("event_subtype") or "no_type"] += 1
+        partial_tail_lines += parsed["partial_tail_lines"]
+        unknown_tool_result_status += sum(
+            1 for result in parsed["tool_results"] if result.get("is_error") is None
+        )
+
+    session_rows.sort(key=lambda row: (row["project"] or "", row["file"]))
+    delegation_rows.sort(key=lambda row: (row["project"] or "", row["file"], row["line"]))
+    coverage = {
+        "host": "codex",
+        "parser_version": codexlog.PARSER_VERSION,
+        "generated_from": sorted(str(source) for source in sources),
+        "sources_missing": sorted(str(source) for source in sources if not source.is_dir()),
+        "files_by_kind": dict(sorted(files_by_kind.items())),
+        "files_skipped": 0,
+        "files_unreadable": dict(sorted(files_unreadable.items())),
+        "files_unreadable_total": len(files_unreadable),
+        "event_type_counts": dict(sorted(event_type_counts.items())),
+        "unknown_raw_types": dict(sorted(unknown_raw_types.items())),
+        "record_parse_errors": record_parse_errors,
+        "replayed_records_skipped": 0,
+        "partial_tail_lines": partial_tail_lines,
+        "unknown_tool_result_status": unknown_tool_result_status,
+        "row_totals": {"sessions": len(session_rows), "delegations": len(delegation_rows)},
+    }
+    if self_session is not None:
+        coverage["self_session"] = self_session
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "sessions.jsonl").write_text(
+        "".join(_dumps(row) + "\n" for row in session_rows), encoding="utf-8",
+    )
+    (out_dir / "delegations.jsonl").write_text(
+        "".join(_dumps(row) + "\n" for row in delegation_rows), encoding="utf-8",
+    )
+    (out_dir / "parse_coverage.json").write_text(
+        _dumps(coverage) + "\n", encoding="utf-8",
+    )
     return coverage
 
 
@@ -1079,6 +1177,7 @@ def _lens_coverage_caveats(coverage: dict) -> dict:
         "replayed_records_skipped": coverage.get("replayed_records_skipped", 0),
         "partial_tail_lines": coverage.get("partial_tail_lines", 0),
         "unknown_raw_types": coverage.get("unknown_raw_types", {}),
+        "unknown_tool_result_status": coverage.get("unknown_tool_result_status", 0),
         "row_totals": coverage.get("row_totals", {}),
     }
     # self-session truncation caveat is only present when trace ran inside a live CC session
@@ -1198,14 +1297,15 @@ def run_decide(rec_id: str, decision: str, title: str | None, note: str | None, 
 
 
 # ------------------------------------------------------------------ CLI
-def _parse_trace_args(argv: list[str]) -> tuple[list[str], set[str], str | None]:
+def _parse_trace_args(argv: list[str]) -> tuple[list[str], set[str], str | None, str | None]:
     sources: list[str] = []
     projects: set[str] = set()
     out: str | None = None
+    host: str | None = None
     i = 0
     while i < len(argv):
         a = argv[i]
-        if a in ("--source", "--project", "--out"):
+        if a in ("--source", "--project", "--out", "--host"):
             if i + 1 >= len(argv):
                 raise WorkflowError(f"{a} requires a value")
             val = argv[i + 1]
@@ -1213,12 +1313,16 @@ def _parse_trace_args(argv: list[str]) -> tuple[list[str], set[str], str | None]
                 sources.append(val)
             elif a == "--project":
                 projects.add(val)
+            elif a == "--host":
+                host = val
             else:
                 out = val
             i += 2
         else:
             raise WorkflowError(f"unexpected argument {a!r}")
-    return sources, projects, out
+    if host is not None and host not in ("claude", "codex"):
+        raise WorkflowError(f"--host must be claude|codex, got {host!r}")
+    return sources, projects, out, host
 
 
 def _parse_single_opt(argv: list[str], flag: str) -> str | None:
@@ -1257,12 +1361,13 @@ def _residence_checked(value: str | None, flag: str) -> Path:
 
 def _cli_trace(argv: list[str]) -> int:
     try:
-        raw_sources, projects, out = _parse_trace_args(argv)
+        raw_sources, projects, out, explicit_host = _parse_trace_args(argv)
         out_dir = _residence_checked(out, "--out")
     except WorkflowError as e:
         print(f"waystone improve trace: {e}", file=sys.stderr)
         return 1
 
+    host = explicit_host or ("codex" if os.environ.get("WAYSTONE_HOST") == "codex" else "claude")
     if raw_sources:
         sources = [Path(s).expanduser().resolve() for s in raw_sources]
         # an EXPLICITLY-named source that is not a directory is a precondition failure (exit 1); the
@@ -1273,15 +1378,20 @@ def _cli_trace(argv: list[str]) -> int:
                   + ", ".join(str(m) for m in missing), file=sys.stderr)
             return 1
     else:
-        base = os.environ.get("CLAUDE_CONFIG_DIR")
-        base_path = Path(base) if base else Path.home() / ".claude"
-        sources = [(base_path / "projects").resolve()]
+        if host == "codex":
+            base = os.environ.get("CODEX_HOME")
+            base_path = Path(base) if base else Path.home() / ".codex"
+            sources = [(base_path / "sessions").resolve()]
+        else:
+            base = os.environ.get("CLAUDE_CONFIG_DIR")
+            base_path = Path(base) if base else Path.home() / ".claude"
+            sources = [(base_path / "projects").resolve()]
     # dedupe while preserving order (a source passed twice must not double-count)
     seen: set[str] = set()
     sources = [s for s in sources if not (str(s) in seen or seen.add(str(s)))]
 
     try:
-        cov = run_trace(sources, projects, out_dir)
+        cov = run_trace(sources, projects, out_dir, host=host)
     except OSError as e:
         print(f"waystone improve trace: cannot write outputs — {e}", file=sys.stderr)
         return 2
@@ -1315,9 +1425,11 @@ def _cli_reviews(argv: list[str]) -> int:
 
 def _cli_evidence(argv: list[str]) -> int:
     try:
-        _sources, projects, out = _parse_trace_args(argv)
+        _sources, projects, out, host = _parse_trace_args(argv)
         if _sources:
             raise WorkflowError("--source is not valid for evidence")
+        if host is not None:
+            raise WorkflowError("--host is only valid for trace")
         out_dir = _residence_checked(out, "--out")
     except WorkflowError as e:
         print(f"waystone improve evidence: {e}", file=sys.stderr)

@@ -1,35 +1,46 @@
 ---
 name: init
-description: This skill should be used when the user runs "/waystone:init", asks to "initialize the workflow harness", "set up waystone", "adopt the workflow in this project", or "re-sync the workflow setup". One-click setup for new projects and non-destructive retrofit for projects already in progress.
+description: This skill should be used when the user runs "/waystone:init" in Claude Code or "$waystone:init" in Codex, asks to "initialize the workflow harness", "set up waystone", "adopt the workflow in this project", or "re-sync the workflow setup". One-click setup for new projects and non-destructive retrofit for projects already in progress.
 argument-hint: "[ssot-path] (optional — skips SSOT detection)"
 disable-model-invocation: true
 ---
 
 # waystone: init
 
+## Host contract
+
+- Claude Code: invoke `/waystone:init`; assign `$CLAUDE_PLUGIN_ROOT` to
+  `WAYSTONE_PLUGIN_ROOT`, then run command examples with `waystone` from `PATH`.
+- Codex: invoke `$waystone:init`; from this skill's directory walk up two parents, assign that
+  absolute path to `WAYSTONE_PLUGIN_ROOT`, then run command examples with
+  `$WAYSTONE_PLUGIN_ROOT/bin/waystone-codex`.
+- Resolve plugin resources from `$WAYSTONE_PLUGIN_ROOT`. Ask required choices through the host's native
+  user-interaction mechanism; never require a specifically named question tool.
+
 Set up (or repair) the waystone harness in the current project. Greenfield projects get
 the full structure; in-progress projects are retrofitted **non-destructively**: existing docs,
 codenames, and commit history are never rewritten — the convention applies from now on only.
 
-Shared resources: `${CLAUDE_PLUGIN_ROOT}/references/conventions.md` and
-`${CLAUDE_PLUGIN_ROOT}/templates/*`.
+Shared resources: `$WAYSTONE_PLUGIN_ROOT/references/conventions.md` and
+`$WAYSTONE_PLUGIN_ROOT/templates/*`.
 
 ## Step 0 — Preconditions and mode
 
 1. Verify the project is a git repository (`git rev-parse --git-dir`). If not, ask the user whether to `git init` first; do not proceed without git.
-2. If `.waystone.yml` or legacy `.jahns-workflow.yml` already exists → **repair mode**: skip to Step 5 and re-run Steps 5–9 idempotently, reporting anything that drifted (missing dirs, stale generated views, missing CLAUDE.md stanza, unregistered project). The first `waystone` command renames the legacy config before reading it.
+2. If `.waystone.yml` or legacy `.jahns-workflow.yml` already exists → **repair mode**: skip to Step 5 and re-run Steps 5–9 idempotently, reporting anything that drifted (missing dirs, stale generated views, missing host instruction stanza, unregistered project). The first `waystone` command renames the legacy config before reading it.
 
 ## Step 1 — Detect the existing structure
 
 Scan before creating anything:
 
-- **SSOT candidates**: argument if given; else root-level and `docs/` markdown whose name suggests design/theory/spec/SSOT, plus any root .md over ~200 lines that is not README/PROGRESS/CLAUDE/ROADMAP. Note size and headings of each candidate.
-- **Existing homes**: PROGRESS-like log files, ADR directories (any naming), review/feedback files, docs layout, CLAUDE.md.
-- Read `${CLAUDE_PLUGIN_ROOT}/references/conventions.md` to have the target model in mind.
+- **SSOT candidates**: argument if given; else root-level and `docs/` markdown whose name suggests design/theory/spec/SSOT, plus any root .md over ~200 lines that is not README/PROGRESS/CLAUDE/AGENTS/ROADMAP. Note size and headings of each candidate.
+- **Existing homes**: PROGRESS-like log files, ADR directories (any naming), review/feedback files,
+  docs layout, and the current host instruction file (`CLAUDE.md` or `AGENTS.md`).
+- Read `$WAYSTONE_PLUGIN_ROOT/references/conventions.md` to have the target model in mind.
 
 ## Step 2 — Confirm the one decision that matters
 
-Ask the user ONE question (AskUserQuestion): which file is the SSOT — listing detected
+Ask the user ONE host-native question: which file is the SSOT — listing detected
 candidates with size/role, plus options "no SSOT yet — create an SSOT.md skeleton" and
 "this project has no single design doc" (then SSOT features are disabled: omit `ssot:` from
 config; everything else still works). Map all other detected structures automatically and
@@ -74,7 +85,7 @@ guard the merge; suits repos that already work through PRs with a `@codex` bot).
    `origin`, `branch`, `notes`, `ruling` — the user's decision on a `decision/...` task,
    `result` — a recorded measurement/outcome, `lane` — `{branch, base_sha, depends_on}` for
    parallel worktree lanes, verified by `waystone lanes verify`).
-3. Missing directories for adr/reviews/progress-archive; `docs/CONVENTIONS.md` as a verbatim copy of `${CLAUDE_PLUGIN_ROOT}/references/conventions.md`; an ADR-0000 from `${CLAUDE_PLUGIN_ROOT}/templates/adr.md` recording "adopted waystone" (so the numbering and format are established by example).
+3. Missing directories for adr/reviews/progress-archive; `docs/CONVENTIONS.md` as a verbatim copy of `$WAYSTONE_PLUGIN_ROOT/references/conventions.md`; an ADR-0000 from `$WAYSTONE_PLUGIN_ROOT/templates/adr.md` recording "adopted waystone" (so the numbering and format are established by example).
 4. If no PROGRESS file exists, create one with a one-line header pointing at tasks.yaml/ROADMAP.
 
 ## Step 4 — Seed the task registry (brownfield only)
@@ -94,20 +105,22 @@ waystone roadmap .
 waystone validate tasks.yaml
 ```
 
-## Step 6 — CLAUDE.md stanza
+## Step 6 — Host instruction stanza
 
-Insert `${CLAUDE_PLUGIN_ROOT}/templates/claude-md-stanza.md` into the project CLAUDE.md (create the
-file if absent), substituting `{SSOT_PATH}`/`{GENERATED_DIR}`. Recognize and replace both the legacy
+For Claude Code, insert `$WAYSTONE_PLUGIN_ROOT/templates/claude-md-stanza.md` into project `CLAUDE.md`.
+For Codex, insert `$WAYSTONE_PLUGIN_ROOT/templates/agents-md-stanza.md` into project `AGENTS.md`. Create the
+selected file if absent and substitute `{SSOT_PATH}`/`{GENERATED_DIR}`. Recognize and replace both the legacy
 `<!-- jahns-workflow:begin -->` … `<!-- jahns-workflow:end -->` block and the current
 `<!-- waystone:begin -->` … `<!-- waystone:end -->` block (the template's begin marker may carry an
 annotation). Always write the new `waystone` markers, never the legacy markers, and never duplicate
-the managed block. Do not touch anything outside the markers. If CLAUDE.md currently carries a running
-status log (acting as a de-facto PROGRESS), propose moving that content into PROGRESS.md and
-leaving a pointer — show the user the move before applying it.
+the managed block. Do not touch anything outside the markers. If the selected host instruction file
+currently carries a running status log (acting as a de-facto PROGRESS), propose moving that content
+into PROGRESS.md and leaving a pointer — show the user the move before applying it.
 
-## Step 7 — Reorganize agent memory
+## Step 7 — Reorganize Claude Code agent memory
 
-Check `~/.claude/projects/<dash-escaped-project-path>/memory/` — the directory name is the
+In Codex, skip this step; do not reorganize Codex memory. In Claude Code, check
+`~/.claude/projects/<dash-escaped-project-path>/memory/` — the directory name is the
 absolute project path with `/` (and other separators) replaced by `-`, e.g.
 `/home/u/work/proj` → `-home-u-work-proj`; when in doubt, glob `~/.claude/projects/*<repo-name>*/memory/`. For each memory file that
 duplicates repo-derivable state (progress snapshots, task lists, design summaries): move any
@@ -118,14 +131,15 @@ environment/user-preference memories.
 
 ## Step 8 — Register the project
 
-Add `{ "name": <project>, "path": <abs path> }` to `~/.claude/waystone/projects.json`
+Add `{ "name": <project>, "path": <abs path> }` to the host registry:
+`~/.claude/waystone/projects.json` for Claude Code or `~/.codex/waystone/projects.json` for Codex
 (create `{"projects": []}` if missing; skip if already registered). This feeds
-`/waystone:status`.
+`/waystone:status` in Claude Code or `$waystone:status` in Codex.
 
 ## Step 9 — Report
 
 Leave all changes **uncommitted** for user review. Report in the user's configured language:
 what was created vs adapted, the config mapping, memory changes, and next steps (commit
 suggestion `docs: adopt waystone harness`; start working; close rounds with
-`/waystone:round`). Generated document content (PROGRESS, ADR-0000) is written in the
+`/waystone:round` in Claude Code or `$waystone:round` in Codex). Generated document content (PROGRESS, ADR-0000) is written in the
 user's configured response language; `docs/CONVENTIONS.md` stays a verbatim copy.

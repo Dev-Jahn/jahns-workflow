@@ -43,6 +43,7 @@ from common import (  # noqa: E402
 DELEG_REF_NS = "refs/waystone/delegations"
 TERMINAL_STATES = ("applied", "discarded")
 _TEMPLATE_PATH = Path(__file__).resolve().parent.parent / "templates" / "delegate-prompt.md"
+_VERIFY_SCHEMA_PATH = Path(__file__).resolve().parent.parent / "templates" / "verifier-output-schema.json"
 _EFFORT_VALUES = ("none", "minimal", "low", "medium", "high", "xhigh")
 
 # lockfile -> (prep command, kind), first match wins (S7). None env_prep in config falls through here.
@@ -61,6 +62,12 @@ _PROFILE_EXAMPLE = (
     "  verifier: {execution: codex-companion, backend: \"codex:gpt-5.6-sol\", "
     "entry: adversarial-review}\n"
 )
+
+
+def _profile_example() -> str:
+    if os.environ.get("WAYSTONE_HOST") == "codex":
+        return _PROFILE_EXAMPLE.replace("execution: codex-companion", "execution: codex-cli")
+    return _PROFILE_EXAMPLE
 
 
 class _RefusedWrite(WorkflowError):
@@ -200,7 +207,8 @@ def _load_profile() -> tuple[dict, str]:
     path = _profile_path()
     if not path.is_file():
         raise WorkflowError(
-            f"no delegation profile at {path} — create it with a role binding, e.g.:\n\n{_PROFILE_EXAMPLE}")
+            f"no delegation profile at {path} — create it with a role binding, e.g.:\n\n"
+            f"{_profile_example()}")
     raw = path.read_bytes()
     fingerprint = "sha256:" + hashlib.sha256(raw).hexdigest()[:12]
     data = yaml.safe_load(raw.decode("utf-8")) or {}
@@ -215,7 +223,8 @@ def _resolve_binding(profile: dict, role: str) -> dict:
     b = bindings.get(role) if isinstance(bindings, dict) else None
     if not isinstance(b, dict):
         raise WorkflowError(
-            f"profile has no binding for role {role!r} — add it to {_profile_path()}, e.g.:\n\n{_PROFILE_EXAMPLE}")
+            f"profile has no binding for role {role!r} — add it to {_profile_path()}, e.g.:\n\n"
+            f"{_profile_example()}")
     execution = b.get("execution")
     backend = b.get("backend")
     if execution != "external-runner":
@@ -233,19 +242,20 @@ def _resolve_binding(profile: dict, role: str) -> dict:
 
 
 def _resolve_verifier_binding(profile: dict) -> dict:
-    """M2 verifier binding: codex-companion + explicit codex model + adversarial-review only.
-    Every other accepted-looking value fails loud; no ignored profile axes (S14/R7)."""
+    """Resolve one explicit Claude-companion or native Codex verifier transport."""
     bindings = profile.get("bindings")
     b = bindings.get("verifier") if isinstance(bindings, dict) else None
     if not isinstance(b, dict):
         raise WorkflowError(
             f"profile has no binding for role 'verifier' — add it to {_profile_path()}, e.g.:\n\n"
-            f"{_PROFILE_EXAMPLE}")
+            f"{_profile_example()}")
     execution = b.get("execution")
     backend = b.get("backend")
     entry = b.get("entry")
-    if execution != "codex-companion":
-        raise WorkflowError(f"verifier execution {execution!r} not implemented in M2")
+    if execution not in ("codex-companion", "codex-cli"):
+        raise WorkflowError(
+            f"verifier execution {execution!r} not implemented in M2 "
+            "(expected 'codex-companion' or 'codex-cli')")
     if not isinstance(backend, str) or not backend.startswith("codex:") or not backend[6:]:
         raise WorkflowError(f"verifier backend must be 'codex:<model>', got {backend!r}")
     if entry != "adversarial-review":
@@ -684,6 +694,39 @@ def _run_companion(worktree: Path, args: list[str], record_dir: Path) -> tuple[i
     return p.returncode, p.stdout
 
 
+def _run_codex_verifier(worktree: Path, model: str, focus: str,
+                        record_dir: Path) -> tuple[int, str]:
+    """Run the native Codex verifier in a read-only, ephemeral session with schema output."""
+    output = record_dir / "verify-last-message.json"
+    cmd = [
+        "codex", "exec", "-C", str(worktree), "-m", model, "-s", "read-only",
+        "--ephemeral", "--output-schema", str(_VERIFY_SCHEMA_PATH),
+        "--output-last-message", str(output), "--color", "never", "--json", "-",
+    ]
+    env = {**os.environ, "UV_CACHE_DIR": str(worktree / ".waystone-uv-cache")}
+    try:
+        with open(record_dir / "verify-codex.jsonl", "w", encoding="utf-8") as jout, \
+             open(record_dir / "verify.stderr", "w", encoding="utf-8") as jerr:
+            proc = subprocess.run(
+                cmd, input=focus, stdout=jout, stderr=jerr, text=True,
+                timeout=1800, env=env,
+            )
+    except subprocess.TimeoutExpired:
+        return 124, ""
+    except OSError as e:
+        try:
+            (record_dir / "verify.stderr").write_text(str(e), encoding="utf-8")
+        except OSError:
+            pass
+        return 127, ""
+    if proc.returncode != 0:
+        return proc.returncode, ""
+    try:
+        return 0, output.read_text(encoding="utf-8")
+    except OSError:
+        return 0, ""
+
+
 def _validate_verify_contract(rec: Path, contract: dict, exposure: dict) -> Path | None:
     """Validate every contract field trusted by worktree normalization before mutating the tree."""
     if type(contract.get("empty")) is not bool:
@@ -877,7 +920,7 @@ def verify_delegation(root: Path, did: str) -> int:
     try:
         profile, _fingerprint = _load_profile()
         binding = _resolve_verifier_binding(profile)
-        script = _companion_script()
+        script = _companion_script() if binding["execution"] == "codex-companion" else None
         contract = _load_contract(rec)
         exposure = _load_exposure(rec)
         patch = _validate_verify_contract(rec, contract, exposure)
@@ -885,11 +928,15 @@ def verify_delegation(root: Path, did: str) -> int:
         _normalize_verify_worktree(worktree, contract, patch)
         focus = _verify_focus(rec, contract)
         model = binding["backend"].split(":", 1)[1]
-        args = ["node", str(script), "adversarial-review", "--json", "--wait", "--scope",
-                "working-tree", "-C", str(worktree), "-m", model, focus]
-        rc, stdout = _run_companion(worktree, args, rec)
-        cleanup = _cleanup_companion_broker(worktree)
-        print(cleanup)
+        if binding["execution"] == "codex-companion":
+            args = ["node", str(script), "adversarial-review", "--json", "--wait", "--scope",
+                    "working-tree", "-C", str(worktree), "-m", model, focus]
+            rc, stdout = _run_companion(worktree, args, rec)
+            print(_cleanup_companion_broker(worktree))
+            transport = "codex-companion:adversarial-review"
+        else:
+            rc, stdout = _run_codex_verifier(worktree, model, focus, rec)
+            transport = "codex-exec:read-only"
         if rc != 0:
             raise WorkflowError(
                 f"independent verifier failed (rc {rc}) — delegation remains needs-review")
@@ -900,7 +947,7 @@ def verify_delegation(root: Path, did: str) -> int:
                 f"independent verifier returned invalid JSON ({e}) — delegation remains needs-review")
         artifact = {
             "schema": "waystone-verify-1", "at": _now_iso(),
-            "transport": "codex-companion:adversarial-review", "backend": binding["backend"],
+            "transport": transport, "backend": binding["backend"],
             "provenance": "independent-verifier", "payload": payload,
         }
         out = _write_verify_artifact(rec, artifact)
