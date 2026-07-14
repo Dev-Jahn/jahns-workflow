@@ -19,15 +19,21 @@ Groups:
   delegate run|status|show|verify|apply|discard ...  worktree runner + independent verifier evidence
   overlay  add|list|show|promote|demote|suspend|retire|replay ...  project-local adaptive warn deltas
   check    [--root DIR]               evaluate active overlay deltas at an explicit boundary (never blocks)
+  paths    [--root DIR] [--json]      show resolved machine and project storage paths
+  project  register|unregister|list ...  manage the cross-project registry
 
 Existing hook/skill call sites that invoke sibling scripts directly keep working; this is an
 additive convenience front door (GPT review: consolidate under one `waystone` CLI).
 """
 from __future__ import annotations
 
+import json
+import os
 import runpy
 import sys
 from pathlib import Path
+
+import yaml
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -39,6 +45,157 @@ def _run_module_main(modname: str, argv: list[str]) -> int:
     sys.argv = [modname, *argv]
     ns = runpy.run_path(str(HERE / f"{modname}.py"), run_name="__waystone_dispatch__")
     return int(ns["main"]() or 0)
+
+
+def _resolved(path: Path) -> str:
+    return str(path.expanduser().resolve())
+
+
+def _paths_main(argv: list[str]) -> int:
+    root_arg = None
+    as_json = False
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--root":
+            if i + 1 >= len(argv):
+                print("waystone paths: --root requires a path", file=sys.stderr)
+                return 1
+            root_arg = argv[i + 1]
+            i += 2
+        elif arg == "--json":
+            as_json = True
+            i += 1
+        else:
+            print(f"waystone paths: unexpected argument {arg!r}", file=sys.stderr)
+            return 1
+
+    start = Path(root_arg).expanduser() if root_arg is not None else Path.cwd()
+    root = common.find_project_root(start)
+    if root_arg is not None and root is None:
+        print(f"waystone paths: no waystone project found from {start.resolve()}", file=sys.stderr)
+        return 1
+
+    paths = {
+        "machine_root": _resolved(common.machine_dir()),
+        "worktrees_cache": _resolved(common.worktrees_cache_dir()),
+        "registry": _resolved(common.registry_path()),
+    }
+    if root is not None:
+        import delegate
+        import overlay
+
+        paths.update({
+            "project_root": _resolved(root),
+            "project_state": _resolved(common.project_state_dir(root)),
+            "resume": _resolved(common.resume_path(root)),
+            "start_here": _resolved(common.start_here_path(root)),
+            "delegations": _resolved(delegate._delegations_dir(root)),
+            "overlay": _resolved(overlay._overlay_dir(root)),
+            "exposure": _resolved(overlay._exposure_dir(root)),
+            "profile": _resolved(delegate._profile_path(root)),
+        })
+
+    if as_json:
+        print(json.dumps(paths, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        for name, path in paths.items():
+            print(f"{name}: {path}")
+    return 0
+
+
+def _load_registry(path: Path) -> dict:
+    if not path.is_file():
+        return {"projects": []}
+    try:
+        registry = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        raise common.WorkflowError(f"registry unreadable/unparseable: {path} ({type(e).__name__})")
+    if not isinstance(registry, dict):
+        raise common.WorkflowError(f"registry has wrong shape (expected a JSON object): {path}")
+    projects = registry.get("projects", [])
+    if not isinstance(projects, list):
+        raise common.WorkflowError(f"registry has wrong shape (`projects` must be a list): {path}")
+    registry["projects"] = projects
+    return registry
+
+
+def _write_registry(path: Path, registry: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(registry, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _entry_path(entry: object) -> Path | None:
+    if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+        return None
+    return Path(entry["path"]).expanduser().resolve()
+
+
+def _project_main(argv: list[str]) -> int:
+    if not argv or argv[0] not in ("register", "unregister", "list"):
+        print("waystone project: expected register <path>, unregister <path>, or list", file=sys.stderr)
+        return 1
+    command, rest = argv[0], argv[1:]
+    if command == "list":
+        if rest:
+            print("waystone project list: takes no arguments", file=sys.stderr)
+            return 1
+    elif len(rest) != 1:
+        print(f"waystone project {command}: expected one path", file=sys.stderr)
+        return 1
+
+    path = common.registry_path()
+    try:
+        registry = _load_registry(path)
+        projects = registry["projects"]
+        if command == "list":
+            if not projects:
+                print("no projects registered")
+                return 0
+            for entry in projects:
+                if not isinstance(entry, dict):
+                    print("?\t(invalid entry)")
+                    continue
+                location = entry.get("path") or entry.get("repo") or "(no path or repo)"
+                print(f"{entry.get('name', '?')}\t{location}")
+            return 0
+
+        requested = Path(rest[0]).expanduser().resolve()
+        if command == "register":
+            root = common.find_project_root(requested)
+            if root is None:
+                raise common.WorkflowError(f"no waystone project found from {requested}")
+            try:
+                project_data = common.load_tasks(root)
+            except (OSError, ValueError, yaml.YAMLError) as e:
+                raise common.WorkflowError(f"cannot read {root / common.TASKS_NAME}: {e}") from e
+            name = project_data.get("project")
+            if not isinstance(name, str) or not name.strip():
+                raise common.WorkflowError(f"{root / common.TASKS_NAME} has no non-empty project name")
+            root = root.resolve()
+            if any(_entry_path(entry) == root for entry in projects):
+                print(f"already registered: {name}\t{root}")
+                return 0
+            projects.append({"name": name, "path": str(root)})
+            _write_registry(path, registry)
+            print(f"registered: {name}\t{root}")
+            return 0
+
+        before = len(projects)
+        registry["projects"] = [entry for entry in projects if _entry_path(entry) != requested]
+        if len(registry["projects"]) == before:
+            raise common.WorkflowError(f"project path is not registered: {requested}")
+        _write_registry(path, registry)
+        print(f"unregistered: {requested}")
+        return 0
+    except common.WorkflowError as e:
+        print(f"waystone project {command}: {e}", file=sys.stderr)
+        return 1
+    except OSError as e:
+        print(f"waystone project {command}: cannot update registry {path}: {e}", file=sys.stderr)
+        return 2
 
 
 def main(argv: list[str]) -> int:
@@ -67,6 +224,10 @@ def main(argv: list[str]) -> int:
     if group == "check":
         import overlay
         return overlay.main(["check", *rest])
+    if group == "paths":
+        return _paths_main(rest)
+    if group == "project":
+        return _project_main(rest)
     if group == "remote":
         import importlib
         mod = importlib.import_module("remote")

@@ -752,6 +752,109 @@ class StoragePathTests(unittest.TestCase):
             )
 
 
+class WaystoneStorageCliTests(unittest.TestCase):
+    def _capture(self, home: Path, cwd: Path, argv: list[str]):
+        import contextlib
+        import io
+        import os
+        import waystone
+
+        old_cwd = Path.cwd()
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            os.chdir(cwd)
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = _run_with_home(home, lambda: waystone.main(argv))
+        finally:
+            os.chdir(old_cwd)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_paths_outside_project_lists_only_machine_paths(self):
+        import json as _json
+
+        with tempfile.TemporaryDirectory() as d:
+            outside = Path(d) / "outside"
+            outside.mkdir()
+            home = Path(d) / "home"
+            home.mkdir()
+            rc, out, err = self._capture(home, outside, ["paths", "--json"])
+            self.assertEqual((rc, err), (0, ""))
+            paths = _json.loads(out)
+            self.assertEqual(set(paths), {"machine_root", "worktrees_cache", "registry"})
+            self.assertEqual(paths["machine_root"], str((home / ".waystone").resolve()))
+            self.assertEqual(paths["registry"], str((home / ".waystone" / "projects.json").resolve()))
+
+    def test_paths_inside_project_lists_resolved_project_paths(self):
+        import json as _json
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "repo"
+            nested = root / "a" / "b"
+            nested.mkdir(parents=True)
+            (root / ".waystone.yml").write_text("version: 1\nproject: demo\n")
+            home = Path(d) / "home"
+            home.mkdir()
+            rc, out, err = self._capture(home, nested, ["paths", "--json"])
+            self.assertEqual((rc, err), (0, ""))
+            paths = _json.loads(out)
+            state = root.resolve() / ".waystone"
+            self.assertEqual(paths["project_root"], str(root.resolve()))
+            self.assertEqual(paths["project_state"], str(state))
+            self.assertEqual(paths["resume"], str(state / "resume.md"))
+            self.assertEqual(paths["start_here"], str(state / "start-here.md"))
+            self.assertEqual(paths["delegations"], str(state / "delegations"))
+            self.assertEqual(paths["overlay"], str(state / "overlay"))
+            self.assertEqual(paths["exposure"], str(state / "exposure"))
+            self.assertEqual(paths["profile"], str(state / "profile.yml"))
+            self.assertEqual((state / ".gitignore").read_text(), "*\n")
+            rc, human, err = self._capture(
+                home, Path(d), ["paths", "--root", str(root)])
+            self.assertEqual((rc, err), (0, ""))
+            self.assertIn(f"project_state: {state}", human)
+
+    def test_project_register_list_unregister_roundtrip_is_atomic(self):
+        import json as _json
+        import waystone
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "repo"
+            root.mkdir()
+            (root / ".waystone.yml").write_text("version: 1\nproject: demo\n")
+            (root / "tasks.yaml").write_text("version: 1\nproject: demo\ntasks: []\n")
+            home = Path(d) / "home"
+            home.mkdir()
+            calls = []
+            original_replace = waystone.os.replace
+
+            def tracked_replace(src, dst):
+                calls.append((Path(src), Path(dst)))
+                return original_replace(src, dst)
+
+            waystone.os.replace = tracked_replace
+            try:
+                rc, out, err = self._capture(
+                    home, root, ["project", "register", str(root)])
+                self.assertEqual((rc, err), (0, ""))
+                self.assertIn("registered: demo", out)
+                rc, out, err = self._capture(home, root, ["project", "list"])
+                self.assertEqual((rc, err), (0, ""))
+                self.assertIn(f"demo\t{root.resolve()}", out)
+                rc, out, err = self._capture(
+                    home, root, ["project", "unregister", str(root)])
+                self.assertEqual((rc, err), (0, ""))
+                self.assertIn("unregistered:", out)
+            finally:
+                waystone.os.replace = original_replace
+
+            registry = home / ".waystone" / "projects.json"
+            self.assertEqual(_json.loads(registry.read_text()), {"projects": []})
+            self.assertEqual(calls, [
+                (registry.with_name("projects.json.tmp"), registry),
+                (registry.with_name("projects.json.tmp"), registry),
+            ])
+            self.assertFalse(registry.with_name("projects.json.tmp").exists())
+
+
 class ConfigTests(unittest.TestCase):
     def _cfg(self, body: str) -> dict:
         with tempfile.TemporaryDirectory() as d:
@@ -5576,6 +5679,8 @@ class M2DocsTests(unittest.TestCase):
             self.assertIn(f"`{surface}`", readme)
         import waystone
         for surface in ("improve", "evidence", "delegate", "verify", "overlay", "check"):
+            self.assertIn(surface, waystone.__doc__)
+        for surface in ("paths", "project"):
             self.assertIn(surface, waystone.__doc__)
 
     def test_waystone_bin_front_door(self):
