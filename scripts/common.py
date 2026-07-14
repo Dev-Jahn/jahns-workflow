@@ -59,11 +59,10 @@ def _legacy_data_dir(home: Path | None = None) -> Path:
 
 def migrate_home_data(home: Path | None = None) -> Path:
     """Move the legacy data root once. A conflict is preserved and reported, never merged."""
-    new = machine_dir(home)
-    # The legacy jahns-workflow home only existed on Claude. Preserve the existing Codex-launch
-    # no-move behavior until C2 replaces this migration.
+    # C1 keeps the 0.8.x migration intact. C2 owns migration into the host-neutral storage model.
     if os.environ.get("WAYSTONE_HOST") == "codex":
-        return new
+        return _legacy_codex_root(home)
+    new = _legacy_claude_root(home)
     old = _legacy_data_dir(home)
     if new.exists():
         if old.exists():

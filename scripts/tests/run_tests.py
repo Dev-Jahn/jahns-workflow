@@ -5555,8 +5555,7 @@ class MigrationTests(unittest.TestCase):
             (old / "sentinel").write_text("kept")
             with contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(_run_with_home(home, lambda: waystone.main([])), 1)
-            new = home / ".waystone"
-            self.assertEqual(common.machine_dir(home), new)
+            new = home / ".claude" / "waystone"
             self.assertFalse(old.exists())
             self.assertEqual((new / "sentinel").read_text(), "kept")
 
@@ -5567,7 +5566,7 @@ class MigrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             home = Path(d) / "home"
             old = home / ".claude" / "jahns-workflow"
-            new = home / ".waystone"
+            new = home / ".claude" / "waystone"
             old.mkdir(parents=True)
             new.mkdir(parents=True)
             (old / "legacy").write_text("old")
@@ -5951,11 +5950,13 @@ class CodexPluginContractTests(unittest.TestCase):
                 legacy.mkdir(parents=True)
                 (legacy / "sentinel").write_text("keep")
                 self.assertEqual(_run_with_home(home, common.migrate_home_data),
-                                 home / ".waystone")
+                                 home / ".codex" / "waystone")
                 self.assertTrue((legacy / "sentinel").is_file())
-                self.assertFalse((home / ".waystone").exists())
+                self.assertFalse((home / ".claude" / "waystone").exists())
                 os.environ["CODEX_HOME"] = str(home / "custom-codex")
                 self.assertEqual(_run_with_home(home, common.machine_dir), home / ".waystone")
+                self.assertEqual(_run_with_home(home, common.migrate_home_data),
+                                 home / "custom-codex" / "waystone")
             finally:
                 if old_host is None:
                     os.environ.pop("WAYSTONE_HOST", None)
