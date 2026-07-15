@@ -38,13 +38,30 @@ Scan before creating anything:
   docs layout, and the current host instruction file (`CLAUDE.md` or `AGENTS.md`).
 - Read `$WAYSTONE_PLUGIN_ROOT/references/conventions.md` to have the target model in mind.
 
-## Step 2 — Confirm the one decision that matters
+## Step 2 — Confirm SSOT and consent defaults
 
-Ask the user ONE host-native question: which file is the SSOT — listing detected
+Ask the user which file is the SSOT — listing detected
 candidates with size/role, plus options "no SSOT yet — create an SSOT.md skeleton" and
 "this project has no single design doc" (then SSOT features are disabled: omit `ssot:` from
 config; everything else still works). Map all other detected structures automatically and
 report the mapping instead of asking.
+
+Then ask two separate host-native consent questions:
+
+1. Start level: `observe-only` (default; collect evidence without warning) or `warn-allowed`
+   (warnings may be promoted only through the existing replay gate).
+2. Delegation worktree/runner: enabled (default) or disabled. This controls
+   `delegation.enabled`; disabled means `waystone delegate run` fails loud.
+
+Do not infer either choice from repository contents. After writing `.waystone.yml` in Step 3,
+record both choices in the standard local consent log:
+
+```bash
+waystone consent record init.start-level <observe-only|warn-allowed> \
+  --context start_level=<observe-only|warn-allowed> --root <project-root>
+waystone consent record init.delegation <enabled|disabled> \
+  --context enabled=<true|false> --root <project-root>
+```
 
 **Adapt config to the repo, not the repo to the config**: if ADRs/reviews/progress already
 live somewhere, point the config at the existing paths. Only create what is missing. Moving
@@ -66,10 +83,15 @@ generated_dir: docs/ssot
 digest_max_lines: 150
 review:
   mode: packet                  # packet (hand the change to a web reviewer) | pr (SHA-bound PR review cycles)
-  reviewers: [codex, gpt-5.5-pro]
+  reviewers: [role:reviewer]
   require_ci: false             # if true, the merge gate blocks until CI passes
   # operators: []               # PR mode: extra GitHub logins trusted to post review markers (owner always is)
   # approvers: []               # PR mode: extra GitHub logins trusted to post the final approval
+policy:
+  start_level: observe-only     # observe-only | warn-allowed (use the recorded Step 2 choice)
+delegation:
+  enabled: true                 # use the recorded Step 2 choice
+  env_prep: null                # null = lockfile auto-detection
 state:
   last_round_commit: null
 ```
@@ -144,7 +166,13 @@ This feeds `/waystone:status` in Claude Code or `$waystone:status` in Codex.
 
 Ask one host-native question offering the managed project agent, the project boundary hooks, both,
 or neither. This is optional and must not change the result of initialization when declined. For
-each surface the user accepts, record the consent first and then install it:
+each offered surface, display this preview **before** asking for or recording consent:
+
+- target path (`.claude/agents/waystone-operator.md` for agents or `.claude/settings.json` for hooks);
+- effect (which managed agent or boundary hook becomes available);
+- rollback (delete that exact installed file; no other project file is changed by rollback).
+
+Only after the user has seen the target path, effect, and rollback, record consent and install:
 
 ```bash
 waystone consent record install.agents accept --context kind=agents --root <project-root>

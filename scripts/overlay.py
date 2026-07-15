@@ -26,7 +26,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from common import (  # noqa: E402
     ROUND_RE, WorkflowError, _project_slug, _read_registry, canonical_payload_hash,
-    ensure_project_state_dir, find_project_root, has_accepted_consent, hold_lock, load_config,
+    content_hash, ensure_project_state_dir, find_project_root, has_accepted_consent, hold_lock,
+    load_config, load_tasks,
     machine_dir, migrate_project_state, overlay_lock_path, parse_iso_timestamp, project_lock_path,
     project_state_path, record_consent, registry_entry_paths, registry_lock_path, registry_path,
     write_text_atomic,
@@ -35,6 +36,7 @@ from common import (  # noqa: E402
 # delta-id grammar mirrors the improve rec_id (`<lens>/<kebab-gist>`, S2) so a rec materialises to a
 # delta under the same id and the same recommendation keeps a stable identity across cycles.
 DELTA_ID_RE = re.compile(r"^[a-z][a-z0-9_]*/[a-z0-9]+(?:-[a-z0-9]+)*$")
+POLICY_ID_RE = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
 # R6: `add` is the acceptance event, so an extra `accepted` lifecycle state is intentionally absent.
 DELTA_STATUSES = ("proposed", "observing", "warning", "suspended", "retired")
 ACTIVE_STATUSES = ("observing", "warning")
@@ -44,6 +46,8 @@ RUNTIME_POLICY_STAGES = ("observing", "warning")
 PROJECT_POLICY_SCHEMA = "waystone-project-policy-1"
 DELTA_SCHEMAS = ("waystone-delta-1", "jw-delta-1")
 REVIEW_FEEDBACK_SCHEMA = "waystone-review-feedback-1"
+MATERIALIZATION_MAP_SCHEMA = "waystone-materialization-map-1"
+ROUTING_POLICY_PATH = Path(__file__).resolve().parent.parent / "templates" / "routing-policy.yaml"
 
 
 class _RefusedWrite(WorkflowError):
@@ -84,7 +88,9 @@ RULES: dict[str, dict] = {
     "review-skipped-closes-v1": {
         "boundaries": {"round-close", "check"},
         "corpus": "rounds",
-        "default_params": {"consecutive": 2},
+        "default_params": {
+            "consecutive": 2, "diff_files_threshold": 20, "open_blocker_threshold": 1,
+        },
         "finding_types": [
             "architecture", "correctness", "reporting", "reproducibility", "scope", "verification",
         ],
@@ -310,10 +316,17 @@ def _logical_round_rows(rounds: list[dict]) -> list[dict]:
 
 
 def evaluate_review_skipped_closes(rounds: list[dict], ingests: list[dict], *,
-                                   consecutive: int = 2) -> dict:
+                                   consecutive: int = 2, diff_files_threshold: int = 20,
+                                   open_blocker_threshold: int = 1) -> dict:
     """Evaluate logical close streaks over canonical packet/PR review-feedback events."""
     if type(consecutive) is not int or consecutive < 1:
         raise WorkflowError("review-skipped-closes-v1 consecutive must be a positive integer")
+    if type(diff_files_threshold) is not int or diff_files_threshold < 1:
+        raise WorkflowError(
+            "review-skipped-closes-v1 diff_files_threshold must be a positive integer")
+    if type(open_blocker_threshold) is not int or open_blocker_threshold < 1:
+        raise WorkflowError(
+            "review-skipped-closes-v1 open_blocker_threshold must be a positive integer")
     closes = _logical_round_rows(rounds)
     review_events = sorted(
         (row for row in ingests if isinstance(row, dict) and isinstance(row.get("at"), str)
@@ -349,19 +362,36 @@ def evaluate_review_skipped_closes(rounds: list[dict], ingests: list[dict], *,
             continue
         saw_feedback = bool(interval_events)
         streak = 1 if saw_feedback else streak + 1
-        fired = streak >= consecutive
+        changed_files = payload.get("changed_files")
+        open_blockers = payload.get("open_blocker_task_ids")
+        risk_reason = None
+        if not saw_feedback and isinstance(changed_files, list) \
+                and len(changed_files) >= diff_files_threshold:
+            risk_reason = "diff-files-threshold"
+        elif not saw_feedback and isinstance(open_blockers, list) \
+                and len(open_blockers) >= open_blocker_threshold:
+            risk_reason = "open-blocker-threshold"
+        risk_known = saw_feedback or (isinstance(changed_files, list)
+                                      and isinstance(open_blockers, list))
+        fired = streak >= consecutive or risk_reason is not None
+        if not risk_known:
+            unknown["high-risk-input-unavailable"] += 1
         if fired:
             fires.append(close["round_id"])
         by_round.append({"round_id": close["round_id"], "streak": streak, "fired": fired,
-                         "evaluable": True, "coverage_reason": None})
+                         "evaluable": True, "coverage_reason": None,
+                         "risk_reason": risk_reason, "risk_evaluable": risk_known})
         previous_close_at = close["at"]
     opportunities = sum(row["evaluable"] for row in by_round)
     return {"evaluable": bool(opportunities), "fired": bool(fires),
             "coverage_reason": None if opportunities else "review-state-unavailable",
             "opportunities": opportunities, "fires": fires, "by_round": by_round,
             "consecutive": consecutive,
+            "diff_files_threshold": diff_files_threshold,
+            "open_blocker_threshold": open_blocker_threshold,
             "unevaluable_pr_state": unknown["pr-state-unavailable"],
-            "unevaluable_review_mode": unknown["review-mode-unavailable"]}
+            "unevaluable_review_mode": unknown["review-mode-unavailable"],
+            "unevaluable_high_risk": unknown["high-risk-input-unavailable"]}
 
 
 # ---- residence (§2 — project-local, never committed) --------------------------
@@ -771,8 +801,11 @@ def _validate_rule_params(rule: str, params: dict, label: str) -> None:
         return
     if rule == "review-skipped-closes-v1":
         consecutive = params.get("consecutive")
-        if (set(params) != {"consecutive"} or type(consecutive) is not int
-                or consecutive < 1):
+        diff_threshold = params.get("diff_files_threshold")
+        blocker_threshold = params.get("open_blocker_threshold")
+        if (set(params) != {"consecutive", "diff_files_threshold", "open_blocker_threshold"}
+                or any(type(value) is not int or value < 1
+                       for value in (consecutive, diff_threshold, blocker_threshold))):
             raise WorkflowError(f"{label} has invalid params for {rule}")
         return
     if params:
@@ -796,17 +829,14 @@ def _load_project_policy(root: Path) -> list[dict]:
     for index, policy in enumerate(document["policies"]):
         label = f"committed project policy {path}: policies[{index}]"
         if (not isinstance(policy, dict) or not isinstance(policy.get("id"), str)
-                or DELTA_ID_RE.fullmatch(policy["id"]) is None
+                or POLICY_ID_RE.fullmatch(policy["id"]) is None
                 or not isinstance(policy.get("rule"), str)
                 or policy.get("stage") not in POLICY_STAGES
                 or not isinstance(policy.get("params"), dict)
                 or not isinstance(policy.get("summary"), str)
                 or not policy["summary"].strip()
                 or "\n" in policy["summary"] or "\r" in policy["summary"]
-                or not isinstance(policy.get("origin_delta_id"), str)
-                or DELTA_ID_RE.fullmatch(policy["origin_delta_id"]) is None
-                or set(policy) != {
-                    "id", "rule", "stage", "params", "summary", "origin_delta_id"}
+                or set(policy) != {"id", "rule", "stage", "params", "summary"}
                 or policy["id"] in seen_ids):
             raise WorkflowError(f"corrupt {label}")
         seen_ids.add(policy["id"])
@@ -815,13 +845,16 @@ def _load_project_policy(root: Path) -> list[dict]:
             raise WorkflowError(
                 f"committed project policy {policy['id']} requests enforce, which is not reachable "
                 "until the Adapt & Enforce arc")
-        out.append({
+        runtime = {
             "id": policy["id"], "rule": policy["rule"], "stage": policy["stage"],
             "status": policy["stage"], "params": dict(policy.get("params") or {}),
             "layer": "project", "source_kind": "committed", "enabled": True,
             "identity": {"layer": "project", "id": policy["id"]},
-            "origin_delta_id": policy["origin_delta_id"],
-        })
+        }
+        origin = _materialization_origins(root).get(policy["id"])
+        if origin is not None:
+            runtime["origin_delta_id"] = origin
+        out.append(runtime)
     return out
 
 
@@ -1063,18 +1096,71 @@ def compose_policy(root: Path, round_id: str | None = None) -> dict:
     }
 
 
+def _neutral_policy_id(rule: str) -> str:
+    policy_id = re.sub(r"-v[0-9]+$", "", rule)
+    if POLICY_ID_RE.fullmatch(policy_id) is None:
+        raise WorkflowError(f"rule {rule!r} cannot produce a neutral committed policy id")
+    return policy_id
+
+
+def _materialization_map_path(root: Path) -> Path:
+    return _overlay_dir(root) / "materializations.json"
+
+
+def _load_materialization_map(root: Path) -> dict:
+    path = _materialization_map_path(root)
+    if not path.is_file():
+        return {"schema": MATERIALIZATION_MAP_SCHEMA, "mappings": []}
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise WorkflowError(f"corrupt local materialization mapping {path} ({e})") from e
+    if (not isinstance(document, dict) or set(document) != {"schema", "mappings"}
+            or document.get("schema") != MATERIALIZATION_MAP_SCHEMA
+            or not isinstance(document.get("mappings"), list)):
+        raise WorkflowError(f"corrupt local materialization mapping {path}")
+    seen = set()
+    for row in document["mappings"]:
+        if (not isinstance(row, dict)
+                or set(row) != {"policy_id", "origin_delta_id", "rule", "candidate_hash", "at"}
+                or POLICY_ID_RE.fullmatch(str(row.get("policy_id") or "")) is None
+                or DELTA_ID_RE.fullmatch(str(row.get("origin_delta_id") or "")) is None
+                or not isinstance(row.get("rule"), str)
+                or not isinstance(row.get("candidate_hash"), str)
+                or parse_iso_timestamp(row.get("at")) is None
+                or row["policy_id"] in seen):
+            raise WorkflowError(f"corrupt local materialization mapping {path}")
+        seen.add(row["policy_id"])
+    return document
+
+
+def _materialization_origins(root: Path) -> dict[str, str]:
+    return {row["policy_id"]: row["origin_delta_id"]
+            for row in _load_materialization_map(root)["mappings"]}
+
+
+def _write_materialization_mapping(root: Path, delta: dict, candidate: dict) -> None:
+    document = _load_materialization_map(root)
+    if any(row["policy_id"] == candidate["id"] for row in document["mappings"]):
+        raise WorkflowError(
+            f"local materialization mapping for policy {candidate['id']} already exists")
+    document["mappings"].append({
+        "policy_id": candidate["id"], "origin_delta_id": delta["id"],
+        "rule": candidate["rule"], "candidate_hash": canonical_payload_hash(candidate),
+        "at": _now_iso(),
+    })
+    path = _materialization_map_path(root)
+    _mkdir_or_refuse(path.parent)
+    write_text_atomic(path, json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+
+
 def _materialized_candidate(root: Path, delta: dict) -> dict:
-    raw_summary = str(delta.get("title") or delta["id"])
-    for root_text in {str(Path(root)), str(Path(root).resolve())}:
-        raw_summary = raw_summary.replace(root_text, "[project]")
-    raw_summary = re.sub(r"(?<![A-Za-z0-9])(?:~|/)[^\s]+", "[local-path]", raw_summary)
-    summary = " ".join(raw_summary.split())[:160]
-    if not summary:
-        summary = f"Local policy candidate {delta['id']}"
+    del root
+    summary = f"Project policy for {re.sub(r'-v[0-9]+$', '', delta['rule']).replace('-', ' ')}."
     return {
-        "id": delta["id"], "rule": delta["rule"], "stage": delta["status"],
+        "id": _neutral_policy_id(delta["rule"]),
+        "rule": delta["rule"], "stage": delta["status"],
         "params": dict(delta.get("params") or {}), "summary": summary,
-        "origin_delta_id": delta["id"],
     }
 
 
@@ -1114,9 +1200,10 @@ def materialize(root: Path, delta_id: str, *, consent_recorded: bool = False) ->
             document = yaml.safe_load(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, yaml.YAMLError) as e:
             raise WorkflowError(f"corrupt committed project policy {path} ({e})") from e
-    if any(policy.get("id") == delta_id for policy in document["policies"]
+    if any(policy.get("id") == candidate["id"] for policy in document["policies"]
            if isinstance(policy, dict)):
-        raise WorkflowError(f"committed project policy {delta_id} already exists in {path}")
+        raise WorkflowError(
+            f"committed project policy {candidate['id']} already exists in {path}")
     context = materialize_consent_context(root, delta_id)
     if consent_recorded:
         record_consent(root, "materialize", "accept", context)
@@ -1127,7 +1214,22 @@ def materialize(root: Path, delta_id: str, *, consent_recorded: bool = False) ->
     document["policies"].append(candidate)
     path.parent.mkdir(parents=True, exist_ok=True)
     text = yaml.safe_dump(document, sort_keys=False, allow_unicode=True)
-    write_text_atomic(path, text)
+    policy_before = path.read_bytes() if path.is_file() else None
+    mapping_path = _materialization_map_path(root)
+    mapping_before = mapping_path.read_bytes() if mapping_path.is_file() else None
+    try:
+        write_text_atomic(path, text)
+        _write_materialization_mapping(root, delta, candidate)
+    except Exception:
+        if policy_before is None:
+            path.unlink(missing_ok=True)
+        else:
+            write_text_atomic(path, policy_before.decode("utf-8"))
+        if mapping_before is None:
+            mapping_path.unlink(missing_ok=True)
+        else:
+            write_text_atomic(mapping_path, mapping_before.decode("utf-8"))
+        raise
     return path
 
 
@@ -1400,13 +1502,16 @@ def _replay_rounds(root: Path, rule_id: str, params: dict) -> dict:
         ingests, ingest_errors, legacy_approximations = _review_ingests_for_rounds(root, rows)
         errors += ingest_errors
         result = evaluate_review_skipped_closes(
-            rows, ingests, consecutive=params.get("consecutive", 2))
+            rows, ingests, consecutive=params.get("consecutive", 2),
+            diff_files_threshold=params.get("diff_files_threshold", 20),
+            open_blocker_threshold=params.get("open_blocker_threshold", 1))
         fired_rounds = result["fires"]
         opportunities = result["opportunities"]
         by_round = [{"round_id": row["round_id"], "subject_id": row["round_id"],
                      "snapshot": row["round_id"],
                      "opportunities": int(row["evaluable"]),
                      "fires": int(row["fired"]), "streak": row["streak"],
+                     "risk_reason": row.get("risk_reason"),
                      "evaluable": row["evaluable"],
                      "coverage_reason": row["coverage_reason"]}
                     for row in result["by_round"]]
@@ -1600,13 +1705,17 @@ def _round_rule_at_boundary(root: Path, rule_id: str, context: dict, params: dic
         rows, round_errors = _round_records(root)
         ingests, ingest_errors, legacy_approximations = _review_ingests_for_rounds(root, rows)
         result = evaluate_review_skipped_closes(
-            rows, ingests, consecutive=params.get("consecutive", 2))
+            rows, ingests, consecutive=params.get("consecutive", 2),
+            diff_files_threshold=params.get("diff_files_threshold", 20),
+            open_blocker_threshold=params.get("open_blocker_threshold", 1))
         result["evaluation_errors"] = round_errors + ingest_errors
         result["legacy_ingest_approximations"] = legacy_approximations
         current_rows = [row for row in result["by_round"]
                         if row["round_id"] == current["round_id"]]
         result["current_fired"] = bool(current_rows and current_rows[-1]["fired"])
         result["current_streak"] = current_rows[-1]["streak"] if current_rows else None
+        result["current_risk_reason"] = (
+            current_rows[-1].get("risk_reason") if current_rows else None)
         result["evaluable"] = bool(current_rows and current_rows[-1]["evaluable"])
         result["fired"] = result["current_fired"]
         result["coverage_reason"] = (
@@ -1787,6 +1896,9 @@ def _evaluate_boundary(root: Path, boundary: str, context: dict) -> list[dict]:
                 attribution["task_ids"] = out.get("fires") or []
             else:
                 attribution["consecutive"] = params.get("consecutive", 2)
+                attribution["diff_files_threshold"] = params.get("diff_files_threshold", 20)
+                attribution["open_blocker_threshold"] = params.get("open_blocker_threshold", 1)
+                attribution["risk_reason"] = out.get("current_risk_reason")
             if out.get("evaluable", True) is not True:
                 attribution.update({"evaluable": False, "fired": False,
                                     "coverage_reason": out.get("coverage_reason") or "unknown"})
@@ -1804,8 +1916,12 @@ def _evaluate_boundary(root: Path, boundary: str, context: dict) -> list[dict]:
                     message = (f"round {round_id} closes {len(out['fires'])} task(s) without joined "
                                "satisfied apply-verdict or structured main-session verification")
                 else:
-                    message = (f"round {round_id} reaches {out['current_streak']} consecutive "
-                               "closes without an intervening review feedback ingest")
+                    if out.get("current_risk_reason"):
+                        message = (f"round {round_id} closes without review feedback and meets "
+                                   f"high-risk condition {out['current_risk_reason']}")
+                    else:
+                        message = (f"round {round_id} reaches {out['current_streak']} consecutive "
+                                   "closes without an intervening review feedback ingest")
                 events.append(_emit(
                     root, boundary, rep, rule_id, eff, "fire", message, attribution))
             if out.get("evaluation_errors"):
@@ -1986,11 +2102,18 @@ def _capture_round_evidence(root: Path, base_sha: str | None, head_sha: str | No
     head = head_sha if isinstance(head_sha, str) and head_sha else None
     delegation_index, delegation_errors = _delegation_evidence_index(root)
     main_verification = _main_verification_evidence(root, session_id)
+    task_document = load_tasks(root)
+    open_blocker_task_ids = sorted(
+        task["id"] for task in (task_document.get("tasks") or [])
+        if isinstance(task, dict) and isinstance(task.get("id"), str)
+        and task.get("severity") == "blocker"
+        and task.get("status") not in ("done", "dropped"))
     payload = {
         "evaluable": False, "coverage_reason": "round-diff-unavailable",
         "changed_files": [], "manifest_paths": [], "env_prep_changed": None,
         "env_prep_before": None, "env_prep_after": None, "env_prep_change_kind": None,
         "review_mode": review_mode,
+        "open_blocker_task_ids": open_blocker_task_ids,
         "task_scopes": {task_id: list(scopes) for task_id, scopes in sorted(task_scopes.items())},
         "task_scope_coverage": dict(sorted(task_scope_coverage.items())),
         "done_task_ids": sorted(set(done_task_ids)),
@@ -2042,7 +2165,8 @@ def write_round_exposure(root: Path, round_id: str, head_sha: str | None, waterm
                          session_id: str | None = None, *, base_sha: str | None = None,
                          task_scopes: dict[str, list[str]] | None = None,
                          task_scope_coverage: dict[str, str] | None = None,
-                         done_task_ids: list[str] | None = None):
+                         done_task_ids: list[str] | None = None,
+                         routes: list[dict] | None = None):
     """Immutable per-round exposure record written at close (§9/#4). A re-close of the same round-id
     gets a `-2`/`-3` suffix (H4 precedent — existing records are never overwritten)."""
     _ensure_project_state_or_refuse(root)
@@ -2050,6 +2174,13 @@ def write_round_exposure(root: Path, round_id: str, head_sha: str | None, waterm
     cfg = load_config(root)
     env_prep = (cfg.get("delegation") or {}).get("env_prep")
     review_mode = (cfg.get("review") or {}).get("mode", "packet")
+
+    def file_fingerprint(path: Path) -> str | None:
+        return "sha256:" + content_hash(path.read_bytes()) if path.is_file() else None
+
+    config_fingerprint = file_fingerprint(Path(root) / ".waystone.yml")
+    committed_policy_fingerprint = file_fingerprint(_project_policy_path(root))
+    routing_policy_fingerprint = file_fingerprint(ROUTING_POLICY_PATH)
     try:
         round_evidence = _capture_round_evidence(
             root, base_sha, watermark, task_scopes or {}, done_task_ids or [],
@@ -2061,6 +2192,7 @@ def write_round_exposure(root: Path, round_id: str, head_sha: str | None, waterm
             "evaluation_errors": 1, "changed_files": [], "manifest_paths": [],
             "env_prep_before": None, "env_prep_after": None, "env_prep_change_kind": None,
             "review_mode": review_mode, "task_scopes": {},
+            "open_blocker_task_ids": None,
             "task_scope_coverage": dict(sorted((task_scope_coverage or {}).items())),
             "done_task_ids": sorted(set(done_task_ids or [])), "done_evidence": [],
         }
@@ -2071,6 +2203,10 @@ def write_round_exposure(root: Path, round_id: str, head_sha: str | None, waterm
         "project": {"pslug": _project_slug(root), "root": str(Path(root).resolve())},
         "head_sha": head_sha, "config_watermark": watermark, "base_sha": base_sha,
         "profile_fingerprint": fp, "bindings": bindings,
+        "routes": list(routes or []),
+        "config_fingerprint": config_fingerprint,
+        "committed_policy_fingerprint": committed_policy_fingerprint,
+        "routing_policy_fingerprint": routing_policy_fingerprint,
         "env_prep": env_prep, "review_mode": review_mode, "round_evidence": round_evidence,
         "overlays_active": [{
             "identity": d["identity"], "status": d["stage"],

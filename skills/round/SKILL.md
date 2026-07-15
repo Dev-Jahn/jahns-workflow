@@ -50,8 +50,14 @@ Then close the round in one atomic, deterministic step instead of hand-editing e
 
 ```bash
 waystone round close . --round <round-id> \
-    --done <comma-ids that fully passed> --touched <comma-ids worked but not done>
+    --done <comma-ids that fully passed> --touched <comma-ids worked but not done> \
+    --route-note <role>,<execution>,<backend>
 ```
+
+Repeat `--route-note` once for each host-guided role actually used in the round. Do not record an
+external-runner here; delegation exposure already records it. The close command validates every
+note against the current profile and stores it in the immutable round exposure. If no host-guided
+route was used, omit the flag; downstream role attribution remains unknown rather than guessed.
 
 `round close` flips the `--done` tasks to `done`, stamps `round:` on every worked task, validates
 the registry, regenerates `ROADMAP.md` (and SSOT views if configured), and advances

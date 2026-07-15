@@ -153,7 +153,54 @@ def _parse_ids(s: str | None) -> list[str]:
     return [x.strip() for x in (s or "").split(",") if x.strip()]
 
 
-def close(root: Path, round_id: str, done: list[str], touched: list[str], commit: str) -> int:
+def _parse_route_notes(values: list[str]) -> list[dict]:
+    """Parse repeatable ``role,execution,backend`` host-guided route observations."""
+    import delegate
+
+    routes = []
+    for value in values:
+        parts = [part.strip() for part in value.split(",")]
+        if len(parts) != 3 or any(not part for part in parts):
+            raise WorkflowError(
+                "--route-note must be role,execution,backend (backend is <runner>:<model>)")
+        role, execution, backend = parts
+        if role not in delegate.PROFILE_ROLES:
+            raise WorkflowError(
+                f"--route-note role must be one of {', '.join(delegate.PROFILE_ROLES)}")
+        if execution not in delegate.HOST_GUIDED_EXECUTIONS:
+            raise WorkflowError(
+                "--route-note records host-guided execution only; external-runner is already "
+                "recorded by delegate exposure")
+        delegate._validate_profile_binding(
+            role, {"execution": execution, "backend": backend})
+        routes.append({
+            "role": role, "execution": execution, "backend": backend,
+            "provenance": "main-session",
+        })
+    unique = {(row["role"], row["execution"], row["backend"]): row for row in routes}
+    return [unique[key] for key in sorted(unique)]
+
+
+def _validate_recorded_routes(root: Path, routes: list[dict]) -> None:
+    if not routes:
+        return
+    import delegate
+
+    profile, _fingerprint = delegate._load_profile(root)
+    bindings = profile.get("bindings") or {}
+    for route in routes:
+        binding = bindings.get(route["role"])
+        if not isinstance(binding, dict):
+            raise WorkflowError(
+                f"--route-note role {route['role']!r} has no profile binding")
+        execution = delegate._validate_profile_binding(route["role"], binding)
+        if (execution, binding.get("backend")) != (route["execution"], route["backend"]):
+            raise WorkflowError(
+                f"--route-note {route['role']} route does not match the current profile binding")
+
+
+def close(root: Path, round_id: str, done: list[str], touched: list[str], commit: str,
+          routes: list[dict] | None = None) -> int:
     """Fail-closed: resolve the commit and confirm the watermark slot up front, apply edits in
     memory and validate BEFORE writing anything, then write tasks.yaml → views → watermark."""
     import shutil
@@ -167,6 +214,12 @@ def close(root: Path, round_id: str, done: list[str], touched: list[str], commit
         print(f"round close: --round must match YYYY-MM-DD-<slug>, got {round_id!r}", file=sys.stderr)
         return 1
     cfg = load_config(root)
+    routes = list(routes or [])
+    try:
+        _validate_recorded_routes(root, routes)
+    except WorkflowError as e:
+        print(f"round close: cannot record host-guided route — {e}", file=sys.stderr)
+        return 1
     try:
         review_reviewers = review.resolve_reviewers(root, cfg["review"]["reviewers"])
     except WorkflowError as e:
@@ -281,7 +334,8 @@ def close(root: Path, round_id: str, done: list[str], touched: list[str], commit
             exposure_path, round_exposure = overlay.write_round_exposure(
                 root, round_id, head_sha, full, session_id=session_id,
                 base_sha=prev_wm, task_scopes=task_scopes,
-                task_scope_coverage=task_scope_coverage, done_task_ids=done_transitions)
+                task_scope_coverage=task_scope_coverage, done_task_ids=done_transitions,
+                routes=routes)
             created_event_paths.append(exposure_path)
             binding_path = review.write_round_request_binding(
                 root, round_id, full, prev_wm, review_reviewers,
@@ -345,7 +399,19 @@ def main() -> int:
 
     def opt(name):
         return rest[rest.index(name) + 1] if name in rest and rest.index(name) < len(rest) - 1 else None
-    positional = [a for a in rest if not a.startswith("--") and (rest.index(a) == 0 or rest[rest.index(a) - 1] not in ("--round", "--done", "--touched", "--commit"))]
+
+    def repeated(name):
+        values = []
+        for index, value in enumerate(rest):
+            if value == name:
+                if index + 1 >= len(rest) or rest[index + 1].startswith("--"):
+                    raise WorkflowError(f"{name} requires a value")
+                values.append(rest[index + 1])
+        return values
+
+    value_flags = ("--round", "--done", "--touched", "--commit", "--route-note")
+    positional = [a for i, a in enumerate(rest) if not a.startswith("--")
+                  and (i == 0 or rest[i - 1] not in value_flags)]
     root = Path(positional[0]).resolve() if positional else find_project_root(Path.cwd())
     if root is None:
         print("round: no initialized project", file=sys.stderr)
@@ -355,13 +421,14 @@ def main() -> int:
         print("round close: --round <id> is required", file=sys.stderr)
         return 1
     try:
+        routes = _parse_route_notes(repeated("--route-note"))
         # Phase-2 migration is a separate pre-verb span; close then owns one project-lock span from
         # preflight through exposure/warn recording. Nested libraries must not acquire it again.
         with hold_lock(project_lock_path(root)):
             migrate_project_state(root)
         with hold_lock(project_lock_path(root)):
             return close(root, round_id, _parse_ids(opt("--done")),
-                         _parse_ids(opt("--touched")), opt("--commit") or "HEAD")
+                         _parse_ids(opt("--touched")), opt("--commit") or "HEAD", routes)
     except WorkflowError as e:
         print(e, file=sys.stderr)
         return 1

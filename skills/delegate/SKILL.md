@@ -32,7 +32,24 @@ verdict, not as something to ask the user about.
 
 Resolve the profile path with `waystone paths --root <project-root>`, then inspect only the selected
 workflow role's binding in `{project_root}/.waystone/profile.yml`. This skill's implementation
-handoff uses the `implementer` role. Route it by the binding's `execution` and `backend`:
+handoff uses the `implementer` role. Before choosing the execution, explicitly check all eight
+SessionStart routing questions in policy order:
+
+1. `reasoning` — required reasoning level;
+2. `context-inheritance` — whether current context must carry over;
+3. `independent-perspective` — whether isolation of perspective matters;
+4. `bounded-scope` — whether the scope is clear and bounded;
+5. `repetitive-tools` — whether repeatable tool execution dominates;
+6. `retry-cost` — cost of a failed attempt and retry;
+7. `independent-verification` — who verifies final quality;
+8. `budget-sensitivity` — the user's execution-budget sensitivity.
+
+Questions `reasoning`, `independent-perspective`, `bounded-scope`, and
+`independent-verification` are the policy questions whose preferences can admit
+`external-runner`; `context-inheritance`, `repetitive-tools`, `retry-cost`, and
+`budget-sensitivity` name host-guided executions only. A question admitting external execution does
+not override the selected profile binding. Route the task by that binding's `execution` and
+`backend`:
 
 - `implementer` + `external-runner`: continue to `waystone delegate run`; this is the only role and
   execution pair that command can start.
@@ -43,6 +60,16 @@ handoff uses the `implementer` role. Route it by the binding's `execution` and `
 
 Do not translate a host-guided binding into a headless runner. Other external-runner roles are not
 an implemented `delegate run` surface; verifier execution is handled separately in Step 4.
+
+For an external-runner route, record the budget-sensitivity judgment as one free, single-line
+main-session note in the immutable packet:
+
+```bash
+waystone delegate run <task-id> --routing-note "<budget judgment>" --root <project-root>
+```
+
+For a host-guided route, preserve the same judgment in PROGRESS and use the round route note in
+Step 2 of the round skill; no delegation packet exists on that route.
 
 When the task's path scope is exactly derivable from owner-authored task, SSOT, or review material,
 record each repo-relative prefix before either route runs:

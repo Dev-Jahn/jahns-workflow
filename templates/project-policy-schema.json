@@ -11,17 +11,13 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "rule", "stage", "params", "summary", "origin_delta_id"],
+        "required": ["id", "rule", "stage", "params", "summary"],
         "properties": {
-          "id": {"type": "string", "pattern": "^[a-z][a-z0-9_]*/[a-z0-9]+(?:-[a-z0-9]+)*$"},
+          "id": {"type": "string", "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"},
           "rule": {"type": "string"},
           "stage": {"enum": ["observing", "warning", "enforce"]},
           "params": {"type": "object"},
-          "summary": {"type": "string", "minLength": 1, "pattern": "^[^\\r\\n]+$"},
-          "origin_delta_id": {
-            "type": "string",
-            "pattern": "^[a-z][a-z0-9_]*/[a-z0-9]+(?:-[a-z0-9]+)*$"
-          }
+          "summary": {"type": "string", "minLength": 1, "pattern": "^[^\\r\\n]+$"}
         },
         "oneOf": [
           {
@@ -61,9 +57,11 @@
               "params": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["consecutive"],
+                "required": ["consecutive", "diff_files_threshold", "open_blocker_threshold"],
                 "properties": {
-                  "consecutive": {"type": "integer", "minimum": 1}
+                  "consecutive": {"type": "integer", "minimum": 1},
+                  "diff_files_threshold": {"type": "integer", "minimum": 1},
+                  "open_blocker_threshold": {"type": "integer", "minimum": 1}
                 }
               }
             }

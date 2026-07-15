@@ -13,7 +13,7 @@
 <img alt="version" src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2FDev-Jahn%2Fwaystone%2Fmain%2F.claude-plugin%2Fplugin.json&query=%24.version&prefix=v&label=version&style=flat-square">
 <img alt="Claude Code plugin" src="https://img.shields.io/badge/Claude%20Code-plugin-8A5CF6?style=flat-square">
 <img alt="Codex plugin" src="https://img.shields.io/badge/Codex-plugin-111111?style=flat-square">
-<img alt="tests" src="https://img.shields.io/badge/tests-429-success?style=flat-square">
+<img alt="tests" src="https://img.shields.io/badge/tests-543-success?style=flat-square">
 <img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square">
 </p>
 
@@ -84,7 +84,13 @@ Codex:      $waystone:ideate "one-line project idea"    # optional
 Codex:      $waystone:init
 ```
 
-`ideate` turns the idea into `SSOT.md`, a concise project-direction document. `init` then builds the working structure around it. For an existing project, run `/waystone:init` (Claude Code) or `$waystone:init` (Codex) alone — setup is non-destructive: Waystone adapts to existing files, leaves changes uncommitted for review, and applies its conventions only from that point forward.
+`ideate` turns the idea into `SSOT.md`, a concise project-direction document. `init` then builds the
+working structure around it and asks separately for the initial policy level (`observe-only` or
+`warn-allowed`) and whether delegation worktrees/runners are enabled. New projects bind review
+through `role:reviewer`; older explicit literal reviewer lists remain valid. For an existing project,
+run `/waystone:init` (Claude Code) or `$waystone:init` (Codex) alone — setup is non-destructive:
+Waystone adapts to existing files, leaves changes uncommitted for review, and applies its conventions
+only from that point forward.
 
 A normal cycle:
 
@@ -150,10 +156,11 @@ Most validation, rendering, bookkeeping, log parsing, and policy checks are plai
 | `waystone project` | Registers, unregisters, and lists projects through the machine-wide registry. |
 | `waystone delegate verify` | Re-runs independent read-only verification of a delegation result in its preserved worktree. |
 | `waystone delegate verdict` | Records the main session's evidence-backed apply or discard decision before resolution. |
+| `waystone round close --route-note <role>,<execution>,<backend>` | Records an actually used host-guided route in the immutable round exposure; repeat once per route. |
 | `waystone overlay` | Stores adaptive checks and manages their observing/warning lifecycle; promotion to warning requires deterministic shadow replay. |
 | `waystone overlay compose` | Shows the effective base, user, project, and current-round policy plus conflicts and shadowed entries. |
 | `waystone overlay promote-user` | Promotes a user-scope candidate only after evidence from at least two registered projects. |
-| `waystone overlay materialize` | Writes a consent-approved sanitized policy to `docs/waystone-policy.yaml` and leaves it uncommitted. |
+| `waystone overlay materialize` | Writes a consent-approved, rule-named sanitized policy to `docs/waystone-policy.yaml`, keeps delta provenance only in local state, and leaves the policy uncommitted. |
 | `waystone consent record` | Records candidate-bound user consent for materialization or managed installation. The command group is `waystone consent`. |
 | `waystone install agents` / `waystone install hooks` | Installs a consent-approved managed project agent or hook without overwriting or committing it. The command group is `waystone install`. |
 | `waystone check` | Evaluates active overlay rules against the current project state; warnings are visible but never block the host command. |
@@ -173,7 +180,10 @@ The project chooses one review mode during setup:
 - **Packet mode** (default) — give the generated Markdown request to any capable external reviewer.
 - **PR mode** — for pull-request workflows. Review, CI, issue resolution, and final approval are tied to the exact commit being merged, so an old review cannot approve a newer push.
 
-Reviewer comments are treated as claims, not facts. The `review` skill checks them against the code before confirmed issues become tracked work.
+PR freeze also writes a round-bound local SHA sidecar, allowing `improve` to project the reviewed
+head/base without querying GitHub again; rounds predating that evidence remain unknown. Reviewer
+comments are treated as claims, not facts. The `review` skill assigns one of six finding taxonomy
+types while checking them against the code before confirmed issues become tracked work.
 
 <br>
 
@@ -192,6 +202,11 @@ be derived exactly from owner-authored project material. Waystone then:
 The main session owns the routine decision and records every acceptance with cited evidence. The user
 audits that record. Worker claims never become facts merely because their report exists, and a missing
 worker report never means verification was absent.
+
+Before routing, the skill checks all eight policy questions (reasoning, context inheritance,
+independent perspective, bounded scope, repetitive tools, retry cost, independent verification, and
+budget sensitivity). An external run stores the budget judgment as the packet's main-session
+`routing_note`; host-guided work is recorded at round close and is otherwise left unattributed.
 
 The autonomous loop keeps the existing safety rails: one nonterminal delegation per task, required
 criteria and valid profile bindings, read-only independent verification, a bounded
@@ -245,8 +260,11 @@ where it came from and whether it is directly observed or inferred. The machine-
 Calibrate, or Tune maturity stage labels evidence strength; it does not suppress supported
 recommendations. `waystone improve metrics` records quality, delegation effectiveness,
 reproducibility/environment, and governance snapshots with provenance, coverage, first-measured
-version, and a factual previous/current delta. Unavailable metrics keep their reason instead of
-being omitted or treated as zero, and trends are never presented as causal effects.
+version, and a factual previous/current delta. This includes severe-finding recurrence,
+verification-finding trend, main direct work/context inflow, repeated-warning exposure, retained
+deltas, and verifier judgment-set reproducibility when the same delegation has at least two verify
+runs. Unavailable metrics keep their reason instead of being omitted or treated as zero, and trends
+are never presented as causal effects.
 
 Project analysis, metrics, and accept/reject decisions stay under
 `{project_root}/.waystone/improve/`; opt-in `--user-wide` analysis stays under

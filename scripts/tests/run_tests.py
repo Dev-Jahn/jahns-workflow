@@ -8162,9 +8162,9 @@ class ImproveL2BTests(unittest.TestCase):
                           if row["lens"] == "finding_concentration"]
             self.assertEqual([(row["task_id"], row["findings"]) for row in candidates],
                              [("feat/x", 1)])
-            self.assertEqual(project["by_role"], {"main": 1})
+            self.assertEqual(project["by_role"], {"unknown": 1})
             self.assertEqual(project["by_project_area"], {"scripts": 1})
-            self.assertEqual(project["round_session_unknown"], 0)
+            self.assertEqual(project["round_session_unknown"], 1)
 
     def test_reviewed_sha_projection_is_byte_stable(self):
         with tempfile.TemporaryDirectory() as d:
@@ -8361,7 +8361,7 @@ class ImproveL2BAdversarialTests(unittest.TestCase):
             improve.run_reviews(registry, out)
             row = self._rows(out / "reviews.jsonl")[0]
             self.assertEqual(row["review_binding_provenance"], "unknown")
-            self.assertEqual(row["review_binding_reason"], "pr-comment-canonical-unavailable")
+            self.assertEqual(row["review_binding_reason"], "missing-pr-freeze-sidecar")
 
     def test_f2_only_delegate_canonical_verdict_becomes_explicit(self):
         with tempfile.TemporaryDirectory() as d:
@@ -11481,9 +11481,9 @@ class L2DPolicyMachineTests(unittest.TestCase):
             policy = {
                 "schema": "waystone-project-policy-1",
                 "policies": [{
-                    "id": "verification_debt/committed",
+                    "id": "delegation-verification-evidence",
                     "rule": "delegation-verification-evidence-v1", "stage": "warning",
-                    "params": {}, "summary": "committed", "origin_delta_id": delta_id,
+                    "params": {}, "summary": "committed",
                 }],
             }
             (root / "docs").mkdir()
@@ -11556,7 +11556,9 @@ class L2DPolicyMachineTests(unittest.TestCase):
             path = _run_with_home(home, lambda: overlay.materialize(root, delta_id))
             document = yaml.safe_load(path.read_text())
             self.assertEqual(document["schema"], "waystone-project-policy-1")
-            self.assertEqual(document["policies"][0]["origin_delta_id"], delta_id)
+            self.assertNotIn("origin_delta_id", document["policies"][0])
+            mapping = _json.loads(overlay._materialization_map_path(root).read_text())
+            self.assertEqual(mapping["mappings"][0]["origin_delta_id"], delta_id)
             self.assertNotIn("provenance", document["policies"][0])
             self.assertIn("docs/waystone-policy.yaml", git(
                 root, "status", "--short", "--untracked-files=all").stdout)
@@ -11711,12 +11713,12 @@ class L2DAdversarialFindingTests(unittest.TestCase):
             stream.write(_json.dumps(row, sort_keys=True) + "\n")
 
     @staticmethod
-    def _policy(rule: str, *, policy_id: str = "verification_debt/committed",
+    def _policy(rule: str, *, policy_id: str = "verification-evidence",
                 stage: str = "warning", params: dict | None = None, **extra) -> dict:
         return {
             "id": policy_id, "rule": rule, "stage": stage,
             "params": {} if params is None else params,
-            "summary": "committed policy", "origin_delta_id": "verification_debt/origin",
+            "summary": "committed policy",
             **extra,
         }
 
@@ -11949,9 +11951,9 @@ class L2DAdversarialFindingTests(unittest.TestCase):
                 home, lambda: overlay.materialize(root, delta_id, consent_recorded=True))
             document = yaml.safe_load(path.read_text())
             policy = document["policies"][0]
-            self.assertEqual(set(policy), {
-                "id", "rule", "stage", "params", "summary", "origin_delta_id",
-            })
+            self.assertEqual(set(policy), {"id", "rule", "stage", "params", "summary"})
+            mapping = _json.loads(overlay._materialization_map_path(root).read_text())
+            self.assertEqual(mapping["mappings"][0]["origin_delta_id"], delta_id)
             self.assertNotIn("\n", policy["summary"])
             serialized = path.read_text()
             self.assertNotIn(str(root), serialized)
@@ -12114,6 +12116,258 @@ class CodexPluginContractTests(unittest.TestCase):
                     os.environ.pop("CODEX_HOME", None)
                 else:
                     os.environ["CODEX_HOME"] = old_codex_home
+
+
+class L3GapClosureAcceptanceTests(unittest.TestCase):
+    """L3-3 acceptance failures: every new contract has a deterministic consumer."""
+
+    def test_routing_questions_render_and_budget_note_reaches_packet(self):
+        sys.path.insert(0, str(SCRIPTS.parent / "hooks" / "scripts"))
+        import session_context
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / ".waystone.yml").write_text("version: 1\nproject: demo\n")
+            rendered = "\n".join(session_context._routing_block(root))
+            policy = yaml.safe_load(session_context.ROUTING_POLICY_PATH.read_text())
+            for question in policy["questions"]:
+                self.assertIn(question["id"], rendered)
+            self.assertLessEqual(len(session_context._routing_block(root)), 12)
+            data = {"project": "demo", "tasks": [{
+                "id": "feat/route", "title": "route", "status": "active",
+                "accept": ["routed"],
+            }]}
+            packet, _acceptance = delegate._build_packet(
+                data, "feat/route", [], root,
+                routing_note="budget favors deterministic workflow")
+            self.assertEqual(packet["routing_note"], {
+                "provenance": "main-session",
+                "note": "budget favors deterministic workflow",
+            })
+        skill = (SCRIPTS.parent / "skills" / "delegate" / "SKILL.md").read_text()
+        for question_id in (
+            "reasoning", "context-inheritance", "independent-perspective", "bounded-scope",
+            "repetitive-tools", "retry-cost", "independent-verification", "budget-sensitivity",
+        ):
+            self.assertIn(question_id, skill)
+        self.assertIn("--routing-note", skill)
+        self.assertIn("external-runner", skill)
+        self.assertIn("host-guided", skill)
+
+    def test_host_guided_routes_project_into_join_and_role_lens(self):
+        routes = round._parse_route_notes([
+            "implementer,forked-subagent,codex:gpt-test",
+        ])
+        self.assertEqual(routes, [{
+            "role": "implementer", "execution": "forked-subagent",
+            "backend": "codex:gpt-test", "provenance": "main-session",
+        }])
+        exposure = {"round_id": "r1", "at": "2026-07-15T00:00:00Z", "routes": routes}
+        projected = improve._round_exposure_projection(
+            {"round": "r1"}, {"r1": exposure})
+        self.assertEqual(projected["routes"], routes)
+        lens = improve._lens_finding_concentration([{
+            "project": "demo", "round_id": "r1", "routes": routes,
+            "findings": [{"id": "f1", "status": "REAL", "type": "correctness"}],
+        }], [])
+        self.assertEqual(lens["per_project"]["demo"]["by_role"], {"implementer": 1})
+
+    def test_new_reviewer_default_is_role_and_skills_are_role_first(self):
+        legacy = common.normalize_config({"version": 1, "project": "demo"})
+        self.assertEqual(legacy["review"]["reviewers"], ["codex", "gpt-5.5-pro"])
+        init_skill = (SCRIPTS.parent / "skills" / "init" / "SKILL.md").read_text()
+        review_skill = (SCRIPTS.parent / "skills" / "review" / "SKILL.md").read_text()
+        self.assertIn("reviewers: [role:reviewer]", init_skill)
+        self.assertIn("role:reviewer", review_skill)
+        self.assertIn('--reviewer "<resolved reviewer backend>"', review_skill)
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / ".waystone.yml").write_text("version: 1\nproject: demo\n")
+            with self.assertRaisesRegex(common.WorkflowError, "profile") as raised:
+                review.resolve_reviewers(root, ["role:reviewer"])
+            self.assertIn("reviewers: [codex", str(raised.exception))
+
+    def test_review_skill_requires_taxonomy_or_reasoned_unknown(self):
+        text = (SCRIPTS.parent / "skills" / "review" / "SKILL.md").read_text()
+        for finding_type in improve.FINDING_TYPES:
+            self.assertIn(finding_type, text)
+        self.assertIn("unknown", text)
+        self.assertIn("reason", text.lower())
+
+    def test_pr_freeze_sidecar_is_local_reviewed_sha_evidence(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / ".waystone.yml").write_text(
+                "version: 1\nproject: demo\nreviews_dir: docs/reviews\n")
+            path = review.write_pr_freeze_binding(
+                root, "2026-07-15-r", 7, 2, "a" * 40, "b" * 40,
+                ["codex:test"], "sha256:abc", "docs/reviews")
+            row = _json.loads(path.read_text())
+            self.assertEqual(row["schema"], review.PR_FREEZE_BINDING_SCHEMA)
+            sidecars = improve._round_review_sidecars(root / "docs" / "reviews")
+            binding = improve._review_sha_binding(
+                None, "2026-07-15-r", "pr", sidecars["2026-07-15-r"])
+            self.assertEqual(binding, (
+                "a" * 40, "b" * 40, "explicit", None, "pr-freeze-sidecar"))
+            conflict = {**sidecars["2026-07-15-r"][0],
+                        "target_sha": "c" * 40, "_file": "conflict.json"}
+            self.assertEqual(improve._review_sha_binding(
+                None, "2026-07-15-r", "pr",
+                [*sidecars["2026-07-15-r"], conflict]), (
+                    None, None, "unknown", "conflicting-pr-freeze-sidecars", None))
+
+    def test_exposure_fingerprints_cover_full_config_policy_and_routing(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            init_repo(root)
+            (root / ".waystone.yml").write_text(
+                "version: 1\nproject: demo\nreview: {mode: packet}\n"
+                "delegation: {env_prep: null}\n")
+            (root / "tasks.yaml").write_text("version: 1\nproject: demo\ntasks: []\n")
+            _path, exposure = overlay.write_round_exposure(
+                root, "2026-07-15-fp", "a" * 40, "b" * 40)
+            for field in (
+                "config_fingerprint", "committed_policy_fingerprint",
+                "routing_policy_fingerprint",
+            ):
+                self.assertIn(field, exposure)
+            before = [{**exposure, "at": "2026-07-15T00:00:00Z"}]
+            (root / ".waystone.yml").write_text(
+                "version: 1\nproject: demo\nreview: {mode: pr}\n"
+                "delegation: {env_prep: [uv sync]}\n")
+            events, _coverage = improve._staleness_change_events(root, before)
+            self.assertIn("current-config-fingerprint-mismatch", {reason for _at, reason in events})
+
+    def test_fresh_missing_reviews_and_decisions_is_bootstrap_not_degraded(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "repo"
+            out = root / ".waystone" / "improve"
+            out.mkdir(parents=True)
+            (root / ".waystone.yml").write_text("version: 1\nproject: demo\n")
+            (root / "tasks.yaml").write_text("version: 1\nproject: demo\ntasks: []\n")
+            _write_jsonl(out / "sessions.jsonl", [])
+            _write_jsonl(out / "delegations.jsonl", [])
+            (out / "parse_coverage.json").write_text(_json.dumps({"row_totals": {}}))
+            facts = improve.run_audit(
+                out, improve.PROJECT_LENS_SCOPE, project_root=root)
+            self.assertEqual(facts["maturity"]["stage"], "bootstrap")
+            self.assertIs(facts["maturity"]["degraded"], False)
+
+    def test_committed_policy_candidate_is_sanitized_and_mapping_stays_local(self):
+        candidate = overlay._materialized_candidate(Path("/tmp/project"), {
+            "id": "verification_debt/local-name", "title": "/tmp/project secret",
+            "rule": "delegation-verification-evidence-v1", "status": "observing", "params": {},
+        })
+        self.assertNotIn("origin_delta_id", candidate)
+        self.assertEqual(candidate["id"], "delegation-verification-evidence")
+        self.assertNotIn("verification_debt/local-name", _json.dumps(candidate))
+        self.assertEqual(candidate["summary"],
+                         "Project policy for delegation verification evidence.")
+
+    def test_init_consent_fields_are_validated_and_documented(self):
+        cfg = common.normalize_config({"version": 1, "project": "demo"})
+        self.assertEqual(cfg["policy"]["start_level"], "observe-only")
+        self.assertIs(cfg["delegation"]["enabled"], True)
+        with self.assertRaisesRegex(ValueError, "start_level"):
+            common.normalize_config({"policy": {"start_level": "enforce"}})
+        with self.assertRaisesRegex(ValueError, "delegation.enabled"):
+            common.normalize_config({"delegation": {"enabled": "yes"}})
+        skill = (SCRIPTS.parent / "skills" / "init" / "SKILL.md").read_text()
+        for text in (
+            "observe-only", "warn-allowed", "delegation.enabled",
+            "init.start-level", "init.delegation",
+        ):
+            self.assertIn(text, skill)
+
+    def test_install_skill_previews_target_effect_rollback_before_consent(self):
+        skill = (SCRIPTS.parent / "skills" / "init" / "SKILL.md").read_text()
+        step = skill.split("## Step 8.5", 1)[1].split("## Step 9", 1)[0]
+        for phrase in ("target path", "effect", "rollback", "delete"):
+            self.assertIn(phrase, step.lower())
+        self.assertLess(step.index("target path"), step.index("consent record"))
+
+    def test_direct_delegable_work_signal_and_high_risk_single_skip(self):
+        sessions = [{
+            "project": "demo", "kind": "main", "session_id": "s1",
+            "tools": {"by_category": {"file_write": 1, "shell": 0}},
+            "retry_loops": {"count": 0}, "context_heavy": {"max_result_bytes": 0},
+            "usage": {"input": 1},
+        }]
+        evidence = [{
+            "project": "demo", "task_id": "feat/direct", "delegations": [],
+            "task_context": {"session_id": "s1", "acceptance_criteria": 1,
+                             "declared_scope_count": 1},
+        }]
+        lens = improve._lens_delegation_opportunity(sessions, evidence)
+        candidate = lens["_projection_rows"][0]
+        self.assertIn("delegable-direct-work", candidate["triggered_by"])
+        rounds = [{
+            "schema": "waystone-round-exposure-1", "round_id": "r1",
+            "at": "2026-07-15T00:00:00Z", "review_mode": "packet",
+            "round_evidence": {"changed_files": [f"f{i}" for i in range(20)],
+                               "open_blocker_task_ids": []},
+        }]
+        result = overlay.evaluate_review_skipped_closes(
+            rounds, [], consecutive=2, diff_files_threshold=20, open_blocker_threshold=1)
+        self.assertEqual(result["fires"], ["r1"])
+        self.assertEqual(result["by_round"][0]["risk_reason"], "diff-files-threshold")
+
+    def test_remaining_section15_metrics_are_actual_and_longitudinal(self):
+        from datetime import datetime, timezone
+
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d)
+            out.joinpath("facts.json").write_text(_json.dumps({
+                "generated_from": "fixture", "inputs": {}, "skipped_lenses": [], "lenses": [],
+            }))
+            _write_jsonl(out / "sessions.jsonl", [{
+                "project": "demo", "kind": "main", "session_id": "s1",
+                "tools": {"by_category": {"file_write": 2, "shell": 3}},
+                "context_heavy": {"max_result_bytes": 2048, "tool_results_over_100kb": 0},
+                "usage": {"input": 100, "output": 10, "cache_read": 0, "cache_creation": 0},
+            }])
+            _write_jsonl(out / "delegations.jsonl", [])
+            _write_jsonl(out / "reviews.jsonl", [
+                {"project": "demo", "round_id": "r1", "findings": [
+                    {"id": "f1", "status": "REAL", "type": "verification", "severity": "major"}]},
+                {"project": "demo", "round_id": "r2", "findings": [
+                    {"id": "f2", "status": "REAL", "type": "verification", "severity": "major"}]},
+            ])
+            _write_jsonl(out / "evidence.jsonl", [{
+                "project": "demo", "task_id": "feat/x", "findings": [],
+                "delegations": [{
+                    "did": "d1", "state": "applied", "verification_runs": [
+                        {"number": 1, "judgment_set_hash": "same", "findings": 1},
+                        {"number": 2, "judgment_set_hash": "same", "findings": 1},
+                    ],
+                }],
+            }, {"coverage": {"warning_observations": [{
+                "project": "demo", "coverage": {"warnings_file_present": True},
+            }]}}])
+            _write_jsonl(out / "evidence_warnings.jsonl", [
+                {"project": "demo", "event": "fire", "rule": "done-without-evidence-v1",
+                 "policy_identity": {"layer": "project", "id": "p1"}, "context": {}},
+                {"project": "demo", "event": "fire", "rule": "done-without-evidence-v1",
+                 "policy_identity": {"layer": "project", "id": "p1"}, "context": {}},
+            ])
+            (out / "adaptive_feedback.json").write_text(_json.dumps([{
+                "project": "demo", "facts": {"deltas": [
+                    {"identity": {"layer": "project", "id": "p1"}, "status": "observing"},
+                    {"identity": {"layer": "project", "id": "p2"}, "status": "retired"},
+                ], "coverage": {"accept_delta_conflicts": {}}},
+            }]))
+            snap = improve.run_metrics(
+                out, improve.PROJECT_LENS_SCOPE,
+                now=datetime(2026, 7, 15, tzinfo=timezone.utc))
+            self.assertEqual(snap["metrics"]["quality"]["severe_finding_recurrence_rate"]["value"], .5)
+            self.assertEqual(snap["metrics"]["quality"]["verification_finding_trend"]["value"],
+                             {"first": 1, "last": 1, "delta": 0})
+            self.assertEqual(snap["metrics"]["delegation_effectiveness"]["main_direct_work"]["value"], 5)
+            self.assertEqual(snap["metrics"]["delegation_effectiveness"]["main_context_inflow"]["value"], 100)
+            self.assertEqual(snap["metrics"]["governance"]["repeated_warning_exposure_count"]["value"], 1)
+            self.assertEqual(snap["metrics"]["governance"]["retained_delta_count"]["value"], 1)
+            self.assertEqual(snap["metrics"]["reproducibility_environment"]
+                             ["acceptance_reproducibility"]["value"], 1.0)
 
 
 if __name__ == "__main__":

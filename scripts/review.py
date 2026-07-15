@@ -51,6 +51,7 @@ from common import (  # noqa: E402
 CODEX_BOT = "chatgpt-codex-connector[bot]"  # REST `user.login` form
 INBOX = Path("/tmp/review.md")  # fixed drop-file: user saves the reviewer reply here, byte-exact
 ROUND_REQUEST_BINDING_SCHEMA = "waystone-round-request-binding-1"
+PR_FREEZE_BINDING_SCHEMA = "waystone-pr-freeze-binding-1"
 PACKET_REVIEWING_RE = re.compile(
     r"(?m)^- Reviewing:\s*([0-9a-f]{40})\s+\(diff against\s+([0-9a-f]{40}|\(root\))\)\s*$")
 
@@ -82,8 +83,8 @@ def write_round_request_binding(root: Path, round_id: str, target_sha: str, base
                                 reviewers: list[str], *, mode: str) -> Path:
     """Append an immutable round-bound sidecar for packet request projection.
 
-    PR comments remain the canonical PR-mode event store; the local row records that relationship
-    but is never promoted to a reviewed-SHA fact by the offline improve projection.
+    A PR request row records the pre-freeze relationship but is never promoted to a reviewed-SHA
+    fact; successful PR freeze has its own cycle-bound local evidence.
     """
     if not _is_sha(target_sha) or (base_sha is not None and not _is_sha(base_sha)):
         raise WorkflowError("round request binding requires full target/base commit SHAs")
@@ -99,6 +100,39 @@ def write_round_request_binding(root: Path, round_id: str, target_sha: str, base
         "at": datetime.now(timezone.utc).isoformat(),
     }
     base = directory / f"{round_id}-request.binding.json"
+    path = base
+    number = 2
+    content = json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
+    while True:
+        try:
+            with path.open("x", encoding="utf-8") as stream:
+                stream.write(content)
+            return path
+        except FileExistsError:
+            path = base.with_name(f"{base.stem}-{number}{base.suffix}")
+            number += 1
+
+
+def write_pr_freeze_binding(root: Path, round_id: str, pr: int, cycle: int,
+                            target_sha: str, base_sha: str, reviewers: list[str],
+                            profile_fingerprint: str | None, reviews_dir: str) -> Path:
+    """Record the successful PR freeze as local, immutable, round-bound improve evidence."""
+    if (not isinstance(round_id, str) or not round_id.strip() or type(pr) is not int or pr < 1
+            or not _is_cycle(cycle) or not _is_sha(target_sha) or not _is_sha(base_sha)
+            or not _is_strlist(reviewers)
+            or (profile_fingerprint is not None and not _nonempty_str(profile_fingerprint))
+            or not _nonempty_str(reviews_dir)):
+        raise WorkflowError("PR freeze binding requires round, PR, cycle, SHAs, and reviewers")
+    directory = Path(root) / reviews_dir
+    directory.mkdir(parents=True, exist_ok=True)
+    row = {
+        "schema": PR_FREEZE_BINDING_SCHEMA, "round_id": round_id, "pr": pr,
+        "cycle": cycle, "target_sha": target_sha, "base_sha": base_sha,
+        "reviewers": reviewers, "profile_fingerprint": profile_fingerprint,
+        "mode": "pr", "canonical_store": "local-freeze-evidence",
+        "at": datetime.now(timezone.utc).isoformat(),
+    }
+    base = directory / f"{round_id}-freeze-{cycle}.binding.json"
     path = base
     number = 2
     content = json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
@@ -531,13 +565,19 @@ def resolve_reviewer_set(root: Path, configured: list[str] | tuple[str, ...]) \
         return list(configured), None
     import delegate
 
-    profile, fingerprint = delegate._load_profile(root)
+    try:
+        profile, fingerprint = delegate._load_profile(root)
+    except WorkflowError as e:
+        raise WorkflowError(
+            f"{e}\nAlternatively, keep literal reviewer compatibility in .waystone.yml, e.g. "
+            "`review: {reviewers: [codex, gpt-5.5-pro]}`.") from e
     bindings = profile.get("bindings")
     binding = bindings.get("reviewer") if isinstance(bindings, dict) else None
     if not isinstance(binding, dict):
         raise WorkflowError(
             f"review.reviewers uses 'role:reviewer' but profile has no binding for role "
-            f"'reviewer' at {delegate._profile_path(root)}")
+            f"'reviewer' at {delegate._profile_path(root)}; add that binding or keep a literal "
+            "compatibility list in .waystone.yml, e.g. `reviewers: [codex, gpt-5.5-pro]`")
     delegate._validate_profile_binding("reviewer", binding)
     backend = binding["backend"]
     resolved = [backend if reviewer == "role:reviewer" else reviewer for reviewer in configured]
@@ -680,6 +720,17 @@ def freeze(root: Path, pr: int, round_id: str | None) -> int:
     if rc != 0:
         print(f"review freeze: gh pr comment failed: {out}", file=sys.stderr)
         return 1
+    if round_id is not None:
+        try:
+            write_pr_freeze_binding(
+                root, round_id, pr, n, head, base_sha, reviewers, profile_fingerprint,
+                policy["reviews_dir"])
+        except (OSError, WorkflowError) as e:
+            print(
+                f"review freeze: PR comment posted but local freeze binding was not recorded: {e}",
+                file=sys.stderr,
+            )
+            return 1
     print(f"review cycle {n} frozen at {head[:12]} on PR #{pr} (reviewers: {', '.join(reviewers)})")
     return 0
 

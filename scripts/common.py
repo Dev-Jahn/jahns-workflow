@@ -1478,6 +1478,8 @@ def normalize_config(cfg: dict | None) -> dict:
     if not isinstance(rv, dict):
         raise ValueError("review: must be a mapping (mode/reviewers/require_ci/approvers/operators)")
     rv.setdefault("mode", "packet")  # packet | pr
+    # `waystone:init` writes role:reviewer explicitly for new projects. A config created by an
+    # older release may omit the field entirely, so preserve that release's implicit literals.
     rv.setdefault("reviewers", ["codex", "gpt-5.5-pro"])
     rv.setdefault("require_ci", False)
     rv.setdefault("approvers", [])  # extra trusted approver logins beyond the repo owner
@@ -1505,11 +1507,20 @@ def normalize_config(cfg: dict | None) -> dict:
         raise ValueError("review.operators must be a list of strings")
     dl = cfg.setdefault("delegation", {})
     if not isinstance(dl, dict):
-        raise ValueError("delegation: must be a mapping (env_prep)")
+        raise ValueError("delegation: must be a mapping (enabled/env_prep)")
+    dl.setdefault("enabled", True)
+    if not isinstance(dl["enabled"], bool):
+        raise ValueError("delegation.enabled must be a boolean")
     dl.setdefault("env_prep", None)  # None -> lockfile auto-detection at delegation time (no sandbox knob, R7)
     ep = dl["env_prep"]
     if ep is not None and not (isinstance(ep, list) and all(isinstance(x, str) for x in ep)):
         raise ValueError("delegation.env_prep must be a list of shell command strings")
+    policy = cfg.setdefault("policy", {})
+    if not isinstance(policy, dict):
+        raise ValueError("policy: must be a mapping (start_level)")
+    policy.setdefault("start_level", "observe-only")
+    if policy["start_level"] not in ("observe-only", "warn-allowed"):
+        raise ValueError("policy.start_level must be 'observe-only' or 'warn-allowed'")
     return cfg
 
 

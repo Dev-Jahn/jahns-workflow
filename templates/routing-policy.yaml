@@ -41,9 +41,9 @@ questions:
       roles: [orchestrator, clerk]
       executions: [deterministic-workflow]
 roles:
-  main: Own routing and final acceptance.
-  orchestrator: Coordinate bounded bundles.
-  implementer: Implement scope and produce verification evidence.
-  clerk: Perform low-ambiguity repeatable work.
-  verifier: Independently check acceptance and risk.
-  reviewer: Adversarially inspect diffs and artifacts.
+  main: Route and accept.
+  orchestrator: Coordinate bounded work.
+  implementer: Implement and verify scope.
+  clerk: Run repeatable work.
+  verifier: Verify independently.
+  reviewer: Review adversarially.

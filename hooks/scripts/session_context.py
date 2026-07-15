@@ -31,6 +31,10 @@ MAX_START_HERE = 2560  # ~2.5KB cap on the injected re-entry narrative (read-tim
 MAX_CONTRACT = 1200
 CONTRACT_PATH = Path(__file__).resolve().parents[2] / "references" / "main-contract.md"
 ROUTING_POLICY_PATH = Path(__file__).resolve().parents[2] / "templates" / "routing-policy.yaml"
+ROUTING_QUESTION_IDS = (
+    "reasoning", "context-inheritance", "independent-perspective", "bounded-scope",
+    "repetitive-tools", "retry-cost", "independent-verification", "budget-sensitivity",
+)
 MIGRATION_LOCK_TIMEOUT = 3.0
 
 
@@ -45,7 +49,20 @@ def _routing_block(root: Path) -> list[str]:
         roles = policy.get("roles")
         if not isinstance(roles, dict) or set(roles) != set(delegate.PROFILE_ROLES):
             raise ValueError("routing policy roles do not match the profile roles")
-        lines = ["routing policy: role guidance"]
+        questions = policy.get("questions")
+        if (not isinstance(questions, list) or len(questions) != 8
+                or any(not isinstance(question, dict)
+                       or not isinstance(question.get("id"), str) for question in questions)):
+            raise ValueError("routing policy must contain the eight §9 questions")
+        question_ids = [question["id"] for question in questions]
+        if tuple(question_ids) != ROUTING_QUESTION_IDS:
+            raise ValueError("routing policy §9 questions or order do not match the contract")
+        lines = [
+            "routing Q1-3: " + ",".join(question_ids[:3]),
+            "routing Q4-6: " + ",".join(question_ids[3:6]),
+            "routing Q7-8: " + ",".join(question_ids[6:]),
+            "routing policy: role guidance",
+        ]
         for role in delegate.PROFILE_ROLES:
             guidance = roles[role]
             if not isinstance(guidance, str) or not guidance.strip() or "\n" in guidance:

@@ -451,7 +451,8 @@ def _runner_model(backend: str) -> str:
 
 # ---- task packet (§7 — assemble the fields a delegate needs, not a raw copy) --
 def _build_packet(data: dict, task_id: str, accept_flags: list[str], root: Path,
-                  retry_note: str | None = None) -> tuple[dict, list[str]]:
+                  retry_note: str | None = None,
+                  routing_note: str | None = None) -> tuple[dict, list[str]]:
     """Assemble packet.yaml from the registry + --accept flags. Fail loud on non-delegable status or an
     empty acceptance set (#3 — the harness never invents criteria)."""
     tasks = [t for t in (data.get("tasks") or []) if isinstance(t, dict)]
@@ -493,6 +494,12 @@ def _build_packet(data: dict, task_id: str, accept_flags: list[str], root: Path,
         if not retry_note.strip():
             raise WorkflowError("--note must be non-empty")
         packet["retry_context"] = {"provenance": "main-session", "note": retry_note}
+    if routing_note is not None:
+        if not routing_note.strip() or "\n" in routing_note or "\r" in routing_note:
+            raise WorkflowError("--routing-note must be one non-empty line")
+        packet["routing_note"] = {
+            "provenance": "main-session", "note": routing_note.strip(),
+        }
     return packet, acceptance
 
 
@@ -832,7 +839,8 @@ def _add_worktree(root: Path, worktree_path: Path, base_sha: str) -> None:
 
 # ---- run (§§3-10 — the delegation vertical slice) -----------------------------
 def _prepare_run(root: Path, task_id: str, role: str, accept_flags: list[str],
-                 retry_note: str | None = None, *, allow_unsandboxed_runner: bool = False,
+                 retry_note: str | None = None, routing_note: str | None = None, *,
+                 allow_unsandboxed_runner: bool = False,
                  unsandboxed_reason: str | None = None) -> dict:
     _ensure_project_state_or_refuse(root)
     _check_snapshot_preconditions(root)
@@ -844,15 +852,21 @@ def _prepare_run(root: Path, task_id: str, role: str, accept_flags: list[str],
         binding, allow_unsandboxed_runner, unsandboxed_reason)
     model = _runner_model(binding["backend"])
     cfg = load_config(root)
+    if (cfg.get("delegation") or {}).get("enabled") is not True:
+        raise WorkflowError(
+            "delegation is disabled by .waystone.yml delegation.enabled; re-run init consent "
+            "before enabling worktree/runner execution")
     packet, _acceptance = _build_packet(
-        load_tasks(root), task_id, accept_flags, root, retry_note=retry_note)
+        load_tasks(root), task_id, accept_flags, root, retry_note=retry_note,
+        routing_note=routing_note)
     if runner_override is not None:
         packet["runner_override"] = runner_override
     bindings = profile.get("bindings")
     verifier_bound = isinstance(bindings, dict) and "verifier" in bindings
     return {"task_id": task_id, "binding": binding, "model": model, "cfg": cfg,
             "packet": packet, "fingerprint": fingerprint, "accept_flags": list(accept_flags),
-            "retry_note": retry_note, "verifier_bound": verifier_bound,
+            "retry_note": retry_note, "routing_note": routing_note,
+            "verifier_bound": verifier_bound,
             "runner_override": runner_override}
 
 
@@ -861,7 +875,7 @@ def _claim_run(root: Path, plan: dict) -> tuple[str, Path]:
     try:
         current_packet, _acceptance = _build_packet(
             load_tasks(root), task_id, plan["accept_flags"], root,
-            retry_note=plan["retry_note"])
+            retry_note=plan["retry_note"], routing_note=plan["routing_note"])
         if plan["runner_override"] is not None:
             current_packet["runner_override"] = plan["runner_override"]
     except WorkflowError as e:
@@ -1012,11 +1026,12 @@ def _run_claimed(root: Path, plan: dict, did: str, record_dir: Path) -> int:
 
 
 def run_delegation(root: Path, task_id: str, role: str, accept_flags: list[str],
-                   retry_note: str | None = None, *, allow_unsandboxed_runner: bool = False,
+                   retry_note: str | None = None, routing_note: str | None = None, *,
+                   allow_unsandboxed_runner: bool = False,
                    unsandboxed_reason: str | None = None) -> int:
     """Library entry: prepare, claim, then run without acquiring flock; CLI owns lock placement."""
     plan = _prepare_run(
-        root, task_id, role, accept_flags, retry_note=retry_note,
+        root, task_id, role, accept_flags, retry_note=retry_note, routing_note=routing_note,
         allow_unsandboxed_runner=allow_unsandboxed_runner,
         unsandboxed_reason=unsandboxed_reason)
     did, record_dir = _claim_run(root, plan)
@@ -2152,7 +2167,7 @@ def _resolve_root(explicit: str | None) -> Path:
 
 def _cli_run(rest: list[str]) -> int:
     pos, opts = _parse_opts(
-        rest, value=("role", "root", "note", "reason"), repeat=("accept",),
+        rest, value=("role", "root", "note", "routing-note", "reason"), repeat=("accept",),
         boolean=("allow-unsandboxed-runner",))
     if not pos:
         raise WorkflowError("run requires a <task-id>")
@@ -2164,7 +2179,8 @@ def _cli_run(rest: list[str]) -> int:
     root = _resolve_root(opts.get("root"))
     plan = _prepare_run(
         root, pos[0], opts.get("role", "implementer"), opts.get("accept", []),
-        retry_note=opts.get("note"), allow_unsandboxed_runner=allow_unsandboxed,
+        retry_note=opts.get("note"), routing_note=opts.get("routing-note"),
+        allow_unsandboxed_runner=allow_unsandboxed,
         unsandboxed_reason=opts.get("reason"))
     # Constant-level lock span: only local task/overlay revalidation, owner scan, and one claim write.
     # Git preflight, profile/packet preparation, snapshot/worktree setup, and the runner stay outside.

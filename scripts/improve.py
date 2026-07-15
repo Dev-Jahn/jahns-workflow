@@ -950,7 +950,17 @@ def _round_session_binding(round_id: str, exposures: list[dict] | dict[str, dict
 def _review_sha_binding(request_file: Path | None, round_id: str, mode: str,
                         sidecars: list[dict]) -> tuple[str | None, str | None, str, str | None, str | None]:
     if mode == "pr":
-        return None, None, "unknown", "pr-comment-canonical-unavailable", None
+        pr_sidecars = [row for row in sidecars if row.get("mode") == "pr"]
+        if not pr_sidecars:
+            return None, None, "unknown", "missing-pr-freeze-sidecar", None
+        latest_cycle = max(row["cycle"] for row in pr_sidecars)
+        cycle_rows = [row for row in pr_sidecars if row["cycle"] == latest_cycle]
+        bindings = {(row["target_sha"], row["base_sha"]) for row in cycle_rows}
+        if len(bindings) != 1:
+            return None, None, "unknown", "conflicting-pr-freeze-sidecars", None
+        latest = max(cycle_rows, key=lambda row: (row["at"], row["_file"]))
+        return (latest["target_sha"], latest["base_sha"], "explicit", None,
+                "pr-freeze-sidecar")
     if request_file is None:
         return None, None, "unknown", "missing-review-request", None
     import review
@@ -989,7 +999,7 @@ def _review_sha_binding(request_file: Path | None, round_id: str, mode: str,
     return target_sha, base_sha, "explicit", None, "round-bound-request-marker"
 
 
-def _round_request_sidecars(rdir: Path) -> dict[str, list[dict]]:
+def _round_review_sidecars(rdir: Path) -> dict[str, list[dict]]:
     import review
 
     rows: dict[str, list[dict]] = {}
@@ -1005,6 +1015,22 @@ def _round_request_sidecars(rdir: Path) -> dict[str, list[dict]]:
                 or not isinstance(data.get("at"), str)):
             continue
         rows.setdefault(data["round_id"], []).append({**data, "_file": str(path)})
+    for path in sorted(rdir.glob("*-freeze-*.binding*.json")):
+        data = _load_record_mapping(path, "json")
+        if (data is None or data.get("schema") != review.PR_FREEZE_BINDING_SCHEMA
+                or not isinstance(data.get("round_id"), str)
+                or type(data.get("pr")) is not int or data["pr"] < 1
+                or not review._is_cycle(data.get("cycle"))
+                or not review._is_sha(data.get("target_sha"))
+                or not review._is_sha(data.get("base_sha"))
+                or not review._is_strlist(data.get("reviewers"))
+                or (data.get("profile_fingerprint") is not None
+                    and not review._nonempty_str(data.get("profile_fingerprint")))
+                or data.get("mode") != "pr"
+                or data.get("canonical_store") != "local-freeze-evidence"
+                or parse_iso_timestamp(data.get("at")) is None):
+            continue
+        rows.setdefault(data["round_id"], []).append({**data, "_file": str(path)})
     return rows
 
 
@@ -1017,7 +1043,7 @@ def _project_review_rows(name: str, root: Path, cfg: dict) -> list[dict]:
             request_files[p.stem[: -len("-request")]] = p
         for p in sorted(rdir.glob("*-feedback.md")):
             feedback_files[p.stem[: -len("-feedback")]] = p
-    request_sidecars = _round_request_sidecars(rdir)
+    request_sidecars = _round_review_sidecars(rdir)
     tasks_by_round = _finding_tasks_by_round(root)
     round_exposures, _exposures_skipped = _round_exposure_rows(root)
     latest_round_exposures = _latest_round_exposures(round_exposures)
@@ -1089,6 +1115,7 @@ def _project_review_rows(name: str, root: Path, cfg: dict) -> list[dict]:
             "session_id": session_id,
             "round_session_provenance": session_provenance,
             "round_session_reason": session_reason,
+            "routes": (latest_round_exposures.get(rid) or {}).get("routes") or [],
             "findings": findings,
             "counts": counts,
         })
@@ -1223,14 +1250,34 @@ def _latest_verdict_acceptance(record: Path) -> tuple[dict | None, int]:
     }, 0
 
 
-def _project_delegation_rows(root: Path) -> tuple[list[dict], int, int]:
+def _verification_run_projection(record: Path) -> tuple[list[dict], int]:
+    import delegate
+
+    try:
+        artifacts = delegate._verify_artifacts(record)
+    except WorkflowError:
+        return [], 1
+    runs = []
+    for number, artifact in sorted(artifacts.items()):
+        findings = artifact["payload"]["findings"]
+        judgments = sorted({_dumps(finding) for finding in findings})
+        digest = hashlib.sha256("\n".join(judgments).encode("utf-8")).hexdigest()
+        runs.append({
+            "number": number, "judgment_set_hash": f"sha256:{digest}",
+            "findings": len(judgments),
+        })
+    return runs, 0
+
+
+def _project_delegation_rows(root: Path) -> tuple[list[dict], int, int, int]:
     """Project task-linked delegation facts parsed directly from immutable/local record files."""
     rows: list[dict] = []
     skipped = 0
     verdicts_invalid = 0
+    verification_artifacts_invalid = 0
     directory = project_state_path(root) / "delegations"
     if not directory.is_dir():
-        return rows, skipped, verdicts_invalid
+        return rows, skipped, verdicts_invalid, verification_artifacts_invalid
     for record in sorted(directory.iterdir()):
         if not record.is_dir() or not ((record / "claim.json").exists()
                                       or (record / "exposure.json").exists()):
@@ -1248,6 +1295,8 @@ def _project_delegation_rows(root: Path) -> tuple[list[dict], int, int]:
         report = (contract or {}).get("delegate_report") or {}
         acceptance, verdict_skipped = _latest_verdict_acceptance(record)
         verdicts_invalid += verdict_skipped
+        verification_runs, verify_skipped = _verification_run_projection(record)
+        verification_artifacts_invalid += verify_skipped
         row = {
             "task_id": exposure["task_id"], "did": record.name, "state": status.get("state"),
             "verification_present": (
@@ -1257,11 +1306,13 @@ def _project_delegation_rows(root: Path) -> tuple[list[dict], int, int]:
             "overlays_active": exposure.get("overlays") if isinstance(exposure.get("overlays"), list) else [],
             "binding": exposure.get("binding") if isinstance(exposure.get("binding"), dict) else None,
         }
+        if verification_runs:
+            row["verification_runs"] = verification_runs
         if acceptance is not None:
             row["acceptance"] = acceptance
         rows.append(row)
     rows.sort(key=lambda row: row["did"])
-    return rows, skipped, verdicts_invalid
+    return rows, skipped, verdicts_invalid, verification_artifacts_invalid
 
 
 def _project_task_rows(root: Path) -> list[dict]:
@@ -1490,6 +1541,47 @@ def _recent_round_trend(phase_rows: dict[str, list[dict]],
     return trend[-5:]
 
 
+def _staleness_change_events(root: Path, latest_exposures: list[dict]) \
+        -> tuple[list[tuple[str, str]], dict]:
+    """Observed fingerprint transitions plus a latest-exposure/current-state mismatch cutoff."""
+    fields = (
+        ("config_fingerprint", "config-fingerprint-changed",
+         Path(root) / ".waystone.yml", "current-config-fingerprint-mismatch"),
+        ("committed_policy_fingerprint", "committed-policy-fingerprint-changed",
+         Path(root) / "docs" / "waystone-policy.yaml",
+         "current-committed-policy-fingerprint-mismatch"),
+        ("routing_policy_fingerprint", "routing-policy-fingerprint-changed",
+         Path(__file__).resolve().parent.parent / "templates" / "routing-policy.yaml",
+         "current-routing-policy-fingerprint-mismatch"),
+    )
+    events: list[tuple[str, str]] = []
+    coverage: dict[str, object] = {}
+    for field, transition_reason, path, mismatch_reason in fields:
+        sentinel = object()
+        previous = sentinel
+        for exposure in latest_exposures:
+            if field not in exposure:
+                continue
+            current = exposure.get(field)
+            if previous is not sentinel and previous != current:
+                events.append((exposure["at"], transition_reason))
+            previous = current
+        coverage[f"{field}_snapshots"] = sum(field in row for row in latest_exposures)
+        try:
+            current_fingerprint = (
+                "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+                if path.is_file() else None)
+            current_known = True
+        except OSError:
+            current_fingerprint = None
+            current_known = False
+        coverage[f"current_{field}_known"] = current_known
+        if (latest_exposures and current_known and field in latest_exposures[-1]
+                and latest_exposures[-1].get(field) != current_fingerprint):
+            events.append((latest_exposures[-1]["at"], mismatch_reason))
+    return events, coverage
+
+
 def _adaptive_feedback_observation(name: str, root: Path, reviews: list[dict],
                                    warnings: list[dict], exposures: list[dict],
                                    warning_context_unknown: dict[str, int]) -> dict:
@@ -1651,7 +1743,7 @@ def _adaptive_feedback_observation(name: str, root: Path, reviews: list[dict],
 
     # An environment snapshot change makes only earlier evidence stale. Current-state mismatches are
     # bounded by the latest immutable exposure: deltas newer than that point remain unknown, not stale.
-    change_events: list[tuple[str, str]] = []
+    change_events, setting_coverage = _staleness_change_events(root, latest_exposures)
     for field, reason in (("profile_fingerprint", "profile-fingerprint-changed"),
                           ("env_prep", "delegation-env-prep-changed")):
         sentinel = object()
@@ -1710,6 +1802,7 @@ def _adaptive_feedback_observation(name: str, root: Path, reviews: list[dict],
             "current_profile_known": current_profile_known,
             "profile_snapshots": sum("profile_fingerprint" in row for row in latest_exposures),
             "env_prep_snapshots": sum("env_prep" in row for row in latest_exposures),
+            **setting_coverage,
             "accept_delta_conflicts": dict(sorted(join_conflicts.items())),
             "warning_context_unknown": dict(sorted(warning_context_unknown.items())),
         },
@@ -1852,7 +1945,7 @@ def _round_exposure_projection(task: dict, exposures: list[dict] | dict[str, dic
     if match is None:
         return None
     return {key: match.get(key) for key in (
-        "round_id", "at", "session_id", "head_sha", "overlays_active", "bindings")}
+        "round_id", "at", "session_id", "head_sha", "overlays_active", "bindings", "routes")}
 
 
 def _task_acceptance(task: dict, delegations: list[dict],
@@ -1896,6 +1989,7 @@ def run_evidence(registry_path: Path, out_dir: Path, projects: set[str],
     adaptive_observations: list[dict] = []
     warning_rows_skipped = round_exposures_skipped = 0
     task_session_unknown = acceptance_approximations = 0
+    verification_artifacts_invalid = 0
     normalized_warnings: list[dict] = []
     warning_context_coverage: Counter = Counter()
 
@@ -1923,9 +2017,11 @@ def run_evidence(registry_path: Path, out_dir: Path, projects: set[str],
         exposures, exposure_skipped = _round_exposure_rows(root)
         latest_exposures = _latest_round_exposures(exposures)
         warnings, warning_skipped, warnings_present = _load_warning_rows(root)
-        delegations, n_skipped, n_verdicts_invalid = _project_delegation_rows(root)
+        delegations, n_skipped, n_verdicts_invalid, n_verify_invalid = (
+            _project_delegation_rows(root))
         delegation_skipped += n_skipped
         verdicts_invalid += n_verdicts_invalid
+        verification_artifacts_invalid += n_verify_invalid
         did_to_task = {delegation["did"]: delegation["task_id"] for delegation in delegations}
         project_warnings, context_unknown = _normalize_warning_rows(warnings, did_to_task)
         warning_context_coverage.update(context_unknown)
@@ -1949,6 +2045,8 @@ def run_evidence(registry_path: Path, out_dir: Path, projects: set[str],
                     "round": task.get("round"), "session_id": session_id,
                     "acceptance_criteria": len(task.get("accept") or [])
                         if isinstance(task.get("accept"), list) else 0,
+                    "declared_scope_count": len(task.get("scope") or [])
+                        if isinstance(task.get("scope"), list) else 0,
                     "anchor": task.get("anchor"),
                 },
             }
@@ -1964,7 +2062,8 @@ def run_evidence(registry_path: Path, out_dir: Path, projects: set[str],
                     "join_key": "task-id", "provenance": "explicit",
                     "task_status": task_statuses.get(task_id),
                     "task_context": {"round": None, "session_id": None,
-                                     "acceptance_criteria": 0, "anchor": None},
+                                     "acceptance_criteria": 0, "declared_scope_count": 0,
+                                     "anchor": None},
                 })
                 projected_finding = {
                     "round": review.get("round_id"), "severity": finding.get("severity"),
@@ -1983,7 +2082,8 @@ def run_evidence(registry_path: Path, out_dir: Path, projects: set[str],
                 "join_key": "task-id", "provenance": "explicit",
                 "task_status": task_statuses.get(task_id),
                 "task_context": {"round": None, "session_id": None,
-                                 "acceptance_criteria": 0, "anchor": None},
+                                 "acceptance_criteria": 0, "declared_scope_count": 0,
+                                 "anchor": None},
             })
             row["delegations"].append({key: value for key, value in delegation.items()
                                        if key != "task_id"})
@@ -2029,6 +2129,7 @@ def run_evidence(registry_path: Path, out_dir: Path, projects: set[str],
         "unlinked_findings": unlinked,
         "delegations_skipped": delegation_skipped,
         "verdicts_invalid": verdicts_invalid,
+        "verification_artifacts_invalid": verification_artifacts_invalid,
         "warning_rows_skipped": warning_rows_skipped,
         "round_exposures_skipped": round_exposures_skipped,
         "task_session_unknown": task_session_unknown,
@@ -2304,6 +2405,9 @@ def _lens_delegation_opportunity(sessions: list[dict], evidence_rows: list[dict]
         input_tokens = (session.get("usage") or {}).get("input", 0)
         evaluated_by_project[project] += 1
         triggered_by = []
+        if (context.get("acceptance_criteria", 0) > 0
+                and context.get("declared_scope_count", 0) > 0 and direct_work > 0):
+            triggered_by.append("delegable-direct-work")
         if direct_work >= DELEGATION_DIRECT_WORK_MIN:
             triggered_by.append("direct-work-size")
         if retries > 0:
@@ -2502,10 +2606,8 @@ def _lens_review_association(reviews: list[dict]) -> dict:
 
 
 def _session_role(session: dict) -> str:
-    """Only the canonical main execution is role-bearing without a task/delegation work join."""
-    if session.get("kind") == "main":
-        return "main"
-    return "unknown"
+    """Classify only the canonical main execution; execution labels are never profile roles."""
+    return "main" if session.get("kind") == "main" else "unknown"
 
 
 def _lens_finding_concentration(reviews: list[dict], sessions: list[dict]) -> dict:
@@ -2531,12 +2633,22 @@ def _lens_finding_concentration(reviews: list[dict], sessions: list[dict]) -> di
         round_session_unknown = 0
         for row in rows:
             findings = row.get("findings") or []
-            session_id = row.get("session_id")
-            matches = (session_index.get((project, session_id), [])
-                       if isinstance(session_id, str) else [])
-            role = _session_role(matches[0]) if len(matches) == 1 else "unknown"
-            session_kind = (matches[0].get("kind") if len(matches) == 1
-                            and isinstance(matches[0].get("kind"), str) else "unknown")
+            routes = [route for route in (row.get("routes") or [])
+                      if isinstance(route, dict) and isinstance(route.get("role"), str)
+                      and route.get("provenance") == "main-session"]
+            routed_roles = sorted({route["role"] for route in routes})
+            if len(routed_roles) == 1:
+                role = routed_roles[0]
+                executions = sorted({str(route.get("execution")) for route in routes})
+                session_kind = (f"host-guided:{executions[0]}" if len(executions) == 1
+                                else "host-guided:mixed")
+            else:
+                role = "unknown"
+                session_id = row.get("session_id")
+                matches = (session_index.get((project, session_id), [])
+                           if isinstance(session_id, str) else [])
+                session_kind = (matches[0].get("kind") if len(matches) == 1
+                                and isinstance(matches[0].get("kind"), str) else "unknown")
             if role == "unknown":
                 round_session_unknown += 1
             for finding in findings:
@@ -2682,7 +2794,9 @@ def _lens_evidence_link(rows: list[dict]) -> dict:
 
 def _maturity_decision_snapshot(path: Path) -> tuple[int, bool]:
     if not path.is_file():
-        return 0, False
+        # A project has no decision log before its first recommendation choice. Absence is a
+        # complete zero-count Bootstrap input; an existing malformed file below is degraded.
+        return 0, True
     count = 0
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -2772,16 +2886,26 @@ def _write_maturity_state(root: Path, counts: dict[str, int], stage: str) -> dic
 
 def _maturity_fact(root: Path, data: dict[str, object], in_dir: Path,
                    present: dict[str, bool]) -> dict:
-    degraded_inputs = [key for key in ("sessions", "delegations", "reviews")
-                       if not present.get(key)
-                       or not isinstance(data.get(key), list)
-                       or any(not isinstance(row, dict) for row in data.get(key, []))]
+    previous = _load_maturity_state(root)
+    degraded_inputs = []
+    for key in ("sessions", "delegations", "reviews"):
+        fresh_absent = (key == "reviews" and not (in_dir / "reviews.jsonl").exists()
+                        and previous is None)
+        if fresh_absent:
+            continue
+        rows = data.get(key)
+        if (not present.get(key) or not isinstance(rows, list)
+                or any(not isinstance(row, dict) for row in rows)):
+            degraded_inputs.append(key)
     _decision_count, decisions_complete = _maturity_decision_snapshot(
         in_dir / "decisions.jsonl")
-    if not decisions_complete:
+    decision_log_missing_after_activity = (
+        not (in_dir / "decisions.jsonl").exists()
+        and previous is not None
+        and int((previous.get("counts") or {}).get("decisions", 0)) > 0)
+    if not decisions_complete or decision_log_missing_after_activity:
         degraded_inputs.append("decisions")
     if degraded_inputs:
-        previous = _load_maturity_state(root)
         stage = previous.get("current_stage") if previous is not None else None
         return {
             "stage": stage,
@@ -2794,7 +2918,6 @@ def _maturity_fact(root: Path, data: dict[str, object], in_dir: Path,
         }
     counts = maturity_counts(data, in_dir)
     stage = maturity_stage(counts)
-    previous = _load_maturity_state(root)
     transitioned = previous is None or previous.get("current_stage") != stage
     _write_maturity_state(root, counts, stage)
     strength = {"bootstrap": "soft", "calibrate": "soft", "tune": "tuned"}[stage]
@@ -2933,6 +3056,8 @@ _METRIC_INPUTS = {
 
 _METRIC_FIRST_MEASURED = {
     "quality.finding_recurrence_rate": "0.8.0",
+    "quality.severe_finding_recurrence_rate": "0.8.0",
+    "quality.verification_finding_trend": "0.8.0",
     "quality.reopen_count": "0.8.0",
     "quality.remediation_round_burden": "0.8.0",
     "quality.post_acceptance_defect_rate": "0.8.0",
@@ -2940,6 +3065,8 @@ _METRIC_FIRST_MEASURED = {
     "delegation_effectiveness.useful_artifact_rate": "0.8.0",
     "delegation_effectiveness.adaptive_before_after_trend": "0.8.0",
     "delegation_effectiveness.opportunity_adjusted_useful_artifact_rate": "0.8.0",
+    "delegation_effectiveness.main_direct_work": "0.7.0",
+    "delegation_effectiveness.main_context_inflow": "0.7.0",
     "reproducibility_environment.environment_failure_rate": "0.8.0",
     "reproducibility_environment.ad_hoc_manifest_mutation_fire_rate": "0.8.0",
     "reproducibility_environment.acceptance_reproducibility": "0.8.0",
@@ -2948,6 +3075,8 @@ _METRIC_FIRST_MEASURED = {
     "governance.decision_acceptance_rate": "0.7.0",
     "governance.decision_rejection_rate": "0.7.0",
     "governance.rejected_materialization_suppression_rate": "0.8.0",
+    "governance.repeated_warning_exposure_count": "0.8.0",
+    "governance.retained_delta_count": "0.8.0",
     "governance.waiver_rate": "0.9.0",
     "governance.hard_block_rate": "0.9.0",
 }
@@ -3051,10 +3180,13 @@ def _quality_metrics(reviews: list[dict] | None,
         return {
             name: _unavailable_metric(f"{group}.{name}", "reviews projection unavailable", missing)
             for name in ("finding_recurrence_rate", "reopen_count",
-                         "remediation_round_burden", "post_acceptance_defect_rate")
+                         "remediation_round_burden", "post_acceptance_defect_rate",
+                         "severe_finding_recurrence_rate", "verification_finding_trend")
         }
 
     type_rounds: dict[tuple[str, str], set[str]] = {}
+    severe_type_rounds: dict[tuple[str, str], set[str]] = {}
+    verification_by_round: Counter = Counter()
     total_findings = verified_typed = unknown_type = non_real = 0
     reopen_by_task: dict[tuple[str, str], int] = {}
     remediation_by_task: dict[tuple[str, str], set[str]] = {}
@@ -3065,6 +3197,8 @@ def _quality_metrics(reviews: list[dict] | None,
             continue
         project = str(review_row.get("project") or "")
         round_id = review_row.get("round_id")
+        if isinstance(round_id, str):
+            verification_by_round[(project, round_id)] += 0
         round_at = parse_iso_timestamp(review_row.get("round_at"))
         if round_at is None:
             review_rounds_without_time += 1
@@ -3081,6 +3215,10 @@ def _quality_metrics(reviews: list[dict] | None,
                     type_rounds.setdefault((project, finding_type), set()).add(round_id)
                 if round_at is not None:
                     review_events.append((project, round_at, finding_type))
+                if finding.get("severity") in ("blocker", "major") and isinstance(round_id, str):
+                    severe_type_rounds.setdefault((project, finding_type), set()).add(round_id)
+                if finding_type == "verification" and isinstance(round_id, str):
+                    verification_by_round[(project, round_id)] += 1
             elif finding.get("status") == "REAL":
                 unknown_type += 1
             else:
@@ -3111,6 +3249,35 @@ def _quality_metrics(reviews: list[dict] | None,
     recurrence = _rate_metric(
         f"{group}.finding_recurrence_rate", recurrences, type_round_observations,
         recurrence_coverage, "inferred", "no verified REAL taxonomy type-round observations")
+
+    severe_observations = sum(len(rounds) for rounds in severe_type_rounds.values())
+    severe_recurrences = sum(max(len(rounds) - 1, 0)
+                             for rounds in severe_type_rounds.values())
+    severe_recurrence = _rate_metric(
+        f"{group}.severe_finding_recurrence_rate", severe_recurrences,
+        severe_observations,
+        {"verified_severe_type_round_observations": severe_observations,
+         "rule": "same-severe-type-across-rounds-v1"},
+        "inferred", "no verified severe taxonomy type-round observations")
+
+    verification_rounds = sorted(verification_by_round)
+    if len(verification_rounds) < 2:
+        verification_trend = _unavailable_metric(
+            f"{group}.verification_finding_trend",
+            "fewer than two rounds with verified verification findings",
+            {"rounds_with_verification_findings": len(verification_rounds)})
+    else:
+        first_key, last_key = verification_rounds[0], verification_rounds[-1]
+        first_count = verification_by_round[first_key]
+        last_count = verification_by_round[last_key]
+        verification_trend = _metric_record(
+            f"{group}.verification_finding_trend",
+            {"first": first_count, "last": last_count, "delta": last_count - first_count},
+            last_count, first_count,
+            {"first_project": first_key[0], "first_round": first_key[1],
+             "last_project": last_key[0], "last_round": last_key[1],
+             "rounds_with_verification_findings": len(verification_rounds)},
+            "observed")
 
     reopen_denominator = len(reopen_by_task)
     reopen_total = sum(reopen_by_task.values())
@@ -3176,6 +3343,8 @@ def _quality_metrics(reviews: list[dict] | None,
             "observed", "no explicit accepted task/type baselines")
     return {
         "finding_recurrence_rate": recurrence,
+        "severe_finding_recurrence_rate": severe_recurrence,
+        "verification_finding_trend": verification_trend,
         "reopen_count": reopen,
         "remediation_round_burden": remediation,
         "post_acceptance_defect_rate": post,
@@ -3186,6 +3355,32 @@ def _delegation_metrics(sessions: list[dict] | None, delegations: list[dict] | N
                         evidence: list[dict] | None,
                         adaptive: list[dict] | None) -> dict[str, dict]:
     group = "delegation_effectiveness"
+    if sessions is None:
+        main_direct_work = _unavailable_metric(
+            f"{group}.main_direct_work", "sessions projection unavailable",
+            {"sessions_available": False})
+        main_context_inflow = _unavailable_metric(
+            f"{group}.main_context_inflow", "sessions projection unavailable",
+            {"sessions_available": False})
+    else:
+        main_sessions = [row for row in sessions
+                         if isinstance(row, dict) and row.get("kind") == "main"]
+        direct_work = sum(_direct_work(row) for row in main_sessions)
+        input_tokens = sum((row.get("usage") or {}).get("input", 0)
+                           for row in main_sessions
+                           if type((row.get("usage") or {}).get("input", 0)) is int)
+        result_bytes = sum((row.get("context_heavy") or {}).get("max_result_bytes", 0)
+                           for row in main_sessions
+                           if type((row.get("context_heavy") or {}).get(
+                               "max_result_bytes", 0)) is int)
+        main_direct_work = _metric_record(
+            f"{group}.main_direct_work", direct_work, direct_work, len(main_sessions),
+            {"main_sessions": len(main_sessions), "lens_rule": "main-direct-work-v1"},
+            "observed")
+        main_context_inflow = _metric_record(
+            f"{group}.main_context_inflow", input_tokens, input_tokens, len(main_sessions),
+            {"main_sessions": len(main_sessions), "max_result_bytes_total": result_bytes,
+             "lens_rule": "context-heavy-v2"}, "observed")
     if delegations is None:
         completion = _unavailable_metric(
             f"{group}.completion_rate", "delegations projection unavailable",
@@ -3291,6 +3486,8 @@ def _delegation_metrics(sessions: list[dict] | None, delegations: list[dict] | N
              "policy_deltas": len(adaptive_deltas)},
             adaptive_coverage, "observed")
     return {
+        "main_direct_work": main_direct_work,
+        "main_context_inflow": main_context_inflow,
         "completion_rate": completion,
         "useful_artifact_rate": useful_artifact,
         "adaptive_before_after_trend": adaptive_trend,
@@ -3358,10 +3555,33 @@ def _environment_metrics(evidence: list[dict] | None,
             f"{group}.ad_hoc_manifest_mutation_fire_rate", mutation_fires, len(evaluable),
             mutation_coverage, "observed", "no evaluable env-manifest-mutation opportunities")
 
-    reproducibility = _unavailable_metric(
-        f"{group}.acceptance_reproducibility",
-        "verify rerun comparison data unavailable",
-        {"verify_rerun_pairs": 0, "comparison_source_available": False})
+    comparison_pairs = []
+    for delegation in delegations:
+        runs = delegation.get("verification_runs")
+        if not isinstance(runs, list) or len(runs) < 2:
+            continue
+        valid = [run for run in runs if isinstance(run, dict)
+                 and type(run.get("number")) is int
+                 and isinstance(run.get("judgment_set_hash"), str)]
+        valid.sort(key=lambda run: run["number"])
+        comparison_pairs.extend(
+            (delegation.get("did"), before["number"], after["number"],
+             before["judgment_set_hash"] == after["judgment_set_hash"])
+            for before, after in zip(valid, valid[1:]))
+    reproducible_pairs = sum(pair[3] for pair in comparison_pairs)
+    repro_coverage = {
+        "verify_rerun_pairs": len(comparison_pairs),
+        "delegations_with_verify_reruns": len({pair[0] for pair in comparison_pairs}),
+        "comparison_source_available": evidence is not None,
+        "comparison_rule": "adjacent-verifier-judgment-set-v1",
+    }
+    reproducibility = (_rate_metric(
+        f"{group}.acceptance_reproducibility", reproducible_pairs,
+        len(comparison_pairs), repro_coverage, "observed",
+        "no delegation has at least two valid verify artifacts")
+        if evidence is not None else _unavailable_metric(
+            f"{group}.acceptance_reproducibility", "evidence projection unavailable",
+            repro_coverage))
     return {
         "environment_failure_rate": environment_failure,
         "ad_hoc_manifest_mutation_fire_rate": mutation,
@@ -3395,6 +3615,24 @@ def _governance_metrics(evidence: list[dict] | None, warnings: list[dict] | None
         conflict_coverage, "observed") if warning_known else _unavailable_metric(
             f"{group}.guard_conflict_count", "normalized warning source unavailable",
             conflict_coverage))
+
+    repeated_groups: Counter = Counter()
+    for row in warnings or []:
+        if not isinstance(row, dict) or row.get("event") != "fire":
+            continue
+        identity = row.get("policy_identity")
+        identity_key = (_dumps(identity) if isinstance(identity, dict) else "unknown")
+        repeated_groups[(str(row.get("project") or ""), str(row.get("rule") or ""),
+                         identity_key)] += 1
+    repeated = sum(max(count - 1, 0) for count in repeated_groups.values())
+    repeated_warning = (_metric_record(
+        f"{group}.repeated_warning_exposure_count", repeated, repeated,
+        sum(repeated_groups.values()),
+        {**warning_coverage, "distinct_warning_identities": len(repeated_groups),
+         "rule": "same-rule-policy-identity-fire-v1"}, "observed")
+        if warning_known else _unavailable_metric(
+            f"{group}.repeated_warning_exposure_count",
+            "normalized warning source unavailable", warning_coverage))
 
     latest: dict[str, dict] = {}
     for decision in decisions:
@@ -3452,6 +3690,20 @@ def _governance_metrics(evidence: list[dict] | None, warnings: list[dict] | None
             f"{group}.rejected_materialization_suppression_rate", suppressed, rejected,
             suppression_coverage, "observed", "no rejected effective decisions")
 
+    adaptive_deltas = [delta for row in adaptive or []
+                       for delta in (((row.get("facts") or {}).get("deltas") or [])
+                                     if isinstance(row, dict) else [])
+                       if isinstance(delta, dict)]
+    retained = sum(delta.get("status") in ("observing", "warning")
+                   for delta in adaptive_deltas)
+    retained_delta = (_metric_record(
+        f"{group}.retained_delta_count", retained, retained, len(adaptive_deltas),
+        {"adaptive_feedback_available": True, "policy_deltas": len(adaptive_deltas),
+         "retained_statuses": ["observing", "warning"]}, "observed")
+        if adaptive is not None else _unavailable_metric(
+            f"{group}.retained_delta_count", "adaptive feedback observations unavailable",
+            {"adaptive_feedback_available": False}))
+
     enforce_coverage = {"source_available": False, "enforce_arc_shipped": False}
     waiver = _unavailable_metric(
         f"{group}.waiver_rate", "enforce arc not shipped", enforce_coverage)
@@ -3460,9 +3712,11 @@ def _governance_metrics(evidence: list[dict] | None, warnings: list[dict] | None
     return {
         "guard_fire_rate": guard_fire,
         "guard_conflict_count": guard_conflict,
+        "repeated_warning_exposure_count": repeated_warning,
         "decision_acceptance_rate": decision_acceptance,
         "decision_rejection_rate": decision_rejection,
         "rejected_materialization_suppression_rate": suppression,
+        "retained_delta_count": retained_delta,
         "waiver_rate": waiver,
         "hard_block_rate": hard_block,
     }
