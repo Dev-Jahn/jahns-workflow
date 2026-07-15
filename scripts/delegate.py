@@ -38,7 +38,7 @@ import yaml  # noqa: E402
 
 from common import (  # noqa: E402
     WorkflowError, _project_slug, ensure_project_state_dir, find_project_root, git_full_sha,
-    load_config, load_tasks, project_state_path, worktrees_cache_dir,
+    load_config, load_tasks, migrate_project_state, project_state_path, worktrees_cache_dir,
 )
 
 DELEG_REF_NS = "refs/waystone/delegations"
@@ -1132,6 +1132,7 @@ def _resolve_root(explicit: str | None) -> Path:
     root = Path(explicit).resolve() if explicit else find_project_root(Path.cwd())
     if root is None:
         raise WorkflowError("no initialized project (run inside one, or pass --root DIR)")
+    migrate_project_state(root)
     return root
 
 

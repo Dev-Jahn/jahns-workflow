@@ -211,8 +211,48 @@ def _project_main(argv: list[str]) -> int:
         return 2
 
 
+def _migrate_command_project(argv: list[str]) -> None:
+    """Run lazy Phase 2 for the project addressed by this CLI invocation, including explicit paths."""
+    candidates = [Path.cwd()]
+    group, rest = argv[0], argv[1:]
+    if "--root" in rest:
+        index = rest.index("--root")
+        if index + 1 < len(rest):
+            candidates.append(Path(rest[index + 1]).expanduser())
+    positional_root_groups = {
+        "validate", "task", "roadmap", "ssot", "remote", "review", "approve",
+        "round", "lanes", "resume", "project",
+    }
+    if group in positional_root_groups:
+        for index, arg in enumerate(rest):
+            if arg.startswith("-") or (index > 0 and rest[index - 1].startswith("-")):
+                continue
+            candidate = Path(arg).expanduser()
+            try:
+                if candidate.exists():
+                    candidates.append(candidate.parent if candidate.is_file() else candidate)
+            except OSError:
+                continue
+    seen: set[Path] = set()
+    for candidate in candidates:
+        root = common.find_project_root(candidate)
+        if root is None or root in seen:
+            continue
+        seen.add(root)
+        common.migrate_project_state(root)
+
+
 def main(argv: list[str]) -> int:
-    common.migrate_home_data()
+    try:
+        common.migrate_home_data()
+        if argv:
+            _migrate_command_project(argv)
+    except common.WorkflowError as e:
+        print(f"waystone migration: {e}", file=sys.stderr)
+        return 1
+    except OSError as e:
+        print(f"waystone migration: filesystem failure: {e}", file=sys.stderr)
+        return 2
     if not argv:
         print(__doc__, file=sys.stderr)
         return 1
