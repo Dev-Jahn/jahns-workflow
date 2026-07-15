@@ -148,6 +148,7 @@ Most validation, rendering, bookkeeping, log parsing, and policy checks are plai
 | `waystone paths` | Shows the resolved project-state, machine-state, and worktree-cache locations. |
 | `waystone project` | Registers, unregisters, and lists projects through the machine-wide registry. |
 | `waystone delegate verify` | Re-runs independent read-only verification of a delegation result in its preserved worktree. |
+| `waystone delegate verdict` | Records the main session's evidence-backed apply or discard decision before resolution. |
 | `waystone overlay` | Stores project-local adaptive checks and manages their observing/warning lifecycle; promotion to warning requires deterministic shadow replay. |
 | `waystone check` | Evaluates active overlay rules against the current project state; warnings are visible but never block the host command. |
 | `waystone improve evidence` | Deterministically joins review findings and delegation records by task ID into a local evidence log. |
@@ -171,19 +172,36 @@ Reviewer comments are treated as claims, not facts. The `review` skill checks th
 
 ## Delegate a task without losing control
 
-The `delegate` skill is for a task with explicit success criteria. Waystone then:
+The `delegate` skill autonomously closes one task whose success criteria are already recorded or can
+be derived exactly from owner-authored project material. Waystone then:
 
-1. fixes the current repository state as an immutable snapshot, including uncommitted work;
-2. creates a separate Git worktree and prepares the environment from the project's lockfiles or configured setup command;
-3. sends the bounded task to the configured external implementer;
-4. computes the resulting patch and changed-file list directly from Git;
-5. keeps the worker's own verification and risk report clearly labeled as a claim;
-6. optionally runs a separate read-only verifier (`waystone delegate verify`);
-7. asks you to apply or discard the patch.
+1. selects an actionable task and, when necessary, records owner-derived criteria through `waystone task set <id> --accept-add` before the run;
+2. fixes the current repository state as an immutable snapshot, including uncommitted work, then runs the configured implementer in a separate Git worktree;
+3. computes the patch and changed-file list directly from Git while keeping the worker's own verification and risk report labeled as a claim;
+4. always produces verification evidence — through `waystone delegate verify` when a verifier is bound, or focused commands in the normalized worktree otherwise;
+5. records a criterion-by-criterion decision with `waystone delegate verdict`, then applies it or discards it with a recorded `--reason`;
+6. reports the result, evidence, warnings, retries, and one pointer to the preserved record and undo information.
 
-The worker and verifier never own final approval — the main session and the user retain that decision.
+The main session owns the routine decision and records every acceptance with cited evidence. The user
+audits that record. Worker claims never become facts merely because their report exists, and a missing
+worker report never means verification was absent.
 
-The current v0.8 runner is Codex-backed, but Waystone stores bindings by responsibility (`implementer`, `verifier`) rather than baking model names into the workflow. Bindings live in the project's uncommitted `{project_root}/.waystone/profile.yml`. A verifier binding normally omits `execution`, allowing Waystone to derive the transport from the current host. Waystone refuses to guess a model when the profile is missing.
+The autonomous loop keeps the existing safety rails: one nonterminal delegation per task, required
+criteria and valid profile bindings, read-only independent verification, a bounded
+`waystone delegate show --failure` diagnostic, at most two run attempts with retry context recorded by
+`--note`, an atomic plain patch apply, and permanent records. It does not read the full runner log or
+silently substitute a model, verification path, 3-way apply, or stash operation. Recorded override
+flags require `--reason`; a main-session blocker override also has to cite direct checks that refute
+each blocker.
+
+Human input is reserved for nine cases: criteria cannot be derived without invention; the profile or
+binding is unusable; an apply judgment still has an unrefuted blocker; two attempts are exhausted; a
+verifier transport fails again after one retry; apply drift is not wholly caused by the current
+session; the runner failure is deterministic; warning rules conflict; or you explicitly request a
+review. When drift touches your uncommitted work, Waystone never commits or stashes it — it reports the
+state and waits. In every other case the main session continues through verdict and apply or discard.
+
+The current runner is Codex-backed, but Waystone stores bindings by responsibility (`implementer`, `verifier`) rather than baking model names into the workflow. Bindings live in the project's uncommitted `{project_root}/.waystone/profile.yml`. A verifier binding normally omits `execution`, allowing Waystone to derive the transport from the current host. Waystone refuses to guess a model when the profile is missing.
 
 <br>
 

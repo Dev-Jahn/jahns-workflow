@@ -150,27 +150,31 @@ brought back through an explicit artifact contract. The invariants:
   commit object under `refs/waystone/delegations/<id>` (never pushed), not a commit on your branch. A
   clean tree uses HEAD directly. Submodules, an unborn HEAD, or an in-progress merge/rebase/
   cherry-pick are refused (they would bake a partial or conflicted state into the base).
-- **Harness computes; the runner claims.** The patch, changed-files list, and base/result SHAs are
-  computed by the harness from git directly (explicit provenance). The runner's own report —
-  verification it ran, limitations, risks, escalations (written to `JW_REPORT.yaml`) — is carried
-  through the contract labeled *delegate-claimed* and is never promoted to fact.
+- **Provenance stays explicit.** There are four kinds: *harness-computed* patch, changed-file, and
+  base/result facts; *delegate-claimed* verification, limitations, risks, and escalations from the
+  runner report; *independent-verifier* findings from `waystone delegate verify`; and the
+  *main-session* decision in `verdict-N.json`. Delegate-claimed content is never promoted to fact,
+  and an absent runner report is a reporting absence rather than proof that no verification happened.
 - **Role sandboxes are fixed, not user knobs.** The implementer runs `workspace-write`; the verifier
-  runs `read-only` through the host-derived transport. `waystone delegate verify` records its payload as
-  *independent-verifier* evidence and leaves the delegation `needs-review` — only the user chooses
-  apply or discard. A per-record `verify.lock` admits only one verifier at a time. The OS releases
-  the lock if its process dies; an unlocked leftover marker is stale and reclaimed on the next try.
-- **You accept or discard.** A finished delegation is `needs-review`, its worktree preserved so a
-  verifier can run the acceptance criteria against the same base. `waystone delegate apply` lands the
-  patch on the live tree with plain `git apply` (it fails atomically if the tree has drifted from
-  the base — nothing is partially applied); `waystone delegate discard` throws it away. Both keep the
-  record directory as history. Until one of them runs, that task is locked against a second
-  delegation (single mutation owner) — a failed env/runner leaves the worktree as evidence and
-  holds the lock too, so `discard` is how you clear it.
-- **Acceptance criteria are required, never invented.** A delegated task must carry an `accept:`
-  field (a YAML list of free-text criteria, edited in `tasks.yaml` directly) or be given
-  `--accept` at delegation time. With neither, delegation is refused — the harness does not make up
-  the bar. `accept` is deliberately not settable through `waystone task add/set` (comma-splitting free
-  text would distort it).
+  runs `read-only` through the host-derived transport. Verification leaves the delegation
+  `needs-review`. The per-record `record.lock` serializes verify, verdict, apply, and discard; the OS
+  releases the lock if its process dies.
+- **The main session judges; the user audits.** `waystone delegate verdict` compares the packet's
+  recorded criteria with harness-computed, independent-verifier, and bounded direct-check evidence.
+  Every acceptance cites concrete evidence and is recorded with *main-session* provenance before
+  apply. A user decision after escalation passes through the same verdict gate with `decided_by:
+  user`; it does not bypass the audit record.
+- **A recorded decision resolves the worktree.** A finished delegation is `needs-review`, with its
+  worktree preserved against the same base until resolution. `waystone delegate apply` accepts only
+  an apply verdict and lands the patch with plain `git apply`; drift fails atomically, with nothing
+  partially applied. `waystone delegate discard --reason` records rejection or cleanup rationale.
+  Both preserve the record directory as history. Until one runs, the task remains locked against a
+  second delegation.
+- **Acceptance criteria are required, never invented.** A delegated task must carry an `accept:` YAML
+  list or receive an explicit ad-hoc `--accept` at delegation time. Criteria synthesized by the main
+  session are allowed only when owner-authored task, ROADMAP, SSOT, or review material determines the
+  bar, and must be persisted before the run with repeated `waystone task set <id> --accept-add` calls.
+  With no real criterion, delegation is refused.
 
 Delegation records live project-local (`{project_root}/.waystone/delegations/…`) and worktrees live
 under `~/.waystone/cache/worktrees/…`; neither is committed. The runner backend (model) is bound

@@ -8182,17 +8182,20 @@ class MigrationTests(unittest.TestCase):
 class M2DocsTests(unittest.TestCase):
     """0.8.0 M2 C7 — guided skills and public operating-surface documentation."""
 
-    def test_delegate_skill_preserves_provenance_and_user_acceptance(self):
+    def test_delegate_skill_preserves_provenance_and_recorded_acceptance(self):
         text = (SCRIPTS.parent / "skills" / "delegate" / "SKILL.md").read_text()
         self.assertIn("name: delegate", text)
         self.assertIn("/waystone:delegate", text)
-        self.assertIn("delegate-claimed", text)
-        self.assertIn("independent-verifier", text)
-        self.assertIn("AskUserQuestion", text)
-        self.assertIn("delegate verify", text)
-        self.assertIn("apply", text)
-        self.assertIn("discard", text)
-        self.assertIn("runner.jsonl", text)
+        for phrase in (
+            "delegate-claimed", "independent-verifier", "delegate verify", "verdict",
+            "main-session", "--reason", "Escalation", "apply", "discard", "runner.jsonl",
+        ):
+            self.assertIn(phrase, text)
+        self.assertNotIn("AskUserQuestion", text)
+        escalation = text.split("## Escalation table", 1)[1].split("## ", 1)[0]
+        rows = [line for line in escalation.splitlines()
+                if line.startswith("| ") and line.split("|", 2)[1].strip().isdigit()]
+        self.assertEqual(len(rows), 9)
 
     def test_improve_skill_has_finite_materialization_map_and_tune_gate(self):
         text = (SCRIPTS.parent / "skills" / "improve" / "SKILL.md").read_text()
@@ -8214,7 +8217,7 @@ class M2DocsTests(unittest.TestCase):
         readme = (SCRIPTS.parent / "README.md").read_text()
         for surface in (
             "waystone paths", "waystone project", "waystone overlay", "waystone check",
-            "waystone improve evidence", "waystone delegate verify",
+            "waystone improve evidence", "waystone delegate verify", "waystone delegate verdict",
         ):
             self.assertIn(f"`{surface}`", readme)
         import waystone
@@ -8237,7 +8240,8 @@ class M2DocsTests(unittest.TestCase):
         text = (SCRIPTS.parent / "references" / "conventions.md").read_text()
         for phrase in (
             "non-blocking", "least-restrictive", "task-id", "estimated nuisance rate",
-            "workspace-write", "read-only", "independent-verifier",
+            "workspace-write", "read-only", "harness-computed", "delegate-claimed",
+            "independent-verifier", "main-session", "waystone delegate verdict",
             "{project_root}/.waystone/overlay/", "{project_root}/.waystone/exposure/",
             "{project_root}/.waystone/improve/evidence.jsonl", "~/.waystone/",
             "~/.waystone/cache/", ".pre-0.9", "git clean -fdx", "waystone paths",
