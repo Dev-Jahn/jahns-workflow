@@ -791,8 +791,11 @@ def _active_overlays(root: Path, composition: dict | None = None) -> list[dict]:
     if composition is None:
         import overlay
         composition = overlay.compose_policy(root)
-    return [{"id": policy["id"], "status": policy["stage"]}
-            for policy in composition["effective"]]
+    return [{
+        "identity": policy["identity"], "status": policy["stage"],
+        **({"origin_delta_id": policy["origin_delta_id"]}
+           if isinstance(policy.get("origin_delta_id"), str) else {}),
+    } for policy in composition["effective"]]
 
 
 def _write_exposure(record_dir, did, root, packet, task_id, head_sha, base_sha, dirty, binding,
@@ -874,8 +877,7 @@ def _claim_run(root: Path, plan: dict) -> tuple[str, Path]:
             f"apply or discard it first")
     import overlay
     plan["policy_composition"] = overlay.compose_policy(root)
-    # Keep the existing one-argument helper seam used by deterministic lock-span tests.
-    plan["overlays"] = _active_overlays(root)
+    plan["overlays"] = _active_overlays(root, plan["policy_composition"])
 
     did = _make_did(task_id)
     base_did, n = did, 2

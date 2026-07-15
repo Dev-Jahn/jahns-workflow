@@ -5086,7 +5086,8 @@ class DelegateRunTests(unittest.TestCase):
             self.assertEqual(exp["schema"], "waystone-exposure-1")
             self.assertEqual(exp["sandbox"], "workspace-write")
             self.assertEqual(exp["binding"]["backend"], "codex:gpt-5.4-codex")
-            self.assertEqual(exp["overlays"], [])
+            self.assertEqual(
+                {row["identity"]["layer"] for row in exp["overlays"]}, {"base"})
             # result ref exists
             self.assertTrue(git(root, "rev-parse", "--verify",
                                 f"refs/waystone/delegations/{rec.name}-result").returncode == 0)
@@ -5270,7 +5271,7 @@ class DelegateRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root, home = self._project(d)
             depth = {"value": 0}
-            observed = {"preflight": [], "packet": [], "overlay": []}
+            observed = {"preflight": [], "packet": [], "overlay": [], "composition": []}
             originals = (delegate.hold_lock, delegate._check_snapshot_preconditions,
                          delegate._build_packet, delegate._active_overlays,
                          delegate._run_codex)
@@ -5291,9 +5292,10 @@ class DelegateRunTests(unittest.TestCase):
                 observed["packet"].append(depth["value"])
                 return originals[2](*args, **kwargs)
 
-            def active_overlays(project):
+            def active_overlays(project, composition):
                 observed["overlay"].append(depth["value"])
-                return originals[3](project)
+                observed["composition"].append(composition)
+                return originals[3](project, composition)
 
             delegate.hold_lock = tracked_lock
             delegate._check_snapshot_preconditions = preflight
@@ -5312,6 +5314,8 @@ class DelegateRunTests(unittest.TestCase):
             self.assertEqual(observed["preflight"], [0])
             self.assertEqual(observed["packet"], [0, 1])
             self.assertEqual(observed["overlay"], [1])
+            self.assertEqual(len(observed["composition"]), 1)
+            self.assertIn("effective", observed["composition"][0])
 
     def test_cli_rejects_task_state_changed_after_packet_preparation(self):
         import contextlib
@@ -6758,7 +6762,7 @@ class OverlayStoreTests(unittest.TestCase):
             self.assertEqual(delta["evidence"]["summary"], "observed 3/5 delegations without verification")
             # proposed -> observing recorded as a transition (add IS the acceptance)
             self.assertEqual([t["to"] for t in delta["transitions"]], ["observing"])
-            self.assertEqual(delta["observed_in"], [common._project_slug(root)])
+            self.assertEqual(delta["observed_in"], [])
             # persisted, slash -> double-dash filename
             p = _run_with_home(home, lambda: overlay._delta_path(root, "verification_debt/skip"))
             self.assertTrue(p.exists())
@@ -6774,13 +6778,13 @@ class OverlayStoreTests(unittest.TestCase):
                 "at": "2026-07-15T00:00:00+00:00",
             }])
             delta = _add_delta(root, home, from_rec="verification_debt/heavy-solo",
-                               pointers=["a.py:1", "b.py:2"], candidate_scope="project_candidate",
-                               observed_in=["proj-a", "proj-b"])
+                               pointers=["a.py:1", "b.py:2"],
+                               candidate_scope="project_candidate")
             self.assertEqual(delta["evidence"]["source"], "improve-rec")
             self.assertEqual(delta["evidence"]["rec_id"], "verification_debt/heavy-solo")
             self.assertEqual(delta["evidence"]["pointers"], ["a.py:1", "b.py:2"])
             self.assertEqual(delta["candidate_scope"], "project_candidate")
-            self.assertEqual(delta["observed_in"], ["proj-a", "proj-b"])
+            self.assertEqual(delta["observed_in"], [])
 
     def test_add_invalid_delta_id_rejected(self):
         with tempfile.TemporaryDirectory() as d:
@@ -7059,8 +7063,11 @@ class BoundaryWarnTests(unittest.TestCase):
             self.assertTrue(any(r["event"] == "fire" for r in rows))
             # row schema
             r = next(r for r in rows if r["event"] == "fire")
-            for key in ("at", "boundary", "delta_id", "rule", "delta_status", "event", "message", "context"):
+            for key in ("at", "boundary", "policy_identity", "origin_delta_id", "rule",
+                        "delta_status", "event", "message", "context"):
                 self.assertIn(key, r)
+            self.assertEqual(r["policy_identity"], {
+                "layer": "project", "id": "verification_debt/skip"})
             self.assertEqual(r["context"]["delegation_id"], did)
 
     def test_delegate_run_warning_emits_stderr(self):
@@ -7312,7 +7319,14 @@ class DelegateExposureOverlayTests(unittest.TestCase):
             _deleg_run(root, home, _deleg_fake({"impl.py": "x\n"}))
             rec = _latest_rec(root, home)
             exp = _json.loads((rec / "exposure.json").read_text())
-            self.assertEqual(exp["overlays"], [{"id": "verification_debt/skip", "status": "observing"}])
+            project_policy = next(
+                row for row in exp["overlays"] if row["identity"]["layer"] == "project")
+            self.assertEqual(project_policy, {
+                "identity": {"layer": "project", "id": "verification_debt/skip"},
+                "origin_delta_id": "verification_debt/skip", "status": "observing",
+            })
+            self.assertEqual(sum(row["identity"]["layer"] == "base"
+                                 for row in exp["overlays"]), len(overlay.RULES) - 1)
 
     def test_corrupt_delta_refuses_exposure_capture_and_names_file(self):
         with tempfile.TemporaryDirectory() as d:
@@ -7830,13 +7844,16 @@ class ImproveL2BTests(unittest.TestCase):
             (state / "overlay").mkdir(parents=True)
             _write_jsonl(state / "overlay" / "warnings.jsonl", [
                 {"at": "2026-07-01T00:30:00+00:00", "boundary": "delegate-run",
-                 "delta_id": "d/a", "rule": "rule-a", "delta_status": "warning",
+                 "policy_identity": {"layer": "project", "id": "d/a"},
+                 "origin_delta_id": "d/a", "rule": "rule-a", "delta_status": "warning",
                  "event": "fire", "message": "x", "context": {"task_ids": ["feat/x"]}},
                 {"at": "2026-07-02T00:30:00+00:00", "boundary": "round-close",
-                 "delta_id": "d/a", "rule": "rule-a", "delta_status": "observing",
+                 "policy_identity": {"layer": "project", "id": "d/a"},
+                 "origin_delta_id": "d/a", "rule": "rule-a", "delta_status": "observing",
                  "event": "fire", "message": "x", "context": {"task_ids": ["feat/x"]}},
                 {"at": "2026-07-02T00:40:00+00:00", "boundary": "round-close",
-                 "delta_id": "d/a", "rule": "rule-a", "delta_status": "observing",
+                 "policy_identity": {"layer": "project", "id": "d/a"},
+                 "origin_delta_id": "d/a", "rule": "rule-a", "delta_status": "observing",
                  "event": "conflict", "message": "x", "context": {"task_ids": ["feat/x"]}},
             ])
             exposure = state / "exposure"
@@ -8005,14 +8022,18 @@ class ImproveL2BTests(unittest.TestCase):
             (exposure / "round-2026-07-01-r1.json").write_text(_json.dumps({
                 "schema": "waystone-round-exposure-1", "round_id": "2026-07-01-r1",
                 "at": "2026-07-01T01:00:00+00:00", "session_id": "s-main",
-                "overlays_active": [{"id": "verification_debt/x", "status": "warning"}],
+                "overlays_active": [{
+                    "identity": {"layer": "project", "id": "verification_debt/x"},
+                    "origin_delta_id": "verification_debt/x", "status": "warning"}],
                 "bindings": {"implementer": "codex:gpt-5.6"},
             }))
             warnings = root / ".waystone" / "overlay" / "warnings.jsonl"
             warnings.parent.mkdir(parents=True)
             _write_jsonl(warnings, [{
                 "at": "2026-07-01T00:30:00+00:00", "boundary": "round-close",
-                "delta_id": "review_association/x", "rule": "round-close-open-findings-v1",
+                "policy_identity": {"layer": "project", "id": "review_association/x"},
+                "origin_delta_id": "review_association/x",
+                "rule": "round-close-open-findings-v1",
                 "delta_status": "warning", "event": "fire", "message": "x",
                 "context": {"task_ids": ["feat/x"], "round_id": "2026-07-01-r1"},
             }])
@@ -8028,7 +8049,9 @@ class ImproveL2BTests(unittest.TestCase):
             row = next(row for row in self._evidence_rows(o1 / "evidence.jsonl")
                        if row.get("task_id") == "feat/x")
             self.assertEqual(row["route_guard"]["round_exposure"]["overlays_active"],
-                             [{"id": "verification_debt/x", "status": "warning"}])
+                             [{"identity": {"layer": "project", "id": "verification_debt/x"},
+                               "origin_delta_id": "verification_debt/x",
+                               "status": "warning"}])
             warning_id = row["route_guard"]["warning_refs"][0]
             normalized = {item["warning_id"]: item for item in
                           self._evidence_rows(o1 / "evidence_warnings.jsonl")}
@@ -10712,27 +10735,34 @@ class L2CImproveFeedbackTests(unittest.TestCase):
                 }))
             _write_jsonl(state / "overlay" / "warnings.jsonl", [
                 {"at": "2026-07-15T02:10:00+00:00", "boundary": "delegate-run",
-                 "delta_id": delta_id, "rule": "delegation-scope-drift-v1",
+                 "policy_identity": {"layer": "project", "id": delta_id},
+                 "origin_delta_id": delta_id, "rule": "delegation-scope-drift-v1",
                  "delta_status": "observing", "event": "evaluation", "message": "evaluated",
                  "context": {"round_id": "r2", "delegation_id": "d1", "task_id": "feat/x",
                              "fired": True}},
                 {"at": "2026-07-15T02:10:00+00:00", "boundary": "delegate-run",
-                 "delta_id": delta_id, "rule": "delegation-scope-drift-v1",
+                 "policy_identity": {"layer": "project", "id": delta_id},
+                 "origin_delta_id": delta_id, "rule": "delegation-scope-drift-v1",
                  "delta_status": "observing", "event": "fire", "message": "outside",
                  "context": {"round_id": "r2", "delegation_id": "d1", "task_id": "feat/x",
                              "outside_scope": ["docs/x"]}},
                 {"at": "2026-07-15T02:11:00+00:00", "boundary": "delegate-run",
-                 "delta_id": delta_id, "rule": "delegation-scope-drift-v1",
+                 "policy_identity": {"layer": "project", "id": delta_id},
+                 "origin_delta_id": delta_id, "rule": "delegation-scope-drift-v1",
                  "delta_status": "observing", "event": "conflict", "message": "conflict",
-                 "context": {"round_id": "r2", "delegation_id": "d1",
-                             "task_id": "feat/x", "delta_ids": [delta_id, "scope/other"]}},
+                 "context": {"round_id": "r2", "delegation_id": "d1", "task_id": "feat/x",
+                             "policy_identities": [
+                                 {"layer": "project", "id": delta_id},
+                                 {"layer": "project", "id": "scope/other"}]}},
             ])
             exposure = state / "exposure"
             exposure.mkdir()
             for rid, at, profile, env, overlays in (
                     ("r1", "2026-07-15T00:30:00+00:00", "p1", None, []),
                     ("r2", "2026-07-15T02:30:00+00:00", "p2",
-                     ["uv sync --frozen"], [{"id": delta_id, "status": "observing"}])):
+                     ["uv sync --frozen"], [{
+                         "identity": {"layer": "project", "id": delta_id},
+                         "origin_delta_id": delta_id, "status": "observing"}])):
                 (exposure / f"round-{rid}.json").write_text(_json.dumps({
                     "schema": "waystone-round-exposure-1", "round_id": rid, "at": at,
                     "profile_fingerprint": profile, "env_prep": env,
@@ -10764,7 +10794,8 @@ class L2CImproveFeedbackTests(unittest.TestCase):
             self.assertEqual(project["same_scope_conflicts"], 1)
             self.assertEqual(project["re_review_candidates"], 1)
             delta = project["deltas"][0]
-            self.assertEqual(delta["delta_id"], delta_id)
+            self.assertEqual(delta["identity"], {"layer": "project", "id": delta_id})
+            self.assertEqual(delta["origin_delta_id"], delta_id)
             self.assertEqual(delta["before"]["fire_rate"], 0.5)
             self.assertEqual(delta["after"]["fire_rate"], 1.0)
             self.assertEqual(delta["after"]["finding_recurrences"]["scope"], 1)
@@ -10919,19 +10950,22 @@ class L2CAdversarialFixTests(unittest.TestCase):
             warnings = [
                 {"at": "2026-07-15T03:10:00+00:00", "boundary": "check",
                  "rule": "delegation-scope-drift-v1", "event": "evaluation",
-                 "delta_id": delta["id"],
+                 "policy_identity": {"layer": "project", "id": delta["id"]},
+                 "origin_delta_id": delta["id"],
                  "context": {"round_id": "r1", "delegation_id": "did-1",
                              "snapshot": "snap-1", "fired": True},
                  "source_pointer": "/w:1"},
                 {"at": "2026-07-15T03:11:00+00:00", "boundary": "check",
                  "rule": "delegation-scope-drift-v1", "event": "evaluation",
-                 "delta_id": delta["id"],
+                 "policy_identity": {"layer": "project", "id": delta["id"]},
+                 "origin_delta_id": delta["id"],
                  "context": {"round_id": "r1", "delegation_id": "did-1",
                              "snapshot": "snap-1", "fired": True},
                  "source_pointer": "/w:2"},
                 {"at": "2026-07-15T05:10:00+00:00", "boundary": "check",
                  "rule": "delegation-scope-drift-v1", "event": "evaluation",
-                 "delta_id": delta["id"],
+                 "policy_identity": {"layer": "project", "id": delta["id"]},
+                 "origin_delta_id": delta["id"],
                  "context": {"round_id": "r2", "delegation_id": "did-2",
                              "snapshot": "snap-2", "fired": True},
                  "source_pointer": "/w:3"},
@@ -11011,12 +11045,16 @@ class L2CAdversarialFixTests(unittest.TestCase):
     def test_f7_warning_context_is_normalized_once_before_any_consumer(self):
         rows = [
             {"at": "2026-07-15T00:00:00+00:00", "boundary": "delegate-run",
-             "rule": "delegation-scope-drift-v1", "event": "conflict", "delta_id": "d",
+             "rule": "delegation-scope-drift-v1", "event": "conflict",
+             "policy_identity": {"layer": "project", "id": "d"},
              "context": {"task_id": "feat/a", "delegation_id": "did-b",
-                         "delta_ids": ["d", "other"], "resolution": "least-restrictive"},
+                         "policy_identities": [{"layer": "project", "id": "d"},
+                                               {"layer": "project", "id": "other"}],
+                         "resolution": "least-restrictive"},
              "source_pointer": "/w:1"},
             {"at": "2026-07-15T00:01:00+00:00", "boundary": "delegate-run",
-             "rule": "delegation-scope-drift-v1", "event": "evaluation", "delta_id": "d",
+             "rule": "delegation-scope-drift-v1", "event": "evaluation",
+             "policy_identity": {"layer": "project", "id": "d"},
              "context": {"task_id": "feat/b", "delegation_id": "did-b", "fired": False},
              "source_pointer": "/w:2"},
         ]
@@ -11102,6 +11140,26 @@ class L2DPolicyMachineTests(unittest.TestCase):
                            "by_round": []}
         overlay._write_delta(root, delta)
 
+    @staticmethod
+    def _promotion_evidence(root: Path, home: Path, rule: str, delta_id: str) -> None:
+        other = root.parent / "other-project"
+        other.mkdir()
+        machine = _run_with_home(home, common.machine_dir)
+        machine.mkdir(parents=True, exist_ok=True)
+        (machine / "projects.json").write_text(_json.dumps({"projects": [
+            {"name": "demo", "path": str(root.resolve()), "aliases": []},
+            {"name": "other", "path": str(other.resolve()), "aliases": []},
+        ]}))
+        for project in (root, other):
+            warnings = project / ".waystone" / "overlay" / "warnings.jsonl"
+            warnings.parent.mkdir(parents=True, exist_ok=True)
+            _write_jsonl(warnings, [{
+                "at": "2026-07-15T00:00:00+00:00", "boundary": "check", "rule": rule,
+                "event": "evaluation", "delta_status": "observing",
+                "policy_identity": {"layer": "project", "id": delta_id},
+                "origin_delta_id": delta_id, "message": "evaluated", "context": {},
+            }])
+
     def test_maturity_is_deterministic_recorded_and_recommendations_stay_allowed(self):
         with tempfile.TemporaryDirectory() as d:
             root, home = self._project(d)
@@ -11153,6 +11211,11 @@ class L2DPolicyMachineTests(unittest.TestCase):
     def test_user_promotion_is_explicit_and_evidence_gated(self):
         with tempfile.TemporaryDirectory() as d:
             root, home = self._project(d)
+            machine = _run_with_home(home, common.machine_dir)
+            machine.mkdir(parents=True, exist_ok=True)
+            (machine / "projects.json").write_text(_json.dumps({"projects": [{
+                "name": "demo", "path": str(root.resolve()), "aliases": [],
+            }]}))
             _run_with_home(home, lambda: overlay.add_delta(
                 root, "retry_loops/one-project", rule="done-without-evidence-v1", summary="s",
                 candidate_scope="user_candidate", observed_in=["demo"]))
@@ -11162,7 +11225,9 @@ class L2DPolicyMachineTests(unittest.TestCase):
 
             _run_with_home(home, lambda: overlay.add_delta(
                 root, "retry_loops/shared", rule="done-without-evidence-v1", summary="s",
-                candidate_scope="user_candidate", observed_in=["demo", "other"]))
+                candidate_scope="user_candidate"))
+            self._promotion_evidence(
+                root, home, "done-without-evidence-v1", "retry_loops/shared")
             promoted = _run_with_home(
                 home, lambda: overlay.promote_user(root, "retry_loops/shared"))
             self.assertEqual(promoted["scope"]["kind"], "user")
@@ -11176,14 +11241,16 @@ class L2DPolicyMachineTests(unittest.TestCase):
             delta_id = "verification_debt/local"
             _run_with_home(home, lambda: overlay.add_delta(
                 root, delta_id, rule="delegation-verification-evidence-v1", summary="s",
-                candidate_scope="user_candidate", observed_in=["demo", "other"]))
+                candidate_scope="user_candidate"))
+            self._promotion_evidence(
+                root, home, "delegation-verification-evidence-v1", delta_id)
             _run_with_home(home, lambda: overlay.promote_user(root, delta_id))
             policy = {
                 "schema": "waystone-project-policy-1",
                 "policies": [{
                     "id": "verification_debt/committed",
                     "rule": "delegation-verification-evidence-v1", "stage": "warning",
-                    "params": {}, "summary": "committed", "provenance": {"source_delta": delta_id},
+                    "params": {}, "summary": "committed", "origin_delta_id": delta_id,
                 }],
             }
             (root / "docs").mkdir()
@@ -11208,7 +11275,8 @@ class L2DPolicyMachineTests(unittest.TestCase):
                              if row["rule"] == "delegation-verification-evidence-v1")
             self.assertEqual((effective["layer"], effective["source_kind"]),
                              ("project", "committed"))
-            shadow = next(row for row in composed["shadowed"] if row["id"] == delta_id)
+            shadow = next(row for row in composed["shadowed"]
+                          if row["identity"] == {"layer": "project", "id": delta_id})
             self.assertEqual(shadow["reason"], "committed-wins")
             self.assertTrue(any(row["resolution"] == "committed-wins"
                                 for row in composed["conflicts"]))
@@ -11247,15 +11315,16 @@ class L2DPolicyMachineTests(unittest.TestCase):
                 _run_with_home(home, lambda: overlay.materialize(root, delta_id))
             self.assertIn("consent", str(cm.exception))
 
+            context = _run_with_home(
+                home, lambda: overlay.materialize_consent_context(root, delta_id))
             consent = _run_with_home(home, lambda: common.record_consent(
-                root, "materialize", "accept", {"rule_id": delta_id}))
+                root, "materialize", "accept", context))
             self.assertEqual(set(consent), {"surface", "choice", "at", "context"})
             path = _run_with_home(home, lambda: overlay.materialize(root, delta_id))
             document = yaml.safe_load(path.read_text())
             self.assertEqual(document["schema"], "waystone-project-policy-1")
-            self.assertEqual(document["policies"][0]["provenance"]["source_delta"], delta_id)
-            self.assertEqual(document["policies"][0]["provenance"]["evidence"]["pointers"],
-                             ["facts.json#verification_debt"])
+            self.assertEqual(document["policies"][0]["origin_delta_id"], delta_id)
+            self.assertNotIn("provenance", document["policies"][0])
             self.assertIn("docs/waystone-policy.yaml", git(
                 root, "status", "--short", "--untracked-files=all").stdout)
 
@@ -11273,7 +11342,10 @@ class L2DPolicyMachineTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             rows = [_json.loads(line) for line in (root / ".waystone" / "consents.jsonl")
                     .read_text().splitlines()]
-            self.assertEqual(rows[0]["context"], {"kind": "agents"})
+            self.assertEqual(rows[0]["context"]["kind"], "agents")
+            self.assertEqual(rows[0]["context"]["stage"], "install")
+            self.assertEqual(len(rows[0]["context"]["candidate_hash"]), 64)
+            self.assertEqual(len(rows[0]["context"]["template_hash"]), 64)
 
     def test_overlay_cli_verbs_are_explicit_gated_and_never_reach_enforce(self):
         import contextlib
@@ -11284,7 +11356,9 @@ class L2DPolicyMachineTests(unittest.TestCase):
             delta_id = "verification_debt/cli"
             _run_with_home(home, lambda: overlay.add_delta(
                 root, delta_id, rule="delegation-verification-evidence-v1", summary="s",
-                candidate_scope="user_candidate", observed_in=["demo", "other"]))
+                candidate_scope="user_candidate"))
+            self._promotion_evidence(
+                root, home, "delegation-verification-evidence-v1", delta_id)
             self._replay(root, delta_id)
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(_run_with_home(home, lambda: overlay.main([
@@ -11362,6 +11436,397 @@ class L2DPolicyMachineTests(unittest.TestCase):
             effective = next(row for row in exposure["policy_composition"]["effective"]
                              if row["rule"] == "delegation-verification-evidence-v1")
             self.assertEqual(effective["layer"], "project")
+
+
+class L2DAdversarialFindingTests(unittest.TestCase):
+    """L2-D adversarial findings F1-F9: policy-machine closure invariants."""
+
+    def _project(self, base: Path, name: str = "repo") -> Path:
+        root = base / name
+        root.mkdir()
+        init_repo(root)
+        (root / ".waystone.yml").write_text(
+            f"version: 1\nproject: {name}\nreviews_dir: docs/reviews\n"
+            "state:\n  last_round_commit: null\n")
+        (root / "tasks.yaml").write_text(f"version: 1\nproject: {name}\ntasks: []\n")
+        return root
+
+    @staticmethod
+    def _register(home: Path, *roots: Path) -> None:
+        machine = _run_with_home(home, common.machine_dir)
+        machine.mkdir(parents=True, exist_ok=True)
+        (machine / "projects.json").write_text(_json.dumps({
+            "projects": [
+                {"name": root.name, "path": str(root.resolve()), "aliases": []}
+                for root in roots
+            ],
+        }))
+
+    @staticmethod
+    def _observation(root: Path, rule: str, delta_id: str) -> None:
+        path = root / ".waystone" / "overlay" / "warnings.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        row = {
+            "at": "2026-07-15T00:00:00+00:00", "boundary": "check",
+            "rule": rule, "event": "evaluation", "delta_status": "observing",
+            "policy_identity": {"layer": "project", "id": delta_id},
+            "origin_delta_id": delta_id,
+            "message": "rule evaluated at workflow boundary",
+            "context": {"evaluable": True, "fired": False, "coverage_reason": None},
+        }
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(_json.dumps(row, sort_keys=True) + "\n")
+
+    @staticmethod
+    def _policy(rule: str, *, policy_id: str = "verification_debt/committed",
+                stage: str = "warning", params: dict | None = None, **extra) -> dict:
+        return {
+            "id": policy_id, "rule": rule, "stage": stage,
+            "params": {} if params is None else params,
+            "summary": "committed policy", "origin_delta_id": "verification_debt/origin",
+            **extra,
+        }
+
+    def test_f1_every_layer_is_effective_and_overrides_the_previous_layer(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            root, home = self._project(base), base / "home"
+            home.mkdir()
+            rule = "delegation-verification-evidence-v1"
+            composed = _run_with_home(home, lambda: overlay.compose_policy(root))
+            effective = next(row for row in composed["effective"] if row["rule"] == rule)
+            self.assertEqual(effective["identity"], {"layer": "base", "id": f"base/{rule}"})
+
+            user_delta = {
+                "schema": "waystone-delta-1", "id": "verification_debt/shared", "rule": rule,
+                "status": "warning", "params": {}, "origin_delta_id": "verification_debt/shared",
+            }
+            _run_with_home(home, lambda: overlay._write_new_user_delta(user_delta))
+            composed = _run_with_home(home, lambda: overlay.compose_policy(root))
+            effective = next(row for row in composed["effective"] if row["rule"] == rule)
+            self.assertEqual(effective["identity"]["layer"], "user")
+
+            _run_with_home(home, lambda: overlay.add_delta(
+                root, "verification_debt/project", rule=rule, summary="project"))
+            composed = _run_with_home(home, lambda: overlay.compose_policy(root))
+            effective = next(row for row in composed["effective"] if row["rule"] == rule)
+            self.assertEqual(effective["identity"]["layer"], "project")
+
+            _run_with_home(home, lambda: overlay.set_round_override(
+                root, "2026-07-15-f1", rule, "warning", "round-specific"))
+            composed = _run_with_home(
+                home, lambda: overlay.compose_policy(root, round_id="2026-07-15-f1"))
+            effective = next(row for row in composed["effective"] if row["rule"] == rule)
+            self.assertEqual(effective["identity"]["layer"], "round")
+
+    def test_f2_observed_in_is_registry_and_evidence_derived_not_user_supplied(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            base, home = Path(d), Path(d) / "home"
+            home.mkdir()
+            root = self._project(base, "one")
+            other = self._project(base, "two")
+            self._register(home, root, other)
+            rule = "done-without-evidence-v1"
+            delta_id = "verification_debt/cross-project"
+            delta = _run_with_home(home, lambda: overlay.add_delta(
+                root, delta_id, rule=rule, summary="candidate",
+                candidate_scope="user_candidate", observed_in=["forged-a", "forged-b"]))
+            self.assertEqual(delta["observed_in"], [])
+            with self.assertRaisesRegex(common.WorkflowError, "2 distinct projects"):
+                _run_with_home(home, lambda: overlay.promote_user(root, delta_id))
+
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(_run_with_home(home, lambda: overlay.main([
+                    "add", "verification_debt/cli-forgery", "--rule", rule,
+                    "--summary", "candidate", "--observed-in", "forged",
+                    "--root", str(root)])), 1)
+
+            self._observation(root, rule, delta_id)
+            self._observation(other, rule, delta_id)
+            promoted = _run_with_home(home, lambda: overlay.promote_user(root, delta_id))
+            self.assertEqual(promoted["observed_in"],
+                             sorted((str(root.resolve()), str(other.resolve()))))
+
+    def test_f3_user_write_is_atomic_machine_locked_and_delegate_reuses_snapshot(self):
+        import contextlib
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as d:
+            base, home = Path(d), Path(d) / "home"
+            home.mkdir()
+            root = self._project(base, "one")
+            other = self._project(base, "two")
+            self._register(home, root, other)
+            rule = "done-without-evidence-v1"
+            delta_id = "verification_debt/locked"
+            _run_with_home(home, lambda: overlay.add_delta(
+                root, delta_id, rule=rule, summary="candidate",
+                candidate_scope="user_candidate"))
+            self._observation(root, rule, delta_id)
+            self._observation(other, rule, delta_id)
+
+            entered = []
+
+            @contextlib.contextmanager
+            def observed_lock(path, timeout=None):
+                entered.append(Path(path))
+                yield
+
+            replaced = []
+            real_replace = overlay.os.replace
+
+            def observed_replace(source, target):
+                replaced.append((Path(source), Path(target)))
+                return real_replace(source, target)
+
+            with mock.patch.object(overlay, "hold_lock", observed_lock), \
+                    mock.patch.object(overlay.os, "replace", observed_replace):
+                _run_with_home(home, lambda: overlay.promote_user(root, delta_id))
+            self.assertEqual(entered, _run_with_home(home, lambda: [
+                common.registry_lock_path(), common.overlay_lock_path(),
+                common.project_lock_path(root),
+            ]))
+            target = _run_with_home(home, lambda: overlay._user_delta_path(delta_id))
+            self.assertEqual(replaced[-1][1], target)
+            self.assertFalse(target.with_name(target.name + ".tmp").exists())
+
+            composition = {"effective": [{
+                "identity": {"layer": "base", "id": "base/x"}, "stage": "observing",
+            }]}
+            with mock.patch.object(overlay, "compose_policy",
+                                   side_effect=AssertionError("must reuse supplied snapshot")):
+                self.assertEqual(delegate._active_overlays(root, composition), [{
+                    "identity": {"layer": "base", "id": "base/x"}, "status": "observing",
+                }])
+
+    def test_f4_layer_qualified_identity_prevents_cross_layer_attribution(self):
+        with tempfile.TemporaryDirectory() as d:
+            base, home = Path(d), Path(d) / "home"
+            home.mkdir()
+            root = self._project(base)
+            rule = "delegation-scope-drift-v1"
+            delta_id = "worker_scope_drift/shared"
+            delta = _run_with_home(home, lambda: overlay.add_delta(
+                root, delta_id, rule=rule, summary="project"))
+            delta["created_at"] = "2026-07-15T01:00:00+00:00"
+            delta["transitions"] = [{"to": "observing", "at": delta["created_at"]}]
+            overlay._write_delta(root, delta)
+            user = {**delta, "scope": {"kind": "user"}, "origin_delta_id": delta_id}
+            _run_with_home(home, lambda: overlay._write_new_user_delta(user))
+
+            composed = _run_with_home(home, lambda: overlay.compose_policy(root))
+            effective = next(row for row in composed["effective"] if row["rule"] == rule)
+            self.assertEqual(effective["identity"], {"layer": "project", "id": delta_id})
+            shadow = next(row for row in composed["shadowed"]
+                          if row["identity"] == {"layer": "user", "id": delta_id})
+            self.assertEqual(shadow["shadowed_by"], {"layer": "project", "id": delta_id})
+
+            warnings = [
+                {"at": "2026-07-15T03:10:00+00:00", "boundary": "check", "rule": rule,
+                 "event": "evaluation", "policy_identity": {"layer": layer, "id": delta_id},
+                 "origin_delta_id": delta_id,
+                 "context": {"round_id": "r1", "delegation_id": f"did-{layer}",
+                             "snapshot": f"snap-{layer}", "fired": True},
+                 "source_pointer": f"/{layer}"}
+                for layer in ("user", "project")
+            ]
+            exposures = [{"round_id": "r1", "at": "2026-07-15T03:00:00+00:00",
+                          "_file": "/r1"}]
+            observation = _run_with_home(home, lambda: improve._adaptive_feedback_observation(
+                "repo", root, [], warnings, exposures, {}))
+            fact = observation["facts"]["deltas"][0]
+            self.assertEqual(fact["identity"], {"layer": "project", "id": delta_id})
+            self.assertEqual(fact["active"]["opportunities"], 1)
+
+    def test_f5_compose_recovers_override_after_durable_round_close(self):
+        with tempfile.TemporaryDirectory() as d:
+            base, home = Path(d), Path(d) / "home"
+            home.mkdir()
+            root = self._project(base)
+            round_id = "2026-07-15-recovery"
+            rule = "done-without-evidence-v1"
+            _run_with_home(home, lambda: overlay.set_round_override(
+                root, round_id, rule, "warning", "temporary"))
+            path = overlay._round_override_path(root)
+            override = _json.loads(path.read_text())
+            self.assertEqual(override["overrides"][0]["round_id"], round_id)
+            exposure = overlay._exposure_dir(root) / f"round-{round_id}.json"
+            exposure.parent.mkdir(parents=True, exist_ok=True)
+            exposure.write_text(_json.dumps({
+                "schema": "waystone-round-exposure-1", "round_id": round_id,
+                "at": "2099-01-01T00:00:00+00:00",
+            }))
+            composed = _run_with_home(home, lambda: overlay.compose_policy(root))
+            effective = next(row for row in composed["effective"] if row["rule"] == rule)
+            self.assertNotEqual(effective["identity"]["layer"], "round")
+            recovered = _json.loads(path.read_text())
+            self.assertIsNotNone(recovered["expired_at"])
+            self.assertEqual(recovered["expiry_reason"], "durable-round-close")
+
+    def test_f6_committed_policy_schema_and_rule_params_fail_loud(self):
+        with tempfile.TemporaryDirectory() as d:
+            base, home = Path(d), Path(d) / "home"
+            home.mkdir()
+            root = self._project(base)
+            docs = root / "docs"
+            docs.mkdir()
+            path = docs / "waystone-policy.yaml"
+            invalid = [
+                self._policy("unknown-rule-v1"),
+                self._policy("delegation-verification-evidence-v1", unexpected=True),
+                self._policy("delegation-verification-evidence-v1", params={"extra": 1}),
+                self._policy("round-close-open-findings-v1", params={"severities": "major"}),
+                self._policy("review-skipped-closes-v1", params={"consecutive": True}),
+            ]
+            for policy in invalid:
+                path.write_text(yaml.safe_dump({
+                    "schema": "waystone-project-policy-1", "policies": [policy],
+                }, sort_keys=False))
+                with self.subTest(policy=policy), self.assertRaises(common.WorkflowError):
+                    _run_with_home(home, lambda: overlay.compose_policy(root))
+            path.write_text(yaml.safe_dump({
+                "schema": "waystone-project-policy-1", "policies": [], "unexpected": True,
+            }, sort_keys=False))
+            with self.assertRaises(common.WorkflowError):
+                _run_with_home(home, lambda: overlay.compose_policy(root))
+            schema = _json.loads((SCRIPTS.parent / "templates" /
+                                  "project-policy-schema.json").read_text())
+            item_schema = schema["properties"]["policies"]["items"]
+            self.assertFalse(item_schema["additionalProperties"])
+            self.assertIn("oneOf", item_schema)
+
+    def test_f7_materialize_commits_only_policy_and_sanitized_description(self):
+        with tempfile.TemporaryDirectory() as d:
+            base, home = Path(d), Path(d) / "home"
+            home.mkdir()
+            root = self._project(base)
+            delta_id = "verification_debt/materialize-safe"
+            _run_with_home(home, lambda: overlay.add_delta(
+                root, delta_id, rule="delegation-verification-evidence-v1",
+                summary=f"ran secret command at {root}/private.log",
+                pointers=[f"{root}/facts.json#behavior"], from_rec=None,
+                title=f"Verification policy\nfor {root} and /tmp/other-secret"))
+            delta = overlay.load_delta(root, delta_id)
+            delta["replay"] = {"fires": 9, "opportunities": 10, "fire_rate": 0.9}
+            overlay._write_delta(root, delta)
+            path = _run_with_home(
+                home, lambda: overlay.materialize(root, delta_id, consent_recorded=True))
+            document = yaml.safe_load(path.read_text())
+            policy = document["policies"][0]
+            self.assertEqual(set(policy), {
+                "id", "rule", "stage", "params", "summary", "origin_delta_id",
+            })
+            self.assertNotIn("\n", policy["summary"])
+            serialized = path.read_text()
+            self.assertNotIn(str(root), serialized)
+            self.assertNotIn("private.log", serialized)
+            self.assertNotIn("/tmp/other-secret", serialized)
+            self.assertNotIn("fire_rate", serialized)
+            self.assertNotIn("provenance", serialized)
+
+    def test_f8_consent_is_bound_to_candidate_stage_target_and_template_hash(self):
+        import contextlib
+        import io
+        import waystone
+
+        with tempfile.TemporaryDirectory() as d:
+            base, home = Path(d), Path(d) / "home"
+            home.mkdir()
+            root = self._project(base)
+            missing = "verification_debt/missing"
+            with self.assertRaises(common.WorkflowError):
+                _run_with_home(
+                    home, lambda: overlay.materialize(root, missing, consent_recorded=True))
+            self.assertFalse((root / ".waystone" / "consents.jsonl").exists())
+
+            delta_id = "verification_debt/hash-bound"
+            _run_with_home(home, lambda: overlay.add_delta(
+                root, delta_id, rule="delegation-verification-evidence-v1", summary="candidate"))
+            delta = overlay.load_delta(root, delta_id)
+            delta["replay"] = {"fires": 1, "opportunities": 1, "fire_rate": 1.0}
+            overlay._write_delta(root, delta)
+            context = _run_with_home(
+                home, lambda: overlay.materialize_consent_context(root, delta_id))
+            self.assertEqual(set(context), {
+                "origin_delta_id", "target_path", "candidate_hash", "stage",
+            })
+            forged_context = {**context, "candidate_hash": "0" * 64}
+            _run_with_home(home, lambda: common.record_consent(
+                root, "materialize", "accept", forged_context))
+            with self.assertRaisesRegex(common.WorkflowError, "consent"):
+                _run_with_home(home, lambda: overlay.materialize(root, delta_id))
+            _run_with_home(home, lambda: common.record_consent(
+                root, "materialize", "accept", context))
+            changed = overlay.load_delta(root, delta_id)
+            changed["status"] = "warning"
+            overlay._write_delta(root, changed)
+            with self.assertRaisesRegex(common.WorkflowError, "consent"):
+                _run_with_home(home, lambda: overlay.materialize(root, delta_id))
+
+            target = root / ".claude" / "agents" / "waystone-operator.md"
+            target.parent.mkdir(parents=True)
+            target.write_text("occupied")
+            before = (root / ".waystone" / "consents.jsonl").read_text()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                rc = _run_with_home(home, lambda: waystone.main([
+                    "install", "agents", "--consent-recorded", "--root", str(root)]))
+            self.assertEqual(rc, 1)
+            self.assertEqual((root / ".waystone" / "consents.jsonl").read_text(), before)
+            target.unlink()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                rc = _run_with_home(home, lambda: waystone.main([
+                    "install", "agents", "--consent-recorded", "--root", str(root)]))
+            self.assertEqual(rc, 0)
+            rows = [_json.loads(line) for line in (root / ".waystone" / "consents.jsonl")
+                    .read_text().splitlines()]
+            install_context = rows[-1]["context"]
+            self.assertEqual(install_context["stage"], "install")
+            self.assertEqual(len(install_context["candidate_hash"]), 64)
+            self.assertEqual(len(install_context["template_hash"]), 64)
+            self.assertEqual(install_context["target_path"], str(target.resolve()))
+
+    def test_f9_degraded_maturity_snapshot_never_records_a_transition(self):
+        with tempfile.TemporaryDirectory() as d:
+            base, home = Path(d), Path(d) / "home"
+            home.mkdir()
+            root = self._project(base)
+            out = root / ".waystone" / "improve"
+            out.mkdir(parents=True)
+            _write_jsonl(out / "sessions.jsonl", [{"project": "repo", "session_id": "s1"}])
+            _write_jsonl(out / "delegations.jsonl", [{"project": "repo", "session_id": "s1"}])
+            _write_jsonl(out / "reviews.jsonl", [
+                {"project": "repo", "round_id": "r1", "feedback_file": "r1-feedback.md",
+                 "findings": [], "counts": {}},
+                {"project": "repo", "round_id": "r2", "feedback_file": None,
+                 "findings": [], "counts": {}},
+            ])
+            (out / "decisions.jsonl").write_text(
+                '{"rec_id":"retry_loops/x","decision":"accept",'
+                '"at":"2026-07-15T00:00:00Z"}\n')
+            (out / "parse_coverage.json").write_text("{}")
+            complete = _run_with_home(home, lambda: improve.run_audit(
+                out, improve.PROJECT_LENS_SCOPE, project_root=root))
+            self.assertEqual(complete["maturity"]["stage"], "calibrate")
+            state_path = root / ".waystone" / "maturity.json"
+            before = state_path.read_bytes()
+
+            (out / "reviews.jsonl").write_text("{broken")
+            degraded = _run_with_home(home, lambda: improve.run_audit(
+                out, improve.PROJECT_LENS_SCOPE, project_root=root))
+            self.assertIs(degraded["maturity"]["degraded"], True)
+            self.assertEqual(degraded["maturity"]["stage"], "calibrate")
+            self.assertIn("reviews", degraded["maturity"]["degraded_inputs"])
+            self.assertEqual(state_path.read_bytes(), before)
+
+            _write_jsonl(out / "reviews.jsonl", [])
+            (out / "decisions.jsonl").unlink()
+            degraded = _run_with_home(home, lambda: improve.run_audit(
+                out, improve.PROJECT_LENS_SCOPE, project_root=root))
+            self.assertIn("decisions", degraded["maturity"]["degraded_inputs"])
+            self.assertEqual(state_path.read_bytes(), before)
 
 
 class CodexPluginContractTests(unittest.TestCase):

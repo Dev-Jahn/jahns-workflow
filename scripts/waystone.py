@@ -145,6 +145,20 @@ def _consent_main(argv: list[str]) -> int:
                 raise common.WorkflowError(f"unexpected argument {rest[i]!r}")
         root = _command_root(root_value)
         with common.hold_lock(common.project_lock_path(root)):
+            if surface == "materialize":
+                import overlay
+
+                delta_id = context.get("origin_delta_id") or context.get("rule_id")
+                if not isinstance(delta_id, str) or not delta_id:
+                    raise common.WorkflowError(
+                        "materialize consent requires --context origin_delta_id=<delta-id>")
+                context = overlay.materialize_consent_context(root, delta_id)
+            elif surface in ("install.agents", "install.hooks"):
+                kind = surface.partition(".")[2]
+                if context and context != {"kind": kind}:
+                    raise common.WorkflowError(
+                        f"{surface} consent context is derived; pass only --context kind={kind}")
+                context, _source, _target, _payload = _install_candidate(root, kind)
             row = common.record_consent(root, surface, choice, context)
     except common.WorkflowError as e:
         print(f"waystone consent record: {e}", file=sys.stderr)
@@ -160,6 +174,25 @@ _INSTALL_TARGETS = {
     "agents": ("waystone-operator-agent.md", Path(".claude/agents/waystone-operator.md")),
     "hooks": ("waystone-boundary-hook.json", Path(".claude/settings.json")),
 }
+
+
+def _install_candidate(root: Path, kind: str) -> tuple[dict, Path, Path, bytes]:
+    template_name, relative_target = _INSTALL_TARGETS[kind]
+    source = HERE.parent / "templates" / template_name
+    target = root / relative_target
+    if os.path.lexists(target):
+        raise common.WorkflowError(f"refusing to overwrite existing managed install target {target}")
+    try:
+        payload = source.read_bytes()
+    except OSError as e:
+        raise common.WorkflowError(f"cannot read managed install template {source}: {e}") from e
+    template_hash = common.content_hash(payload)
+    candidate = {
+        "kind": kind, "target_path": str(target.resolve()), "stage": "install",
+        "template_hash": template_hash,
+    }
+    context = {**candidate, "candidate_hash": common.canonical_payload_hash(candidate)}
+    return context, source, target, payload
 
 
 def _install_main(argv: list[str]) -> int:
@@ -188,19 +221,13 @@ def _install_main(argv: list[str]) -> int:
                 raise common.WorkflowError(f"unexpected argument {rest[i]!r}")
         root = _command_root(root_value)
         surface = f"install.{kind}"
-        context = {"kind": kind}
         with common.hold_lock(common.project_lock_path(root)):
+            context, source, target, payload = _install_candidate(root, kind)
             if consent_recorded:
                 common.record_consent(root, surface, "accept", context)
             if not common.has_accepted_consent(root, surface, context):
                 raise common.WorkflowError(
                     f"consent is required; record `{surface}` acceptance or pass --consent-recorded")
-            template_name, relative_target = _INSTALL_TARGETS[kind]
-            source = HERE.parent / "templates" / template_name
-            target = root / relative_target
-            if os.path.lexists(target):
-                raise common.WorkflowError(f"refusing to overwrite existing managed install target {target}")
-            payload = source.read_bytes()
             target.parent.mkdir(parents=True, exist_ok=True)
             try:
                 with target.open("xb") as stream:

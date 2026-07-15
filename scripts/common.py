@@ -138,6 +138,17 @@ def consent_path(root: Path) -> Path:
     return project_state_path(root) / "consents.jsonl"
 
 
+def canonical_payload_hash(payload: object) -> str:
+    """SHA-256 over the unique compact JSON encoding used to bind consent to a candidate."""
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def content_hash(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
 def record_consent(root: Path, surface: str, choice: str, context: dict | None = None) -> dict:
     """Append one standard consent event after the host has presented the choice to the user."""
     if not isinstance(surface, str) or not surface.strip():
@@ -195,14 +206,19 @@ def registry_path(home: Path | None = None) -> Path:
     return machine_dir(home) / "projects.json"
 
 
-# Any nested acquisition must follow this single order: registry -> project -> record. Never acquire
-# in reverse. Locking belongs to CLI/hook entry points; library functions below remain lock-free so
-# composed verbs such as round close cannot deadlock themselves on flock's non-reentrant semantics.
+# Any nested acquisition must follow this single order: registry -> overlay -> project -> record.
+# Never acquire in reverse. Locking normally belongs to CLI/hook entry points; the cross-project
+# promote-user transaction owns all three leading locks itself because its evidence read and user
+# overlay write must be one machine-wide snapshot.
 # Intentionally unlocked (§2.4): warnings/decisions JSONL use one O_APPEND write; improve outputs are
 # reproducible; SSOT views inherit round close's project lock (standalone regeneration is idempotent);
 # start-here follows its single-writer round-close convention.
 def registry_lock_path(home: Path | None = None) -> Path:
     return machine_dir(home) / "registry.lock"
+
+
+def overlay_lock_path(home: Path | None = None) -> Path:
+    return machine_dir(home) / "overlay.lock"
 
 
 def project_lock_path(root: Path) -> Path:

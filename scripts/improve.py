@@ -1298,15 +1298,22 @@ def _load_warning_rows(root: Path) -> tuple[list[dict], int, bool]:
         if parse_iso_timestamp(row["at"]) is None:
             skipped += 1
             continue
+        identity = row.get("policy_identity")
+        if (not isinstance(identity, dict) or set(identity) != {"layer", "id"}
+                or not all(isinstance(identity.get(field), str) and identity[field]
+                           for field in ("layer", "id"))):
+            identity = None
         rows.append({
             "at": row["at"], "boundary": row["boundary"], "rule": row["rule"],
-            "event": row["event"], "delta_id": row.get("delta_id"),
+            "event": row["event"], "policy_identity": identity,
+            "origin_delta_id": row.get("origin_delta_id"),
             "delta_status": row.get("delta_status"),
             "context": row.get("context") if isinstance(row.get("context"), dict) else {},
             "source_pointer": f"{path}:{line_number}",
         })
     rows.sort(key=lambda row: (
-        row["at"], row["boundary"], row["rule"], row["event"], str(row.get("delta_id"))))
+        row["at"], row["boundary"], row["rule"], row["event"],
+        str(row.get("policy_identity"))))
     return rows, skipped, True
 
 
@@ -1326,7 +1333,8 @@ def _warning_observation(name: str, warnings: list[dict], warnings_skipped: int,
     chronological = sorted(_latest_round_exposures(exposures).values(), key=lambda row: (
         row["at"], row["round_id"], row.get("_file") or ""))
     counted = sorted(counted, key=lambda row: (
-        row["at"], row["boundary"], row["rule"], row["event"], str(row.get("delta_id"))))
+        row["at"], row["boundary"], row["rule"], row["event"],
+        str(row.get("policy_identity"))))
     warning_index = 0
     previous_index = 0
     for exposure in chronological:
@@ -1405,7 +1413,11 @@ def _load_overlay_deltas(root: Path) -> tuple[list[dict], int]:
                 or parse_iso_timestamp(delta.get("created_at")) is None):
             skipped += 1
             continue
-        rows.append({**delta, "source_pointer": str(overlay._delta_path(root, delta["id"]))})
+        rows.append({
+            **delta, "identity": {"layer": "project", "id": delta["id"]},
+            "origin_delta_id": delta.get("origin_delta_id") or delta["id"],
+            "source_pointer": str(overlay._delta_path(root, delta["id"])),
+        })
     rows.sort(key=lambda row: row["id"])
     return rows, skipped
 
@@ -1571,11 +1583,12 @@ def _adaptive_feedback_observation(name: str, root: Path, reviews: list[dict],
                 continue
             subject = row.get("subject_id") or row["round_id"]
             snapshot = row.get("snapshot") or row["round_id"]
-            key = (delta["id"], str(subject), str(snapshot))
+            key = (delta["identity"]["layer"], delta["identity"]["id"],
+                   str(subject), str(snapshot))
             units[key] = (current_phase, row)
         unassigned_evaluations = 0
         for warning in evaluation_rows:
-            if warning.get("delta_id") != delta["id"]:
+            if warning.get("policy_identity") != delta["identity"]:
                 continue
             context = warning.get("context") or {}
             round_id = context.get("round_id")
@@ -1593,7 +1606,8 @@ def _adaptive_feedback_observation(name: str, root: Path, reviews: list[dict],
             subject = (context.get("delegation_id") or round_id or context.get("task_id")
                        or ",".join(context.get("task_ids") or []))
             snapshot = context.get("snapshot") or round_id or subject
-            key = (delta["id"], str(subject), str(snapshot))
+            key = (delta["identity"]["layer"], delta["identity"]["id"],
+                   str(subject), str(snapshot))
             units[key] = (current_phase, {"round_id": round_id, "opportunities": 1,
                                           "fires": int(context.get("fired") is True)})
         phase_rows = {"pre-active": [], "active": [], "post-suspend": []}
@@ -1609,7 +1623,8 @@ def _adaptive_feedback_observation(name: str, root: Path, reviews: list[dict],
         rec_id = evidence.get("rec_id") if evidence.get("source") == "improve-rec" else None
         accepted_row = accepted.get(rec_id) if isinstance(rec_id, str) else None
         fact = {
-            "delta_id": delta["id"], "rule": delta["rule"], "status": delta.get("status"),
+            "identity": delta["identity"], "origin_delta_id": delta["origin_delta_id"],
+            "rule": delta["rule"], "status": delta.get("status"),
             "provenance": "observed",
             "related_finding_types": related_types,
             "pre_active": pre_active, "active": active_phase, "post_suspend": post_suspend,
@@ -1623,7 +1638,8 @@ def _adaptive_feedback_observation(name: str, root: Path, reviews: list[dict],
             "unassigned_replay_rounds": unassigned_replay_rounds,
         }
         delta_facts.append(fact)
-        delta_examples.append({"project": name, "delta_id": delta["id"],
+        delta_examples.append({"project": name, "identity": delta["identity"],
+                               "origin_delta_id": delta["origin_delta_id"],
                                "pointer": delta["source_pointer"]})
 
     # An environment snapshot change makes only earlier evidence stale. Current-state mismatches are
@@ -1662,7 +1678,8 @@ def _adaptive_feedback_observation(name: str, root: Path, reviews: list[dict],
     for delta in active:
         reasons = sorted({reason for at, reason in change_events if delta["created_at"] < at})
         if reasons:
-            stale_rows.append({"project": name, "delta_id": delta["id"], "reasons": reasons,
+            stale_rows.append({"project": name, "identity": delta["identity"],
+                               "origin_delta_id": delta["origin_delta_id"], "reasons": reasons,
                                "pointer": delta["source_pointer"], "provenance": "observed"})
 
     materialized = sum(rec_id in by_rec for rec_id in accepted)
@@ -1694,7 +1711,8 @@ def _adaptive_feedback_observation(name: str, root: Path, reviews: list[dict],
     for rec_id, decision in sorted(accepted.items()):
         delta = by_rec.get(rec_id)
         if delta is not None:
-            examples.append({"project": name, "rec_id": rec_id, "delta_id": delta["id"],
+            examples.append({"project": name, "rec_id": rec_id, "identity": delta["identity"],
+                             "origin_delta_id": delta["origin_delta_id"],
                              "pointer": decision["source_pointer"]})
     examples.extend({"project": name, "rule": row["rule"],
                      "pointer": row["source_pointer"]} for row in conflict_rows)
@@ -1715,22 +1733,22 @@ _WARNING_CONTEXT_BOUNDARIES = {
 
 _WARNING_CONTEXT_FIELDS = {
     "delegation-verification-evidence-v1": {
-        "delegation_id", "task_id", "task_ids", "round_id", "delta_ids", "resolution",
+        "delegation_id", "task_id", "task_ids", "round_id", "policy_identities", "resolution",
         "snapshot", "evaluable", "coverage_reason", "fired"},
     "round-close-open-findings-v1": {
-        "task_id", "task_ids", "delegation_id", "round_id", "unlinked", "delta_ids",
+        "task_id", "task_ids", "delegation_id", "round_id", "unlinked", "policy_identities",
         "resolution", "snapshot", "evaluable", "coverage_reason", "fired"},
     "delegation-scope-drift-v1": {
-        "delegation_id", "task_id", "task_ids", "round_id", "delta_ids", "outside_scope",
+        "delegation_id", "task_id", "task_ids", "round_id", "policy_identities", "outside_scope",
         "coverage_reason", "resolution", "snapshot", "evaluable", "fired"},
     "env-manifest-mutation-v1": {
-        "round_id", "task_id", "task_ids", "delta_ids", "manifest_paths", "resolution",
+        "round_id", "task_id", "task_ids", "policy_identities", "manifest_paths", "resolution",
         "snapshot", "evaluable", "coverage_reason", "fired"},
     "review-skipped-closes-v1": {
-        "round_id", "task_id", "task_ids", "delta_ids", "consecutive", "resolution",
+        "round_id", "task_id", "task_ids", "policy_identities", "consecutive", "resolution",
         "snapshot", "evaluable", "coverage_reason", "fired"},
     "done-without-evidence-v1": {
-        "round_id", "task_id", "task_ids", "delta_ids", "resolution", "snapshot",
+        "round_id", "task_id", "task_ids", "policy_identities", "resolution", "snapshot",
         "evaluable", "coverage_reason", "fired"},
 }
 
@@ -1749,7 +1767,7 @@ def _warning_task_ids(warning: dict, did_to_task: dict[str, str]) -> tuple[set[s
         # Unknown-rule evaluation errors are themselves useful friction evidence. Validate their
         # generic attribution fields without pretending the unknown rule has a known boundary schema.
         allowed = {
-            "delegation_id", "task_id", "task_ids", "round_id", "delta_ids", "resolution",
+            "delegation_id", "task_id", "task_ids", "round_id", "policy_identities", "resolution",
             "snapshot", "evaluable", "coverage_reason", "fired",
         }
     if set(context) - allowed:
@@ -1763,8 +1781,11 @@ def _warning_task_ids(warning: dict, did_to_task: dict[str, str]) -> tuple[set[s
         return set(), "invalid-context-schema"
     if "round_id" in context and context["round_id"] is not None and not isinstance(context["round_id"], str):
         return set(), "invalid-context-schema"
-    if ("delta_ids" in context and (not isinstance(context["delta_ids"], list)
-            or any(not isinstance(delta_id, str) for delta_id in context["delta_ids"]))):
+    if ("policy_identities" in context and (not isinstance(context["policy_identities"], list)
+            or any(not isinstance(identity, dict) or set(identity) != {"layer", "id"}
+                   or not all(isinstance(identity.get(field), str)
+                              for field in ("layer", "id"))
+                   for identity in context["policy_identities"]))):
         return set(), "invalid-context-schema"
     if "unlinked" in context and (type(context["unlinked"]) is not int or context["unlinked"] < 0):
         return set(), "invalid-context-schema"
@@ -2652,24 +2673,27 @@ def _lens_evidence_link(rows: list[dict]) -> dict:
         round_session_mapping={"provenance": "unknown"})
 
 
-def _maturity_decision_count(path: Path) -> int:
+def _maturity_decision_snapshot(path: Path) -> tuple[int, bool]:
     if not path.is_file():
-        return 0
+        return 0, False
     count = 0
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeDecodeError):
-        return 0
+        return 0, False
     for line in lines:
+        if not line.strip():
+            continue
         try:
             row = json.loads(line)
         except json.JSONDecodeError:
-            continue
-        if (isinstance(row, dict) and isinstance(row.get("rec_id"), str)
-                and row.get("decision") in ("accept", "reject")
-                and isinstance(row.get("at"), str)):
-            count += 1
-    return count
+            return count, False
+        if (not isinstance(row, dict) or not isinstance(row.get("rec_id"), str)
+                or row.get("decision") not in ("accept", "reject")
+                or parse_iso_timestamp(row.get("at")) is None):
+            return count, False
+        count += 1
+    return count, True
 
 
 def maturity_counts(data: dict[str, object], in_dir: Path) -> dict[str, int]:
@@ -2687,7 +2711,7 @@ def maturity_counts(data: dict[str, object], in_dir: Path) -> dict[str, int]:
             len(row.get("findings") or []) for row in reviews
             if isinstance(row, dict) and isinstance(row.get("findings") or [], list)),
         "delegations": len(delegations),
-        "decisions": _maturity_decision_count(in_dir / "decisions.jsonl"),
+        "decisions": _maturity_decision_snapshot(in_dir / "decisions.jsonl")[0],
     }
 
 
@@ -2704,18 +2728,25 @@ def maturity_stage(counts: dict[str, int]) -> str:
     return "bootstrap"
 
 
+def _load_maturity_state(root: Path) -> dict | None:
+    path = project_state_path(root) / "maturity.json"
+    if not path.is_file():
+        return None
+    try:
+        previous = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise WorkflowError(f"corrupt maturity state {path} ({e})") from e
+    if (not isinstance(previous, dict) or previous.get("schema") != "waystone-maturity-1"
+            or previous.get("current_stage") not in MATURITY_STAGES
+            or not isinstance(previous.get("counts"), dict)
+            or not isinstance(previous.get("transitions"), list)):
+        raise WorkflowError(f"corrupt maturity state {path}")
+    return previous
+
+
 def _write_maturity_state(root: Path, counts: dict[str, int], stage: str) -> dict:
     path = project_state_path(root) / "maturity.json"
-    previous = None
-    if path.is_file():
-        try:
-            previous = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
-            raise WorkflowError(f"corrupt maturity state {path} ({e})") from e
-        if (not isinstance(previous, dict) or previous.get("schema") != "waystone-maturity-1"
-                or previous.get("current_stage") not in MATURITY_STAGES
-                or not isinstance(previous.get("transitions"), list)):
-            raise WorkflowError(f"corrupt maturity state {path}")
+    previous = _load_maturity_state(root)
     state = previous or {
         "schema": "waystone-maturity-1", "current_stage": None, "counts": {}, "transitions": [],
     }
@@ -2732,14 +2763,38 @@ def _write_maturity_state(root: Path, counts: dict[str, int], stage: str) -> dic
     return state
 
 
-def _maturity_fact(root: Path, data: dict[str, object], in_dir: Path) -> dict:
+def _maturity_fact(root: Path, data: dict[str, object], in_dir: Path,
+                   present: dict[str, bool]) -> dict:
+    degraded_inputs = [key for key in ("sessions", "delegations", "reviews")
+                       if not present.get(key)
+                       or not isinstance(data.get(key), list)
+                       or any(not isinstance(row, dict) for row in data.get(key, []))]
+    _decision_count, decisions_complete = _maturity_decision_snapshot(
+        in_dir / "decisions.jsonl")
+    if not decisions_complete:
+        degraded_inputs.append("decisions")
+    if degraded_inputs:
+        previous = _load_maturity_state(root)
+        stage = previous.get("current_stage") if previous is not None else None
+        return {
+            "stage": stage,
+            "counts": dict(previous.get("counts") or {}) if previous is not None else {},
+            "recommendation_tier": "always-allowed",
+            "recommendation_strength": (
+                {"bootstrap": "soft", "calibrate": "soft", "tune": "tuned"}.get(stage, "soft")),
+            "degraded": True, "degraded_inputs": sorted(set(degraded_inputs)),
+            "state_transition_recorded": False,
+        }
     counts = maturity_counts(data, in_dir)
     stage = maturity_stage(counts)
+    previous = _load_maturity_state(root)
+    transitioned = previous is None or previous.get("current_stage") != stage
     _write_maturity_state(root, counts, stage)
     strength = {"bootstrap": "soft", "calibrate": "soft", "tune": "tuned"}[stage]
     return {
         "stage": stage, "counts": counts, "recommendation_tier": "always-allowed",
-        "recommendation_strength": strength,
+        "recommendation_strength": strength, "degraded": False, "degraded_inputs": [],
+        "state_transition_recorded": transitioned,
     }
 
 
@@ -2841,7 +2896,7 @@ def run_audit(in_dir: Path, lens_scope: str | None = None,
         "lenses": lenses,
     }
     if project_root is not None and lens_scope == PROJECT_LENS_SCOPE:
-        facts["maturity"] = _maturity_fact(project_root, data, in_dir)
+        facts["maturity"] = _maturity_fact(project_root, data, in_dir, present)
     if lens_scope is not None:
         facts["scope"] = lens_scope
     candidate_rows.sort(key=lambda row: (

@@ -25,9 +25,11 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from common import (  # noqa: E402
-    ROUND_RE, WorkflowError, _project_slug, ensure_project_state_dir, find_project_root,
-    has_accepted_consent, hold_lock, load_config, machine_dir, migrate_project_state,
-    parse_iso_timestamp, project_lock_path, project_state_path, record_consent, write_text_atomic,
+    ROUND_RE, WorkflowError, _project_slug, _read_registry, canonical_payload_hash,
+    ensure_project_state_dir, find_project_root, has_accepted_consent, hold_lock, load_config,
+    machine_dir, migrate_project_state, overlay_lock_path, parse_iso_timestamp, project_lock_path,
+    project_state_path, record_consent, registry_entry_paths, registry_lock_path, registry_path,
+    write_text_atomic,
 )
 
 # delta-id grammar mirrors the improve rec_id (`<lens>/<kebab-gist>`, S2) so a rec materialises to a
@@ -604,26 +606,94 @@ def _write_new_user_delta(delta: dict) -> Path:
     directory = _user_deltas_dir()
     _mkdir_or_refuse(directory)
     path = _user_delta_path(delta["id"])
+    if path.exists():
+        raise WorkflowError(f"user overlay delta {delta['id']} already exists at {path}")
+    tmp = path.with_name(path.name + ".tmp")
     try:
-        with path.open("x", encoding="utf-8") as stream:
-            stream.write(json.dumps(delta, ensure_ascii=False, indent=2) + "\n")
-    except FileExistsError as e:
-        raise WorkflowError(f"user overlay delta {delta['id']} already exists at {path}") from e
+        tmp.write_text(json.dumps(delta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
     except BaseException:
-        path.unlink(missing_ok=True)
+        tmp.unlink(missing_ok=True)
         raise
     return path
 
 
-def promote_user(root: Path, delta_id: str) -> dict:
-    """Explicitly copy a cross-project-proven project candidate into the user overlay."""
+def _registered_canonical_roots(root: Path) -> list[Path]:
+    source = registry_path()
+    registry = _read_registry(source)
+    wanted = Path(root).resolve()
+    current_registered = False
+    roots = []
+    for entry in registry["projects"]:
+        identities = registry_entry_paths(entry, source)
+        if not identities:
+            continue
+        roots.append(identities[0])
+        current_registered = current_registered or wanted in identities
+    if not current_registered:
+        raise WorkflowError(
+            f"promote-user requires the source project to be registered by canonical path: {wanted}")
+    return roots
+
+
+def _exposure_observes_rule(root: Path, rule: str) -> bool:
+    paths = sorted(_exposure_dir(root).glob("*.json"))
+    delegations = project_state_path(root) / "delegations"
+    if delegations.is_dir():
+        paths.extend(sorted(delegations.glob("*/exposure.json")))
+    for path in paths:
+        try:
+            row = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        composition = row.get("policy_composition") if isinstance(row, dict) else None
+        if not isinstance(composition, dict):
+            continue
+        if any(isinstance(policy, dict) and policy.get("rule") == rule
+               for policy in composition.get("effective") or []):
+            return True
+    return False
+
+
+def _warnings_observe_rule(root: Path, rule: str) -> bool:
+    path = _warnings_path(root)
+    if not path.is_file():
+        return False
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return False
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if (isinstance(row, dict) and row.get("rule") == rule
+                and row.get("event") in ("evaluation", "fire")
+                and parse_iso_timestamp(row.get("at")) is not None):
+            return True
+    return False
+
+
+def _derived_observed_projects(root: Path, rule: str, *, require_registered: bool) -> list[str]:
+    try:
+        projects = _registered_canonical_roots(root)
+    except WorkflowError:
+        if require_registered:
+            raise
+        return []
+    return sorted(str(project) for project in projects
+                  if _warnings_observe_rule(project, rule)
+                  or _exposure_observes_rule(project, rule))
+
+
+def _promote_user_locked(root: Path, delta_id: str) -> dict:
     delta = load_delta(root, delta_id)
     if delta.get("candidate_scope") != "user_candidate":
         raise WorkflowError(
             f"delta {delta_id} candidate_scope is {delta.get('candidate_scope')!r}; "
             "promote-user requires user_candidate")
-    observed = delta.get("observed_in")
-    projects = sorted({item for item in observed or [] if isinstance(item, str) and item})
+    projects = _derived_observed_projects(root, delta["rule"], require_registered=True)
     if len(projects) < 2:
         raise WorkflowError(
             f"delta {delta_id} has evidence from {len(projects)} distinct project(s); "
@@ -633,12 +703,22 @@ def promote_user(root: Path, delta_id: str) -> dict:
             f"delta {delta_id} is {delta.get('status')}; promote-user requires an active delta")
     promoted = json.loads(json.dumps(delta))
     promoted["scope"] = {"kind": "user"}
+    promoted["origin_delta_id"] = delta_id
+    promoted["observed_in"] = projects
     promoted["promoted_from"] = {
         "project": _project_slug(root), "delta_id": delta_id, "observed_in": projects,
         "at": _now_iso(),
     }
     _write_new_user_delta(promoted)
     return promoted
+
+
+def promote_user(root: Path, delta_id: str) -> dict:
+    """Atomically promote one independently observed candidate under the global lock order."""
+    with hold_lock(registry_lock_path()):
+        with hold_lock(overlay_lock_path()):
+            with hold_lock(project_lock_path(root)):
+                return _promote_user_locked(root, delta_id)
 
 
 def _strict_delta_directory(directory: Path, *, layer: str, source_kind: str) -> list[dict]:
@@ -663,17 +743,40 @@ def _strict_delta_directory(directory: Path, *, layer: str, source_kind: str) ->
             "id": delta["id"], "rule": delta["rule"], "stage": delta["status"],
             "status": delta["status"], "params": dict(delta.get("params") or {}),
             "layer": layer, "source_kind": source_kind, "enabled": True,
+            "identity": {"layer": layer, "id": delta["id"]},
+            "origin_delta_id": delta.get("origin_delta_id") or delta["id"],
         })
     return out
 
 
 def _base_policies() -> list[dict]:
-    """Machine-composable layer 0 defaults; disabled until a narrower layer activates a rule."""
+    """Machine-composable layer 0 defaults; resolved even before an adaptive layer activates."""
     return [{
         "id": f"base/{rule_id}", "rule": rule_id, "stage": "observing",
         "status": "observing", "params": dict(rule.get("default_params") or {}),
         "layer": "base", "source_kind": "built-in", "enabled": False,
+        "identity": {"layer": "base", "id": f"base/{rule_id}"},
     } for rule_id, rule in sorted(RULES.items())]
+
+
+def _validate_rule_params(rule: str, params: dict, label: str) -> None:
+    if rule not in RULES:
+        raise WorkflowError(f"{label} references unknown rule {rule!r}")
+    if rule == "round-close-open-findings-v1":
+        severities = params.get("severities")
+        if (set(params) != {"severities"} or not isinstance(severities, list) or not severities
+                or any(item not in ("blocker", "major", "minor") for item in severities)
+                or len(set(severities)) != len(severities)):
+            raise WorkflowError(f"{label} has invalid params for {rule}")
+        return
+    if rule == "review-skipped-closes-v1":
+        consecutive = params.get("consecutive")
+        if (set(params) != {"consecutive"} or type(consecutive) is not int
+                or consecutive < 1):
+            raise WorkflowError(f"{label} has invalid params for {rule}")
+        return
+    if params:
+        raise WorkflowError(f"{label} has invalid params for {rule}: expected an empty object")
 
 
 def _load_project_policy(root: Path) -> list[dict]:
@@ -685,21 +788,29 @@ def _load_project_policy(root: Path) -> list[dict]:
     except (OSError, UnicodeDecodeError, yaml.YAMLError) as e:
         raise WorkflowError(f"corrupt committed project policy {path} ({e})") from e
     if (not isinstance(document, dict) or document.get("schema") != PROJECT_POLICY_SCHEMA
-            or not isinstance(document.get("policies"), list)):
+            or not isinstance(document.get("policies"), list)
+            or set(document) != {"schema", "policies"}):
         raise WorkflowError(f"corrupt committed project policy {path}")
     out = []
     seen_ids = set()
     for index, policy in enumerate(document["policies"]):
+        label = f"committed project policy {path}: policies[{index}]"
         if (not isinstance(policy, dict) or not isinstance(policy.get("id"), str)
                 or DELTA_ID_RE.fullmatch(policy["id"]) is None
                 or not isinstance(policy.get("rule"), str)
                 or policy.get("stage") not in POLICY_STAGES
                 or not isinstance(policy.get("params"), dict)
                 or not isinstance(policy.get("summary"), str)
-                or not isinstance(policy.get("provenance"), dict)
+                or not policy["summary"].strip()
+                or "\n" in policy["summary"] or "\r" in policy["summary"]
+                or not isinstance(policy.get("origin_delta_id"), str)
+                or DELTA_ID_RE.fullmatch(policy["origin_delta_id"]) is None
+                or set(policy) != {
+                    "id", "rule", "stage", "params", "summary", "origin_delta_id"}
                 or policy["id"] in seen_ids):
-            raise WorkflowError(f"corrupt committed project policy {path}: policies[{index}]")
+            raise WorkflowError(f"corrupt {label}")
         seen_ids.add(policy["id"])
+        _validate_rule_params(policy["rule"], policy["params"], label)
         if policy["stage"] == "enforce":
             raise WorkflowError(
                 f"committed project policy {policy['id']} requests enforce, which is not reachable "
@@ -708,6 +819,8 @@ def _load_project_policy(root: Path) -> list[dict]:
             "id": policy["id"], "rule": policy["rule"], "stage": policy["stage"],
             "status": policy["stage"], "params": dict(policy.get("params") or {}),
             "layer": "project", "source_kind": "committed", "enabled": True,
+            "identity": {"layer": "project", "id": policy["id"]},
+            "origin_delta_id": policy["origin_delta_id"],
         })
     return out
 
@@ -745,7 +858,7 @@ def set_round_override(root: Path, round_id: str, rule: str, stage: str, reason:
     entry = {
         "id": f"round/{rule}", "rule": rule, "stage": stage,
         "params": dict(RULES[rule].get("default_params") or {}),
-        "reason": reason.strip(), "at": _now_iso(),
+        "reason": reason.strip(), "round_id": round_id, "at": _now_iso(),
     }
     document["overrides"].append(entry)
     _ensure_project_state_or_refuse(root)
@@ -764,9 +877,23 @@ def _load_round_overrides(root: Path, round_id: str | None) -> list[dict]:
         raise WorkflowError(f"corrupt round override {path} ({e})") from e
     if (not isinstance(document, dict) or document.get("schema") != "waystone-round-override-1"
             or not isinstance(document.get("round_id"), str)
+            or parse_iso_timestamp(document.get("created_at")) is None
             or not isinstance(document.get("overrides"), list)):
         raise WorkflowError(f"corrupt round override {path}")
     if document.get("expired_at") is not None:
+        return []
+    closed_rounds, _errors = _round_records(root)
+    created_at = parse_iso_timestamp(document["created_at"])
+    durable_close = None if round_id == document["round_id"] else next((
+        row for row in closed_rounds
+        if row["round_id"] == document["round_id"]
+        and parse_iso_timestamp(row["at"]) >= created_at), None)
+    if durable_close is not None:
+        document["expired_at"] = _now_iso()
+        document["expiry_reason"] = "durable-round-close"
+        write_text_atomic(path, json.dumps(document, ensure_ascii=False, indent=2) + "\n")
+        print(f"waystone overlay: recovered expired override for closed round "
+              f"{document['round_id']}", file=sys.stderr)
         return []
     if round_id is not None and document["round_id"] != round_id:
         raise WorkflowError(
@@ -779,6 +906,7 @@ def _load_round_overrides(root: Path, round_id: str | None) -> list[dict]:
                 or entry.get("stage") not in RUNTIME_POLICY_STAGES
                 or not isinstance(entry.get("params") or {}, dict)
                 or not isinstance(entry.get("reason"), str) or not entry["reason"]
+                or entry.get("round_id") != document["round_id"]
                 or entry["rule"] in seen):
             raise WorkflowError(f"corrupt round override {path}: overrides[{index}]")
         seen.add(entry["rule"])
@@ -787,6 +915,7 @@ def _load_round_overrides(root: Path, round_id: str | None) -> list[dict]:
             "status": entry["stage"], "params": dict(entry.get("params") or {}),
             "layer": "round", "source_kind": "override", "enabled": True,
             "round_id": document["round_id"], "reason": entry["reason"],
+            "identity": {"layer": "round", "id": entry["id"]},
         })
     return out
 
@@ -825,18 +954,20 @@ def _resolve_same_scope(policies: list[dict], scope: str,
     for rule, group in sorted(by_rule.items()):
         ordered = sorted(group, key=lambda item: (_STAGE_RANK[item["stage"]], item["id"]))
         winner = ordered[0]
-        source_ids = sorted(item["id"] for item in group)
-        effective = {**winner, "source_ids": source_ids}
+        source_identities = sorted(
+            (item["identity"] for item in group), key=lambda item: (item["layer"], item["id"]))
+        effective = {**winner, "source_identities": source_identities}
         resolved.append(effective)
         if len(group) > 1:
             conflicts.append({
-                "rule": rule, "scope": scope, "ids": source_ids,
-                "effective_id": winner["id"], "effective_stage": winner["stage"],
+                "rule": rule, "scope": scope, "identities": source_identities,
+                "effective_identity": winner["identity"], "effective_stage": winner["stage"],
                 "resolution": "least-restrictive",
             })
             shadowed.extend({
-                "id": item["id"], "rule": rule, "layer": item["layer"],
-                "source_kind": item["source_kind"], "shadowed_by": winner["id"],
+                "identity": item["identity"], "rule": rule, "layer": item["layer"],
+                "source_kind": item["source_kind"], "shadowed_by": winner["identity"],
+                "origin_delta_id": item.get("origin_delta_id"),
                 "reason": "least-restrictive",
             } for item in ordered[1:])
     return resolved
@@ -870,16 +1001,22 @@ def compose_policy(root: Path, round_id: str | None = None) -> dict:
             project_candidates.extend(winners)
             if local_group:
                 winner = winners[0]
-                local_ids = sorted(item["id"] for item in local_group)
                 conflicts.append({
                     "rule": rule, "scope": "project",
-                    "ids": sorted([*local_ids, *(item["id"] for item in committed_group)]),
-                    "effective_id": winner["id"], "effective_stage": winner["stage"],
-                    "resolution": "committed-wins", "shadowed": local_ids,
+                    "identities": sorted(
+                        [*(item["identity"] for item in local_group),
+                         *(item["identity"] for item in committed_group)],
+                        key=lambda item: (item["layer"], item["id"])),
+                    "effective_identity": winner["identity"],
+                    "effective_stage": winner["stage"],
+                    "resolution": "committed-wins",
+                    "shadowed": [item["identity"] for item in sorted(
+                        local_group, key=lambda item: item["id"])],
                 })
                 shadowed.extend({
-                    "id": item["id"], "rule": rule, "layer": "project",
-                    "source_kind": "overlay", "shadowed_by": winner["id"],
+                    "identity": item["identity"], "rule": rule, "layer": "project",
+                    "source_kind": "overlay", "shadowed_by": winner["identity"],
+                    "origin_delta_id": item.get("origin_delta_id"),
                     "reason": "committed-wins",
                 } for item in sorted(local_group, key=lambda item: item["id"]))
         else:
@@ -887,21 +1024,25 @@ def compose_policy(root: Path, round_id: str | None = None) -> dict:
                 local_group, "project", conflicts, shadowed))
 
     resolved_layers = {
+        "base": [{**policy, "source_identities": [policy["identity"]]} for policy in base],
         "user": _resolve_same_scope(user, "user", conflicts, shadowed),
         "project": project_candidates,
         # One override per rule is enforced at write/load, but resolving here keeps the invariant
         # explicit if the representation evolves.
         "round": _resolve_same_scope(round_policies, "round", conflicts, shadowed),
     }
-    effective_by_rule: dict[str, dict] = {}
+    effective_by_rule: dict[str, dict] = {
+        policy["rule"]: policy for policy in resolved_layers["base"]}
     for layer in ("user", "project", "round"):
         for policy in resolved_layers[layer]:
             previous = effective_by_rule.get(policy["rule"])
             if previous is not None:
                 shadowed.append({
-                    "id": previous["id"], "rule": previous["rule"],
+                    "identity": previous["identity"], "rule": previous["rule"],
                     "layer": previous["layer"], "source_kind": previous["source_kind"],
-                    "shadowed_by": policy["id"], "reason": "narrower-scope",
+                    "shadowed_by": policy["identity"],
+                    "origin_delta_id": previous.get("origin_delta_id"),
+                    "reason": "narrower-scope",
                 })
             effective_by_rule[policy["rule"]] = policy
 
@@ -915,21 +1056,47 @@ def compose_policy(root: Path, round_id: str | None = None) -> dict:
         ],
         "effective": sorted(effective_by_rule.values(), key=lambda item: (item["rule"], item["id"])),
         "conflicts": sorted(conflicts, key=lambda item: (
-            item["rule"], item["scope"], item["resolution"], item["effective_id"])),
+            item["rule"], item["scope"], item["resolution"],
+            item["effective_identity"]["layer"], item["effective_identity"]["id"])),
         "shadowed": sorted(shadowed, key=lambda item: (
-            item["rule"], item["layer"], item["id"], item["reason"])),
+            item["rule"], item["layer"], item["identity"]["id"], item["reason"])),
+    }
+
+
+def _materialized_candidate(root: Path, delta: dict) -> dict:
+    raw_summary = str(delta.get("title") or delta["id"])
+    for root_text in {str(Path(root)), str(Path(root).resolve())}:
+        raw_summary = raw_summary.replace(root_text, "[project]")
+    raw_summary = re.sub(r"(?<![A-Za-z0-9])(?:~|/)[^\s]+", "[local-path]", raw_summary)
+    summary = " ".join(raw_summary.split())[:160]
+    if not summary:
+        summary = f"Local policy candidate {delta['id']}"
+    return {
+        "id": delta["id"], "rule": delta["rule"], "stage": delta["status"],
+        "params": dict(delta.get("params") or {}), "summary": summary,
+        "origin_delta_id": delta["id"],
+    }
+
+
+def materialize_consent_context(root: Path, delta_id: str) -> dict:
+    delta = load_delta(root, delta_id)
+    if delta.get("status") not in ACTIVE_STATUSES:
+        raise WorkflowError(f"delta {delta_id} must be active before materialization")
+    if not isinstance(delta.get("replay"), dict):
+        raise WorkflowError(
+            f"delta {delta_id} has no replay evidence; run `waystone overlay replay {delta_id}` first")
+    candidate = _materialized_candidate(root, delta)
+    _validate_rule_params(candidate["rule"], candidate["params"], f"delta {delta_id}")
+    return {
+        "origin_delta_id": delta_id,
+        "target_path": str(_project_policy_path(root).resolve()),
+        "candidate_hash": canonical_payload_hash(candidate),
+        "stage": delta["status"],
     }
 
 
 def materialize(root: Path, delta_id: str, *, consent_recorded: bool = False) -> Path:
     """Promote one replay-validated local delta into the commit-target project policy file."""
-    context = {"rule_id": delta_id}
-    if consent_recorded:
-        record_consent(root, "materialize", "accept", context)
-    if not has_accepted_consent(root, "materialize", context):
-        raise WorkflowError(
-            f"materialize consent is required for {delta_id}; record it with `waystone consent "
-            f"record materialize accept --context rule_id={delta_id}` or pass --consent-recorded")
     delta = load_delta(root, delta_id)
     if delta.get("status") not in ACTIVE_STATUSES:
         raise WorkflowError(f"delta {delta_id} must be active before materialization")
@@ -937,6 +1104,8 @@ def materialize(root: Path, delta_id: str, *, consent_recorded: bool = False) ->
         raise WorkflowError(
             f"delta {delta_id} has no replay evidence; run `waystone overlay replay {delta_id}` first")
     path = _project_policy_path(root)
+    candidate = _materialized_candidate(root, delta)
+    _validate_rule_params(candidate["rule"], candidate["params"], f"delta {delta_id}")
     document = {"schema": PROJECT_POLICY_SCHEMA, "policies": []}
     if path.is_file():
         # Validate the existing document through the same strict loader before preserving it.
@@ -948,21 +1117,14 @@ def materialize(root: Path, delta_id: str, *, consent_recorded: bool = False) ->
     if any(policy.get("id") == delta_id for policy in document["policies"]
            if isinstance(policy, dict)):
         raise WorkflowError(f"committed project policy {delta_id} already exists in {path}")
-    evidence = delta.get("evidence") if isinstance(delta.get("evidence"), dict) else {}
-    replay = delta["replay"]
-    document["policies"].append({
-        "id": delta_id, "rule": delta["rule"], "stage": delta["status"],
-        "params": dict(delta.get("params") or {}),
-        "summary": str(evidence.get("summary") or delta.get("title") or delta_id),
-        "provenance": {
-            "source_delta": delta_id,
-            "evidence": {
-                "source": evidence.get("source"), "rec_id": evidence.get("rec_id"),
-                "summary": evidence.get("summary"), "pointers": list(evidence.get("pointers") or []),
-            },
-            "replay": {key: replay.get(key) for key in ("opportunities", "fires", "fire_rate")},
-        },
-    })
+    context = materialize_consent_context(root, delta_id)
+    if consent_recorded:
+        record_consent(root, "materialize", "accept", context)
+    if not has_accepted_consent(root, "materialize", context):
+        raise WorkflowError(
+            f"materialize consent is required for the current {delta_id} candidate; "
+            "record acceptance after inspecting its bound path, stage, and hash")
+    document["policies"].append(candidate)
     path.parent.mkdir(parents=True, exist_ok=True)
     text = yaml.safe_dump(document, sort_keys=False, allow_unicode=True)
     write_text_atomic(path, text)
@@ -1018,7 +1180,10 @@ def add_delta(root: Path, delta_id: str, *, rule: str, summary: str, pointers=No
         "params": dict(RULES[rule].get("default_params") or {}),
         "scope": {"pslug": pslug, "root": str(Path(root).resolve())},
         "candidate_scope": candidate_scope,
-        "observed_in": list(observed_in) if observed_in else [pslug],
+        # Derived only from registered canonical project roots with durable rule observations.
+        # `observed_in` remains an ignored compatibility argument so older library callers cannot
+        # forge the promotion gate while they migrate away from it.
+        "observed_in": _derived_observed_projects(root, rule, require_registered=False),
         "evidence": {"source": source, "rec_id": rec_id, "summary": summary,
                      "pointers": list(pointers or [])},
         "expected_effect": expected_effect,
@@ -1328,16 +1493,20 @@ def _append_warning(root: Path, row: dict) -> None:
         fh.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def _emit(root: Path, boundary: str, delta_id: str, rule: str, delta_status: str, event: str,
+def _emit(root: Path, boundary: str, policy: dict, rule: str, delta_status: str, event: str,
           message: str, context: dict) -> dict:
     """Append a warnings row; warning-stage fires and every policy conflict are visible on stderr."""
-    row = {"at": _now_iso(), "boundary": boundary, "delta_id": delta_id, "rule": rule,
+    identity = policy["identity"]
+    row = {"at": _now_iso(), "boundary": boundary, "policy_identity": identity, "rule": rule,
            "delta_status": delta_status, "event": event, "message": message, "context": context}
+    if isinstance(policy.get("origin_delta_id"), str):
+        row["origin_delta_id"] = policy["origin_delta_id"]
     _append_warning(root, row)
+    display = f"{identity['layer']}:{identity['id']}"
     if event == "fire" and delta_status == "warning":
-        print(f"waystone warn [{delta_id}]: {message}", file=sys.stderr)
+        print(f"waystone warn [{display}]: {message}", file=sys.stderr)
     elif event == "conflict":
-        print(f"waystone warn conflict [{delta_id}]: {message}", file=sys.stderr)
+        print(f"waystone warn conflict [{display}]: {message}", file=sys.stderr)
     return row
 
 
@@ -1455,7 +1624,7 @@ def _emit_evaluations(root: Path, boundary: str, group: list[dict], rule_id: str
     rows = []
     for delta in sorted(group, key=lambda item: item["id"]):
         rows.append(_emit(
-            root, boundary, delta["id"], rule_id, delta["status"], "evaluation",
+            root, boundary, delta, rule_id, delta["status"], "evaluation",
             "rule evaluated at workflow boundary",
             {**context, "evaluable": True, "fired": fired, "coverage_reason": None}))
     return rows
@@ -1478,7 +1647,9 @@ def evaluate_boundary(root: Path, boundary: str, context: dict) -> list[dict]:
                 unknown_context[key] = context[key]
         try:
             row = _emit(
-                root, boundary, f"boundary/{boundary}", "boundary-evaluation-v1", "observing",
+                root, boundary,
+                {"identity": {"layer": "boundary", "id": f"boundary/{boundary}"}},
+                "boundary-evaluation-v1", "observing",
                 "evaluation-error", f"boundary evaluation failed: {type(e).__name__}",
                 unknown_context)
         except Exception as record_error:  # noqa: BLE001 — the host still cannot be failed by warning IO
@@ -1492,16 +1663,17 @@ def _evaluate_boundary(root: Path, boundary: str, context: dict) -> list[dict]:
     requested_round = context.get("round_id") if boundary == "round-close" else None
     composition = compose_policy(
         root, requested_round if isinstance(requested_round, str) else None)
-    policies_by_id = {
-        policy["id"]: policy for layer in composition["layers"] for policy in layer["policies"]
+    policies_by_identity = {
+        (policy["identity"]["layer"], policy["identity"]["id"]): policy
+        for layer in composition["layers"] for policy in layer["policies"]
     }
-    active = composition["effective"]
+    active = [policy for policy in composition["effective"] if policy.get("enabled") is True]
     events: list[dict] = []
     for d in sorted((d for d in active if d.get("rule") not in RULES),
                     key=lambda d: d.get("id", "")):
         rule_id = d.get("rule")
         message = f"active delta references unknown rule {rule_id!r} and could not be evaluated"
-        events.append(_emit(root, boundary, d.get("id", "(missing-id)"), rule_id,
+        events.append(_emit(root, boundary, d, rule_id,
                             d["status"], "evaluation-error", message, {}))
         print(f"waystone warn [{d.get('id', '(missing-id)')}]: {message}", file=sys.stderr)
 
@@ -1513,23 +1685,28 @@ def _evaluate_boundary(root: Path, boundary: str, context: dict) -> list[dict]:
     for conflict in composition["conflicts"]:
         if conflict["rule"] not in relevant_rules:
             continue
-        conflict_context = {"delta_ids": conflict["ids"], "resolution": conflict["resolution"]}
+        conflict_context = {
+            "policy_identities": conflict["identities"], "resolution": conflict["resolution"]}
         for key in ("delegation_id", "task_id", "round_id"):
             if isinstance(context.get(key), str):
                 conflict_context[key] = context[key]
         if isinstance(context.get("task_ids"), list):
             conflict_context["task_ids"] = context["task_ids"]
         events.append(_emit(
-            root, boundary, conflict["effective_id"], conflict["rule"],
+            root, boundary, policies_by_identity[
+                (conflict["effective_identity"]["layer"], conflict["effective_identity"]["id"])],
+            conflict["rule"],
             conflict["effective_stage"], "conflict",
-            f"{len(conflict['ids'])} policies conflict at {conflict['scope']} scope — "
+            f"{len(conflict['identities'])} policies conflict at {conflict['scope']} scope — "
             f"effective stage {conflict['effective_stage']} ({conflict['resolution']})",
             conflict_context))
 
     for rep in sorted(relevant, key=lambda item: (item["rule"], item["id"])):
         rule_id = rep["rule"]
-        group = [policies_by_id[source_id] for source_id in rep.get("source_ids", [rep["id"]])
-                 if source_id in policies_by_id]
+        source_identities = rep.get("source_identities", [rep["identity"]])
+        group = [policies_by_identity[(identity["layer"], identity["id"])]
+                 for identity in source_identities
+                 if (identity["layer"], identity["id"]) in policies_by_identity]
         if not group:
             group = [rep]
         eff = rep["stage"]
@@ -1548,10 +1725,10 @@ def _evaluate_boundary(root: Path, boundary: str, context: dict) -> list[dict]:
                 attribution = _delegation_context(delegate._record_dir(root, did), did)
                 attribution.update({key: context[key] for key in ("task_id", "round_id")
                                     if isinstance(context.get(key), str)})
-                events.append(_emit(root, boundary, rep["id"], rule_id, eff, "fire",
+                events.append(_emit(root, boundary, rep, rule_id, eff, "fire",
                                     _RULE1_MSG.format(did=did), attribution))
             for did in errors:
-                events.append(_emit(root, boundary, rep["id"], rule_id, eff, "evaluation-error",
+                events.append(_emit(root, boundary, rep, rule_id, eff, "evaluation-error",
                                     f"delegation {did} contract could not be evaluated",
                                     {"delegation_id": did}))
         elif rule_id == "delegation-scope-drift-v1":
@@ -1562,14 +1739,14 @@ def _evaluate_boundary(root: Path, boundary: str, context: dict) -> list[dict]:
                     key: value for key, value in row.items() if key != "outside_scope"}))
                 if outside:
                     events.append(_emit(
-                        root, boundary, rep["id"], rule_id, eff, "fire",
+                        root, boundary, rep, rule_id, eff, "fire",
                         f"delegation {row['delegation_id']} changed {len(outside)} file(s) outside "
                         "its structured declared scope",
                         {**row, "outside_scope": outside}))
             for row in errors:
                 row.update({"evaluable": False, "fired": False})
                 events.append(_emit(
-                    root, boundary, rep["id"], rule_id, eff, "evaluation-error",
+                    root, boundary, rep, rule_id, eff, "evaluation-error",
                     f"delegation {row['delegation_id']} scope could not be evaluated",
                     row))
         elif rule_id == "round-close-open-findings-v1":
@@ -1587,11 +1764,11 @@ def _evaluate_boundary(root: Path, boundary: str, context: dict) -> list[dict]:
                 msg = f"round close leaves {len(out['fires'])} severe finding task(s) open: {desc}"
                 if out["unlinked"]:
                     msg += f" · {out['unlinked']} unlinked finding(s) (provenance unknown)"
-                events.append(_emit(root, boundary, rep["id"], rule_id, eff, "fire", msg,
+                events.append(_emit(root, boundary, rep, rule_id, eff, "fire", msg,
                                     {"task_ids": [f["task_id"] for f in out["fires"]],
                                      "round_id": context.get("round_id"), "unlinked": out["unlinked"]}))
             if out["evaluation_errors"]:
-                events.append(_emit(root, boundary, rep["id"], rule_id, eff, "evaluation-error",
+                events.append(_emit(root, boundary, rep, rule_id, eff, "evaluation-error",
                                     f"{out['evaluation_errors']} review file(s) could not be evaluated",
                                     {"round_id": context.get("round_id")}))
         elif rule_id in ("env-manifest-mutation-v1", "review-skipped-closes-v1",
@@ -1614,7 +1791,7 @@ def _evaluate_boundary(root: Path, boundary: str, context: dict) -> list[dict]:
                 attribution.update({"evaluable": False, "fired": False,
                                     "coverage_reason": out.get("coverage_reason") or "unknown"})
                 events.append(_emit(
-                    root, boundary, rep["id"], rule_id, eff, "evaluation-error",
+                    root, boundary, rep, rule_id, eff, "evaluation-error",
                     f"round {round_id} could not be evaluated: {out.get('coverage_reason')}",
                     attribution))
                 continue
@@ -1630,10 +1807,10 @@ def _evaluate_boundary(root: Path, boundary: str, context: dict) -> list[dict]:
                     message = (f"round {round_id} reaches {out['current_streak']} consecutive "
                                "closes without an intervening review feedback ingest")
                 events.append(_emit(
-                    root, boundary, rep["id"], rule_id, eff, "fire", message, attribution))
+                    root, boundary, rep, rule_id, eff, "fire", message, attribution))
             if out.get("evaluation_errors"):
                 events.append(_emit(
-                    root, boundary, rep["id"], rule_id, eff, "evaluation-error",
+                    root, boundary, rep, rule_id, eff, "evaluation-error",
                     f"{out['evaluation_errors']} round/review evidence row(s) could not be evaluated",
                     attribution))
     return events
@@ -1895,8 +2072,11 @@ def write_round_exposure(root: Path, round_id: str, head_sha: str | None, waterm
         "head_sha": head_sha, "config_watermark": watermark, "base_sha": base_sha,
         "profile_fingerprint": fp, "bindings": bindings,
         "env_prep": env_prep, "review_mode": review_mode, "round_evidence": round_evidence,
-        "overlays_active": [{"id": d["id"], "status": d["stage"]}
-                            for d in policy_composition["effective"]],
+        "overlays_active": [{
+            "identity": d["identity"], "status": d["stage"],
+            **({"origin_delta_id": d["origin_delta_id"]}
+               if isinstance(d.get("origin_delta_id"), str) else {}),
+        } for d in policy_composition["effective"]],
         "policy_composition": policy_composition,
         # Adapt & Enforce has not shipped: null means no effective guard engine and [] means no
         # recorded waivers. These are truthful contract values, not missing-data fallbacks.
@@ -1968,7 +2148,7 @@ def _cli_add(rest: list[str]) -> int:
     pos, opts = _parse_opts(
         rest, value=("rule", "summary", "expected-effect", "risk", "candidate-scope", "from-rec",
                      "title", "root"),
-        repeat=("pointers", "observed-in"))
+        repeat=("pointers",))
     if not pos:
         raise WorkflowError("add requires a <delta-id>")
     if not opts.get("rule"):
@@ -1981,8 +2161,7 @@ def _cli_add(rest: list[str]) -> int:
             root, pos[0], rule=opts["rule"], summary=opts["summary"],
             pointers=opts.get("pointers"), expected_effect=opts.get("expected-effect", ""),
             risk=opts.get("risk", ""), candidate_scope=opts.get("candidate-scope", "unresolved"),
-            observed_in=opts.get("observed-in") or None, from_rec=opts.get("from-rec"),
-            title=opts.get("title", ""))
+            from_rec=opts.get("from-rec"), title=opts.get("title", ""))
     print(f"added delta {delta['id']} ({delta['status']})")
     return 0
 
@@ -2070,8 +2249,7 @@ def _cli_promote_user(rest: list[str]) -> int:
     if len(pos) != 1:
         raise WorkflowError("promote-user requires one <delta-id>")
     root = _resolve_root(opts.get("root"))
-    with hold_lock(project_lock_path(root)):
-        promoted = promote_user(root, pos[0])
+    promoted = promote_user(root, pos[0])
     print(f"promoted {promoted['id']} -> user overlay")
     return 0
 
@@ -2123,7 +2301,8 @@ def _cli_check(rest: list[str]) -> int:
         print("waystone check: no active-delta warnings")
     for e in fires:
         marker = "warn" if e["delta_status"] == "warning" else "observe"
-        print(f"[{marker}] {e['rule']} [{e['delta_id']}]: {e['message']}")
+        identity = e["policy_identity"]
+        print(f"[{marker}] {e['rule']} [{identity['layer']}:{identity['id']}]: {e['message']}")
     for e in (e for e in events if e["event"] == "evaluation-error"):
         print(f"[eval-error] {e['rule']}: {e['message']}")
     return 0
