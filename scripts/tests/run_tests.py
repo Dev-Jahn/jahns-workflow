@@ -3085,21 +3085,30 @@ class ImproveScopeTests(unittest.TestCase):
         ])
 
     @staticmethod
-    def _run(home: Path, cwd: Path, argv: list[str], *, dispatcher: bool = False) -> int:
+    def _run(home: Path, cwd: Path, argv: list[str], *, dispatcher: bool = False,
+             waystone_home: Path | None = None, stderr=None) -> int:
         import contextlib
         import io
         import os
         import waystone
 
         previous = Path.cwd()
+        previous_waystone_home = os.environ.get("WAYSTONE_HOME")
         try:
             os.chdir(cwd)
-            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            if waystone_home is not None:
+                os.environ["WAYSTONE_HOME"] = str(waystone_home)
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+                    stderr if stderr is not None else io.StringIO()):
                 entry = (lambda: waystone.main(["improve", *argv])) if dispatcher else (
                     lambda: improve.main(argv))
-                return _run_with_home(home, entry)
+                return _run_with_home(home, entry, isolate_storage=waystone_home is None)
         finally:
             os.chdir(previous)
+            if previous_waystone_home is None:
+                os.environ.pop("WAYSTONE_HOME", None)
+            else:
+                os.environ["WAYSTONE_HOME"] = previous_waystone_home
 
     @staticmethod
     def _rows(path: Path) -> list[dict]:
@@ -3158,6 +3167,81 @@ class ImproveScopeTests(unittest.TestCase):
                 home, alpha, ["trace", "--source", str(source), "--host", "codex"]), 0)
             rows = self._rows(alpha / ".waystone" / "improve" / "sessions.jsonl")
             self.assertEqual([row["project"] for row in rows], [alpha.name])
+
+    def test_project_codex_filter_excludes_same_basename_other_root(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            home = base / "home"
+            home.mkdir()
+            target, other = base / "a" / "repo", base / "b" / "repo"
+            self._project(target, "target")
+            self._project(other, "other")
+            source = base / "codex-sessions"
+            source.mkdir()
+            self._codex_session(source, target, "10101010-1010-1010-1010-101010101010")
+            self._codex_session(source, other, "20202020-2020-2020-2020-202020202020")
+
+            self.assertEqual(self._run(
+                home, target, ["trace", "--source", str(source), "--host", "codex"]), 0)
+            rows = self._rows(target / ".waystone" / "improve" / "sessions.jsonl")
+            self.assertEqual([row["cwd"] for row in rows], [str(target)])
+
+    def test_project_claude_filter_excludes_punctuation_slug_collision(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            home = base / "home"
+            home.mkdir()
+            target, other = base / "foo-bar", base / "foo_bar"
+            self._project(target, "target")
+            self._project(other, "other")
+            self.assertEqual(self._claude_slug(target), self._claude_slug(other))
+            source = base / "claude-projects"
+            self._claude_session(source, target, "30303030-3030-3030-3030-303030303030")
+            self._claude_session(source, other, "40404040-4040-4040-4040-404040404040")
+
+            self.assertEqual(self._run(
+                home, target, ["trace", "--source", str(source), "--host", "claude"]), 0)
+            rows = self._rows(target / ".waystone" / "improve" / "sessions.jsonl")
+            self.assertEqual([row["cwd"] for row in rows], [str(target)])
+
+    def test_project_codex_filter_includes_session_started_in_subdirectory(self):
+        with tempfile.TemporaryDirectory() as d:
+            home, alpha, _beta, _registry = self._fixture(d)
+            nested = alpha / "src" / "feature"
+            nested.mkdir(parents=True)
+            source = Path(d) / "codex-sessions"
+            source.mkdir()
+            self._codex_session(source, nested, "50505050-5050-5050-5050-505050505050")
+
+            self.assertEqual(self._run(
+                home, alpha, ["trace", "--source", str(source), "--host", "codex"]), 0)
+            rows = self._rows(alpha / ".waystone" / "improve" / "sessions.jsonl")
+            self.assertEqual([row["cwd"] for row in rows], [str(nested)])
+
+    def test_project_filter_excludes_unknown_cwd_and_records_coverage(self):
+        with tempfile.TemporaryDirectory() as d:
+            home, alpha, _beta, _registry = self._fixture(d)
+            source = Path(d) / "claude-projects"
+            project = source / self._claude_slug(alpha)
+            project.mkdir(parents=True)
+            session = project / "60606060-6060-6060-6060-606060606060.jsonl"
+            _write_jsonl(session, [{
+                "type": "user", "uuid": "u-missing-cwd",
+                "message": {"role": "user", "content": "work"},
+            }])
+
+            self.assertEqual(self._run(
+                home, alpha, ["trace", "--source", str(source), "--host", "claude"]), 0)
+            out = alpha / ".waystone" / "improve"
+            self.assertEqual(self._rows(out / "sessions.jsonl"), [])
+            coverage = _json.loads((out / "parse_coverage.json").read_text())
+            self.assertEqual(coverage["project_filter"], {
+                "project_root": str(alpha.resolve()),
+                "sessions_excluded": {
+                    "cwd_outside_project": [],
+                    "cwd_unknown": [str(session.resolve())],
+                },
+            })
 
     def test_user_wide_scans_all_projects_and_never_touches_project_improve(self):
         with tempfile.TemporaryDirectory() as d:
@@ -3296,6 +3380,39 @@ class ImproveScopeTests(unittest.TestCase):
                 "audit", "--user-wide", "--in", str(project_out)]), 1)
             self.assertFalse((machine_out / "project-attempt").exists())
             self.assertFalse((project_out / "user-attempt").exists())
+
+    def test_improve_rejects_waystone_home_equal_to_project_state(self):
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            home, alpha, _beta, _registry = self._fixture(d)
+            err = io.StringIO()
+            rc = self._run(
+                home, alpha, ["decide", "context_heavy/trim", "accept"],
+                waystone_home=alpha / ".waystone", stderr=err,
+            )
+            self.assertEqual(rc, 1)
+            self.assertIn("WAYSTONE_HOME", err.getvalue())
+            self.assertIn("outside the project", err.getvalue())
+
+    def test_improve_rejects_project_below_machine_root(self):
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            home = base / "home"
+            home.mkdir()
+            waystone_home = base / "machine"
+            root = waystone_home / "nested-project"
+            self._project(root, "nested")
+            err = io.StringIO()
+            rc = self._run(
+                home, root, ["decide", "context_heavy/trim", "accept"],
+                waystone_home=waystone_home, stderr=err,
+            )
+            self.assertEqual(rc, 1)
+            self.assertIn("WAYSTONE_HOME", err.getvalue())
+            self.assertIn("outside the project", err.getvalue())
 
 
 class ImproveM1DefectTests(unittest.TestCase):
@@ -5879,7 +5996,7 @@ class ContractInjectTests(unittest.TestCase):
             self._delegation(root, home, "did-one", "needs-review")
             self._delegation(root, home, "did-two", "needs-review")
             self._delegation(root, home, "did-done", "applied")
-            evidence = home / ".waystone" / "improve" / "evidence.jsonl"
+            evidence = root / ".waystone" / "improve" / "evidence.jsonl"
             evidence.parent.mkdir(parents=True)
             _write_jsonl(evidence, [
                 {"task_id": "feat/active", "project": "demo", "findings": [{"severity": "major"}],
@@ -5899,6 +6016,23 @@ class ContractInjectTests(unittest.TestCase):
             self.assertIn("observing 1 (review_association/observe)", ctx)
             self.assertIn("needs-review delegations 2 (did-one did-two)", ctx)
             self.assertIn("unverified+finding tasks 1", ctx)
+
+    def test_machine_only_evidence_is_not_reported_as_project_evidence(self):
+        module = self._module()
+        with tempfile.TemporaryDirectory() as d:
+            root, home = self._project(d)
+            _write_profile(root, DelegateVerifyTests._PROFILE)
+            evidence = home / ".waystone" / "improve" / "evidence.jsonl"
+            evidence.parent.mkdir(parents=True)
+            _write_jsonl(evidence, [{
+                "task_id": "feat/active", "project": "demo",
+                "findings": [{"severity": "major"}],
+                "delegations": [{"verification_present": False}],
+            }])
+
+            rc, ctx = self._context(module, root, home)
+            self.assertEqual(rc, 0)
+            self.assertNotIn("unverified+finding tasks", ctx)
 
     def test_profile_absent_is_explicit_and_constitution_absence_omits_block(self):
         module = self._module()
@@ -5939,7 +6073,7 @@ class ContractInjectTests(unittest.TestCase):
             delta.write_text("{bad")
             rec = self._delegation(root, home, "did-corrupt", "needs-review")
             (rec / "status.json").write_text("{bad")
-            evidence = home / ".waystone" / "improve" / "evidence.jsonl"
+            evidence = root / ".waystone" / "improve" / "evidence.jsonl"
             evidence.parent.mkdir(parents=True)
             evidence.write_text("{bad\n")
             rc, ctx = self._context(module, root, home)

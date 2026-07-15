@@ -434,14 +434,31 @@ def _self_session_anchor(path: Path) -> tuple[int | None, str | None, int]:
     return None, None, 0
 
 
+def _cwd_belongs_to_project(cwd, project_root: Path) -> bool | None:
+    """Return explicit cwd membership, or None when cwd cannot establish provenance."""
+    if not isinstance(cwd, str) or not cwd:
+        return None
+    path = Path(cwd).expanduser()
+    if not path.is_absolute():
+        return None
+    try:
+        return path.resolve().is_relative_to(project_root)
+    except (OSError, ValueError):
+        return None
+
+
 def run_trace(sources: list[Path], projects: set[str], out_dir: Path,
-              host: str = "claude") -> dict:
+              host: str = "claude", project_root: Path | None = None) -> dict:
+    canonical_root = project_root.resolve() if project_root is not None else None
     if host == "codex":
-        return _run_codex_trace(sources, projects, out_dir)
+        return _run_codex_trace(sources, projects, out_dir, canonical_root)
     if host != "claude":
         raise WorkflowError(f"trace host must be claude|codex, got {host!r}")
-    files = discover(sources, projects)
+    # A Claude slug is lossy, so project mode scans every candidate and attributes only by parsed
+    # cwd. User-wide --project remains a path-layout filter because it has no canonical root.
+    files = discover(sources, set() if canonical_root is not None else projects)
     files_by_kind: Counter = Counter(kind for _, _, kind in files)
+    project_exclusions = {"cwd_outside_project": [], "cwd_unknown": []}
 
     # when running inside a live CC session, truncate that session's own mid-write transcript at the
     # improve invocation (env set by the harness); unset/empty -> byte-identical to a plain run
@@ -491,6 +508,12 @@ def run_trace(sources: list[Path], projects: set[str], out_dir: Path,
             files_unreadable["/".join(rel_parts)] = type(e).__name__
             continue
         row, dels = _build_session(path, kind, session_kind, scope, parsed)
+        if canonical_root is not None:
+            membership = _cwd_belongs_to_project(row.get("cwd"), canonical_root)
+            if membership is not True:
+                reason = "cwd_unknown" if membership is None else "cwd_outside_project"
+                project_exclusions[reason].append(str(path))
+                continue
         session_rows.append(row)
         delegation_rows.extend(dels)
 
@@ -522,6 +545,13 @@ def run_trace(sources: list[Path], projects: set[str], out_dir: Path,
         "partial_tail_lines": partial_tail_lines,
         "row_totals": {"sessions": len(session_rows), "delegations": len(delegation_rows)},
     }
+    if canonical_root is not None:
+        coverage["project_filter"] = {
+            "project_root": str(canonical_root),
+            "sessions_excluded": {
+                reason: sorted(paths) for reason, paths in sorted(project_exclusions.items())
+            },
+        }
     # only present when running inside a live CC session (env set) — absent otherwise (byte-identical)
     if self_session is not None:
         coverage["self_session"] = self_session
@@ -535,7 +565,8 @@ def run_trace(sources: list[Path], projects: set[str], out_dir: Path,
     return coverage
 
 
-def _run_codex_trace(sources: list[Path], projects: set[str], out_dir: Path) -> dict:
+def _run_codex_trace(sources: list[Path], projects: set[str], out_dir: Path,
+                     project_root: Path | None = None) -> dict:
     """Project Codex rollouts through the same session/delegation schema as Claude trace."""
     files = codexlog.discover(sources)
     files_by_kind: Counter = Counter()
@@ -547,6 +578,7 @@ def _run_codex_trace(sources: list[Path], projects: set[str], out_dir: Path) -> 
     record_parse_errors = 0
     partial_tail_lines = 0
     unknown_tool_result_status = 0
+    project_exclusions = {"cwd_outside_project": [], "cwd_unknown": []}
 
     self_sid = os.environ.get("CODEX_THREAD_ID") or None
     self_session = ({"session_id": self_sid, "file_found": False,
@@ -574,8 +606,14 @@ def _run_codex_trace(sources: list[Path], projects: set[str], out_dir: Path) -> 
             continue
         session_kind = parsed["session_kind"]
         kind = f"codex_{session_kind}_transcript"
-        files_by_kind[kind] += 1
         row, delegations = _build_session(path, kind, session_kind, scope, parsed)
+        if project_root is not None:
+            membership = _cwd_belongs_to_project(row.get("cwd"), project_root)
+            if membership is not True:
+                reason = "cwd_unknown" if membership is None else "cwd_outside_project"
+                project_exclusions[reason].append(str(path))
+                continue
+        files_by_kind[kind] += 1
         session_rows.append(row)
         delegation_rows.extend(delegations)
 
@@ -610,6 +648,13 @@ def _run_codex_trace(sources: list[Path], projects: set[str], out_dir: Path) -> 
         "unknown_tool_result_status": unknown_tool_result_status,
         "row_totals": {"sessions": len(session_rows), "delegations": len(delegation_rows)},
     }
+    if project_root is not None:
+        coverage["project_filter"] = {
+            "project_root": str(project_root),
+            "sessions_excluded": {
+                reason: sorted(paths) for reason, paths in sorted(project_exclusions.items())
+            },
+        }
     if self_session is not None:
         coverage["self_session"] = self_session
 
@@ -1421,10 +1466,22 @@ def _prepare_project_output(project_root: Path | None, user_wide: bool) -> None:
         ensure_project_state_dir(project_root)
 
 
-def _trace_project(root: Path, host: str) -> str:
-    if host == "codex":
-        return root.resolve().name
-    return re.sub(r"[^A-Za-z0-9]", "-", str(root.resolve()))
+def _validate_improve_residences(project_root: Path) -> None:
+    machine_root = machine_dir().resolve()
+    project_state = project_state_path(project_root).resolve()
+    machine = (machine_root / "improve").resolve()
+    project = (project_state / "improve").resolve()
+
+    def overlaps(first: Path, second: Path) -> bool:
+        return first == second or first.is_relative_to(second) or second.is_relative_to(first)
+
+    if overlaps(machine, project) or overlaps(machine_root, project_state):
+        raise WorkflowError(
+            f"machine improve residence {machine} and project improve residence {project} "
+            f"are not isolated because WAYSTONE_HOME {machine_root} overlaps project state "
+            f"{project_state}; "
+            "set WAYSTONE_HOME to a directory outside the project"
+        )
 
 
 def _cli_trace(argv: list[str], project_root: Path | None, user_wide: bool) -> int:
@@ -1439,7 +1496,7 @@ def _cli_trace(argv: list[str], project_root: Path | None, user_wide: bool) -> i
 
     host = explicit_host or ("codex" if os.environ.get("WAYSTONE_HOST") == "codex" else "claude")
     if not user_wide:
-        projects = {_trace_project(project_root, host)}
+        projects = set()
     if raw_sources:
         sources = [Path(s).expanduser().resolve() for s in raw_sources]
         # an EXPLICITLY-named source that is not a directory is a precondition failure (exit 1); the
@@ -1464,7 +1521,10 @@ def _cli_trace(argv: list[str], project_root: Path | None, user_wide: bool) -> i
 
     try:
         _prepare_project_output(project_root, user_wide)
-        cov = run_trace(sources, projects, out_dir, host=host)
+        cov = run_trace(
+            sources, projects, out_dir, host=host,
+            project_root=None if user_wide else project_root,
+        )
     except WorkflowError as e:
         print(f"waystone improve trace: {e}", file=sys.stderr)
         return 1
@@ -1624,14 +1684,21 @@ def main(argv: list[str]) -> int:
         return 1
     user_wide = "--user-wide" in rest
     rest = [arg for arg in rest if arg != "--user-wide"]
-    project_root = None if user_wide else find_project_root(Path.cwd())
-    if not user_wide and project_root is None:
+    active_project_root = find_project_root(Path.cwd())
+    if not user_wide and active_project_root is None:
         print(
             f"waystone improve {sub}: no waystone project found from {Path.cwd()} "
             "(run inside a project or pass --user-wide)",
             file=sys.stderr,
         )
         return 1
+    if active_project_root is not None:
+        try:
+            _validate_improve_residences(active_project_root)
+        except WorkflowError as e:
+            print(f"waystone improve {sub}: {e}", file=sys.stderr)
+            return 1
+    project_root = None if user_wide else active_project_root
     if sub == "trace":
         return _cli_trace(rest, project_root, user_wide)
     if sub == "reviews":

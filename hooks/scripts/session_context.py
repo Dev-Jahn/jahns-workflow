@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
-from common import git_branch_info, git_full_sha, load_config, load_tasks, machine_dir, migrate_project_state, next_actionable, registry_path, resume_path, start_here_path  # noqa: E402
+from common import git_branch_info, git_full_sha, load_config, load_tasks, migrate_project_state, next_actionable, project_state_path, resume_path, start_here_path  # noqa: E402
 
 MAX_CHARS = 8000
 MAX_TASK_LINES = 8
@@ -89,7 +89,7 @@ def _delegation_summary(root: Path) -> str:
 
 
 def _evidence_summary(root: Path) -> str | None:
-    path = machine_dir() / "improve" / "evidence.jsonl"
+    path = project_state_path(root) / "improve" / "evidence.jsonl"
     if not path.is_file():
         return None
     try:
@@ -97,14 +97,6 @@ def _evidence_summary(root: Path) -> str | None:
         data = load_tasks(root)
         if isinstance(data.get("project"), str):
             aliases.add(data["project"])
-        registry = registry_path()
-        if registry.is_file():
-            reg = json.loads(registry.read_text(encoding="utf-8"))
-            for entry in reg.get("projects", []):
-                if (isinstance(entry, dict) and entry.get("path")
-                        and Path(entry["path"]).expanduser().resolve() == root.resolve()
-                        and isinstance(entry.get("name"), str)):
-                    aliases.add(entry["name"])
         count = 0
         for line in path.read_text(encoding="utf-8").splitlines():
             if not line.strip():
