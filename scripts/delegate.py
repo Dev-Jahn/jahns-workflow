@@ -984,7 +984,11 @@ def _run_claimed(root: Path, plan: dict, did: str, record_dir: Path) -> int:
         _set_state(record_dir, "failed-artifact", env=env_rec, error=str(e))
         raise WorkflowError(
             f"artifact computation failed after the runner — worktree preserved at {worktree_path}: {e}")
-    events = _warn_boundary(root, "delegate-run", {"delegation_id": did})
+    boundary_context = {"delegation_id": did, "task_id": task_id}
+    packet_round = (packet.get("task") or {}).get("round")
+    if isinstance(packet_round, str):
+        boundary_context["round_id"] = packet_round
+    events = _warn_boundary(root, "delegate-run", boundary_context)
     rule1_fired = any(
         event.get("rule") == "delegation-verification-evidence-v1"
         and event.get("event") == "fire"
@@ -1952,7 +1956,12 @@ def apply_delegation(root: Path, did: str, override_no_verdict_reason: str | Non
         if override_no_verdict_reason is not None:
             raise WorkflowError("--override-no-verdict is only valid when no verdict exists")
     contract = _load_contract(rec)
-    _warn_boundary(root, "delegate-apply", {"delegation_id": did})
+    packet = _load_packet(rec)
+    boundary_context = {"delegation_id": did, "task_id": contract.get("task_id")}
+    packet_round = (packet.get("task") or {}).get("round")
+    if isinstance(packet_round, str):
+        boundary_context["round_id"] = packet_round
+    _warn_boundary(root, "delegate-apply", boundary_context)
     if not contract.get("empty"):
         rc, out, err = _git(root, "apply", str(rec / "artifact" / "changes.patch"))
         if rc != 0:

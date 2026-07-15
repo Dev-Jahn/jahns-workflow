@@ -783,6 +783,14 @@ def ingest(root: Path, round_id: str | None, src: Path = INBOX, reviewer: str | 
                       "remain unknown", file=sys.stderr)
     print(f"ingested {len(body)} bytes verbatim → {dest} (consumed {src})")
     print(f"  {len(findings)} finding(s) parsed — verify each before registering")
+    # The ingest observation is the replayable reset signal for review-skipped-closes-v1. Like the
+    # warning itself it is advisory evidence and can never change the completed ingest's exit code.
+    try:
+        import overlay
+        overlay.record_review_ingest(root, round_id)
+    except Exception as e:  # noqa: BLE001
+        print(f"review ingest: overlay ingest observation unavailable ({e}) — ingest still succeeded",
+              file=sys.stderr)
     # M2 §6: evaluate overlay warns at the review-ingest boundary (best-effort; never blocks).
     try:
         import overlay
@@ -810,8 +818,9 @@ def main(argv: list[str]) -> int:
         return 1
     try:
         if sub == "ingest":
-            return ingest(root, _opt(rest, "--round"), reviewer=_opt(rest, "--reviewer"),
-                          force="--force" in rest)
+            with hold_lock(project_lock_path(root)):
+                return ingest(root, _opt(rest, "--round"), reviewer=_opt(rest, "--reviewer"),
+                              force="--force" in rest)
         pr_s = _opt(rest, "--pr")
         if sub == "freeze":
             if not pr_s:

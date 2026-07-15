@@ -28,7 +28,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import (  # noqa: E402
-    ROUND_RE, WorkflowError, find_project_root, git_full_sha, hold_lock, load_config,
+    ROUND_RE, WorkflowError, canonical_scope_prefixes, find_project_root, git_full_sha, hold_lock, load_config,
     migrate_project_state, project_lock_path, write_text_atomic,
 )
 
@@ -199,6 +199,8 @@ def close(root: Path, round_id: str, done: list[str], touched: list[str], commit
     session_id = os.environ.get("CLAUDE_CODE_SESSION_ID") or None
     data0 = yaml.safe_load(text) or {}
     by_id = {t.get("id"): t for t in data0.get("tasks", []) if isinstance(t, dict)}
+    done_transitions = [task_id for task_id in done
+                        if by_id.get(task_id, {}).get("status") != "done"]
     # done tasks must have all deps done — evaluated against the FINAL state (a dependency closed
     # in the SAME round counts), so closing a dependency and its dependent together is allowed.
     final_done = {tid for tid, t in by_id.items() if t.get("status") == "done"} | set(done)
@@ -232,6 +234,17 @@ def close(root: Path, round_id: str, done: list[str], touched: list[str], commit
         for e in errs[:10]:
             print(f"  - {e}", file=sys.stderr)
         return 2
+    final_data = yaml.safe_load(text) or {}
+    final_by_id = {task.get("id"): task for task in final_data.get("tasks", [])
+                   if isinstance(task, dict)}
+    try:
+        task_scopes = {
+            task_id: canonical_scope_prefixes(final_by_id.get(task_id, {}).get("scope", []))
+            for task_id in dict.fromkeys(done + touched)
+        }
+    except WorkflowError as e:
+        print(f"round close: cannot record structured task scope — {e}", file=sys.stderr)
+        return 2
 
     # --- commit phase (all preflight checks passed): write with rollback ---
     # ROADMAP.render reads tasks.yaml from disk, so the new registry must be written first. If any
@@ -257,7 +270,8 @@ def close(root: Path, round_id: str, done: list[str], touched: list[str], commit
         try:
             import overlay
             exposure_path, _exposure = overlay.write_round_exposure(
-                root, round_id, git_full_sha(root, "HEAD"), full, session_id=session_id)
+                root, round_id, git_full_sha(root, "HEAD"), full, session_id=session_id,
+                base_sha=prev_wm, task_scopes=task_scopes, done_task_ids=done_transitions)
             created_event_paths.append(exposure_path)
             binding_path = review.write_round_request_binding(
                 root, round_id, full, prev_wm, review_reviewers,
@@ -298,7 +312,8 @@ def close(root: Path, round_id: str, done: list[str], touched: list[str], commit
     try:
         import overlay
         overlay.evaluate_boundary(
-            root, "round-close", {"round_id": round_id, "closing_task_ids": done})
+            root, "round-close", {"round_id": round_id, "closing_task_ids": done,
+                                  "task_ids": list(dict.fromkeys(done + touched))})
     except Exception as e:  # noqa: BLE001
         print(f"round close: overlay warning unavailable ({e}) — close still succeeded",
               file=sys.stderr)

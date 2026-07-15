@@ -4155,6 +4155,7 @@ class ImproveScopeTests(unittest.TestCase):
                 "delegation_opportunity": frozenset({"project"}),
                 "worker_scope_drift": frozenset({"project"}),
                 "warn_friction": frozenset({"project"}),
+                "adaptive_feedback": frozenset({"project"}),
                 "error_landscape": frozenset({"project"}),
                 "env_unpreparedness": frozenset({"project"}),
                 "review_association": frozenset({"project"}),
@@ -4167,7 +4168,7 @@ class ImproveScopeTests(unittest.TestCase):
             self.assertEqual(set(project_lenses), {
                 name for name, scopes in improve.LENS_SCOPES.items() if "project" in scopes
                 and name not in {"delegation_opportunity", "evidence_link", "warn_friction",
-                                 "worker_scope_drift"}
+                                 "worker_scope_drift", "adaptive_feedback"}
             })
             self.assertEqual(set(user_lenses), {
                 name for name, scopes in improve.LENS_SCOPES.items() if "user-habit" in scopes
@@ -10494,6 +10495,251 @@ class CodexVerifierTests(unittest.TestCase):
                     os.environ.pop("WAYSTONE_HOST", None)
                 else:
                     os.environ["WAYSTONE_HOST"] = old_host
+
+
+class L2CGuardTests(unittest.TestCase):
+    """L2-C G8: four boundary-warn rules share lifecycle, replay, and attribution contracts."""
+
+    def test_rule_vocabulary_contains_all_l2c_guards_at_observing_defaults(self):
+        expected = {
+            "delegation-scope-drift-v1": ({"delegate-run", "delegate-apply", "check"},
+                                            "delegations"),
+            "env-manifest-mutation-v1": ({"round-close", "check"}, "rounds"),
+            "review-skipped-closes-v1": ({"round-close", "check"}, "rounds"),
+            "done-without-evidence-v1": ({"round-close", "check"}, "rounds"),
+        }
+        for rule_id, (boundaries, corpus) in expected.items():
+            self.assertEqual(overlay.RULES[rule_id]["boundaries"], boundaries)
+            self.assertEqual(overlay.RULES[rule_id]["corpus"], corpus)
+        self.assertEqual(
+            overlay.RULES["review-skipped-closes-v1"]["default_params"]["consecutive"], 2)
+
+    def test_scope_drift_reuses_structured_helper_and_replays(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _overlay_project(d)
+            rec = _run_with_home(home, lambda: delegate._delegations_dir(root)) / "did-scope"
+            (rec / "artifact").mkdir(parents=True)
+            (rec / "packet.yaml").write_text(yaml.safe_dump({
+                "task": {"id": "feat/scope", "round": "2026-07-15-r1"},
+                "declared_scope": ["src"],
+            }))
+            (rec / "artifact" / "contract.yaml").write_text(yaml.safe_dump({
+                "task_id": "feat/scope",
+                "changed_files": [{"path": "src/ok.py"}, {"path": "docs/out.md"}],
+            }))
+            (rec / "status.json").write_text(_json.dumps({"state": "needs-review"}))
+            _add_delta(root, home, delta_id="worker_scope_drift/outside",
+                       rule="delegation-scope-drift-v1")
+
+            events = _run_with_home(home, lambda: overlay.evaluate_boundary(
+                root, "delegate-run", {"delegation_id": "did-scope"}))
+            fire = next(event for event in events if event["event"] == "fire")
+            self.assertEqual(fire["context"]["delegation_id"], "did-scope")
+            self.assertEqual(fire["context"]["task_id"], "feat/scope")
+            self.assertEqual(fire["context"]["round_id"], "2026-07-15-r1")
+            self.assertEqual(fire["context"]["outside_scope"], ["docs/out.md"])
+
+            replay = _run_with_home(
+                home, lambda: overlay.replay(root, "worker_scope_drift/outside"))
+            self.assertEqual((replay["opportunities"], replay["fires"]), (1, 1))
+            self.assertEqual(_run_with_home(
+                home, lambda: overlay.promote(root, "worker_scope_drift/outside"))["status"],
+                             "warning")
+
+    def test_round_manifest_and_done_guards_fire_without_blocking_close(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _round_review_project(d)
+            base = git(root, "rev-parse", "HEAD").stdout.strip()
+            cfg = (root / ".waystone.yml").read_text().replace(
+                "last_round_commit: null", f"last_round_commit: {base}")
+            (root / ".waystone.yml").write_text(cfg)
+            (root / "pyproject.toml").write_text("[project]\nname='demo'\n")
+            git(root, "add", "-A")
+            git(root, "commit", "-qm", "manifest mutation")
+            _add_delta(root, home, delta_id="env_unpreparedness/manifest",
+                       rule="env-manifest-mutation-v1")
+            _add_delta(root, home, delta_id="verification_debt/done",
+                       rule="done-without-evidence-v1")
+
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                rc = _run_with_home(home, lambda: round.close(
+                    root, "2026-07-15-r1", done=["chore/close-me"], touched=[], commit="HEAD"))
+            self.assertEqual(rc, 0)
+            rows = _read_warnings(root, home)
+            fires = {row["rule"]: row for row in rows if row["event"] == "fire"}
+            self.assertEqual(fires["env-manifest-mutation-v1"]["context"]["manifest_paths"],
+                             ["pyproject.toml"])
+            self.assertEqual(fires["done-without-evidence-v1"]["context"]["task_ids"],
+                             ["chore/close-me"])
+            self.assertEqual(fires["env-manifest-mutation-v1"]["context"]["round_id"],
+                             "2026-07-15-r1")
+
+            for delta_id in ("env_unpreparedness/manifest", "verification_debt/done"):
+                report = _run_with_home(home, lambda did=delta_id: overlay.replay(root, did))
+                self.assertEqual(report["corpus"], "rounds")
+                self.assertEqual((report["opportunities"], report["fires"]), (1, 1))
+
+    def test_manifest_scope_reference_and_any_done_evidence_suppress_fires(self):
+        round_record = {
+            "round_id": "r1", "evaluable": True,
+            "changed_files": ["pyproject.toml"], "manifest_paths": ["pyproject.toml"],
+            "env_prep_changed": False,
+            "task_scopes": {"feat/deps": ["pyproject.toml"]},
+            "done_evidence": [{"task_id": "feat/deps", "verification": False,
+                               "verify": True, "verdict": False}],
+            "done_task_ids": ["feat/deps"],
+        }
+        self.assertEqual(overlay.evaluate_env_manifest_mutation(round_record)["fires"], [])
+        self.assertEqual(overlay.evaluate_done_without_evidence(round_record)["fires"], [])
+
+    def test_review_ingest_resets_two_close_streak_and_replay_is_deterministic(self):
+        rounds = [
+            {"round_id": "r1", "at": "2026-07-15T00:00:00+00:00"},
+            {"round_id": "r2", "at": "2026-07-15T02:00:00+00:00"},
+            {"round_id": "r3", "at": "2026-07-15T04:00:00+00:00"},
+        ]
+        ingests = [{"round_id": "r1", "at": "2026-07-15T01:00:00+00:00"}]
+        out = overlay.evaluate_review_skipped_closes(rounds, ingests, consecutive=2)
+        self.assertEqual(out["fires"], ["r3"])
+        self.assertEqual(out, overlay.evaluate_review_skipped_closes(
+            list(reversed(rounds)), list(reversed(ingests)), consecutive=2))
+
+    def test_review_skipped_guard_shadow_replay_gates_promotion(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _overlay_project(d)
+            exposure = _run_with_home(home, lambda: overlay._exposure_dir(root))
+            exposure.mkdir(parents=True)
+            for number in (1, 2):
+                (exposure / f"round-r{number}.json").write_text(_json.dumps({
+                    "schema": "waystone-round-exposure-1", "round_id": f"r{number}",
+                    "at": f"2026-07-15T0{number}:00:00+00:00",
+                }))
+            _add_delta(root, home, delta_id="review_association/skipped",
+                       rule="review-skipped-closes-v1")
+            report = _run_with_home(
+                home, lambda: overlay.replay(root, "review_association/skipped"))
+            self.assertEqual((report["opportunities"], report["fires"]), (2, 1))
+            self.assertEqual(report["examples"], ["r2"])
+            self.assertEqual(_run_with_home(
+                home, lambda: overlay.promote(root, "review_association/skipped"))["status"],
+                             "warning")
+            import contextlib
+            import io
+            with contextlib.redirect_stderr(io.StringIO()):
+                events = _run_with_home(home, lambda: overlay.evaluate_boundary(
+                    root, "round-close", {"round_id": "r2"}))
+            fire = next(event for event in events if event["event"] == "fire")
+            self.assertEqual(fire["context"]["round_id"], "r2")
+            self.assertEqual(fire["context"]["consecutive"], 2)
+
+    def test_review_ingest_boundary_records_replay_event(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _overlay_project(d)
+            row = _run_with_home(
+                home, lambda: overlay.record_review_ingest(root, "2026-07-15-r1"))
+            self.assertEqual(row["round_id"], "2026-07-15-r1")
+            loaded, skipped = _run_with_home(home, lambda: overlay.load_review_ingests(root))
+            self.assertEqual(skipped, 0)
+            self.assertEqual({key: loaded[0][key] for key in row}, row)
+            self.assertTrue(loaded[0]["source_pointer"].endswith("review-ingests.jsonl:1"))
+
+
+class L2CImproveFeedbackTests(unittest.TestCase):
+    """L2-C G4: accepted recommendation follow-through, trends, conflicts, and staleness."""
+
+    def test_feedback_fact_is_observed_bounded_and_byte_stable(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            root = base / "repo"
+            root.mkdir()
+            (root / ".waystone.yml").write_text(
+                "version: 1\nproject: demo\ndelegation:\n  env_prep: [uv sync --frozen]\n")
+            (root / "tasks.yaml").write_text(
+                "version: 1\nproject: demo\ntasks:\n"
+                "  - id: feat/x\n    title: x\n    status: done\n    round: r2\n")
+            reviews_dir = root / "docs" / "reviews"
+            reviews_dir.mkdir(parents=True)
+            for rid, fid in (("r1", "JW-GPT-001"), ("r2", "JW-GPT-002")):
+                (reviews_dir / f"{rid}-feedback.md").write_text(
+                    "## Findings (triage skeleton v2)\n"
+                    "| finding | severity | type | verdict | evidence | task id |\n"
+                    "|---|---|---|---|---|---|\n"
+                    f"| {fid} — scope | major | scope | REAL | `x.py:1` | feat/x |\n")
+            state = root / ".waystone"
+            (state / "overlay" / "deltas").mkdir(parents=True)
+            delta_id = "worker_scope_drift/outside"
+            (state / "overlay" / "deltas" / "worker_scope_drift--outside.json").write_text(
+                _json.dumps({
+                    "schema": "waystone-delta-1", "id": delta_id,
+                    "rule": "delegation-scope-drift-v1", "status": "observing",
+                    "created_at": "2026-07-15T01:00:00+00:00",
+                    "evidence": {"source": "improve-rec", "rec_id": delta_id},
+                    "replay": {"by_round": [{"round_id": "r1", "opportunities": 2,
+                                               "fires": 1}]},
+                }))
+            _write_jsonl(state / "overlay" / "warnings.jsonl", [
+                {"at": "2026-07-15T02:10:00+00:00", "boundary": "delegate-run",
+                 "delta_id": delta_id, "rule": "delegation-scope-drift-v1",
+                 "delta_status": "observing", "event": "evaluation", "message": "evaluated",
+                 "context": {"round_id": "r2", "delegation_id": "d1", "task_id": "feat/x",
+                             "fired": True}},
+                {"at": "2026-07-15T02:10:00+00:00", "boundary": "delegate-run",
+                 "delta_id": delta_id, "rule": "delegation-scope-drift-v1",
+                 "delta_status": "observing", "event": "fire", "message": "outside",
+                 "context": {"round_id": "r2", "delegation_id": "d1", "task_id": "feat/x",
+                             "outside_scope": ["docs/x"]}},
+                {"at": "2026-07-15T02:11:00+00:00", "boundary": "delegate-run",
+                 "delta_id": delta_id, "rule": "delegation-scope-drift-v1",
+                 "delta_status": "observing", "event": "conflict", "message": "conflict",
+                 "context": {"round_id": "r2", "delegation_id": "d1",
+                             "task_id": "feat/x", "delta_ids": [delta_id, "scope/other"]}},
+            ])
+            exposure = state / "exposure"
+            exposure.mkdir()
+            for rid, at, profile, env, overlays in (
+                    ("r1", "2026-07-15T00:30:00+00:00", "p1", None, []),
+                    ("r2", "2026-07-15T02:30:00+00:00", "p2",
+                     ["uv sync --frozen"], [{"id": delta_id, "status": "observing"}])):
+                (exposure / f"round-{rid}.json").write_text(_json.dumps({
+                    "schema": "waystone-round-exposure-1", "round_id": rid, "at": at,
+                    "profile_fingerprint": profile, "env_prep": env,
+                    "overlays_active": overlays,
+                }))
+            improve_dir = state / "improve"
+            improve_dir.mkdir()
+            _write_jsonl(improve_dir / "decisions.jsonl", [{
+                "rec_id": delta_id, "decision": "accept", "at": "2026-07-15T00:45:00+00:00",
+            }])
+            registry = base / "projects.json"
+            registry.write_text(_json.dumps({"projects": [{"name": "demo", "path": str(root)}]}))
+            out = base / "out"
+            out.mkdir()
+            _write_jsonl(out / "reviews.jsonl", [
+                {"project": "demo", "round_id": "r1", "findings": [
+                    {"id": "f1", "type": "scope", "status": "REAL"}]},
+                {"project": "demo", "round_id": "r2", "findings": [
+                    {"id": "f2", "type": "scope", "status": "REAL"}]},
+            ])
+            improve.run_evidence(registry, out, set())
+            first = improve.run_audit(out)
+            second = improve.run_audit(out)
+            self.assertEqual(first, second)
+            lens = next(row for row in first["lenses"] if row["lens"] == "adaptive_feedback")
+            self.assertEqual(lens["provenance"], "observed")
+            project = lens["per_project"]["demo"]
+            self.assertEqual(project["decision_follow_through"]["materialized"], 1)
+            self.assertEqual(project["same_scope_conflicts"], 1)
+            self.assertEqual(project["re_review_candidates"], 1)
+            delta = project["deltas"][0]
+            self.assertEqual(delta["delta_id"], delta_id)
+            self.assertEqual(delta["before"]["fire_rate"], 0.5)
+            self.assertEqual(delta["after"]["fire_rate"], 1.0)
+            self.assertEqual(delta["after"]["finding_recurrences"]["scope"], 1)
+            self.assertLessEqual(len(lens["examples"]), 5)
 
 
 class CodexPluginContractTests(unittest.TestCase):
