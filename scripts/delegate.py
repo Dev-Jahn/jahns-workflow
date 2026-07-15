@@ -25,6 +25,7 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -84,10 +85,9 @@ _BACKEND_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*:[^\s:]+$")
 _LEGACY_VERIFIER_EXECUTIONS = ("codex-cli", "codex-companion")
 _EXTERNAL_RUNNERS = ("codex", "claude")
 _CLAUDE_EFFORT_VALUES = ("low", "medium", "high", "xhigh")
-# Claude CLI has no workspace-write/network sandbox corresponding to `codex exec -s
-# workspace-write`. These flags disable network-native tools, Chrome, MCP, skills/plugins/hooks, and
-# unapproved tools. Implementer Bash remains necessary for arbitrary project verification and can
-# still reach the network: that irreducible delta is warned at delegate-run start, never hidden.
+# Claude implementer execution is intentionally refused unless the user records an explicit
+# unsandboxed-runner override. These flags reduce surfaces after that override, but are not described
+# as confinement: bare Bash can cross filesystem, process, repository, and network boundaries.
 _CLAUDE_COMMON_ARGS = (
     "--safe-mode", "--no-chrome", "--disable-slash-commands",
     "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
@@ -95,8 +95,13 @@ _CLAUDE_COMMON_ARGS = (
 )
 _CLAUDE_NETWORK_DENY = "WebFetch,WebSearch"
 CLAUDE_CONFINEMENT_WARN = (
-    "waystone warn: claude external-runner has no process-level network sandbox; "
-    "WebFetch/WebSearch/Chrome/MCP are disabled, but allowed Bash can still access the network")
+    "waystone warn: UNSANDBOXED claude implementer — allowed Bash can read/write filesystem "
+    "paths outside the worktree, operate on other repositories, spawn or affect processes, and "
+    "access the network; cwd and Claude tool permissions are not a security boundary")
+CLAUDE_VERIFIER_DELTA_WARN = (
+    "waystone warn: claude verifier has no OS-level filesystem/process/network sandbox; "
+    "effective tools are Read/Glob/Grep only, Bash/Edit/Write and network-native tools are denied, "
+    "and tracked plus untracked worktree state is checked after execution")
 
 # lockfile -> (prep command, kind), first match wins (S7). None env_prep in config falls through here.
 _LOCKFILE_DETECT = (
@@ -348,7 +353,9 @@ def _resolve_binding(profile: dict, role: str, root: Path) -> dict:
     if role != "implementer" or execution != "external-runner":
         raise WorkflowError(
             f"binding {role!r}/{execution!r} is schema-valid but not executable by waystone: "
-            "it is host-guided (delegate run starts only implementer/external-runner)")
+            "it is host-guided. Follow the injected routing contract in the main session, use "
+            "skill routing to dispatch the bound role/execution/backend, and preserve role-based "
+            "observation attribution; delegate run starts only implementer/external-runner")
     runner, _model = _runner_parts(backend)
     effort = b.get("effort")
     if runner == "claude" and effort is not None and effort not in _CLAUDE_EFFORT_VALUES:
@@ -360,6 +367,26 @@ def _resolve_binding(profile: dict, role: str, root: Path) -> dict:
         if field in b:
             binding[field] = b[field]
     return binding
+
+
+def _unsandboxed_runner_override(binding: dict, allow: bool,
+                                 reason: str | None) -> dict | None:
+    runner, _model = _runner_parts(binding["backend"])
+    if allow and (reason is None or not reason.strip()):
+        raise WorkflowError("--allow-unsandboxed-runner requires a non-empty --reason")
+    if reason is not None and not allow:
+        raise WorkflowError("--reason for delegate run is only valid with --allow-unsandboxed-runner")
+    if runner == "claude":
+        if not allow:
+            raise WorkflowError(
+                "claude implementer has no verified worktree/process/network confinement and is "
+                "refused by default; use --allow-unsandboxed-runner --reason <why> to record an "
+                "explicit exposure override")
+        return {"kind": "allow-unsandboxed-runner", "reason": reason.strip(),
+                "provenance": "user"}
+    if allow:
+        raise WorkflowError("--allow-unsandboxed-runner is only valid for a claude backend")
+    return None
 
 
 def _resolve_verifier_binding(profile: dict, root: Path) -> dict:
@@ -538,12 +565,7 @@ def _run_codex(worktree: Path, model: str, prompt_path: Path, record_dir: Path,
 
 def _run_claude(worktree: Path, model: str, prompt_path: Path, record_dir: Path,
                 *, effort: str | None = None, runner=None) -> tuple[int, float]:
-    """Invoke headless Claude in the worktree with best-effort tool confinement.
-
-    Unlike Codex workspace-write, this is not a process/network sandbox. `_CLAUDE_COMMON_ARGS`
-    disables network-native surfaces and `dontAsk` denies tools outside the explicit allow-list;
-    Bash is retained for implementation/test commands and is the warned residual network delta.
-    """
+    """Invoke the explicitly overridden unsandboxed Claude implementer transport."""
     cmd = ["claude", "-p", "--model", model, *_CLAUDE_COMMON_ARGS]
     if effort is not None:
         cmd.extend(["--effort", effort])
@@ -572,15 +594,31 @@ def _run_claude(worktree: Path, model: str, prompt_path: Path, record_dir: Path,
         rc = 127
 
     last_message = ""
-    if stream_path.is_file():
-        for line in stream_path.read_text(encoding="utf-8", errors="replace").splitlines():
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if event.get("type") == "result" and isinstance(event.get("result"), str):
-                last_message = event["result"]
-    (record_dir / "last_message.md").write_text(last_message, encoding="utf-8")
+    try:
+        if stream_path.is_file():
+            for line_number, line in enumerate(
+                    stream_path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+                if not line.strip():
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError as e:
+                    raise ValueError(
+                        f"invalid stream-json at line {line_number}: {e}") from e
+                if not isinstance(event, dict):
+                    raise ValueError(
+                        f"invalid stream-json event at line {line_number}: expected object")
+                if event.get("type") == "result" and isinstance(event.get("result"), str):
+                    last_message = event["result"]
+        (record_dir / "last_message.md").write_text(last_message, encoding="utf-8")
+    except (OSError, ValueError) as e:
+        try:
+            with open(record_dir / "runner.stderr", "a", encoding="utf-8") as stream:
+                stream.write(f"\nclaude transport output failure: {e}\n")
+        except OSError:
+            pass
+        if rc == 0:
+            rc = 125
     return rc, round(time.monotonic() - start, 3)
 
 
@@ -754,7 +792,7 @@ def _active_overlays(root: Path) -> list[dict]:
 
 
 def _write_exposure(record_dir, did, root, packet, task_id, head_sha, base_sha, dirty, binding,
-                    fingerprint, overlays):
+                    fingerprint, overlays, runner_override=None):
     runner = str(binding.get("backend", "")).partition(":")[0]
     exposure = {
         "schema": "waystone-exposure-1", "delegation_id": did, "at": _now_iso(),
@@ -770,6 +808,8 @@ def _write_exposure(record_dir, did, root, packet, task_id, head_sha, base_sha, 
         # supplies enforceable guards and recorded waivers.
         "guards": None, "waivers": [],
     }
+    if runner_override is not None:
+        exposure["runner_override"] = runner_override
     path = record_dir / "exposure.json"
     if path.exists():
         raise WorkflowError(f"delegation exposure is immutable and already exists: {path}")
@@ -783,22 +823,28 @@ def _add_worktree(root: Path, worktree_path: Path, base_sha: str) -> None:
 
 # ---- run (§§3-10 — the delegation vertical slice) -----------------------------
 def _prepare_run(root: Path, task_id: str, role: str, accept_flags: list[str],
-                 retry_note: str | None = None) -> dict:
+                 retry_note: str | None = None, *, allow_unsandboxed_runner: bool = False,
+                 unsandboxed_reason: str | None = None) -> dict:
     _ensure_project_state_or_refuse(root)
     _check_snapshot_preconditions(root)
     profile, fingerprint = _load_profile(root)
     if role != "implementer":
         raise WorkflowError(f"role {role} not consumed in M1")
     binding = _resolve_binding(profile, role, root)
+    runner_override = _unsandboxed_runner_override(
+        binding, allow_unsandboxed_runner, unsandboxed_reason)
     model = _runner_model(binding["backend"])
     cfg = load_config(root)
     packet, _acceptance = _build_packet(
         load_tasks(root), task_id, accept_flags, root, retry_note=retry_note)
+    if runner_override is not None:
+        packet["runner_override"] = runner_override
     bindings = profile.get("bindings")
     verifier_bound = isinstance(bindings, dict) and "verifier" in bindings
     return {"task_id": task_id, "binding": binding, "model": model, "cfg": cfg,
             "packet": packet, "fingerprint": fingerprint, "accept_flags": list(accept_flags),
-            "retry_note": retry_note, "verifier_bound": verifier_bound}
+            "retry_note": retry_note, "verifier_bound": verifier_bound,
+            "runner_override": runner_override}
 
 
 def _claim_run(root: Path, plan: dict) -> tuple[str, Path]:
@@ -807,6 +853,8 @@ def _claim_run(root: Path, plan: dict) -> tuple[str, Path]:
         current_packet, _acceptance = _build_packet(
             load_tasks(root), task_id, plan["accept_flags"], root,
             retry_note=plan["retry_note"])
+        if plan["runner_override"] is not None:
+            current_packet["runner_override"] = plan["runner_override"]
     except WorkflowError as e:
         raise WorkflowError(
             f"task {task_id} changed while preparing delegation — retry from current state: {e}") from e
@@ -870,7 +918,7 @@ def _run_claimed(root: Path, plan: dict, did: str, record_dir: Path) -> int:
     (record_dir / "packet.yaml").write_text(
         yaml.safe_dump(packet, sort_keys=False, allow_unicode=True), encoding="utf-8")
     _write_exposure(record_dir, did, root, packet, task_id, head_sha, base_sha, dirty, binding,
-                    fingerprint, overlays)
+                    fingerprint, overlays, plan["runner_override"])
     _set_state(record_dir, "running")
 
     env_kind, env_commands = _resolve_env_prep(worktree_path, cfg)
@@ -886,10 +934,17 @@ def _run_claimed(root: Path, plan: dict, did: str, record_dir: Path) -> int:
     runner_name, _model = _runner_parts(binding["backend"])
     run_external = _run_codex if runner_name == "codex" else _run_claude
     if runner_name == "claude":
-        print(CLAUDE_CONFINEMENT_WARN, file=sys.stderr)
+        print(f"{CLAUDE_CONFINEMENT_WARN}; override reason: "
+              f"{plan['runner_override']['reason']}", file=sys.stderr)
     runner_kwargs = {"effort": binding["effort"]} if "effort" in binding else {}
-    runner_rc, duration = run_external(
-        worktree_path, model, record_dir / "prompt.txt", record_dir, **runner_kwargs)
+    try:
+        runner_rc, duration = run_external(
+            worktree_path, model, record_dir / "prompt.txt", record_dir, **runner_kwargs)
+    except Exception as e:  # noqa: BLE001 — every runner transport failure releases running state
+        _set_state(record_dir, "failed-runner", env=env_rec,
+                   error=f"runner transport exception: {e}")
+        raise WorkflowError(
+            f"runner transport failed: {e} — worktree preserved at {worktree_path}") from e
     print(f"runner: backend={binding['backend']} rc={runner_rc}")
     if runner_rc != 0:
         _set_state(record_dir, "failed-runner", env=env_rec, error=f"runner rc {runner_rc}")
@@ -942,9 +997,13 @@ def _run_claimed(root: Path, plan: dict, did: str, record_dir: Path) -> int:
 
 
 def run_delegation(root: Path, task_id: str, role: str, accept_flags: list[str],
-                   retry_note: str | None = None) -> int:
+                   retry_note: str | None = None, *, allow_unsandboxed_runner: bool = False,
+                   unsandboxed_reason: str | None = None) -> int:
     """Library entry: prepare, claim, then run without acquiring flock; CLI owns lock placement."""
-    plan = _prepare_run(root, task_id, role, accept_flags, retry_note=retry_note)
+    plan = _prepare_run(
+        root, task_id, role, accept_flags, retry_note=retry_note,
+        allow_unsandboxed_runner=allow_unsandboxed_runner,
+        unsandboxed_reason=unsandboxed_reason)
     did, record_dir = _claim_run(root, plan)
     return _run_claimed(root, plan, did, record_dir)
 
@@ -1028,14 +1087,12 @@ def _run_codex_verifier(worktree: Path, model: str, focus: str,
 
 def _run_claude_verifier(worktree: Path, model: str, focus: str,
                          record_dir: Path, *, runner=None) -> tuple[int, str]:
-    """Run Claude with schema output and a read-only-oriented, network-native-tool-free allow-list."""
-    allowed = (
-        "Read,Glob,Grep,Bash(git diff *),Bash(git status *),"
-        "Bash(git show *),Bash(git rev-parse *)")
-    denied = "Edit,Write,NotebookEdit,WebFetch,WebSearch"
+    """Run Claude with schema output and no executable or write-capable tools."""
+    allowed = "Read,Glob,Grep"
+    denied = "Edit,Write,NotebookEdit,Bash,WebFetch,WebSearch"
     cmd = [
         "claude", "-p", "--model", model, *_CLAUDE_COMMON_ARGS,
-        "--tools", "Read,Glob,Grep,Bash", "--allowedTools", allowed,
+        "--tools", allowed, "--allowedTools", allowed,
         "--disallowedTools", denied,
         "--json-schema", _VERIFY_SCHEMA_PATH.read_text(encoding="utf-8"),
         "--output-format", "json",
@@ -1063,13 +1120,87 @@ def _run_claude_verifier(worktree: Path, model: str, focus: str,
     stdout = proc.stdout or ""
     try:
         envelope = json.loads(stdout)
-    except json.JSONDecodeError:
-        return 0, stdout
-    if isinstance(envelope, dict) and isinstance(envelope.get("structured_output"), dict):
-        return 0, json.dumps(envelope["structured_output"], ensure_ascii=False)
-    if isinstance(envelope, dict) and isinstance(envelope.get("result"), str):
-        return 0, envelope["result"]
-    return 0, stdout
+    except json.JSONDecodeError as e:
+        try:
+            with open(record_dir / "verify.stderr", "a", encoding="utf-8") as stream:
+                stream.write(f"\ninvalid claude verifier JSON envelope: {e}\n")
+        except OSError:
+            pass
+        return 65, ""
+    if (not isinstance(envelope, dict) or envelope.get("subtype") != "success"
+            or not isinstance(envelope.get("structured_output"), dict)):
+        try:
+            with open(record_dir / "verify.stderr", "a", encoding="utf-8") as stream:
+                stream.write(
+                    "\nclaude verifier requires subtype=success and structured_output object\n")
+        except OSError:
+            pass
+        return 65, ""
+    return 0, json.dumps(envelope["structured_output"], ensure_ascii=False)
+
+
+def _verify_worktree_state(worktree: Path) -> dict:
+    """Capture tracked, untracked (including ignored), and HEAD state for the read-only postcondition."""
+    def raw(*args: str) -> bytes:
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(worktree), *args], capture_output=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise WorkflowError(
+                f"verifier read-only postcondition could not run git {args[0]}: {e}") from e
+        if proc.returncode != 0:
+            detail = proc.stderr.decode("utf-8", "replace").strip()
+            raise WorkflowError(
+                f"verifier read-only postcondition could not capture git {args[0]}: "
+                f"{detail or f'rc {proc.returncode}'}")
+        return proc.stdout
+
+    untracked = raw("ls-files", "-z", "--others", "--exclude-standard").split(b"\0")
+    ignored = raw(
+        "ls-files", "-z", "--others", "--ignored", "--exclude-standard").split(b"\0")
+    state = {
+        "status": raw("status", "--porcelain=v1", "-z", "--untracked-files=all"),
+        "untracked": tuple(filter(None, untracked)),
+        "ignored_untracked": tuple(filter(None, ignored)),
+        "head": raw("rev-parse", "HEAD"),
+    }
+    manifest = []
+    for relative_bytes in sorted(set((*state["untracked"], *state["ignored_untracked"]))):
+        relative = os.fsdecode(relative_bytes)
+        path = worktree / relative
+        try:
+            info = path.lstat()
+            metadata = f"{info.st_mode}:{info.st_size}:{info.st_mtime_ns}".encode()
+            if stat.S_ISLNK(info.st_mode):
+                content = b"symlink\0" + metadata + b"\0" + os.fsencode(os.readlink(path))
+            elif stat.S_ISREG(info.st_mode):
+                digest = hashlib.sha256()
+                with open(path, "rb") as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                content = b"file\0" + metadata + b"\0" + digest.digest()
+            else:
+                content = b"special\0" + metadata
+        except OSError as e:
+            raise WorkflowError(
+                f"verifier read-only postcondition could not fingerprint untracked {relative!r}: "
+                f"{e}") from e
+        manifest.append((relative, content.hex()))
+    state["untracked_manifest"] = manifest
+    return state
+
+
+def _effective_verifier_tool_policy(binding: dict) -> dict:
+    execution = binding["execution"]
+    if execution == "claude-cli":
+        return {"tools": ["Read", "Glob", "Grep"], "bash": False,
+                "filesystem_postcondition": "git-status+untracked-content-unchanged"}
+    if execution == "codex-cli":
+        return {"tools": ["codex-exec"], "sandbox": "read-only", "bash": False,
+                "filesystem_postcondition": "git-status+untracked-content-unchanged"}
+    return {"tools": ["codex-companion:adversarial-review"], "sandbox": "read-only",
+            "bash": False,
+            "filesystem_postcondition": "git-status+untracked-content-unchanged"}
 
 
 def _validate_verify_contract(rec: Path, contract: dict, exposure: dict) -> Path | None:
@@ -1379,7 +1510,10 @@ def _validate_verify_artifact(path: Path, artifact: dict) -> None:
     def invalid(detail: str) -> None:
         raise WorkflowError(f"invalid verify artifact schema {path}: {detail}")
 
-    required = {"schema", "at", "transport", "backend", "provenance", "payload"}
+    required = {
+        "schema", "at", "transport", "backend", "provenance", "payload",
+        "profile_fingerprint", "base_sha", "result_sha", "effective_tool_policy",
+    }
     if set(artifact) != required:
         invalid("envelope fields do not match waystone-verify-1")
     if artifact.get("schema") != "waystone-verify-1":
@@ -1389,6 +1523,16 @@ def _validate_verify_artifact(path: Path, artifact: dict) -> None:
     for field in ("at", "transport", "backend"):
         if not isinstance(artifact.get(field), str) or not artifact[field].strip():
             invalid(f"{field} must be a non-empty string")
+    fingerprint = artifact.get("profile_fingerprint")
+    if not isinstance(fingerprint, str) or not fingerprint.strip():
+        invalid("profile_fingerprint must be a non-empty string")
+    for field in ("base_sha", "result_sha"):
+        if not isinstance(artifact.get(field), str) or re.fullmatch(
+                r"[0-9a-fA-F]{40}", artifact[field]) is None:
+            invalid(f"{field} must be a 40-hex sha")
+    policy = artifact.get("effective_tool_policy")
+    if not isinstance(policy, dict) or not policy:
+        invalid("effective_tool_policy must be a non-empty object")
     payload = artifact.get("payload")
     if not isinstance(payload, dict) or set(payload) != {"summary", "findings", "limitations"}:
         invalid("payload fields do not match verifier-output-schema")
@@ -1642,7 +1786,7 @@ def verify_delegation(root: Path, did: str) -> int:
     if state != "needs-review":
         raise WorkflowError(
             f"delegation {did} is {state} — only a needs-review delegation can be verified")
-    profile, _fingerprint = _load_profile(root)
+    profile, fingerprint = _load_profile(root)
     binding = _resolve_verifier_binding(profile, root)
     script = _companion_script() if binding["execution"] == "codex-companion" else None
     contract = _load_contract(rec)
@@ -1652,18 +1796,37 @@ def verify_delegation(root: Path, did: str) -> int:
     _normalize_verify_worktree(worktree, contract, patch)
     focus = _verify_focus(rec, contract)
     model = binding["backend"].split(":", 1)[1]
-    if binding["execution"] == "codex-companion":
-        args = ["node", str(script), "adversarial-review", "--json", "--wait", "--scope",
-                "working-tree", "-C", str(worktree), "-m", model, focus]
-        rc, stdout = _run_companion(worktree, args, rec)
-        print(_cleanup_companion_broker(worktree))
-        transport = "codex-companion:adversarial-review"
-    elif binding["execution"] == "codex-cli":
-        rc, stdout = _run_codex_verifier(worktree, model, focus, rec)
-        transport = "codex-exec:read-only"
-    else:
-        rc, stdout = _run_claude_verifier(worktree, model, focus, rec)
-        transport = "claude-print:read-only"
+    before = _verify_worktree_state(worktree)
+    transport_error = None
+    try:
+        if binding["execution"] == "codex-companion":
+            args = ["node", str(script), "adversarial-review", "--json", "--wait", "--scope",
+                    "working-tree", "-C", str(worktree), "-m", model, focus]
+            try:
+                rc, stdout = _run_companion(worktree, args, rec)
+            finally:
+                print(_cleanup_companion_broker(worktree))
+            transport = "codex-companion:adversarial-review"
+        elif binding["execution"] == "codex-cli":
+            rc, stdout = _run_codex_verifier(worktree, model, focus, rec)
+            transport = "codex-exec:read-only"
+        else:
+            print(CLAUDE_VERIFIER_DELTA_WARN, file=sys.stderr)
+            rc, stdout = _run_claude_verifier(worktree, model, focus, rec)
+            transport = "claude-print:read-only"
+    except Exception as e:  # noqa: BLE001 — postcondition still runs after any transport failure
+        transport_error = e
+        rc, stdout = 125, ""
+    after = _verify_worktree_state(worktree)
+    if after != before:
+        changed = ", ".join(key for key in before if before[key] != after[key])
+        raise WorkflowError(
+            f"independent verifier modified the review worktree ({changed}) — verify artifact "
+            "was not recorded; delegation remains needs-review")
+    if transport_error is not None:
+        raise WorkflowError(
+            f"independent verifier transport failed ({transport_error}) — delegation remains "
+            "needs-review") from transport_error
     if rc != 0:
         raise WorkflowError(
             f"independent verifier failed (rc {rc}) — delegation remains needs-review")
@@ -1676,7 +1839,11 @@ def verify_delegation(root: Path, did: str) -> int:
         "schema": "waystone-verify-1", "at": _now_iso(),
         "transport": transport, "backend": binding["backend"],
         "provenance": "independent-verifier", "payload": payload,
+        "profile_fingerprint": fingerprint,
+        "base_sha": contract["base_sha"], "result_sha": contract["result_sha"],
+        "effective_tool_policy": _effective_verifier_tool_policy(binding),
     }
+    _validate_verify_artifact(rec / "artifact" / "verify-pending.json", artifact)
     out = _write_verify_artifact(rec, artifact)
     print(f"verify_artifact: {out}")
     return 0
@@ -1952,13 +2119,21 @@ def _resolve_root(explicit: str | None) -> Path:
 
 
 def _cli_run(rest: list[str]) -> int:
-    pos, opts = _parse_opts(rest, value=("role", "root", "note"), repeat=("accept",))
+    pos, opts = _parse_opts(
+        rest, value=("role", "root", "note", "reason"), repeat=("accept",),
+        boolean=("allow-unsandboxed-runner",))
     if not pos:
         raise WorkflowError("run requires a <task-id>")
+    allow_unsandboxed = bool(opts.get("allow-unsandboxed-runner"))
+    if allow_unsandboxed and not opts.get("reason"):
+        raise WorkflowError("--allow-unsandboxed-runner requires --reason")
+    if opts.get("reason") and not allow_unsandboxed:
+        raise WorkflowError("run --reason is only valid with --allow-unsandboxed-runner")
     root = _resolve_root(opts.get("root"))
     plan = _prepare_run(
         root, pos[0], opts.get("role", "implementer"), opts.get("accept", []),
-        retry_note=opts.get("note"))
+        retry_note=opts.get("note"), allow_unsandboxed_runner=allow_unsandboxed,
+        unsandboxed_reason=opts.get("reason"))
     # Constant-level lock span: only local task/overlay revalidation, owner scan, and one claim write.
     # Git preflight, profile/packet preparation, snapshot/worktree setup, and the runner stay outside.
     with hold_lock(project_lock_path(root)):

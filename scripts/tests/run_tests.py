@@ -582,7 +582,7 @@ class MarkerTests(unittest.TestCase):
         self.assertIn("research-auditor", captured.get("body", ""))  # custom reviewer prompted, not name-guessed
         self.assertIn("@codex review", captured["body"])
 
-    def test_reviewer_role_resolves_to_literal_model_in_freeze_request_and_marker(self):
+    def test_reviewer_role_freezes_full_backend_identity_and_profile_fingerprint(self):
         captured = {}
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
@@ -611,10 +611,11 @@ class MarkerTests(unittest.TestCase):
             finally:
                 review.pr_context, review._gh = saved
 
-        self.assertIn("Macro reviewer(s) — opus-4.1", captured["body"])
+        self.assertIn("Macro reviewer(s) — claude:opus-4.1", captured["body"])
         self.assertNotIn("role:reviewer", captured["body"])
         cycle = review.parse_markers(captured["body"], "review-cycle")[0]
-        self.assertEqual(cycle["reviewers"], ["codex", "opus-4.1"])
+        self.assertEqual(cycle["reviewers"], ["codex", "claude:opus-4.1"])
+        self.assertRegex(cycle["profile_fingerprint"], r"^sha256:[0-9a-f]{12}$")
 
     def test_reviewer_role_resolves_before_facts_and_role_marker_is_rejected(self):
         head = "c" * 40
@@ -624,22 +625,104 @@ class MarkerTests(unittest.TestCase):
             (state / "profile.yml").write_text(
                 "schema: waystone-profile-1\nbindings:\n"
                 "  reviewer: {execution: external-runner, backend: 'claude:opus-4.1'}\n")
+            _profile, fingerprint = delegate._load_profile(root)
             cfg = common.normalize_config({
                 "version": 1, "project": "x",
                 "review": {"reviewers": ["role:reviewer"]},
             })
             bundle = {
                 "head": head, "base_sha": "", "bodies": self._bodies(
-                    head, reviewer="opus-4.1"),
+                    head, reviewer="claude:opus-4.1"),
                 "reviews": [], "checks": [], "state": "OPEN", "is_draft": False,
                 "base": "main", "merge_state": "CLEAN",
             }
+            bundle["bodies"][0]["body"] = review.emit_marker("review-cycle", {
+                "cycle": 1, "target_sha": head, "reviewers": ["claude:opus-4.1"],
+                "profile_fingerprint": fingerprint,
+            })
             facts = review.facts_from_bundle(bundle, cfg, None, root=root)
             self.assertTrue(facts["pro_result_at_head"])
 
             bundle["bodies"] = self._bodies(head, reviewer="role:reviewer")
+            bundle["bodies"][0]["body"] = review.emit_marker("review-cycle", {
+                "cycle": 1, "target_sha": head, "reviewers": ["claude:opus-4.1"],
+                "profile_fingerprint": fingerprint,
+            })
             facts = review.facts_from_bundle(bundle, cfg, None, root=root)
             self.assertFalse(facts["pro_result_at_head"])
+
+    def test_frozen_reviewer_identity_survives_profile_drift_but_cycle_is_stale(self):
+        head = "c" * 40
+        base = "d" * 40
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            state = common.ensure_project_state_dir(root)
+            profile_path = state / "profile.yml"
+            profile_path.write_text(
+                "schema: waystone-profile-1\nbindings:\n"
+                "  reviewer: {execution: external-runner, backend: 'claude:opus-old'}\n")
+            _profile, fingerprint = delegate._load_profile(root)
+            cfg = common.normalize_config({
+                "version": 1, "project": "x",
+                "review": {"reviewers": ["role:reviewer"], "operators": ["owner"]},
+            })
+            bodies = [
+                {"body": review.emit_marker("review-cycle", {
+                    "cycle": 1, "target_sha": head, "base_sha": base,
+                    "reviewers": ["claude:opus-old"],
+                    "profile_fingerprint": fingerprint,
+                }), "author": "owner", "at": "2026-07-15T00:00:00Z"},
+                {"body": review.emit_marker("review-result", {
+                    "reviewer": "claude:opus-old", "review_cycle": 1,
+                    "reviewed_sha": head, "verdict": "shipped", "decision_required": [],
+                }), "author": "owner", "at": "2026-07-15T01:00:00Z"},
+            ]
+            bundle = {
+                "head": head, "base_sha": base, "bodies": bodies, "reviews": [],
+                "checks": [], "state": "OPEN", "is_draft": False, "base": "main",
+                "merge_state": "CLEAN",
+            }
+            profile_path.write_text(
+                "schema: waystone-profile-1\nbindings:\n"
+                "  reviewer: {execution: external-runner, backend: 'claude:opus-new'}\n")
+            facts = review.facts_from_bundle(bundle, cfg, "owner/repo", root=root)
+            self.assertEqual(facts["reviewers"], ["claude:opus-old"])
+            self.assertTrue(facts["pro_result_at_head"])
+            self.assertTrue(facts["reviewer_profile_drift"])
+            self.assertFalse(facts["cycle_fresh"])
+
+    def test_codex_backend_identity_does_not_alias_codex_trust_sentinel(self):
+        head = "c" * 40
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            state = common.ensure_project_state_dir(root)
+            (state / "profile.yml").write_text(
+                "schema: waystone-profile-1\nbindings:\n"
+                "  reviewer: {execution: external-runner, backend: 'codex:gpt-review'}\n")
+            _profile, fingerprint = delegate._load_profile(root)
+            cfg = common.normalize_config({
+                "version": 1, "project": "x", "review": {
+                    "reviewers": ["codex", "role:reviewer"], "operators": ["owner"]},
+            })
+            bundle = {
+                "head": head, "base_sha": "", "reviews": [], "checks": [],
+                "state": "OPEN", "is_draft": False, "base": "main", "merge_state": "CLEAN",
+                "bodies": [
+                    {"body": review.emit_marker("review-cycle", {
+                        "cycle": 1, "target_sha": head,
+                        "reviewers": ["codex", "codex:gpt-review"],
+                        "profile_fingerprint": fingerprint,
+                    }), "author": "owner", "at": "2026-07-15T00:00:00Z"},
+                    {"body": review.emit_marker("review-result", {
+                        "reviewer": "codex:gpt-review", "review_cycle": 1,
+                        "reviewed_sha": head, "verdict": "shipped", "decision_required": [],
+                    }), "author": "owner", "at": "2026-07-15T01:00:00Z"},
+                ],
+            }
+            facts = review.facts_from_bundle(bundle, cfg, "owner/repo", root=root)
+        self.assertEqual(facts["reviewers"], ["codex", "codex:gpt-review"])
+        self.assertTrue(facts["pro_result_at_head"])
+        self.assertFalse(facts["codex_fresh"])
 
     def test_reviewer_role_without_profile_binding_fails_loud(self):
         with tempfile.TemporaryDirectory() as d:
@@ -1660,7 +1743,7 @@ class RoundCloseTests(unittest.TestCase):
                 rc = round.close(
                     root, "2026-07-15-l2-a", done=["feat/alpha"], touched=[], commit="HEAD")
             self.assertEqual(rc, 0)
-            self.assertIn("review reviewers = opus-4.1", out.getvalue())
+            self.assertIn("review reviewers = claude:opus-4.1", out.getvalue())
             self.assertNotIn("role:reviewer", out.getvalue())
 
     def test_close_role_reviewer_without_binding_fails_before_write(self):
@@ -1812,8 +1895,14 @@ class BasePolicyTests(unittest.TestCase):
         RELAXED_HEAD = ("version: 1\nproject: x\nreview:\n  mode: pr\n  reviewers: []\n"
                         "  require_ci: false\n  operators: [attacker]\n  approvers: [attacker]\n")
         TASKS = "version: 1\nproject: x\ntasks: []\n"
-        bundle = {"head": "H" * 40, "base_sha": "B" * 40, "bodies": [], "reviews": [], "checks": [],
+        bundle = {"head": "a" * 40, "base_sha": "b" * 40, "bodies": [], "reviews": [], "checks": [],
                   "merge_state": "", "state": "OPEN", "is_draft": False, "base": "main", "head_ref": "feat/x"}
+        bundle["bodies"] = [{
+            "body": review.emit_marker("review-cycle", {
+                "cycle": 1, "target_sha": bundle["head"], "base_sha": bundle["base_sha"],
+                "reviewers": ["codex", "gpt-5.5-pro"], "profile_fingerprint": None,
+            }), "author": "owner", "at": "2026-07-15T00:00:00Z",
+        }]
         calls = []
 
         def fake_file_at_ref(root, repo, path, ref):
@@ -1849,8 +1938,14 @@ class BasePolicyTests(unittest.TestCase):
         # a reviewer that isn't 'codex' and isn't named gpt/pro must still gate the merge
         BASE = ("version: 1\nproject: x\nreview:\n  mode: pr\n  reviewers: [codex, research-auditor]\n"
                 "  require_ci: false\n  operators: [owner]\n  approvers: [owner]\n")
-        bundle = {"head": "H" * 40, "base_sha": "B" * 40, "bodies": [], "reviews": [], "checks": [],
+        bundle = {"head": "a" * 40, "base_sha": "b" * 40, "bodies": [], "reviews": [], "checks": [],
                   "merge_state": "", "state": "OPEN", "is_draft": False, "base": "main", "head_ref": "feat/x"}
+        bundle["bodies"] = [{
+            "body": review.emit_marker("review-cycle", {
+                "cycle": 1, "target_sha": bundle["head"], "base_sha": bundle["base_sha"],
+                "reviewers": ["codex", "research-auditor"], "profile_fingerprint": None,
+            }), "author": "owner", "at": "2026-07-15T00:00:00Z",
+        }]
         saved = (review.resolve_repo, review.pr_bundle, review.file_at_ref, review._gh)
         review.resolve_repo = lambda root: "owner/repo"
         review.pr_bundle = lambda root, pr, repo=None: bundle
@@ -1864,6 +1959,57 @@ class BasePolicyTests(unittest.TestCase):
         finally:
             review.resolve_repo, review.pr_bundle, review.file_at_ref, review._gh = saved
         self.assertTrue(g["want_pro"])  # research-auditor must be required, not name-guessed away
+
+    def test_merge_gather_role_reviewer_uses_one_frozen_backend_list(self):
+        head, base = "a" * 40, "b" * 40
+        policy = common.normalize_config({
+            "version": 1, "project": "x", "review": {
+                "mode": "pr", "reviewers": ["role:reviewer"],
+                "require_ci": False, "operators": ["owner"], "approvers": ["owner"],
+            },
+        })
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / ".waystone.yml").write_text("version: 1\nproject: x\n")
+            state = common.ensure_project_state_dir(root)
+            (state / "profile.yml").write_text(
+                "schema: waystone-profile-1\nbindings:\n"
+                "  reviewer: {execution: external-runner, backend: 'claude:opus'}\n")
+            _profile, fingerprint = delegate._load_profile(root)
+            bodies = [
+                {"body": review.emit_marker("review-cycle", {
+                    "cycle": 1, "target_sha": head, "base_sha": base,
+                    "reviewers": ["claude:opus"], "profile_fingerprint": fingerprint,
+                }), "author": "owner", "at": "2026-07-15T00:00:00Z"},
+                {"body": review.emit_marker("review-result", {
+                    "reviewer": "claude:opus", "review_cycle": 1,
+                    "reviewed_sha": head, "verdict": "shipped", "decision_required": [],
+                }), "author": "owner", "at": "2026-07-15T01:00:00Z"},
+                {"body": review.emit_marker("findings", {"cycle": 1, "resolved": True}),
+                 "author": "owner", "at": "2026-07-15T02:00:00Z"},
+                {"body": review.emit_marker("approval", {
+                    "sha": head, "cycle": 1, "base_sha": base, "by": "owner"}),
+                 "author": "owner", "at": "2026-07-15T03:00:00Z"},
+            ]
+            bundle = {
+                "head": head, "base_sha": base, "bodies": bodies, "reviews": [],
+                "checks": [], "merge_state": "CLEAN", "state": "OPEN",
+                "is_draft": False, "base": "main", "head_ref": "feat/x",
+            }
+            ctx = {"repo": "owner/repo", "bundle": bundle, "head": head,
+                   "base_sha": base, "base": "main", "policy": policy}
+            saved = review.pr_context, review.file_at_ref, review._gh
+            review.pr_context = lambda _root, _pr: ctx
+            review.file_at_ref = lambda *_args: "version: 1\nproject: x\ntasks: []\n"
+            review._gh = lambda _root, *_args: (0, "main")
+            try:
+                facts = merge._gather(root, 7)
+            finally:
+                review.pr_context, review.file_at_ref, review._gh = saved
+        self.assertEqual(facts["reviewers"], ["claude:opus"])
+        self.assertFalse(facts["want_codex"])
+        self.assertTrue(facts["want_pro"])
+        self.assertTrue(merge.merge_gate(facts)[0], merge.merge_gate(facts)[1])
 
 
 class IngestTests(unittest.TestCase):
@@ -2163,7 +2309,9 @@ class IntegrationSmokeTests(unittest.TestCase):
         mk = review.emit_marker
         comments = [
             {"id": 1, "user": {"login": "owner"}, "updated_at": "2026-06-22T01:00:00Z",
-             "body": mk("review-cycle", {"cycle": 1, "target_sha": self.HEAD, "base_sha": self.BASE})},
+             "body": mk("review-cycle", {
+                 "cycle": 1, "target_sha": self.HEAD, "base_sha": self.BASE,
+                 "reviewers": ["codex", "gpt-5.5-pro"], "profile_fingerprint": None})},
             {"id": 2, "user": {"login": "owner"}, "updated_at": "2026-06-22T03:00:00Z",
              "body": mk("review-result", {"reviewer": "gpt-5.5-pro", "review_cycle": 1,
                  "reviewed_sha": self.HEAD, "verdict": "shipped", "decision_required": []})},
@@ -2185,7 +2333,10 @@ class IntegrationSmokeTests(unittest.TestCase):
                     rc_pass = merge.merge(root, 7, execute=False, method=None)
                     # re-freeze cycle 2 (same head/base, later) — every cycle-1 evidence must go stale
                     comments.append({"id": 5, "user": {"login": "owner"}, "updated_at": "2026-06-22T06:00:00Z",
-                        "body": mk("review-cycle", {"cycle": 2, "target_sha": self.HEAD, "base_sha": self.BASE})})
+                        "body": mk("review-cycle", {
+                            "cycle": 2, "target_sha": self.HEAD, "base_sha": self.BASE,
+                            "reviewers": ["codex", "gpt-5.5-pro"],
+                            "profile_fingerprint": None})})
                     review._gh = self._gh(comments, reviews)
                     rc_stale = merge.merge(root, 7, execute=False, method=None)
         finally:
@@ -4656,7 +4807,8 @@ class DelegateProfileTests(unittest.TestCase):
         profile = {"bindings": {"implementer": {
             "execution": "clean-subagent", "backend": "claude:sonnet"}}}
         with self.assertRaisesRegex(
-                delegate.WorkflowError, "host-guided"):
+                delegate.WorkflowError,
+                "routing contract.*skill routing.*observation attribution"):
             delegate._resolve_binding(profile, "implementer", Path("/project"))
 
     def test_missing_role_binding_raises(self):
@@ -4869,7 +5021,9 @@ class DelegateRunTests(unittest.TestCase):
         try:
             return _run_with_home(
                 home, lambda: delegate.run_delegation(
-                    root, task, "implementer", accept or []))
+                    root, task, "implementer", accept or [],
+                    allow_unsandboxed_runner=True,
+                    unsandboxed_reason="synthetic test transport"))
         finally:
             delegate._run_claude = orig
 
@@ -4927,12 +5081,87 @@ class DelegateRunTests(unittest.TestCase):
                 rc = self._run_claude_backend(root, home, fake)
             self.assertEqual(rc, 0)
             self.assertIn("waystone warn:", err.getvalue())
-            self.assertIn("Bash can still access the network", err.getvalue())
+            for delta in ("filesystem", "process", "network"):
+                self.assertIn(delta, err.getvalue().lower())
             rec = self._record_dir(root, home)
             contract = yaml.safe_load((rec / "artifact" / "contract.yaml").read_text())
             self.assertEqual(contract["runner"]["backend"], "claude:sonnet")
             exp = _json.loads((rec / "exposure.json").read_text())
             self.assertEqual(exp["sandbox"], "none")
+
+    def test_claude_implementer_refuses_without_explicit_unsandboxed_override(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = self._project(d)
+            _write_profile(root, (
+                "schema: waystone-profile-1\nbindings:\n"
+                "  implementer: {execution: external-runner, backend: 'claude:sonnet'}\n"))
+            called = []
+            original = delegate._run_claude
+            delegate._run_claude = lambda *args, **kwargs: (called.append(True) or (0, 0.1))
+            try:
+                with self.assertRaisesRegex(
+                        delegate.WorkflowError, "--allow-unsandboxed-runner.*--reason"):
+                    _run_with_home(home, lambda: delegate.run_delegation(
+                        root, "feat/xyz", "implementer", []))
+            finally:
+                delegate._run_claude = original
+            self.assertEqual(called, [])
+            self.assertFalse(delegate._delegations_dir(root).exists())
+
+    def test_claude_unsandboxed_override_records_packet_exposure_and_full_delta(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            root, home = self._project(d)
+            _write_profile(root, (
+                "schema: waystone-profile-1\nbindings:\n"
+                "  implementer: {execution: external-runner, backend: 'claude:sonnet'}\n"))
+            fake = self._fake_runner({"impl.py": "claude\n"})
+            original = delegate._run_claude
+            delegate._run_claude = fake
+            err = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                    rc = _run_with_home(home, lambda: delegate.run_delegation(
+                        root, "feat/xyz", "implementer", [],
+                        allow_unsandboxed_runner=True,
+                        unsandboxed_reason="legacy Claude-only backend"))
+            finally:
+                delegate._run_claude = original
+            self.assertEqual(rc, 0)
+            rec = self._record_dir(root, home)
+            packet = yaml.safe_load((rec / "packet.yaml").read_text())
+            exposure = _json.loads((rec / "exposure.json").read_text())
+            expected = {"kind": "allow-unsandboxed-runner",
+                        "reason": "legacy Claude-only backend", "provenance": "user"}
+            self.assertEqual(packet["runner_override"], expected)
+            self.assertEqual(exposure["runner_override"], expected)
+            self.assertEqual(exposure["sandbox"], "none")
+            for delta in ("filesystem", "process", "network"):
+                self.assertIn(delta, err.getvalue().lower())
+
+    def test_claude_unsandboxed_cli_override_requires_paired_reason(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            root, home = self._project(d)
+            _write_profile(root, (
+                "schema: waystone-profile-1\nbindings:\n"
+                "  implementer: {execution: external-runner, backend: 'claude:sonnet'}\n"))
+            cases = (
+                (["--allow-unsandboxed-runner"], "requires --reason"),
+                (["--reason", "because"], "only valid with --allow-unsandboxed-runner"),
+            )
+            for extra, needle in cases:
+                err = io.StringIO()
+                with self.subTest(extra=extra), contextlib.redirect_stderr(err):
+                    rc = _run_with_home(home, lambda: delegate.main([
+                        "run", "feat/xyz", "--root", str(root), *extra]))
+                self.assertEqual(rc, 1)
+                self.assertIn(needle, err.getvalue())
+            self.assertFalse(delegate._delegations_dir(root).exists())
 
     def test_claude_runner_injected_failure_preserves_failed_runner(self):
         import contextlib
@@ -4983,6 +5212,33 @@ class DelegateRunTests(unittest.TestCase):
             self.assertIn("WebFetch", cmd[cmd.index("--disallowedTools") + 1])
             self.assertEqual(Path(kwargs["cwd"]), root)
             self.assertEqual((root / "last_message.md").read_text(), "done")
+
+    def test_run_claude_rejects_non_object_stream_event_as_transport_failure(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            prompt = root / "prompt.txt"
+            prompt.write_text("implement")
+
+            def transport(cmd, **kwargs):
+                kwargs["stdout"].write("[]\n")
+                return subprocess.CompletedProcess(cmd, 0)
+
+            rc, _duration = delegate._run_claude(
+                root, "sonnet", prompt, root, runner=transport)
+            self.assertNotEqual(rc, 0)
+            self.assertIn("object", (root / "runner.stderr").read_text().lower())
+
+    def test_unexpected_runner_exception_transitions_failed_runner(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = self._project(d)
+
+            def boom(*_args, **_kwargs):
+                raise RuntimeError("transport exploded")
+
+            with self.assertRaisesRegex(delegate.WorkflowError, "transport exploded"):
+                self._run(root, home, boom)
+            rec = self._record_dir(root, home)
+            self.assertEqual(delegate._read_status(rec)["state"], "failed-runner")
 
     def test_cli_prepares_slow_inputs_before_claim_lock_and_revalidates_inside(self):
         import contextlib
@@ -5932,6 +6188,8 @@ class DelegateVerdictTests(unittest.TestCase):
             "verdict", rec.name, "--file", str(path), "--root", str(root), *flags]))
 
     def _verify(self, rec, findings=None):
+        contract = yaml.safe_load((rec / "artifact" / "contract.yaml").read_text())
+        exposure = _json.loads((rec / "exposure.json").read_text())
         artifact = {
             "schema": "waystone-verify-1",
             "at": "2026-07-15T00:00:00+00:00",
@@ -5939,6 +6197,12 @@ class DelegateVerdictTests(unittest.TestCase):
             "backend": "codex:gpt-test",
             "provenance": "independent-verifier",
             "payload": {"summary": "reviewed", "findings": findings or [], "limitations": []},
+            "profile_fingerprint": exposure["profile_fingerprint"],
+            "base_sha": contract["base_sha"], "result_sha": contract["result_sha"],
+            "effective_tool_policy": {
+                "tools": ["codex-exec"], "sandbox": "read-only", "bash": False,
+                "filesystem_postcondition": "git-status+untracked-content-unchanged",
+            },
         }
         (rec / "artifact" / "verify-1.json").write_text(
             _json.dumps(artifact) + "\n", encoding="utf-8")
@@ -6098,6 +6362,9 @@ class DelegateVerdictTests(unittest.TestCase):
             "transport": "codex-exec:read-only", "backend": "codex:gpt-test",
             "provenance": "independent-verifier",
             "payload": {"summary": "reviewed", "findings": [], "limitations": []},
+            "profile_fingerprint": "sha256:123456789abc",
+            "base_sha": "a" * 40, "result_sha": "b" * 40,
+            "effective_tool_policy": {"tools": ["synthetic"]},
         }
         cases = (
             ("verify-final.json", valid, "non-canonical"),
@@ -7825,7 +8092,8 @@ class DelegateVerifyTests(unittest.TestCase):
                 calls.append((worktree, model, focus, record_dir))
                 return (0, _json.dumps(payload))
 
-            with contextlib.redirect_stdout(io.StringIO()):
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
                 rc = _run_with_home(home, lambda: self._with_claude_verifier(
                     fake, lambda: delegate.verify_delegation(root, rec.name)))
             self.assertEqual(rc, 0)
@@ -7834,6 +8102,17 @@ class DelegateVerifyTests(unittest.TestCase):
             self.assertEqual(artifact["transport"], "claude-print:read-only")
             self.assertEqual(artifact["backend"], "claude:sonnet")
             self.assertEqual(artifact["payload"], payload)
+            contract = yaml.safe_load((rec / "artifact" / "contract.yaml").read_text())
+            self.assertEqual(artifact["profile_fingerprint"],
+                             delegate._load_profile(root)[1])
+            self.assertEqual(artifact["base_sha"], contract["base_sha"])
+            self.assertEqual(artifact["result_sha"], contract["result_sha"])
+            self.assertEqual(artifact["effective_tool_policy"], {
+                "tools": ["Read", "Glob", "Grep"], "bash": False,
+                "filesystem_postcondition": "git-status+untracked-content-unchanged",
+            })
+            for delta in ("filesystem", "process", "network"):
+                self.assertIn(delta, err.getvalue().lower())
 
     def test_run_claude_verifier_transport_is_injectable_and_read_only(self):
         with tempfile.TemporaryDirectory() as d:
@@ -7843,7 +8122,8 @@ class DelegateVerifyTests(unittest.TestCase):
 
             def transport(cmd, **kwargs):
                 calls.append((cmd, kwargs))
-                wrapped = {"type": "result", "structured_output": payload}
+                wrapped = {"type": "result", "subtype": "success",
+                           "structured_output": payload}
                 return subprocess.CompletedProcess(cmd, 0, stdout=_json.dumps(wrapped), stderr="")
 
             rc, output = delegate._run_claude_verifier(
@@ -7855,9 +8135,32 @@ class DelegateVerifyTests(unittest.TestCase):
             self.assertIn("--permission-mode", cmd)
             self.assertEqual(cmd[cmd.index("--permission-mode") + 1], "dontAsk")
             denied = cmd[cmd.index("--disallowedTools") + 1]
-            for tool in ("Edit", "Write", "WebFetch", "WebSearch"):
+            for tool in ("Edit", "Write", "Bash", "WebFetch", "WebSearch"):
                 self.assertIn(tool, denied)
+            allowed = cmd[cmd.index("--allowedTools") + 1]
+            self.assertNotIn("Bash", allowed)
+            self.assertNotIn("Bash", cmd[cmd.index("--tools") + 1])
             self.assertEqual(Path(kwargs["cwd"]), root)
+
+    def test_claude_verifier_requires_success_structured_output(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            payload = {"summary": "ok", "findings": [], "limitations": []}
+            envelopes = (
+                {"type": "result", "structured_output": payload},
+                {"type": "result", "subtype": "success", "result": _json.dumps(payload)},
+                payload,
+            )
+            for envelope in envelopes:
+                with self.subTest(envelope=envelope):
+                    def transport(cmd, **kwargs):
+                        return subprocess.CompletedProcess(
+                            cmd, 0, stdout=_json.dumps(envelope), stderr="")
+
+                    rc, output = delegate._run_claude_verifier(
+                        root, "sonnet", "review", root, runner=transport)
+                    self.assertNotEqual(rc, 0)
+                    self.assertEqual(output, "")
 
     def test_success_normalizes_committed_delegate_and_preserves_labels(self):
         with tempfile.TemporaryDirectory() as d:
@@ -7866,7 +8169,8 @@ class DelegateVerifyTests(unittest.TestCase):
 
             def fake(wt, args, record_dir):
                 calls.append((wt, args, record_dir))
-                return (0, _json.dumps({"verdict": "challenge", "findings": []}))
+                return (0, _json.dumps({
+                    "summary": "challenged", "findings": [], "limitations": []}))
 
             import contextlib
             import io
@@ -7891,7 +8195,47 @@ class DelegateVerifyTests(unittest.TestCase):
             self.assertEqual(artifact["schema"], "waystone-verify-1")
             self.assertEqual(artifact["backend"], "codex:gpt-5.6-sol")
             self.assertEqual(artifact["provenance"], "independent-verifier")
-            self.assertEqual(artifact["payload"]["verdict"], "challenge")
+            self.assertEqual(artifact["payload"]["summary"], "challenged")
+
+    def test_verifier_worktree_mutation_is_fail_loud_and_records_no_artifact(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home, rec, worktree, _plugin = self._setup(d, committed=False)
+
+            def fake(wt, _args, _record_dir):
+                (wt / "verifier-write.txt").write_text("forbidden\n")
+                return (0, _json.dumps({
+                    "summary": "mutated", "findings": [], "limitations": []}))
+
+            with self.assertRaisesRegex(delegate.WorkflowError, "modified.*worktree"):
+                _run_with_home(home, lambda: self._with_companion(
+                    fake, lambda: delegate.verify_delegation(root, rec.name)))
+            self.assertEqual(list((rec / "artifact").glob("verify-*.json")), [])
+
+    def test_verifier_detects_content_change_to_existing_ignored_untracked_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home, rec, worktree, _plugin = self._setup(d, committed=False)
+
+            def fake(wt, _args, _record_dir):
+                (wt / ".ignored-cache" / "keep.txt").write_text("mutated\n")
+                return (0, _json.dumps({
+                    "summary": "mutated", "findings": [], "limitations": []}))
+
+            with self.assertRaisesRegex(delegate.WorkflowError, "modified.*worktree"):
+                _run_with_home(home, lambda: self._with_companion(
+                    fake, lambda: delegate.verify_delegation(root, rec.name)))
+            self.assertEqual(list((rec / "artifact").glob("verify-*.json")), [])
+
+    def test_invalid_verifier_payload_is_rejected_before_artifact_write(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home, rec, _worktree, _plugin = self._setup(d, committed=False)
+
+            def fake(*_args):
+                return (0, _json.dumps({"summary": "missing fields"}))
+
+            with self.assertRaisesRegex(delegate.WorkflowError, "verify artifact schema"):
+                _run_with_home(home, lambda: self._with_companion(
+                    fake, lambda: delegate.verify_delegation(root, rec.name)))
+            self.assertEqual(list((rec / "artifact").glob("verify-*.json")), [])
 
     def test_contract_empty_must_be_bool_before_normalization(self):
         with tempfile.TemporaryDirectory() as d:
@@ -7987,7 +8331,8 @@ class DelegateVerifyTests(unittest.TestCase):
             lock.write_text("stale fixture\n")
 
             def fake(*args):
-                return (0, "{}")
+                return (0, _json.dumps({
+                    "summary": "ok", "findings": [], "limitations": []}))
 
             rc = _run_with_home(home, lambda: self._with_companion(
                 fake, lambda: delegate.main(["verify", rec.name, "--root", str(root)])))
@@ -8011,7 +8356,8 @@ class DelegateVerifyTests(unittest.TestCase):
                 return paths
 
             def fake(*args):
-                return (0, _json.dumps({"run": "new"}))
+                return (0, _json.dumps({
+                    "summary": "new", "findings": [], "limitations": []}))
 
             delegate._verify_paths = raced_paths
             try:
@@ -8021,7 +8367,7 @@ class DelegateVerifyTests(unittest.TestCase):
                 delegate._verify_paths = orig_paths
             self.assertEqual(_json.loads((rec / "artifact" / "verify-1.json").read_text()), sentinel)
             self.assertEqual(
-                _json.loads((rec / "artifact" / "verify-2.json").read_text())["payload"]["run"],
+                _json.loads((rec / "artifact" / "verify-2.json").read_text())["payload"]["summary"],
                 "new")
 
     def test_repeated_verify_increments_and_show_surfaces_latest(self):
@@ -8031,7 +8377,8 @@ class DelegateVerifyTests(unittest.TestCase):
 
             def fake(*args):
                 n["value"] += 1
-                return (0, _json.dumps({"run": n["value"]}))
+                return (0, _json.dumps({
+                    "summary": f"run {n['value']}", "findings": [], "limitations": []}))
 
             import contextlib
             import io
@@ -8048,7 +8395,7 @@ class DelegateVerifyTests(unittest.TestCase):
             with contextlib.redirect_stdout(latest):
                 _run_with_home(home, lambda: delegate.show(root, rec.name, "verify"))
             self.assertIn("verify_artifacts: 2", summary.getvalue())
-            self.assertEqual(_json.loads(latest.getvalue())["payload"]["run"], 2)
+            self.assertEqual(_json.loads(latest.getvalue())["payload"]["summary"], "run 2")
 
     def test_plugin_missing_and_wrong_state_fail_before_companion(self):
         with tempfile.TemporaryDirectory() as d:

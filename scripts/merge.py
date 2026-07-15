@@ -154,9 +154,9 @@ def _gather(root: Path, pr: int) -> dict | None:
         read_ok = False
     if policy is None:
         policy = load_config(root)  # for facts only; read_ok is already False → gate blocks
-    facts = review.facts_from_bundle(bundle, policy, repo)
-    reviewers = policy["review"]["reviewers"]
-    # any configured reviewer other than codex is a mandatory macro reviewer — never guess by name
+    facts = review.facts_from_bundle(bundle, policy, repo, root=root)
+    reviewers = facts["reviewers"]
+    # any frozen reviewer other than the exact codex sentinel is a mandatory macro reviewer — never guess by name
     # (a reviewer like 'research-auditor' must not be silently dropped from the gate).
     macro = [r for r in reviewers if r != "codex"]
     return {

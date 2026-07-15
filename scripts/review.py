@@ -18,7 +18,8 @@ SHA the Codex bot names in its own review comment (timing is irrelevant once the
 Markers in fenced code blocks are ignored.
 
 Markers (HTML comments embedded in PR comment bodies):
-  waystone-review-cycle  : a freeze — {round_id, cycle, target_sha, base_sha, reviewers}
+  waystone-review-cycle  : a freeze — {round_id, cycle, target_sha, base_sha, reviewers,
+                                       profile_fingerprint}
   waystone-review-result : an external reviewer reply footer — {reviewer, review_cycle, reviewed_sha, verdict, decision_required}
   waystone-findings      : adjudication outcome for a cycle — {cycle, resolved}
   waystone-approval      : SHA-bound human approval — {sha, by}
@@ -104,7 +105,9 @@ def marker_valid(m: dict) -> bool:
                 and (m.get("base_sha") is None or _is_sha(m.get("base_sha")))
                 and (m.get("reviewers") is None or (
                     _is_strlist(m.get("reviewers"))
-                    and all(_literal_reviewer(value) for value in m["reviewers"]))))
+                    and all(_literal_reviewer(value) for value in m["reviewers"])))
+                and (m.get("profile_fingerprint") is None
+                     or _nonempty_str(m.get("profile_fingerprint"))))
     if k == "review-result":
         return (_is_cycle(m.get("review_cycle")) and _is_sha(m.get("reviewed_sha"))
                 and _literal_reviewer(m.get("reviewer")) and _nonempty_str(m.get("verdict"))
@@ -200,7 +203,10 @@ def classify(markers: list[dict], current_head: str, macro_reviewers: tuple = ()
     if trusted_cycles:
         max_cycle = max(m["cycle"] for m in trusted_cycles)
         same_cycle = [m for m in trusted_cycles if m["cycle"] == max_cycle]
-        conflict = len({(str(m.get("target_sha")), str(m.get("base_sha"))) for m in same_cycle}) > 1
+        conflict = len({(
+            str(m.get("target_sha")), str(m.get("base_sha")),
+            tuple(m.get("reviewers") or ()), str(m.get("profile_fingerprint")),
+        ) for m in same_cycle}) > 1
         lc = max(same_cycle, key=at)
     else:
         conflict, lc = False, None
@@ -442,13 +448,14 @@ def ci_state(bundle: dict) -> str:
     return "failing"
 
 
-def resolve_reviewers(root: Path, configured: list[str] | tuple[str, ...]) -> list[str]:
-    """Resolve `role:reviewer` to the reviewer's literal backend model identity."""
+def resolve_reviewer_set(root: Path, configured: list[str] | tuple[str, ...]) \
+        -> tuple[list[str], str | None]:
+    """Resolve `role:reviewer` to a namespaced backend identity and profile fingerprint."""
     if not any(reviewer == "role:reviewer" for reviewer in configured):
-        return list(configured)
+        return list(configured), None
     import delegate
 
-    profile, _fingerprint = delegate._load_profile(root)
+    profile, fingerprint = delegate._load_profile(root)
     bindings = profile.get("bindings")
     binding = bindings.get("reviewer") if isinstance(bindings, dict) else None
     if not isinstance(binding, dict):
@@ -457,13 +464,15 @@ def resolve_reviewers(root: Path, configured: list[str] | tuple[str, ...]) -> li
             f"'reviewer' at {delegate._profile_path(root)}")
     delegate._validate_profile_binding("reviewer", binding)
     backend = binding["backend"]
-    _runner, separator, model = backend.partition(":")
-    if not separator or not model:
-        raise WorkflowError(f"reviewer binding backend has no literal model identity: {backend!r}")
-    resolved = [model if reviewer == "role:reviewer" else reviewer for reviewer in configured]
+    resolved = [backend if reviewer == "role:reviewer" else reviewer for reviewer in configured]
     if any(reviewer.startswith("role:") for reviewer in resolved):
         raise WorkflowError("review reviewer identities must be literal after profile resolution")
-    return resolved
+    return resolved, fingerprint
+
+
+def resolve_reviewers(root: Path, configured: list[str] | tuple[str, ...]) -> list[str]:
+    """Compatibility wrapper for request renderers that only need the resolved identities."""
+    return resolve_reviewer_set(root, configured)[0]
 
 
 def facts_from_bundle(bundle: dict, cfg: dict, repo: str | None,
@@ -472,15 +481,30 @@ def facts_from_bundle(bundle: dict, cfg: dict, repo: str | None,
     approvers = tuple({owner, *cfg["review"].get("approvers", [])} - {""})
     operators = tuple({owner, *cfg["review"].get("operators", [])} - {""})
     configured = cfg["review"]["reviewers"]
-    if any(reviewer == "role:reviewer" for reviewer in configured) and root is None:
-        raise WorkflowError("reviewer role resolution requires the project root")
-    reviewers = resolve_reviewers(root, configured) if root is not None else list(configured)
-    macro = tuple(r for r in reviewers if r != "codex")
     markers = parse_bodies(bundle["bodies"])
     # Codex signals must be bound to the exact head AND post-date the latest freeze — so a re-freeze
     # (new cycle/base, same head) can't reuse a Codex review from a previous cycle. The newest
     # signal's timestamp also gates findings/approval freshness.
     lc = latest_cycle(markers, operators)
+    frozen_reviewers = lc.get("reviewers") if lc else None
+    reviewers = list(frozen_reviewers) if isinstance(frozen_reviewers, list) else []
+    frozen_contract_ok = isinstance(frozen_reviewers, list) or not configured
+    reviewer_profile_drift = False
+    if any(reviewer == "role:reviewer" for reviewer in configured):
+        if root is None:
+            reviewer_profile_drift = True
+        else:
+            try:
+                current_reviewers, current_fingerprint = resolve_reviewer_set(root, configured)
+            except WorkflowError:
+                reviewer_profile_drift = True
+            else:
+                reviewer_profile_drift = (
+                    not lc
+                    or lc.get("profile_fingerprint") != current_fingerprint
+                    or reviewers != current_reviewers
+                )
+    macro = tuple(r for r in reviewers if r != "codex")
     freeze_at = lc.get("_at") if lc else None
     signals = codex_signals_at_head(bundle.get("reviews", []), bundle.get("bodies", []),
                                     bundle["head"], since_at=freeze_at)
@@ -488,6 +512,10 @@ def facts_from_bundle(bundle: dict, cfg: dict, repo: str | None,
     cls = classify(markers, bundle["head"], macro_reviewers=macro, approvers=approvers,
                    operators=operators, current_base=bundle.get("base_sha") or None,
                    codex_signal_at=codex_at)
+    if not frozen_contract_ok or reviewer_profile_drift:
+        cls["cycle_fresh"] = False
+    cls["reviewers"] = reviewers
+    cls["reviewer_profile_drift"] = reviewer_profile_drift
     cls["codex_fresh"] = bool(signals)
     cls["ci"] = ci_state(bundle)
     cls["pr_state"] = bundle["state"]
@@ -556,10 +584,12 @@ def freeze(root: Path, pr: int, round_id: str | None) -> int:
     base_sha = bundle.get("base_sha", "")
     markers = parse_bodies(bundle["bodies"])
     n = next_cycle_number(markers)
-    reviewers = resolve_reviewers(root, policy["review"]["reviewers"])
+    reviewers, profile_fingerprint = resolve_reviewer_set(
+        root, policy["review"]["reviewers"])
     marker = emit_marker("review-cycle", {
         "round_id": round_id or "(unset)", "cycle": n, "target_sha": head,
         "base_sha": base_sha, "reviewers": reviewers,
+        "profile_fingerprint": profile_fingerprint,
     })
     macro = [r for r in reviewers if r != "codex"]
     body = (f"## Review cycle {n} — frozen at `{head[:12]}` (base `{base_sha[:12]}`)\n\n"
@@ -591,6 +621,7 @@ def status(root: Path, pr: int | None) -> int:
         print(f"  current head:   {facts['current_head'][:12]}")
         print(f"  latest cycle:   {facts['latest_cycle']} (frozen {str(facts['frozen_sha'])[:12]})")
         print(f"  cycle fresh:    {facts['cycle_fresh']}  (False = push after freeze → re-freeze)")
+        print(f"  profile drift:  {facts['reviewer_profile_drift']}")
         print(f"  codex fresh:    {facts['codex_fresh']}")
         print(f"  CI:             {facts['ci']}")
         print(f"  pro result@head:{facts['pro_result_at_head']}  ({facts['n_results']} result(s))")
