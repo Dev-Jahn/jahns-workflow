@@ -580,13 +580,18 @@ def write_round_exposure(root: Path, round_id: str, head_sha: str | None, waterm
     }
     edir = _exposure_dir(root)
     _mkdir_or_refuse(edir)
-    p = edir / f"round-{round_id}.json"
+    base = edir / f"round-{round_id}.json"
+    p = base
     n = 2
-    while p.exists():
-        p = edir / f"round-{round_id}-{n}.json"
-        n += 1
-    p.write_text(json.dumps(exposure, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    return p, exposure
+    content = json.dumps(exposure, ensure_ascii=False, indent=2) + "\n"
+    while True:
+        try:
+            with p.open("x", encoding="utf-8") as stream:
+                stream.write(content)
+            return p, exposure
+        except FileExistsError:
+            p = base.with_name(f"{base.stem}-{n}{base.suffix}")
+            n += 1
 
 
 # ---- CLI (hand-rolled parsing; {0,1,2} exit contract) --------------------------

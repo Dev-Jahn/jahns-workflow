@@ -33,7 +33,7 @@ import round  # noqa: E402  — reuse the AST-bounded text-surgery helpers
 import validate  # noqa: E402
 from common import (  # noqa: E402
     WorkflowError, find_project_root, hold_lock, load_tasks, migrate_project_state,
-    project_lock_path,
+    project_lock_path, write_text_atomic,
 )
 
 ARCHIVE_NAME = "tasks.archive.yaml"
@@ -191,7 +191,7 @@ def _write_validated(tasks_path: Path, new_text: str, what: str) -> int:
         for e in errs[:10]:
             print(f"  - {e}", file=sys.stderr)
         return 2
-    tasks_path.write_text(new_text, encoding="utf-8")
+    write_text_atomic(tasks_path, new_text)
     return 0
 
 
@@ -266,14 +266,14 @@ def cmd_archive(root: Path, threshold: int, keep: int) -> int:
     # (archived tasks legitimately reference tasks that stayed live, so it is not dependency-closed).
     seen = {t.get("id") for t in doc["tasks"] if isinstance(t, dict)}
     doc["tasks"].extend(by_id[i] for i in ids if i not in seen)  # dedup → a re-run never double-appends
-    archive_path.write_text(yaml.safe_dump(doc, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    write_text_atomic(archive_path, yaml.safe_dump(doc, sort_keys=False, allow_unicode=True))
     try:
-        tasks_path.write_text(new_text, encoding="utf-8")
+        write_text_atomic(tasks_path, new_text)
     except OSError as e:  # roll the archive back so the tasks aren't stranded in both files
         if orig_archive is None:
             archive_path.unlink(missing_ok=True)
         else:
-            archive_path.write_text(orig_archive, encoding="utf-8")
+            write_text_atomic(archive_path, orig_archive)
         print(f"task archive: failed writing tasks.yaml, rolled back — {e}", file=sys.stderr)
         return 1
     print(f"task archive: moved {len(ids)} done/dropped task(s) to {ARCHIVE_NAME}; "

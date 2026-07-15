@@ -1258,6 +1258,30 @@ class RoundCloseTests(unittest.TestCase):
             head = git(root, "rev-parse", "HEAD").stdout.strip()
             self.assertIn(f"last_round_commit: {head}", (root / ".waystone.yml").read_text())
 
+    def test_close_replaces_all_primary_files_atomically(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._setup(root, "version: 1\nproject: x\nstate:\n  last_round_commit: null\n")
+            targets = []
+            original_replace = common.os.replace
+
+            def tracked_replace(src, dst):
+                targets.append(Path(dst).resolve())
+                return original_replace(src, dst)
+
+            common.os.replace = tracked_replace
+            try:
+                rc = round.close(
+                    root, "2026-06-19-atomic", done=["feat/alpha"], touched=[], commit="HEAD")
+            finally:
+                common.os.replace = original_replace
+            self.assertEqual(rc, 0)
+            self.assertTrue({
+                (root / "tasks.yaml").resolve(),
+                (root / ".waystone.yml").resolve(),
+                (root / "ROADMAP.md").resolve(),
+            }.issubset(set(targets)))
+
     def _setup(self, root, cfg_body):
         init_repo(root)
         (root / ".waystone.yml").write_text(cfg_body)
@@ -1469,6 +1493,43 @@ class IngestTests(unittest.TestCase):
             src = root / "inbox.md"; src.write_bytes(b"review body")
             self.assertEqual(review.ingest(root, None, src=src), 0)
             self.assertTrue((rdir / "2026-06-20-a-feedback.md").is_file())
+
+    def test_reingest_requires_force_and_preserves_source_on_refusal(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root(d)
+            first = root / "first.md"
+            first.write_bytes(b"first review")
+            self.assertEqual(review.ingest(root, "2026-06-22-x", src=first), 0)
+            dest = root / "docs/reviews/2026-06-22-x-feedback.md"
+            original = dest.read_bytes()
+
+            second = root / "second.md"
+            second.write_bytes(b"second review")
+            self.assertEqual(review.ingest(root, "2026-06-22-x", src=second), 1)
+            self.assertEqual(dest.read_bytes(), original)
+            self.assertTrue(second.exists())
+            self.assertEqual(
+                review.ingest(root, "2026-06-22-x", src=second, force=True), 0)
+            self.assertIn(b"second review", dest.read_bytes())
+            self.assertNotIn(b"first review", dest.read_bytes())
+            self.assertFalse(second.exists())
+
+    def test_ingest_cli_forwards_force_flag(self):
+        seen = {}
+        original = review.ingest
+
+        def fake(root, round_id, src=review.INBOX, reviewer=None, force=False):
+            seen["force"] = force
+            return 0
+
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root(d)
+            review.ingest = fake
+            try:
+                self.assertEqual(review.main(["ingest", "--force", str(root)]), 0)
+            finally:
+                review.ingest = original
+        self.assertIs(seen["force"], True)
 
     def test_warn_failure_is_noticed_without_changing_ingest_exit(self):
         import contextlib
@@ -1773,6 +1834,29 @@ class TaskCliTests(unittest.TestCase):
             self.assertEqual(byid["gate/beta"]["status"], "dropped")
             self.assertEqual(validate.validate(data), [])
             self.assertIn("# registry — comments must be preserved", (root / "tasks.yaml").read_text())
+
+    def test_task_set_replaces_tasks_file_atomically(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            home = root / "home"
+            home.mkdir()
+            (root / ".waystone.yml").write_text("version: 1\nproject: x\n")
+            (root / "tasks.yaml").write_text(TASKS_FIXTURE)
+            targets = []
+            original_replace = common.os.replace
+
+            def tracked_replace(src, dst):
+                targets.append(Path(dst))
+                return original_replace(src, dst)
+
+            common.os.replace = tracked_replace
+            try:
+                rc = _run_with_home(home, lambda: tasks.main(
+                    ["set", "feat/alpha", "status", "done", str(root)]))
+            finally:
+                common.os.replace = original_replace
+            self.assertEqual(rc, 0)
+            self.assertIn((root / "tasks.yaml").resolve(), [target.resolve() for target in targets])
 
     def test_main_add_rejects_invalid_id(self):
         with tempfile.TemporaryDirectory() as d:
@@ -5396,6 +5480,30 @@ class RoundExposureTests(unittest.TestCase):
             edir = self._exposure_dir(root, home)
             self.assertTrue((edir / "round-2026-01-02-close.json").exists())
             self.assertTrue((edir / "round-2026-01-02-close-2.json").exists())
+
+    def test_exposure_open_x_collision_never_overwrites(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _round_review_project(d)
+            target = self._exposure_dir(root, home) / "round-race.json"
+            original_open = Path.open
+            injected = {"done": False}
+
+            def raced_open(path, mode="r", *args, **kwargs):
+                if path == target and mode == "x" and not injected["done"]:
+                    injected["done"] = True
+                    with original_open(path, "w", encoding="utf-8") as stream:
+                        stream.write("sentinel\n")
+                return original_open(path, mode, *args, **kwargs)
+
+            Path.open = raced_open
+            try:
+                path, _exposure = _run_with_home(
+                    home, lambda: overlay.write_round_exposure(root, "race", None, None))
+            finally:
+                Path.open = original_open
+            self.assertTrue(injected["done"])
+            self.assertEqual(target.read_text(), "sentinel\n")
+            self.assertEqual(path.name, "round-race-2.json")
 
     def test_exposure_failure_keeps_close_success(self):
         with tempfile.TemporaryDirectory() as d:

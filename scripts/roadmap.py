@@ -20,7 +20,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import (  # noqa: E402
     WorkflowError, find_project_root, git, hold_lock, load_tasks, migrate_project_state,
-    project_lock_path,
+    project_lock_path, write_text_atomic,
 )
 
 STATUS_CLASS = {"pending": "pending", "active": "active", "blocked": "blocked",
@@ -133,7 +133,7 @@ def main() -> int:
             migrate_project_state(root)
         with hold_lock(project_lock_path(root)):
             out = root / "ROADMAP.md"
-            out.write_text(render(root), encoding="utf-8")
+            write_text_atomic(out, render(root))
             print(f"wrote {out}")
             return 0
     except WorkflowError as e:

@@ -293,7 +293,7 @@ def _registry_key(entry: object, source: Path) -> tuple[str, str]:
     raise WorkflowError(f"migration registry entry has neither path nor repo: {source}")
 
 
-def _write_text_atomic(path: Path, text: str) -> None:
+def write_text_atomic(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp: Path | None = None
     try:
@@ -302,6 +302,25 @@ def _write_text_atomic(path: Path, text: str) -> None:
                 suffix=".tmp", delete=False) as stream:
             tmp = Path(stream.name)
             stream.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
+        raise
+
+
+def write_bytes_atomic(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                "wb", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp",
+                delete=False) as stream:
+            tmp = Path(stream.name)
+            stream.write(content)
         os.replace(tmp, path)
     except BaseException:
         if tmp is not None:
@@ -381,7 +400,7 @@ def _merge_registries(sources: list[tuple[str, Path]], destination: Path) -> lis
             )
     if merged != registry["projects"] or (not destination.exists() and merged):
         registry["projects"] = merged
-        _write_text_atomic(destination, json.dumps(registry, ensure_ascii=False, indent=2) + "\n")
+        write_text_atomic(destination, json.dumps(registry, ensure_ascii=False, indent=2) + "\n")
     return merged
 
 
@@ -460,11 +479,11 @@ def _migrate_improve(sources: list[tuple[str, Path]], destination: Path) -> None
         for order, (path, _marker) in enumerate(pending, 1):
             rows.extend(_decision_lines(path, order))
         rows.sort(key=lambda row: (row[0], row[1], row[2]))
-        _write_text_atomic(
+        write_text_atomic(
             machine_improve / "decisions.jsonl", "".join(f"{row[3]}\n" for row in rows))
         for marker in dict.fromkeys(marker for _path, marker in pending):
             if not _lexists(marker):
-                _write_text_atomic(marker, "")
+                write_text_atomic(marker, "")
         print(
             f"waystone migration: merged {len(rows)} decision row(s) by timestamp -> "
             f"{machine_improve / 'decisions.jsonl'}",
@@ -542,7 +561,7 @@ def _report_unmapped_slugs(host: str, root: Path, slugs: set[str]) -> None:
         )
     if new:
         preserved.mkdir(parents=True, exist_ok=True)
-        _write_text_atomic(marker, json.dumps(sorted(reported | slugs), indent=2) + "\n")
+        write_text_atomic(marker, json.dumps(sorted(reported | slugs), indent=2) + "\n")
 
 
 def _preserve_phase1_root(root: Path) -> None:
@@ -921,7 +940,7 @@ def _mark_worktree_discard_only(state: Path, did: str, reason: str) -> None:
     })
     status["state"] = "migration-worktree-failed"
     status["migration"] = {"disposition": "discard-only", "reason": reason}
-    _write_text_atomic(status_path, json.dumps(status, ensure_ascii=False, indent=2) + "\n")
+    write_text_atomic(status_path, json.dumps(status, ensure_ascii=False, indent=2) + "\n")
 
 
 def _worktree_migration_marker(new: Path) -> Path:
@@ -1015,7 +1034,7 @@ def _migrate_worktree(root: Path, state: Path, slug: str, did: str, old: Path) -
         filesystem_error = f"destination already exists: {new}"
     else:
         git_rc(root, "worktree", "lock", str(old))
-        _write_text_atomic(marker, str(old))
+        write_text_atomic(marker, str(old))
         try:
             shutil.move(str(old), str(new))
         except OSError as e:
