@@ -45,6 +45,9 @@ DELEG_REF_NS = "refs/waystone/delegations"
 TERMINAL_STATES = ("applied", "discarded")
 _TEMPLATE_PATH = Path(__file__).resolve().parent.parent / "templates" / "delegate-prompt.md"
 _VERIFY_SCHEMA_PATH = Path(__file__).resolve().parent.parent / "templates" / "verifier-output-schema.json"
+_VERDICT_INPUT_SCHEMA_PATH = (
+    Path(__file__).resolve().parent.parent / "templates" / "verdict-input-schema.json")
+_VERDICT_SCHEMA_PATH = Path(__file__).resolve().parent.parent / "templates" / "verdict-schema.json"
 _EFFORT_VALUES = ("none", "minimal", "low", "medium", "high", "xhigh")
 
 # lockfile -> (prep command, kind), first match wins (S7). None env_prep in config falls through here.
@@ -421,7 +424,8 @@ def _read_status(record_dir: Path) -> dict:
 
 
 def _set_state(record_dir: Path, state: str, *, env: dict | None = None, error: str | None = None,
-               reason: str | None = None, overrides: list[str] | None = None) -> dict:
+               reason: str | None = None, overrides: list[str] | None = None,
+               verification_required: bool | None = None) -> dict:
     st = _read_status_raw(record_dir) or {}  # a corrupt file is superseded — discard IS the recovery path
     transition = {"state": state, "at": _now_iso()}
     if reason is not None:
@@ -434,6 +438,8 @@ def _set_state(record_dir: Path, state: str, *, env: dict | None = None, error: 
         st["env"] = env
     if error is not None:
         st["error"] = error
+    if verification_required is not None:
+        st["verification_required"] = verification_required
     tmp = record_dir / "status.json.tmp"  # atomic replace: a crash mid-write must not corrupt the record
     tmp.write_text(json.dumps(st, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.replace(tmp, record_dir / "status.json")
@@ -601,9 +607,11 @@ def _prepare_run(root: Path, task_id: str, role: str, accept_flags: list[str],
     cfg = load_config(root)
     packet, _acceptance = _build_packet(
         load_tasks(root), task_id, accept_flags, root, retry_note=retry_note)
+    bindings = profile.get("bindings")
+    verifier_bound = isinstance(bindings, dict) and "verifier" in bindings
     return {"task_id": task_id, "binding": binding, "model": model, "cfg": cfg,
             "packet": packet, "fingerprint": fingerprint, "accept_flags": list(accept_flags),
-            "retry_note": retry_note}
+            "retry_note": retry_note, "verifier_bound": verifier_bound}
 
 
 def _claim_run(root: Path, plan: dict) -> tuple[str, Path]:
@@ -732,9 +740,17 @@ def _run_claimed(root: Path, plan: dict, did: str, record_dir: Path) -> int:
         _set_state(record_dir, "failed-artifact", env=env_rec, error=str(e))
         raise WorkflowError(
             f"artifact computation failed after the runner — worktree preserved at {worktree_path}: {e}")
-    _set_state(record_dir, "needs-review", env=env_rec)
+    events = _warn_boundary(root, "delegate-run", {"delegation_id": did})
+    rule1_fired = any(
+        event.get("rule") == "delegation-verification-evidence-v1"
+        and event.get("event") == "fire"
+        and isinstance(event.get("context"), dict)
+        and event["context"].get("delegation_id") == did
+        for event in events
+    )
+    _set_state(record_dir, "needs-review", env=env_rec,
+               verification_required=plan["verifier_bound"] or rule1_fired)
     print(f"artifact: {artifact_dir / 'contract.yaml'}")
-    _warn_boundary(root, "delegate-run", {"delegation_id": did})
     return 0
 
 
@@ -746,15 +762,16 @@ def run_delegation(root: Path, task_id: str, role: str, accept_flags: list[str],
     return _run_claimed(root, plan, did, record_dir)
 
 
-def _warn_boundary(root: Path, boundary: str, context: dict) -> None:
+def _warn_boundary(root: Path, boundary: str, context: dict) -> list[dict]:
     """Best-effort overlay warn at a delegation boundary. evaluate_boundary already swallows its own
     exceptions; the extra guard covers an import failure — a warn must never affect the host exit (S5)."""
     try:
         import overlay
-        overlay.evaluate_boundary(root, boundary, context)
+        return overlay.evaluate_boundary(root, boundary, context)
     except Exception as e:  # noqa: BLE001
         print(f"waystone delegate: overlay warning unavailable at {boundary} ({e}) — host command continued",
               file=sys.stderr)
+        return []
 
 
 # ---- independent verifier (§11 — same-base codex-companion transport) --------
@@ -941,17 +958,33 @@ def _cleanup_companion_broker(worktree: Path, *, state_root: Path | None = None)
     return "broker cleanup: daemon may remain"
 
 
+def _artifact_paths(rec: Path, prefix: str) -> list[Path]:
+    """Return a canonical contiguous artifact sequence; ambiguous numbering is corruption."""
+    numbered: list[tuple[int, Path]] = []
+    for path in sorted((rec / "artifact").glob(f"{prefix}-*.json")):
+        match = re.fullmatch(rf"{re.escape(prefix)}-([1-9][0-9]*)\.json", path.name)
+        if match is None:
+            raise WorkflowError(f"non-canonical {prefix} artifact filename: {path}")
+        if path.is_symlink() or not path.is_file():
+            raise WorkflowError(f"non-regular {prefix} artifact file: {path}")
+        numbered.append((int(match.group(1)), path))
+    numbered.sort(key=lambda item: item[0])
+    actual = [number for number, _path in numbered]
+    expected = list(range(1, len(numbered) + 1))
+    if actual != expected:
+        raise WorkflowError(
+            f"{prefix} artifact numbers must be contiguous from 1; found {actual or 'none'}")
+    return [path for _number, path in numbered]
+
+
 def _verify_paths(rec: Path) -> list[Path]:
-    def number(path: Path) -> int:
-        part = path.stem.removeprefix("verify-")
-        return int(part) if part.isdigit() else -1
-    return sorted((p for p in (rec / "artifact").glob("verify-*.json") if number(p) >= 0),
-                  key=number)
+    return _artifact_paths(rec, "verify")
 
 
 def _write_verify_artifact(rec: Path, artifact: dict) -> Path:
     """Create the next verify artifact without overwriting a concurrently appearing filename."""
-    n = len(_verify_paths(rec)) + 1
+    paths = _verify_paths(rec)
+    n = _artifact_number(paths[-1], "verify") + 1 if paths else 1
     content = json.dumps(artifact, ensure_ascii=False, indent=2) + "\n"
     while True:
         out = rec / "artifact" / f"verify-{n}.json"
@@ -960,7 +993,8 @@ def _write_verify_artifact(rec: Path, artifact: dict) -> Path:
                 f.write(content)
             return out
         except FileExistsError:
-            n += 1
+            paths = _verify_paths(rec)
+            n = _artifact_number(paths[-1], "verify") + 1 if paths else 1
         except OSError as e:
             raise _RefusedWrite(f"cannot write verifier artifact {out}: {e}")
 
@@ -971,11 +1005,7 @@ def _artifact_number(path: Path, prefix: str) -> int:
 
 
 def _verdict_paths(rec: Path) -> list[Path]:
-    return sorted(
-        (path for path in (rec / "artifact").glob("verdict-*.json")
-         if _artifact_number(path, "verdict") >= 0),
-        key=lambda path: _artifact_number(path, "verdict"),
-    )
+    return _artifact_paths(rec, "verdict")
 
 
 def _load_json_object(path: Path, label: str) -> dict:
@@ -992,13 +1022,22 @@ def _string_list(value: object) -> bool:
     return isinstance(value, list) and all(isinstance(item, str) for item in value)
 
 
-def _validate_verdict_input(verdict: dict) -> None:
-    """Validate the user-authored portion of waystone-verdict-1 without accepting spoofed harness fields."""
-    required = {
-        "schema", "decision", "decided_by", "criteria", "agent_checks", "warnings_seen",
-        "rationale", "limitations",
-    }
-    allowed = required | {"overrides"}
+def _verdict_schema_shape(path: Path, label: str) -> tuple[set[str], set[str], set[str]]:
+    try:
+        schema = json.loads(path.read_text(encoding="utf-8"))
+        required = set(schema["required"])
+        properties = set(schema["properties"])
+        override_properties = set(schema["properties"]["overrides"]["items"]["properties"])
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as e:
+        raise WorkflowError(f"cannot load {label} {path}: {e}") from e
+    return required, properties, override_properties
+
+
+def _validate_verdict_fields(verdict: dict, *, stored: bool) -> None:
+    """Validate the input or enriched artifact shape, including non-blank executable evidence."""
+    schema_path = _VERDICT_SCHEMA_PATH if stored else _VERDICT_INPUT_SCHEMA_PATH
+    label = "stored verdict schema" if stored else "verdict input schema"
+    required, allowed, allowed_override = _verdict_schema_shape(schema_path, label)
     missing = sorted(required - verdict.keys())
     extra = sorted(verdict.keys() - allowed)
     if missing:
@@ -1032,6 +1071,10 @@ def _validate_verdict_input(verdict: dict) -> None:
         if (not isinstance(item["cmd"], str) or type(item["exit"]) is not int
                 or not isinstance(item["summary"], str)):
             raise WorkflowError(f"verdict agent_checks[{index}] has invalid field types")
+        if not item["cmd"].strip():
+            raise WorkflowError(f"verdict agent_checks[{index}].cmd must be non-empty")
+        if not item["summary"].strip():
+            raise WorkflowError(f"verdict agent_checks[{index}].summary must be non-empty")
     if not _string_list(verdict.get("warnings_seen")):
         raise WorkflowError("verdict warnings_seen must be a list of strings")
     if not isinstance(verdict.get("rationale"), str):
@@ -1041,7 +1084,6 @@ def _validate_verdict_input(verdict: dict) -> None:
     overrides = verdict.get("overrides", [])
     if not isinstance(overrides, list):
         raise WorkflowError("verdict overrides must be a list")
-    allowed_override = {"gate", "reason", "finding_index", "criterion_indices", "refuted_by"}
     for index, item in enumerate(overrides):
         if not isinstance(item, dict) or not set(item).issubset(allowed_override):
             raise WorkflowError(f"verdict overrides[{index}] has unsupported fields")
@@ -1049,9 +1091,44 @@ def _validate_verdict_input(verdict: dict) -> None:
         if refuted is not None and (not isinstance(refuted, list)
                                     or any(type(value) is not int or value < 0 for value in refuted)):
             raise WorkflowError(f"verdict overrides[{index}].refuted_by must be index integers")
+        if refuted is not None and not refuted:
+            raise WorkflowError(f"verdict overrides[{index}].refuted_by must be non-empty")
         finding_index = item.get("finding_index")
         if finding_index is not None and (type(finding_index) is not int or finding_index < 0):
             raise WorkflowError(f"verdict overrides[{index}].finding_index must be an index")
+        if stored:
+            if item.get("gate") not in ("blocker", "unmet"):
+                raise WorkflowError(f"verdict overrides[{index}].gate must be blocker|unmet")
+            reason = item.get("reason")
+            if not isinstance(reason, str) or not reason.strip():
+                raise WorkflowError(f"verdict overrides[{index}].reason must be non-empty")
+            verify_number = item.get("verify_number")
+            if verify_number is not None and (type(verify_number) is not int or verify_number < 1):
+                raise WorkflowError(f"verdict overrides[{index}].verify_number must be positive")
+            criterion_indices = item.get("criterion_indices")
+            if criterion_indices is not None and (
+                    not isinstance(criterion_indices, list)
+                    or any(type(value) is not int or value < 0 for value in criterion_indices)):
+                raise WorkflowError(
+                    f"verdict overrides[{index}].criterion_indices must be index integers")
+        elif item.get("gate") not in (None, "blocker"):
+            raise WorkflowError(f"verdict overrides[{index}].gate must be blocker")
+    if stored:
+        if not isinstance(verdict.get("at"), str) or not verdict["at"].strip():
+            raise WorkflowError("stored verdict at must be non-empty")
+        if verdict.get("provenance") != "main-session":
+            raise WorkflowError("stored verdict provenance must be main-session")
+        verify_number = verdict.get("verify_number")
+        if verify_number is not None and (type(verify_number) is not int or verify_number < 1):
+            raise WorkflowError("stored verdict verify_number must be null or positive")
+        fingerprint = verdict.get("profile_fingerprint")
+        if fingerprint is not None and not isinstance(fingerprint, str):
+            raise WorkflowError("stored verdict profile_fingerprint must be string|null")
+
+
+def _validate_verdict_input(verdict: dict) -> None:
+    """Validate only the public user-input schema; harness fields cannot be supplied."""
+    _validate_verdict_fields(verdict, stored=False)
 
 
 def _load_packet(rec: Path) -> dict:
@@ -1065,47 +1142,167 @@ def _load_packet(rec: Path) -> dict:
     return packet
 
 
-def _rule1_fired_for_run(root: Path, did: str) -> bool:
-    import overlay
+def _validate_verify_artifact(path: Path, artifact: dict) -> None:
+    def invalid(detail: str) -> None:
+        raise WorkflowError(f"invalid verify artifact schema {path}: {detail}")
 
-    path = overlay._warnings_path(root)
-    if not path.exists():
+    required = {"schema", "at", "transport", "backend", "provenance", "payload"}
+    if set(artifact) != required:
+        invalid("envelope fields do not match waystone-verify-1")
+    if artifact.get("schema") != "waystone-verify-1":
+        invalid("schema must be waystone-verify-1")
+    if artifact.get("provenance") != "independent-verifier":
+        invalid("provenance must be independent-verifier")
+    for field in ("at", "transport", "backend"):
+        if not isinstance(artifact.get(field), str) or not artifact[field].strip():
+            invalid(f"{field} must be a non-empty string")
+    payload = artifact.get("payload")
+    if not isinstance(payload, dict) or set(payload) != {"summary", "findings", "limitations"}:
+        invalid("payload fields do not match verifier-output-schema")
+    if not isinstance(payload["summary"], str):
+        invalid("payload.summary must be a string")
+    findings = payload["findings"]
+    if not isinstance(findings, list):
+        invalid("payload.findings must be a list")
+    finding_fields = {"title", "severity", "evidence", "recommendation"}
+    for index, finding in enumerate(findings):
+        if not isinstance(finding, dict) or set(finding) != finding_fields:
+            invalid(f"payload.findings[{index}] fields are invalid")
+        if finding.get("severity") not in ("blocker", "major", "minor"):
+            invalid(f"payload.findings[{index}].severity is invalid")
+        for field in ("title", "evidence", "recommendation"):
+            if not isinstance(finding.get(field), str):
+                invalid(f"payload.findings[{index}].{field} must be a string")
+    if not _string_list(payload["limitations"]):
+        invalid("payload.limitations must be a list of strings")
+
+
+def _verify_artifacts(rec: Path) -> dict[int, dict]:
+    artifacts: dict[int, dict] = {}
+    for path in _verify_paths(rec):
+        artifact = _load_json_object(path, "verify artifact")
+        _validate_verify_artifact(path, artifact)
+        artifacts[_artifact_number(path, "verify")] = artifact
+    return artifacts
+
+
+def _evidence_ref_resolves(reference: str, checks: list[dict],
+                           verify_artifacts: dict[int, dict]) -> bool:
+    check_match = re.fullmatch(r"agent_checks\[([0-9]+)\]", reference)
+    if check_match is not None:
+        return int(check_match.group(1)) < len(checks)
+    verify_match = re.fullmatch(r"verify-([1-9][0-9]*)(?:\.json)?#(.+)", reference)
+    if verify_match is None:
         return False
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError as e:
-        raise WorkflowError(f"cannot read warnings evidence {path}: {e}") from e
-    for line_number, line in enumerate(lines, 1):
-        if not line.strip():
-            continue
-        try:
-            row = json.loads(line)
-        except json.JSONDecodeError as e:
-            raise WorkflowError(f"corrupt warnings evidence {path}:{line_number}: {e}") from e
-        if not isinstance(row, dict):
-            raise WorkflowError(f"corrupt warnings evidence {path}:{line_number}: row is not an object")
-        context = row.get("context")
-        if (row.get("boundary") == "delegate-run"
-                and row.get("rule") == "delegation-verification-evidence-v1"
-                and row.get("event") == "fire" and isinstance(context, dict)
-                and context.get("delegation_id") == did):
-            return True
+    artifact = verify_artifacts.get(int(verify_match.group(1)))
+    if artifact is None:
+        return False
+    fragment = verify_match.group(2)
+    payload = artifact["payload"]
+    if fragment == "summary":
+        return bool(payload["summary"].strip())
+    finding_match = re.fullmatch(r"finding-([0-9]+)", fragment)
+    if finding_match is not None:
+        number = int(finding_match.group(1))
+        return 1 <= number <= len(payload["findings"])
+    limitation_match = re.fullmatch(r"limitation-([0-9]+)", fragment)
+    if limitation_match is not None:
+        number = int(limitation_match.group(1))
+        return 1 <= number <= len(payload["limitations"])
     return False
 
 
-def _latest_verify(rec: Path) -> tuple[int | None, dict | None]:
-    paths = _verify_paths(rec)
-    if not paths:
-        return None, None
-    latest = paths[-1]
-    artifact = _load_json_object(latest, "verify artifact")
-    if artifact.get("schema") != "waystone-verify-1" or not isinstance(artifact.get("payload"), dict):
-        raise WorkflowError(f"invalid verify artifact: {latest}")
-    return _artifact_number(latest, "verify"), artifact
+def _verdict_gate_context(rec: Path, did: str, verdict: dict) -> dict:
+    state = _read_status(rec)
+    if state.get("state") != "needs-review":
+        raise WorkflowError(
+            f"delegation {did} is {state.get('state')} — only a needs-review delegation can receive a verdict")
+    verification_required = state.get("verification_required")
+    if type(verification_required) is not bool:
+        raise WorkflowError(
+            f"delegation {did} lacks harness-computed verification_required in status.json")
+    packet = _load_packet(rec)
+    packet_acceptance = packet["acceptance"]
+    verdict_acceptance = [item["criterion"] for item in verdict["criteria"]]
+    if (len(verdict_acceptance) != len(packet_acceptance)
+            or set(verdict_acceptance) != set(packet_acceptance)):
+        raise WorkflowError(
+            "verdict criteria must exactly match the packet acceptance criterion set (original text)")
+    verify_artifacts = _verify_artifacts(rec)
+    verify_number = max(verify_artifacts) if verify_artifacts else None
+    verify_artifact = verify_artifacts.get(verify_number) if verify_number is not None else None
+    if verification_required and verify_artifact is None:
+        raise WorkflowError(
+            "verdict requires at least one verify-N.json because the run recorded verification_required")
+    if not verification_required and not verdict["agent_checks"]:
+        raise WorkflowError("verdict requires at least one agent_checks entry when verify is not required")
+    blockers = []
+    if verify_artifact is not None:
+        blockers = [
+            (index, finding)
+            for index, finding in enumerate(verify_artifact["payload"]["findings"])
+            if finding["severity"] == "blocker"
+        ]
+    return {
+        "packet": packet,
+        "verification_required": verification_required,
+        "verify_artifacts": verify_artifacts,
+        "verify_number": verify_number,
+        "blockers": blockers,
+    }
+
+
+def _validate_verdict_gates(rec: Path, did: str, verdict: dict) -> dict:
+    """Re-run G1-G5 over one enriched verdict; both verdict and apply call this function."""
+    _validate_verdict_fields(verdict, stored=True)
+    context = _verdict_gate_context(rec, did, verdict)
+    if verdict["verify_number"] != context["verify_number"]:
+        raise WorkflowError(
+            "stored verdict verify_number does not match the latest verify artifact; record a new verdict")
+    if verdict["decision"] != "apply":
+        if verdict.get("overrides"):
+            raise WorkflowError("discard verdict must not contain apply gate overrides")
+        return context
+
+    checks = verdict["agent_checks"]
+    for index, criterion in enumerate(verdict["criteria"]):
+        if criterion["met"] and not any(
+                _evidence_ref_resolves(reference, checks, context["verify_artifacts"])
+                for reference in criterion["evidence"] if reference.strip()):
+            raise WorkflowError(
+                f"apply verdict criteria[{index}] met=true requires at least one resolvable evidence reference")
+
+    overrides = verdict.get("overrides", [])
+    blocker_overrides = [item for item in overrides if item["gate"] == "blocker"]
+    if context["blockers"]:
+        by_finding = {item.get("finding_index"): item for item in blocker_overrides}
+        if (len(by_finding) != len(blocker_overrides)
+                or set(by_finding) != {index for index, _finding in context["blockers"]}):
+            raise WorkflowError("stored verdict does not override every latest unresolved blocker exactly once")
+        for finding_index, _finding in context["blockers"]:
+            item = by_finding[finding_index]
+            if item.get("verify_number") != context["verify_number"]:
+                raise WorkflowError("blocker override verify_number does not match latest verify artifact")
+            refuted_by = item.get("refuted_by")
+            if not refuted_by or any(index >= len(checks) for index in refuted_by):
+                raise WorkflowError(
+                    "blocker override refuted_by must reference non-empty existing agent_checks")
+    elif blocker_overrides:
+        raise WorkflowError("stored verdict has blocker overrides but latest verify has no blockers")
+
+    unmet = [index for index, item in enumerate(verdict["criteria"]) if not item["met"]]
+    unmet_overrides = [item for item in overrides if item["gate"] == "unmet"]
+    if unmet:
+        if len(unmet_overrides) != 1 or unmet_overrides[0].get("criterion_indices") != unmet:
+            raise WorkflowError("stored verdict does not override the exact unmet criterion indices")
+    elif unmet_overrides:
+        raise WorkflowError("stored verdict has an unmet override but every criterion is met")
+    return context
 
 
 def _write_verdict_artifact(rec: Path, verdict: dict) -> Path:
-    n = len(_verdict_paths(rec)) + 1
+    paths = _verdict_paths(rec)
+    n = _artifact_number(paths[-1], "verdict") + 1 if paths else 1
     content = json.dumps(verdict, ensure_ascii=False, indent=2) + "\n"
     while True:
         out = rec / "artifact" / f"verdict-{n}.json"
@@ -1114,13 +1311,14 @@ def _write_verdict_artifact(rec: Path, verdict: dict) -> Path:
                 stream.write(content)
             return out
         except FileExistsError:
-            n += 1
+            paths = _verdict_paths(rec)
+            n = _artifact_number(paths[-1], "verdict") + 1 if paths else 1
         except OSError as e:
             raise _RefusedWrite(f"cannot write verdict artifact {out}: {e}") from e
 
 
-def _main_blocker_overrides(input_overrides: list[dict], blockers: list[tuple[int, dict]],
-                            checks: list[dict], reason: str, verify_number: int) -> list[dict]:
+def _blocker_overrides(input_overrides: list[dict], blockers: list[tuple[int, dict]],
+                       checks: list[dict], reason: str, verify_number: int) -> list[dict]:
     candidates = [item for item in input_overrides if item.get("gate") in (None, "blocker")]
     unused = list(candidates)
     recorded: list[dict] = []
@@ -1129,18 +1327,20 @@ def _main_blocker_overrides(input_overrides: list[dict], blockers: list[tuple[in
         item = explicit or next((item for item in unused if "finding_index" not in item), None)
         if item is None:
             raise WorkflowError(
-                "main-session --override-blocker requires one overrides[] refuted_by entry per blocker finding")
+                "--override-blocker requires one overrides[] refuted_by entry per blocker finding")
         unused.remove(item)
         refuted_by = item.get("refuted_by")
         if not refuted_by:
             raise WorkflowError(
-                "main-session --override-blocker requires non-empty refuted_by agent_checks indices")
+                "--override-blocker requires non-empty refuted_by agent_checks indices")
         if any(index >= len(checks) for index in refuted_by):
             raise WorkflowError("override refuted_by references a missing agent_checks index")
         recorded.append({
             "gate": "blocker", "reason": reason, "verify_number": verify_number,
             "finding_index": finding_index, "refuted_by": list(refuted_by),
         })
+    if unused:
+        raise WorkflowError("verdict overrides[] contains an entry that does not match a blocker finding")
     return recorded
 
 
@@ -1150,60 +1350,28 @@ def record_verdict(root: Path, did: str, input_path: Path, *,
     """Validate and append a verdict artifact. The CLI owns the record lock; state never changes."""
     _ensure_project_state_or_refuse(root)
     rec = _load_delegation(root, did)
-    state = _read_status(rec).get("state")
-    if state != "needs-review":
-        raise WorkflowError(
-            f"delegation {did} is {state} — only a needs-review delegation can receive a verdict")
     verdict = _load_json_object(Path(input_path), "verdict input")
     _validate_verdict_input(verdict)
-    packet = _load_packet(rec)
-    packet_acceptance = packet["acceptance"]
-    verdict_acceptance = [item["criterion"] for item in verdict["criteria"]]
-    if (len(verdict_acceptance) != len(packet_acceptance)
-            or set(verdict_acceptance) != set(packet_acceptance)):
-        raise WorkflowError(
-            "verdict criteria must exactly match the packet acceptance criterion set (original text)")
-
-    profile, current_fingerprint = _load_profile(root)
-    bindings = profile.get("bindings")
-    verifier_bound = isinstance(bindings, dict) and "verifier" in bindings
-    rule1_fired = _rule1_fired_for_run(root, did)
-    verify_number, verify_artifact = _latest_verify(rec)
-    if (verifier_bound or rule1_fired) and verify_artifact is None:
-        raise WorkflowError(
-            "verdict requires at least one verify-N.json because a verifier is bound or rule1 fired")
-    if not verifier_bound and not rule1_fired and not verdict["agent_checks"]:
-        raise WorkflowError("verdict requires at least one agent_checks entry when no verifier is bound")
+    context = _verdict_gate_context(rec, did, verdict)
+    _profile, current_fingerprint = _load_profile(root)
 
     if override_blocker_reason is not None and not override_blocker_reason.strip():
         raise WorkflowError("--override-blocker --reason must be non-empty")
     if override_unmet_reason is not None and not override_unmet_reason.strip():
         raise WorkflowError("--override-unmet --reason must be non-empty")
     input_overrides = verdict.pop("overrides", [])
+    if input_overrides and verdict["decision"] != "apply":
+        raise WorkflowError("verdict overrides[] is only valid for an apply decision")
     recorded_overrides: list[dict] = []
-    blockers: list[tuple[int, dict]] = []
-    if verify_artifact is not None:
-        findings = verify_artifact["payload"].get("findings", [])
-        if not isinstance(findings, list):
-            raise WorkflowError("latest verify artifact payload.findings must be a list")
-        blockers = [
-            (index, finding) for index, finding in enumerate(findings)
-            if isinstance(finding, dict) and finding.get("severity") == "blocker"
-            and finding.get("resolved") is not True
-        ]
+    blockers = context["blockers"]
+    verify_number = context["verify_number"]
     if verdict["decision"] == "apply" and blockers:
         if override_blocker_reason is None:
             raise WorkflowError(
                 "latest verify has unresolved blocker finding(s) — use --override-blocker --reason")
-        if verdict["decided_by"] == "main-session":
-            recorded_overrides.extend(_main_blocker_overrides(
-                input_overrides, blockers, verdict["agent_checks"],
-                override_blocker_reason, verify_number))
-        else:
-            recorded_overrides.extend({
-                "gate": "blocker", "reason": override_blocker_reason,
-                "verify_number": verify_number, "finding_index": finding_index,
-            } for finding_index, _finding in blockers)
+        recorded_overrides.extend(_blocker_overrides(
+            input_overrides, blockers, verdict["agent_checks"],
+            override_blocker_reason, verify_number))
     elif override_blocker_reason is not None:
         raise WorkflowError("--override-blocker is only valid for an apply verdict with blockers")
 
@@ -1228,6 +1396,7 @@ def record_verdict(root: Path, did: str, input_path: Path, *,
     verdict["profile_fingerprint"] = current_fingerprint
     if recorded_overrides:
         verdict["overrides"] = recorded_overrides
+    _validate_verdict_gates(rec, did, verdict)
     out = _write_verdict_artifact(rec, verdict)
     print(f"verdict_artifact: {out}")
     return 0
@@ -1285,17 +1454,55 @@ def _load_delegation(root: Path, did: str) -> Path:
     return rec
 
 
+def _ref_exists(root: Path, ref: str) -> bool:
+    rc, out, err = _git(root, "show-ref", "--verify", "--quiet", ref)
+    if rc == 0:
+        return True
+    if rc == 1:
+        return False
+    raise WorkflowError(
+        f"delegation cleanup could not inspect ref {ref}: {err or out or f'rc {rc}'}")
+
+
 def _cleanup(root: Path, did: str, *, preserve_refs: bool = False) -> None:
-    """Remove cache worktree; discard also removes refs, while successful apply preserves both."""
+    """Remove cache worktree and optional refs, then prove that the requested cleanup completed."""
     worktree_path = _worktree_path(root, did)
-    if worktree_path.exists():
-        _git(root, "worktree", "remove", "--force", str(worktree_path))
-    if worktree_path.exists():
-        shutil.rmtree(worktree_path, ignore_errors=True)
+    if os.path.lexists(worktree_path):
+        rc, out, err = _git(root, "worktree", "remove", "--force", str(worktree_path))
+        if rc != 0:
+            raise WorkflowError(
+                f"delegation cleanup failed at git worktree remove: {err or out or f'rc {rc}'}")
     if not preserve_refs:
-        _git(root, "update-ref", "-d", f"{DELEG_REF_NS}/{did}")
-        _git(root, "update-ref", "-d", f"{DELEG_REF_NS}/{did}-result")
-    _git(root, "worktree", "prune")
+        for ref in (f"{DELEG_REF_NS}/{did}", f"{DELEG_REF_NS}/{did}-result"):
+            rc, out, err = _git(root, "update-ref", "-d", ref)
+            if rc != 0:
+                raise WorkflowError(
+                    f"delegation cleanup failed at git update-ref -d {ref}: "
+                    f"{err or out or f'rc {rc}'}")
+    rc, out, err = _git(root, "worktree", "prune")
+    if rc != 0:
+        raise WorkflowError(
+            f"delegation cleanup failed at git worktree prune: {err or out or f'rc {rc}'}")
+    if os.path.lexists(worktree_path):
+        raise WorkflowError(f"delegation cleanup postcondition failed: worktree remains at {worktree_path}")
+    rc, listed, err = _git(root, "worktree", "list", "--porcelain")
+    if rc != 0:
+        raise WorkflowError(
+            f"delegation cleanup failed at git worktree list: {err or listed or f'rc {rc}'}")
+    target = os.path.realpath(worktree_path)
+    registered = [line.removeprefix("worktree ") for line in listed.splitlines()
+                  if line.startswith("worktree ")]
+    if any(os.path.realpath(path) == target for path in registered):
+        raise WorkflowError(
+            f"delegation cleanup postcondition failed: worktree remains registered at {worktree_path}")
+    if not preserve_refs:
+        remaining = [
+            ref for ref in (f"{DELEG_REF_NS}/{did}", f"{DELEG_REF_NS}/{did}-result")
+            if _ref_exists(root, ref)
+        ]
+        if remaining:
+            raise WorkflowError(
+                f"delegation cleanup postcondition failed: refs remain: {', '.join(remaining)}")
 
 
 def _latest_verdict(rec: Path) -> dict | None:
@@ -1303,12 +1510,7 @@ def _latest_verdict(rec: Path) -> dict | None:
     if not paths:
         return None
     latest = paths[-1]
-    verdict = _load_json_object(latest, "verdict artifact")
-    if (verdict.get("schema") != "waystone-verdict-1"
-            or verdict.get("decision") not in ("apply", "discard")
-            or verdict.get("provenance") != "main-session"):
-        raise WorkflowError(f"invalid verdict artifact: {latest}")
-    return verdict
+    return _load_json_object(latest, "verdict artifact")
 
 
 def apply_delegation(root: Path, did: str, override_no_verdict_reason: str | None = None) -> int:
@@ -1326,10 +1528,12 @@ def apply_delegation(root: Path, did: str, override_no_verdict_reason: str | Non
             raise WorkflowError("no verdict recorded — run 'waystone delegate verdict' first")
         if not override_no_verdict_reason.strip():
             raise WorkflowError("--override-no-verdict --reason must be non-empty")
-    elif verdict["decision"] != "apply":
-        raise WorkflowError(f"latest verdict decision is {verdict['decision']} — refusing apply")
-    elif override_no_verdict_reason is not None:
-        raise WorkflowError("--override-no-verdict is only valid when no verdict exists")
+    else:
+        _validate_verdict_gates(rec, did, verdict)
+        if verdict["decision"] != "apply":
+            raise WorkflowError(f"latest verdict decision is {verdict['decision']} — refusing apply")
+        if override_no_verdict_reason is not None:
+            raise WorkflowError("--override-no-verdict is only valid when no verdict exists")
     contract = _load_contract(rec)
     _warn_boundary(root, "delegate-apply", {"delegation_id": did})
     if not contract.get("empty"):
@@ -1359,6 +1563,14 @@ def discard_delegation(root: Path, did: str, reason: str | None = None) -> int:
     state = st.get("state") if st is not None else None
     if state in TERMINAL_STATES:
         raise WorkflowError(f"delegation {did} is already {state}")
+    if state == "discarding":
+        transitions = st.get("at_transitions") if isinstance(st, dict) else None
+        recorded_reason = transitions[-1].get("reason") if transitions else None
+        if recorded_reason != reason:
+            raise WorkflowError(
+                "discard is resuming an interrupted cleanup; retry with the originally recorded --reason")
+    else:
+        _set_state(rec, "discarding", reason=reason)
     _cleanup(root, did)
     _set_state(rec, "discarded", reason=reason)
     print(f"discarded {did}")
@@ -1374,7 +1586,7 @@ def discard_orphan(root: Path, did: str, reason: str) -> int:
             f"delegation record {did} exists — use ordinary discard so its state transition is recorded")
     worktree = _worktree_path(root, did)
     refs = [f"{DELEG_REF_NS}/{did}", f"{DELEG_REF_NS}/{did}-result"]
-    if not worktree.exists() and not any(_git(root, "rev-parse", "--verify", ref)[0] == 0 for ref in refs):
+    if not os.path.lexists(worktree) and not any(_ref_exists(root, ref) for ref in refs):
         raise WorkflowError(f"no orphaned refs or cache worktree found for {did}")
     _cleanup(root, did)
     print(f"discarded orphan {did}: {reason}")
@@ -1515,7 +1727,8 @@ def _cli_run(rest: list[str]) -> int:
     # Git preflight, profile/packet preparation, snapshot/worktree setup, and the runner stay outside.
     with hold_lock(project_lock_path(root)):
         did, record_dir = _claim_run(root, plan)
-    return _run_claimed(root, plan, did, record_dir)
+    with hold_lock(record_dir / "record.lock"):
+        return _run_claimed(root, plan, did, record_dir)
 
 
 def _cli_status(rest: list[str]) -> int:
@@ -1561,7 +1774,8 @@ def _cli_discard(rest: list[str]) -> int:
         raise WorkflowError("discard requires --reason")
     root = _resolve_root(opts.get("root"))
     if opts.get("orphan"):
-        return discard_orphan(root, pos[0], opts["reason"])
+        with hold_lock(project_lock_path(root)):
+            return discard_orphan(root, pos[0], opts["reason"])
     rec = _load_delegation(root, pos[0])
     with hold_lock(rec / "record.lock"):
         return discard_delegation(root, pos[0], opts["reason"])

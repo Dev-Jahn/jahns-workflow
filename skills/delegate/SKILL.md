@@ -53,8 +53,8 @@ waystone delegate run <task-id> --root <project-root>
 ```
 
 Retain the command's bounded stdout as operational evidence. Treat every `waystone warn` stderr line
-as an input to the decision and preserve the original line for the final report; warnings do not by
-themselves change the command result.
+as an input to the decision and preserve the original line in the verdict's `warnings_seen`; warnings
+do not by themselves change the command result. The final report summarizes only their plain meaning.
 
 If the run fails, identify its delegation ID from the bounded run/status output and inspect only:
 
@@ -126,7 +126,9 @@ Record each exact command, integer exit code, and concise observed result in the
 
 ## Step 5 — Judge, record, and resolve
 
-Create a temporary `verdict.json` matching `waystone-verdict-1`, then pass it to the harness. The
+Create a temporary `verdict.json` matching the public input contract in
+`templates/verdict-input-schema.json`, then pass it to the harness. The harness enriches the accepted
+input into the stored artifact contract in `templates/verdict-schema.json`. The
 criteria array must reproduce every packet acceptance string exactly, with no additions, omissions,
 or rewriting. For each criterion, record `met`, cite concrete evidence, and include a rationale and
 honest limitations. Copy every captured warning line into `warnings_seen`. Use
@@ -184,7 +186,7 @@ jargon. Include:
 - one line per criterion with the decision and a concrete evidence citation;
 - independent verification finding counts by severity;
 - which criteria, if any, the agent wrote from owner material;
-- every captured warning line verbatim;
+- each captured warning's plain-language meaning, without raw delta IDs or raw internal lines;
 - the run-attempt and retry history;
 - exactly one final record pointer.
 
@@ -203,7 +205,7 @@ record path anywhere else in the report.
 | 5 | The verifier transport still fails after one retry. |
 | 6 | Apply drift is not completely explained by this main-session's own edits. Never commit or stash the user's uncommitted work; report it and wait. |
 | 7 | The runner failure is deterministic; preserve its record and worktree evidence. |
-| 8 | An overlay warning contains a conflict row that requires a policy choice. |
+| 8 | A `waystone warn conflict` stderr line reports an overlay conflict that requires a policy choice. |
 | 9 | The user explicitly requested review of the task. |
 
 These are the only escalation cases. Otherwise, do not ask the user; continue through verdict and

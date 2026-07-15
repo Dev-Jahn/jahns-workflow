@@ -4680,7 +4680,7 @@ class DelegateRunTests(unittest.TestCase):
     def test_artifact_failure_is_failed_artifact_lock_held(self):
         # H1: a post-runner artifact-computation failure must not strand the record as `running`
         # (permanent owner-lock) — it transitions to failed-artifact, preserves the worktree as
-        # evidence, keeps the lock, and discard clears it.
+        # evidence, and keeps the lock. A broken git worktree must make discard cleanup fail loud.
         with tempfile.TemporaryDirectory() as d:
             root, home = self._project(d)
 
@@ -4701,9 +4701,14 @@ class DelegateRunTests(unittest.TestCase):
                 with self.assertRaises(delegate.WorkflowError) as cm:
                     self._run(root, home, self._fake_runner({"impl.py": "y\n"}))
                 self.assertIn("already has active delegation", str(cm.exception))
-                rc = _run_with_home(
-                    home, lambda: delegate.discard_delegation(root, rec.name, "clear failed artifact"))
-            self.assertEqual(rc, 0)
+                with self.assertRaises(delegate.WorkflowError) as cleanup:
+                    _run_with_home(
+                        home, lambda: delegate.discard_delegation(
+                            root, rec.name, "clear failed artifact"))
+            self.assertIn("git worktree remove", str(cleanup.exception))
+            status = delegate._read_status(rec)
+            self.assertEqual(status["state"], "discarding")
+            self.assertEqual(status["at_transitions"][-1]["reason"], "clear failed artifact")
 
     def test_same_second_did_gets_suffix(self):
         # H4: two delegations minted in the same second must land in two independent records —
@@ -4902,17 +4907,21 @@ def _latest_rec(root, home):
 def _write_apply_verdict(rec):
     """Install a valid verdict fixture for tests whose subject is the apply mechanics, not judging."""
     packet = yaml.safe_load((rec / "packet.yaml").read_text())
+    exposure = _json.loads((rec / "exposure.json").read_text())
     verdict = {
         "schema": "waystone-verdict-1",
         "decision": "apply",
         "decided_by": "main-session",
-        "criteria": [{"criterion": criterion, "met": True, "evidence": ["fixture"]}
+        "criteria": [{"criterion": criterion, "met": True, "evidence": ["agent_checks[0]"]}
                      for criterion in packet["acceptance"]],
         "agent_checks": [{"cmd": "fixture", "exit": 0, "summary": "fixture"}],
         "warnings_seen": [],
         "rationale": "apply mechanics fixture",
         "limitations": [],
+        "at": "2026-07-15T00:00:00+00:00",
         "provenance": "main-session",
+        "verify_number": None,
+        "profile_fingerprint": exposure["profile_fingerprint"],
     }
     (rec / "artifact" / "verdict-1.json").write_text(
         _json.dumps(verdict, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -5162,6 +5171,54 @@ class DelegateApplyTests(unittest.TestCase):
             self.assertIn("latest verdict decision is discard", err.getvalue())
             self.assertFalse((root / "impl.py").exists())
 
+    def test_apply_revalidates_directly_planted_verdict_evidence(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _deleg_project(d)
+            _deleg_run(root, home, _deleg_fake({"impl.py": "x\n"}))
+            rec = _latest_rec(root, home)
+            _write_apply_verdict(rec)
+            verdict_path = rec / "artifact" / "verdict-1.json"
+            verdict = _json.loads(verdict_path.read_text())
+            verdict["criteria"][0]["evidence"] = ["fabricated-check"]
+            verdict_path.write_text(_json.dumps(verdict) + "\n")
+
+            with self.assertRaises(delegate.WorkflowError) as cm:
+                _run_with_home(home, lambda: delegate.apply_delegation(root, rec.name))
+            self.assertIn("evidence", str(cm.exception))
+            self.assertFalse((root / "impl.py").exists())
+            self.assertEqual(delegate._read_status(rec)["state"], "needs-review")
+
+    def test_apply_revalidates_verify_schema_before_blocker_gate(self):
+        verifier_profile = (
+            'schema: waystone-profile-1\nbindings:\n'
+            '  implementer: {execution: external-runner, backend: "codex:gpt-test"}\n'
+            '  verifier: {backend: "codex:gpt-test", entry: adversarial-review}\n'
+        )
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _deleg_project(d)
+            _write_profile(root, verifier_profile)
+            _deleg_run(root, home, _deleg_fake({"impl.py": "x\n"}))
+            rec = _latest_rec(root, home)
+            invalid_verify = {
+                "schema": "waystone-verify-1", "at": "2026-07-15T00:00:00+00:00",
+                "transport": "codex-exec:read-only", "backend": "codex:gpt-test",
+                "provenance": "independent-verifier",
+                "payload": {"summary": "reviewed", "findings": [{"severity": "minor"}],
+                            "limitations": []},
+            }
+            (rec / "artifact" / "verify-1.json").write_text(
+                _json.dumps(invalid_verify) + "\n")
+            _write_apply_verdict(rec)
+            verdict_path = rec / "artifact" / "verdict-1.json"
+            verdict = _json.loads(verdict_path.read_text())
+            verdict["verify_number"] = 1
+            verdict_path.write_text(_json.dumps(verdict) + "\n")
+
+            with self.assertRaises(delegate.WorkflowError) as cm:
+                _run_with_home(home, lambda: delegate.apply_delegation(root, rec.name))
+            self.assertIn("verify artifact schema", str(cm.exception))
+            self.assertFalse((root / "impl.py").exists())
+
     def test_discard_cli_requires_reason_and_records_it(self):
         import contextlib
         import io
@@ -5205,6 +5262,86 @@ class DelegateApplyTests(unittest.TestCase):
                 self.assertNotEqual(git(root, "rev-parse", "--verify",
                                         f"refs/waystone/delegations/{did}{suffix}").returncode, 0)
 
+    def test_discard_records_intent_before_cleanup_and_resumes_after_interruption(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _deleg_project(d)
+            _deleg_run(root, home, _deleg_fake({"impl.py": "x\n"}))
+            rec = _latest_rec(root, home)
+            original_cleanup = delegate._cleanup
+            calls = {"value": 0}
+
+            def interrupted(*args, **kwargs):
+                calls["value"] += 1
+                raise delegate.WorkflowError("injected cleanup interruption")
+
+            delegate._cleanup = interrupted
+            try:
+                with self.assertRaises(delegate.WorkflowError):
+                    _run_with_home(
+                        home, lambda: delegate.discard_delegation(root, rec.name, "review rejected"))
+            finally:
+                delegate._cleanup = original_cleanup
+
+            status = delegate._read_status(rec)
+            self.assertEqual(status["state"], "discarding")
+            self.assertEqual(status["at_transitions"][-1]["reason"], "review rejected")
+            self.assertEqual(_run_with_home(
+                home, lambda: delegate.discard_delegation(root, rec.name, "review rejected")), 0)
+            transitions = delegate._read_status(rec)["at_transitions"]
+            self.assertEqual([item["state"] for item in transitions[-2:]],
+                             ["discarding", "discarded"])
+            self.assertEqual(calls["value"], 1)
+
+    def test_discard_orphan_is_project_locked_and_cleanup_failures_are_loud(self):
+        import contextlib
+        import fcntl
+        import io
+        import shutil
+
+        for mode in ("git-failure", "lying-success"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as d:
+                root, home = _deleg_project(d)
+                _deleg_run(root, home, _deleg_fake({"impl.py": "x\n"}))
+                rec = _latest_rec(root, home)
+                did = rec.name
+                shutil.rmtree(rec)
+                original_git = delegate._git
+                lock_observed = []
+
+                def project_lock_held():
+                    path = common.project_lock_path(root)
+                    with path.open("a+", encoding="utf-8") as stream:
+                        try:
+                            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        except BlockingIOError:
+                            return True
+                        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+                        return False
+
+                def injected_git(cwd, *args, **kwargs):
+                    if args[:2] == ("update-ref", "-d"):
+                        lock_observed.append(project_lock_held())
+                        if mode == "git-failure":
+                            return 1, "", "injected update-ref failure"
+                        return 0, "", ""
+                    return original_git(cwd, *args, **kwargs)
+
+                delegate._git = injected_git
+                err = io.StringIO()
+                try:
+                    with contextlib.redirect_stderr(err):
+                        rc = _run_with_home(home, lambda: delegate.main([
+                            "discard", "--orphan", did, "--root", str(root),
+                            "--reason", "remove orphaned delegation storage"]))
+                finally:
+                    delegate._git = original_git
+                self.assertEqual(rc, 1)
+                self.assertTrue(lock_observed)
+                self.assertTrue(all(lock_observed))
+                self.assertIn("cleanup", err.getvalue())
+                self.assertEqual(git(root, "rev-parse", "--verify",
+                                     f"refs/waystone/delegations/{did}").returncode, 0)
+
 
 class DelegateVerdictTests(unittest.TestCase):
     """0.9.0-c: verdict schema, G1-G5, overrides, and append-only artifacts."""
@@ -5228,7 +5365,7 @@ class DelegateVerdictTests(unittest.TestCase):
         criteria = [{
             "criterion": criterion if criterion is not None else item,
             "met": met,
-            "evidence": ["agent_checks[0]"] if checks else [],
+            "evidence": ["agent_checks[0]"] if checks else ["verify-1#summary"],
         } for item in packet["acceptance"]]
         payload = {
             "schema": "waystone-verdict-1",
@@ -5258,6 +5395,8 @@ class DelegateVerdictTests(unittest.TestCase):
         artifact = {
             "schema": "waystone-verify-1",
             "at": "2026-07-15T00:00:00+00:00",
+            "transport": "codex-exec:read-only",
+            "backend": "codex:gpt-test",
             "provenance": "independent-verifier",
             "payload": {"summary": "reviewed", "findings": findings or [], "limitations": []},
         }
@@ -5265,9 +5404,14 @@ class DelegateVerdictTests(unittest.TestCase):
             _json.dumps(artifact) + "\n", encoding="utf-8")
 
     def test_schema_file_and_g1_wrong_state_refused(self):
-        schema = _json.loads((SCRIPTS.parent / "templates" / "verdict-schema.json").read_text())
-        self.assertEqual(schema["properties"]["schema"]["const"], "waystone-verdict-1")
-        self.assertIn("agent_checks", schema["required"])
+        templates = SCRIPTS.parent / "templates"
+        stored = _json.loads((templates / "verdict-schema.json").read_text())
+        user_input = _json.loads((templates / "verdict-input-schema.json").read_text())
+        self.assertEqual(stored["properties"]["schema"]["const"], "waystone-verdict-1")
+        self.assertIn("agent_checks", user_input["required"])
+        for field in ("at", "provenance", "verify_number", "profile_fingerprint"):
+            self.assertIn(field, stored["required"])
+            self.assertNotIn(field, user_input["properties"])
         with tempfile.TemporaryDirectory() as d:
             root, home, rec = self._record(d)
             delegate._set_state(rec, "running")
@@ -5315,7 +5459,7 @@ class DelegateVerdictTests(unittest.TestCase):
             contract = yaml.safe_load((rec / "artifact" / "contract.yaml").read_text())
             self.assertNotIn("verdict", contract)  # contract has no verdict
 
-    def test_g3_rule1_run_fire_requires_verify_even_without_binding(self):
+    def test_g3_uses_run_recorded_requirement_not_later_warning_rows(self):
         with tempfile.TemporaryDirectory() as d:
             root, home, rec = self._record(d)
             warnings = overlay._warnings_path(root)
@@ -5325,12 +5469,122 @@ class DelegateVerdictTests(unittest.TestCase):
                 "event": "fire", "context": {"delegation_id": rec.name},
             }) + "\n")
             path = self._input(d, self._payload(rec))
-            with self.assertRaises(delegate.WorkflowError) as cm:
-                _run_with_home(home, lambda: delegate.record_verdict(root, rec.name, path))
-            self.assertIn("verify-N.json", str(cm.exception))
-            self._verify(rec)
             self.assertEqual(_run_with_home(
                 home, lambda: delegate.record_verdict(root, rec.name, path)), 0)
+
+    def test_g3_actual_run_atomically_records_verify_requirement_before_publication(self):
+        import contextlib
+        import fcntl
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _deleg_project(d)
+            _run_with_home(home, lambda: overlay.add_delta(
+                root, "verification_debt/required",
+                rule="delegation-verification-evidence-v1", summary="s"))
+            original_runner = delegate._run_codex
+            original_warn = delegate._warn_boundary
+            observed = {}
+
+            def checked_warn(project, boundary, context):
+                rec = delegate._record_dir(project, context["delegation_id"])
+                observed["state_during_rule"] = delegate._read_status(rec).get("state")
+                with (rec / "record.lock").open("a+", encoding="utf-8") as stream:
+                    try:
+                        fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        observed["record_lock_held"] = True
+                    else:
+                        observed["record_lock_held"] = False
+                        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+                return original_warn(project, boundary, context)
+
+            delegate._run_codex = _deleg_fake({"impl.py": "x\n"})
+            delegate._warn_boundary = checked_warn
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(_run_with_home(home, lambda: delegate.main([
+                        "run", "feat/xyz", "--root", str(root)])), 0)
+            finally:
+                delegate._run_codex = original_runner
+                delegate._warn_boundary = original_warn
+
+            rec = _latest_rec(root, home)
+            status = delegate._read_status(rec)
+            self.assertTrue(observed["record_lock_held"])
+            self.assertEqual(observed["state_during_rule"], "running")
+            self.assertEqual(status["state"], "needs-review")
+            self.assertIs(status["verification_required"], True)
+            with self.assertRaises(delegate.WorkflowError) as cm:
+                _run_with_home(home, lambda: delegate.record_verdict(
+                    root, rec.name, self._input(d, self._payload(rec))))
+            self.assertIn("verify-N.json", str(cm.exception))
+
+    def test_g3_verifier_binding_is_recorded_by_actual_run(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _deleg_project(d)
+            _write_profile(root, self._VERIFIER_PROFILE)
+            _deleg_run(root, home, _deleg_fake({"impl.py": "x\n"}))
+            rec = _latest_rec(root, home)
+            self.assertIs(delegate._read_status(rec)["verification_required"], True)
+
+    def test_agent_checks_and_met_evidence_are_semantically_nonempty(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home, rec = self._record(d)
+            for field in ("cmd", "summary"):
+                payload = self._payload(rec)
+                payload["agent_checks"][0][field] = " \t"
+                with self.subTest(field=field), self.assertRaises(delegate.WorkflowError) as cm:
+                    _run_with_home(home, lambda p=payload: delegate.record_verdict(
+                        root, rec.name, self._input(d, p)))
+                self.assertIn(field, str(cm.exception))
+
+            for evidence in ([], ["fabricated"], ["agent_checks[9]"], ["verify-9#finding-0"]):
+                payload = self._payload(rec)
+                payload["criteria"][0]["evidence"] = evidence
+                with self.subTest(evidence=evidence), self.assertRaises(delegate.WorkflowError) as cm:
+                    _run_with_home(home, lambda p=payload: delegate.record_verdict(
+                        root, rec.name, self._input(d, p)))
+                self.assertIn("evidence", str(cm.exception))
+
+            payload = self._payload(rec)
+            payload["agent_checks"][0]["exit"] = 7
+            self.assertEqual(_run_with_home(home, lambda: delegate.record_verdict(
+                root, rec.name, self._input(d, payload))), 0)
+
+    def test_verify_schema_and_numbering_are_fail_loud(self):
+        valid = {
+            "schema": "waystone-verify-1", "at": "2026-07-15T00:00:00+00:00",
+            "transport": "codex-exec:read-only", "backend": "codex:gpt-test",
+            "provenance": "independent-verifier",
+            "payload": {"summary": "reviewed", "findings": [], "limitations": []},
+        }
+        cases = (
+            ("verify-final.json", valid, "non-canonical"),
+            ("verify-2.json", valid, "contiguous"),
+            ("verify-1.json", {**valid, "payload": {"findings": [{"severity": "minor"}]}},
+             "schema"),
+        )
+        for name, artifact, needle in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as d:
+                root, home, rec = self._record(d, verifier=True)
+                (rec / "artifact" / name).write_text(_json.dumps(artifact) + "\n")
+                with self.assertRaises(delegate.WorkflowError) as cm:
+                    _run_with_home(home, lambda: delegate.record_verdict(
+                        root, rec.name, self._input(d, self._payload(rec))))
+                self.assertIn(needle, str(cm.exception))
+
+    def test_verdict_numbering_rejects_sparse_and_noncanonical_files(self):
+        for name, needle in (("verdict-7.json", "contiguous"),
+                             ("verdict-final.json", "non-canonical"),
+                             ("verdict-01.json", "non-canonical")):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as d:
+                root, home, rec = self._record(d)
+                (rec / "artifact" / name).write_text("{}\n")
+                with self.assertRaises(delegate.WorkflowError) as cm:
+                    _run_with_home(home, lambda: delegate.record_verdict(
+                        root, rec.name, self._input(d, self._payload(rec, decision="discard"))))
+                self.assertIn(needle, str(cm.exception))
 
     def test_g4_blocker_and_main_session_refuted_by_gate(self):
         blocker = {"title": "false positive", "severity": "blocker", "evidence": "x",
@@ -5360,19 +5614,25 @@ class DelegateVerdictTests(unittest.TestCase):
             self.assertEqual(verdict["overrides"][0]["finding_index"], 0)
             self.assertEqual(verdict["overrides"][0]["refuted_by"], [0])
 
-    def test_g4_user_blocker_override_needs_reason_not_refuted_by(self):
+    def test_g4_user_blocker_override_also_requires_concrete_refutation(self):
         blocker = {"title": "known risk", "severity": "blocker", "evidence": "x",
                    "recommendation": "change it"}
         with tempfile.TemporaryDirectory() as d:
             root, home, rec = self._record(d, verifier=True)
             self._verify(rec, [blocker])
-            payload = self._payload(rec, decided_by="user", checks=False)
+            payload = self._payload(rec, decided_by="user")
+            with self.assertRaises(delegate.WorkflowError) as cm:
+                _run_with_home(home, lambda: delegate.record_verdict(
+                    root, rec.name, self._input(d, payload),
+                    override_blocker_reason="user accepts known risk"))
+            self.assertIn("refuted_by", str(cm.exception))
+            payload["overrides"] = [{"refuted_by": [0]}]
             self.assertEqual(_run_with_home(home, lambda: delegate.record_verdict(
                 root, rec.name, self._input(d, payload),
                 override_blocker_reason="user accepts known risk")), 0)
             verdict = _json.loads((rec / "artifact" / "verdict-1.json").read_text())
             self.assertEqual(verdict["overrides"][0]["reason"], "user accepts known risk")
-            self.assertNotIn("refuted_by", verdict["overrides"][0])
+            self.assertEqual(verdict["overrides"][0]["refuted_by"], [0])
 
     def test_g5_unmet_blocks_apply_and_override_records_reason(self):
         with tempfile.TemporaryDirectory() as d:
@@ -6045,6 +6305,9 @@ class BoundaryWarnTests(unittest.TestCase):
             self.assertIn("future-rule-v9", err.getvalue())
 
     def test_conflict_least_restrictive(self):
+        import contextlib
+        import io
+
         with tempfile.TemporaryDirectory() as d:
             root, home, did = self._deleg_needs_review(d, report=None)
             _run_with_home(home, lambda: overlay.add_delta(
@@ -6052,10 +6315,14 @@ class BoundaryWarnTests(unittest.TestCase):
             _run_with_home(home, lambda: overlay.add_delta(
                 root, "verification_debt/two", rule="delegation-verification-evidence-v1", summary="s"))
             _force_status(root, home, "verification_debt/one", "warning")  # two stays observing
-            events = _run_with_home(home, lambda: overlay.evaluate_boundary(
-                root, "delegate-run", {"delegation_id": did}))
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                events = _run_with_home(home, lambda: overlay.evaluate_boundary(
+                    root, "delegate-run", {"delegation_id": did}))
             # effective status is least-restrictive (observing wins) + a conflict event recorded
-            self.assertTrue(any(e["event"] == "conflict" for e in events))
+            conflict = next(e for e in events if e["event"] == "conflict")
+            self.assertEqual(conflict["context"]["delegation_id"], did)
+            self.assertIn("waystone warn conflict", err.getvalue())
             self.assertEqual([e for e in events if e["event"] == "fire"][0]["delta_status"], "observing")
 
     def test_check_multi_delegation_multi_finding_pin(self):
@@ -8196,6 +8463,24 @@ class M2DocsTests(unittest.TestCase):
         rows = [line for line in escalation.splitlines()
                 if line.startswith("| ") and line.split("|", 2)[1].strip().isdigit()]
         self.assertEqual(len(rows), 9)
+        for meaning in (
+            "owner-authored", "profile is missing", "unresolved blocker", "Two run attempts",
+            "after one retry", "Apply drift", "runner failure is deterministic",
+            "waystone warn conflict", "user explicitly requested review",
+        ):
+            self.assertIn(meaning, escalation)
+        self.assertIn("These are the only escalation cases. Otherwise, do not ask", escalation)
+        self.assertIn("When a verifier binding exists, always run it", text)
+        self.assertIn("Allow at most two total run attempts", text)
+
+    def test_delegate_report_summarizes_warnings_without_internal_delta_ids(self):
+        text = (SCRIPTS.parent / "skills" / "delegate" / "SKILL.md").read_text()
+        report = text.split("## Step 6", 1)[1].split("## Escalation table", 1)[0]
+        self.assertIn("plain-language meaning", report)
+        self.assertNotIn("verbatim", report)
+        self.assertIn("warnings_seen", text)
+        self.assertIn("verdict-input-schema.json", text)
+        self.assertIn("verdict-schema.json", text)
 
     def test_improve_skill_has_finite_materialization_map_and_tune_gate(self):
         text = (SCRIPTS.parent / "skills" / "improve" / "SKILL.md").read_text()

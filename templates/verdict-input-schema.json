@@ -10,22 +10,12 @@
     "agent_checks",
     "warnings_seen",
     "rationale",
-    "limitations",
-    "at",
-    "provenance",
-    "verify_number",
-    "profile_fingerprint"
+    "limitations"
   ],
   "properties": {
-    "schema": {
-      "const": "waystone-verdict-1"
-    },
-    "decision": {
-      "enum": ["apply", "discard"]
-    },
-    "decided_by": {
-      "enum": ["main-session", "user"]
-    },
+    "schema": {"const": "waystone-verdict-1"},
+    "decision": {"enum": ["apply", "discard"]},
+    "decided_by": {"enum": ["main-session", "user"]},
     "criteria": {
       "type": "array",
       "items": {
@@ -60,27 +50,10 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["gate", "reason"],
-        "allOf": [
-          {
-            "if": {"properties": {"gate": {"const": "blocker"}}},
-            "then": {"required": ["verify_number", "finding_index", "refuted_by"]}
-          },
-          {
-            "if": {"properties": {"gate": {"const": "unmet"}}},
-            "then": {"required": ["criterion_indices"]}
-          }
-        ],
+        "required": ["refuted_by"],
         "properties": {
-          "gate": {"enum": ["blocker", "unmet"]},
-          "reason": {"type": "string", "minLength": 1},
-          "verify_number": {"type": "integer", "minimum": 1},
+          "gate": {"const": "blocker"},
           "finding_index": {"type": "integer", "minimum": 0},
-          "criterion_indices": {
-            "type": "array",
-            "minItems": 1,
-            "items": {"type": "integer", "minimum": 0}
-          },
           "refuted_by": {
             "type": "array",
             "minItems": 1,
@@ -88,10 +61,6 @@
           }
         }
       }
-    },
-    "at": {"type": "string"},
-    "provenance": {"const": "main-session"},
-    "verify_number": {"type": ["integer", "null"], "minimum": 1},
-    "profile_fingerprint": {"type": ["string", "null"]}
+    }
   }
 }

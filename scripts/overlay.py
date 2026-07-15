@@ -415,13 +415,14 @@ def _append_warning(root: Path, row: dict) -> None:
 
 def _emit(root: Path, boundary: str, delta_id: str, rule: str, delta_status: str, event: str,
           message: str, context: dict) -> dict:
-    """Append a warnings.jsonl row and (only for a fire on a warning-stage delta) print to stderr.
-    Observing fires and conflict/evaluation-error events are logged silently (S6)."""
+    """Append a warnings row; warning-stage fires and every policy conflict are visible on stderr."""
     row = {"at": _now_iso(), "boundary": boundary, "delta_id": delta_id, "rule": rule,
            "delta_status": delta_status, "event": event, "message": message, "context": context}
     _append_warning(root, row)
     if event == "fire" and delta_status == "warning":
         print(f"waystone warn [{delta_id}]: {message}", file=sys.stderr)
+    elif event == "conflict":
+        print(f"waystone warn conflict [{delta_id}]: {message}", file=sys.stderr)
     return row
 
 
@@ -474,7 +475,7 @@ _RULE1_MSG = ("delegation {did} carries no delegate-side verification evidence �
 
 def evaluate_boundary(root: Path, boundary: str, context: dict) -> list[dict]:
     """Evaluate active (observing/warning) deltas whose rule declares `boundary`, append fire/
-    evaluation-error/conflict rows to warnings.jsonl, and (warning stage only) print fires to stderr.
+    evaluation-error/conflict rows to warnings.jsonl, print warning-stage fires and all conflicts.
     Wrapped so ANY exception is swallowed with one stderr notice — a warn-engine bug must never change
     the host command's exit or abort its flow (S5, host-exit invariant)."""
     try:
@@ -509,10 +510,13 @@ def _evaluate_boundary(root: Path, boundary: str, context: dict) -> list[dict]:
         rep = observing[0] if observing else sorted(group, key=lambda d: d["id"])[0]
         eff = "observing" if observing else "warning"
         if len(group) > 1:
+            conflict_context = {"delta_ids": sorted(d["id"] for d in group)}
+            if context.get("delegation_id"):
+                conflict_context["delegation_id"] = context["delegation_id"]
             events.append(_emit(
                 root, boundary, rep["id"], rule_id, eff, "conflict",
                 f"{len(group)} active deltas reference {rule_id} — effective stage {eff} "
-                f"(least-restrictive)", {"delta_ids": sorted(d["id"] for d in group)}))
+                f"(least-restrictive)", conflict_context))
         params = rep.get("params") or {}
 
         if rule_id == "delegation-verification-evidence-v1":
