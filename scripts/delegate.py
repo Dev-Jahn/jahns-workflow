@@ -5,7 +5,7 @@
 # ///
 """Delegation primitive — `waystone delegate` (0.8.0 M1).
 
-Delegate a single implementation task to an external runner (codex) in an isolated git worktree,
+Delegate a single implementation task to an external runner (Codex or Claude) in an isolated git worktree,
 then bring the result back through an explicit, harness-computed artifact contract. The dirty working
 tree is fixed as an immutable snapshot commit (no history pollution) and used as the delegation base,
 so what the delegate sees is exactly what the user sees now. The harness computes the patch and
@@ -54,10 +54,14 @@ PROFILE_EXECUTIONS = (
     "main-session", "clean-subagent", "forked-subagent",
     "deterministic-workflow", "external-runner",
 )
-# §8.2 L439 role/execution semantics: every worker role may run through a fork; verifier/reviewer
-# independence is from the implementer, not from inherited main context. A listed pair is
-# schema-valid, not necessarily shipped by a consumer. main/orchestrator/clerk bindings have no L1
-# executor: SessionStart routing injection is their only current consumer.
+# Honest execution boundary (design revision R3): waystone directly starts a process only for an
+# external-runner. The other four executions are host-guided through routing-contract injection;
+# Claude Code/Codex owns their main session, subagent, or workflow process. In particular this table
+# does not imply a clerk runner. A listed pair is schema-valid, not necessarily waystone-executable.
+WAYSTONE_EXECUTABLE_EXECUTIONS = ("external-runner",)
+HOST_GUIDED_EXECUTIONS = tuple(
+    execution for execution in PROFILE_EXECUTIONS
+    if execution not in WAYSTONE_EXECUTABLE_EXECUTIONS)
 VALID_ROLE_EXECUTIONS = {
     "main": ("main-session",),
     "orchestrator": (
@@ -78,6 +82,21 @@ VALID_ROLE_EXECUTIONS = {
 }
 _BACKEND_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*:[^\s:]+$")
 _LEGACY_VERIFIER_EXECUTIONS = ("codex-cli", "codex-companion")
+_EXTERNAL_RUNNERS = ("codex", "claude")
+_CLAUDE_EFFORT_VALUES = ("low", "medium", "high", "xhigh")
+# Claude CLI has no workspace-write/network sandbox corresponding to `codex exec -s
+# workspace-write`. These flags disable network-native tools, Chrome, MCP, skills/plugins/hooks, and
+# unapproved tools. Implementer Bash remains necessary for arbitrary project verification and can
+# still reach the network: that irreducible delta is warned at delegate-run start, never hidden.
+_CLAUDE_COMMON_ARGS = (
+    "--safe-mode", "--no-chrome", "--disable-slash-commands",
+    "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+    "--permission-mode", "dontAsk", "--no-session-persistence",
+)
+_CLAUDE_NETWORK_DENY = "WebFetch,WebSearch"
+CLAUDE_CONFINEMENT_WARN = (
+    "waystone warn: claude external-runner has no process-level network sandbox; "
+    "WebFetch/WebSearch/Chrome/MCP are disabled, but allowed Bash can still access the network")
 
 # lockfile -> (prep command, kind), first match wins (S7). None env_prep in config falls through here.
 _LOCKFILE_DETECT = (
@@ -328,8 +347,14 @@ def _resolve_binding(profile: dict, role: str, root: Path) -> dict:
     backend = b.get("backend")
     if role != "implementer" or execution != "external-runner":
         raise WorkflowError(
-            f"binding {role!r}/{execution!r} is schema-valid but not executable by delegate run "
-            "(only implementer/external-runner is shipped)")
+            f"binding {role!r}/{execution!r} is schema-valid but not executable by waystone: "
+            "it is host-guided (delegate run starts only implementer/external-runner)")
+    runner, _model = _runner_parts(backend)
+    effort = b.get("effort")
+    if runner == "claude" and effort is not None and effort not in _CLAUDE_EFFORT_VALUES:
+        raise WorkflowError(
+            f"claude external-runner effort must be one of {', '.join(_CLAUDE_EFFORT_VALUES)}, "
+            f"got {effort!r}")
     binding = {"role": role, "execution": execution, "backend": backend, "source": "profile"}
     for field in ("effort", "use_for"):
         if field in b:
@@ -338,7 +363,7 @@ def _resolve_binding(profile: dict, role: str, root: Path) -> dict:
 
 
 def _resolve_verifier_binding(profile: dict, root: Path) -> dict:
-    """Resolve one explicit Claude-companion or native Codex verifier transport."""
+    """Resolve a Codex companion/native transport or a headless Claude verifier transport."""
     bindings = profile.get("bindings")
     b = bindings.get("verifier") if isinstance(bindings, dict) else None
     if not isinstance(b, dict):
@@ -348,9 +373,22 @@ def _resolve_verifier_binding(profile: dict, root: Path) -> dict:
     canonical = _validate_profile_binding("verifier", b)
     if canonical != "external-runner":
         raise WorkflowError(
-            f"binding 'verifier'/{canonical!r} is schema-valid but not executable by the verifier "
-            "consumer (only verifier/external-runner is shipped)")
+            f"binding 'verifier'/{canonical!r} is schema-valid but not executable by waystone: "
+            "it is host-guided (the verifier consumer starts only external-runner)")
     execution = b.get("execution")
+    backend = b.get("backend")
+    runner, _model = _runner_parts(backend)
+    entry = b.get("entry")
+    if entry != "adversarial-review":
+        raise WorkflowError(f"entry {entry!r} not implemented in M2")
+    if runner == "claude":
+        if execution in _LEGACY_VERIFIER_EXECUTIONS:
+            raise WorkflowError(
+                f"verifier execution {execution!r} is a legacy Codex transport and conflicts "
+                f"with backend {backend!r}; use external-runner")
+        return {"role": "verifier", "execution": "claude-cli", "backend": backend,
+                "entry": entry, "source": "profile"}
+
     derived = "codex-cli" if os.environ.get("WAYSTONE_HOST") == "codex" else "codex-companion"
     if execution is None or execution == "external-runner":
         execution = derived
@@ -364,22 +402,23 @@ def _resolve_verifier_binding(profile: dict, root: Path) -> dict:
         raise WorkflowError(
             f"verifier execution {execution!r} conflicts with WAYSTONE_HOST-derived {derived!r} — "
             "remove the execution key to let waystone derive it")
-    backend = b.get("backend")
-    entry = b.get("entry")
-    if not isinstance(backend, str) or not backend.startswith("codex:") or not backend[6:]:
-        raise WorkflowError(f"verifier backend must be 'codex:<model>', got {backend!r}")
-    if entry != "adversarial-review":
-        raise WorkflowError(f"entry {entry!r} not implemented in M2")
     return {"role": "verifier", "execution": execution, "backend": backend, "entry": entry,
             "source": "profile"}
 
 
-def _runner_model(backend: str) -> str:
-    """Extract the model from a `codex:<model>` backend. Non-codex runners are schema-valid but not
-    executable in M1 (§6) — fail loud rather than silently substitute."""
+def _runner_parts(backend: str) -> tuple[str, str]:
+    """Return a shipped external runner token and model; never substitute an unsupported runner."""
     runner, _, model = backend.partition(":")
-    if runner != "codex":
-        raise WorkflowError(f"backend {backend!r} not implemented in M1 (only 'codex:<model>')")
+    if runner not in _EXTERNAL_RUNNERS or not model:
+        raise WorkflowError(
+            f"backend {backend!r} is not waystone-executable; external-runner supports "
+            f"{', '.join(f'{name}:<model>' for name in _EXTERNAL_RUNNERS)}")
+    return runner, model
+
+
+def _runner_model(backend: str) -> str:
+    """Extract the explicit model from a shipped external-runner backend."""
+    _runner, model = _runner_parts(backend)
     return model
 
 
@@ -471,7 +510,7 @@ def _run_env_prep(worktree: Path, commands: list[str]) -> tuple[int, str]:
     return 0, ""
 
 
-# ---- runner (§6 — codex exec; isolated for monkeypatching in tests) -----------
+# ---- runners (§6 — isolated and transport-injectable for tests) ---------------
 def _run_codex(worktree: Path, model: str, prompt_path: Path, record_dir: Path,
                *, effort: str | None = None) -> tuple[int, float]:
     """Invoke `codex exec` in the worktree (workspace-write sandbox hardcoded, S8). Returns (rc,
@@ -494,6 +533,54 @@ def _run_codex(worktree: Path, model: str, prompt_path: Path, record_dir: Path,
     except OSError as e:
         (record_dir / "runner.stderr").write_text(str(e), encoding="utf-8")
         rc = 127
+    return rc, round(time.monotonic() - start, 3)
+
+
+def _run_claude(worktree: Path, model: str, prompt_path: Path, record_dir: Path,
+                *, effort: str | None = None, runner=None) -> tuple[int, float]:
+    """Invoke headless Claude in the worktree with best-effort tool confinement.
+
+    Unlike Codex workspace-write, this is not a process/network sandbox. `_CLAUDE_COMMON_ARGS`
+    disables network-native surfaces and `dontAsk` denies tools outside the explicit allow-list;
+    Bash is retained for implementation/test commands and is the warned residual network delta.
+    """
+    cmd = ["claude", "-p", "--model", model, *_CLAUDE_COMMON_ARGS]
+    if effort is not None:
+        cmd.extend(["--effort", effort])
+    cmd.extend([
+        "--tools", "Read,Edit,Write,Glob,Grep,Bash",
+        "--allowedTools", "Read,Edit,Write,Glob,Grep,Bash",
+        "--disallowedTools", _CLAUDE_NETWORK_DENY,
+        "--output-format", "stream-json", "--verbose",
+    ])
+    start = time.monotonic()
+    invoke = runner or subprocess.run
+    stream_path = record_dir / "runner.jsonl"
+    try:
+        with open(prompt_path, encoding="utf-8") as pin, \
+             open(stream_path, "w", encoding="utf-8") as jout, \
+             open(record_dir / "runner.stderr", "w", encoding="utf-8") as jerr:
+            proc = invoke(
+                cmd, cwd=str(worktree), stdin=pin, stdout=jout, stderr=jerr,
+                timeout=3600, env=dict(os.environ), text=True,
+            )
+        rc = proc.returncode
+    except subprocess.TimeoutExpired:
+        rc = 124
+    except OSError as e:
+        (record_dir / "runner.stderr").write_text(str(e), encoding="utf-8")
+        rc = 127
+
+    last_message = ""
+    if stream_path.is_file():
+        for line in stream_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") == "result" and isinstance(event.get("result"), str):
+                last_message = event["result"]
+    (record_dir / "last_message.md").write_text(last_message, encoding="utf-8")
     return rc, round(time.monotonic() - start, 3)
 
 
@@ -668,6 +755,7 @@ def _active_overlays(root: Path) -> list[dict]:
 
 def _write_exposure(record_dir, did, root, packet, task_id, head_sha, base_sha, dirty, binding,
                     fingerprint, overlays):
+    runner = str(binding.get("backend", "")).partition(":")[0]
     exposure = {
         "schema": "waystone-exposure-1", "delegation_id": did, "at": _now_iso(),
         "project": {"pslug": _project_slug(root), "root": str(root.resolve()), "name": packet["project"]["name"]},
@@ -676,7 +764,7 @@ def _write_exposure(record_dir, did, root, packet, task_id, head_sha, base_sha, 
                  "dirty_state_policy": "snapshot-commit-v1"},
         "binding": binding,
         "profile_fingerprint": fingerprint,
-        "sandbox": "workspace-write",
+        "sandbox": "workspace-write" if runner == "codex" else "none",
         "overlays": overlays,
         # Adapt & Enforce has not shipped: null/[] are the truthful effective values until that arc
         # supplies enforceable guards and recorded waivers.
@@ -795,13 +883,13 @@ def _run_claimed(root: Path, plan: dict, did: str, record_dir: Path) -> int:
             f"env prep failed (rc {env_rc}) — worktree preserved at {worktree_path}\n{env_tail}")
 
     (record_dir / "prompt.txt").write_text(_render_prompt(packet, base_sha), encoding="utf-8")
-    if "effort" in binding:
-        runner_rc, duration = _run_codex(
-            worktree_path, model, record_dir / "prompt.txt", record_dir,
-            effort=binding["effort"])
-    else:
-        runner_rc, duration = _run_codex(
-            worktree_path, model, record_dir / "prompt.txt", record_dir)
+    runner_name, _model = _runner_parts(binding["backend"])
+    run_external = _run_codex if runner_name == "codex" else _run_claude
+    if runner_name == "claude":
+        print(CLAUDE_CONFINEMENT_WARN, file=sys.stderr)
+    runner_kwargs = {"effort": binding["effort"]} if "effort" in binding else {}
+    runner_rc, duration = run_external(
+        worktree_path, model, record_dir / "prompt.txt", record_dir, **runner_kwargs)
     print(f"runner: backend={binding['backend']} rc={runner_rc}")
     if runner_rc != 0:
         _set_state(record_dir, "failed-runner", env=env_rec, error=f"runner rc {runner_rc}")
@@ -936,6 +1024,52 @@ def _run_codex_verifier(worktree: Path, model: str, focus: str,
         return 0, output.read_text(encoding="utf-8")
     except OSError:
         return 0, ""
+
+
+def _run_claude_verifier(worktree: Path, model: str, focus: str,
+                         record_dir: Path, *, runner=None) -> tuple[int, str]:
+    """Run Claude with schema output and a read-only-oriented, network-native-tool-free allow-list."""
+    allowed = (
+        "Read,Glob,Grep,Bash(git diff *),Bash(git status *),"
+        "Bash(git show *),Bash(git rev-parse *)")
+    denied = "Edit,Write,NotebookEdit,WebFetch,WebSearch"
+    cmd = [
+        "claude", "-p", "--model", model, *_CLAUDE_COMMON_ARGS,
+        "--tools", "Read,Glob,Grep,Bash", "--allowedTools", allowed,
+        "--disallowedTools", denied,
+        "--json-schema", _VERIFY_SCHEMA_PATH.read_text(encoding="utf-8"),
+        "--output-format", "json",
+    ]
+    invoke = runner or subprocess.run
+    try:
+        proc = invoke(
+            cmd, cwd=str(worktree), input=focus, capture_output=True, text=True,
+            timeout=1800, env=dict(os.environ),
+        )
+    except subprocess.TimeoutExpired:
+        return 124, ""
+    except OSError as e:
+        try:
+            (record_dir / "verify.stderr").write_text(str(e), encoding="utf-8")
+        except OSError:
+            pass
+        return 127, ""
+    try:
+        (record_dir / "verify.stderr").write_text(proc.stderr or "", encoding="utf-8")
+    except OSError:
+        pass
+    if proc.returncode != 0:
+        return proc.returncode, ""
+    stdout = proc.stdout or ""
+    try:
+        envelope = json.loads(stdout)
+    except json.JSONDecodeError:
+        return 0, stdout
+    if isinstance(envelope, dict) and isinstance(envelope.get("structured_output"), dict):
+        return 0, json.dumps(envelope["structured_output"], ensure_ascii=False)
+    if isinstance(envelope, dict) and isinstance(envelope.get("result"), str):
+        return 0, envelope["result"]
+    return 0, stdout
 
 
 def _validate_verify_contract(rec: Path, contract: dict, exposure: dict) -> Path | None:
@@ -1524,9 +1658,12 @@ def verify_delegation(root: Path, did: str) -> int:
         rc, stdout = _run_companion(worktree, args, rec)
         print(_cleanup_companion_broker(worktree))
         transport = "codex-companion:adversarial-review"
-    else:
+    elif binding["execution"] == "codex-cli":
         rc, stdout = _run_codex_verifier(worktree, model, focus, rec)
         transport = "codex-exec:read-only"
+    else:
+        rc, stdout = _run_claude_verifier(worktree, model, focus, rec)
+        transport = "claude-print:read-only"
     if rc != 0:
         raise WorkflowError(
             f"independent verifier failed (rc {rc}) — delegation remains needs-review")

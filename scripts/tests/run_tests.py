@@ -582,6 +582,108 @@ class MarkerTests(unittest.TestCase):
         self.assertIn("research-auditor", captured.get("body", ""))  # custom reviewer prompted, not name-guessed
         self.assertIn("@codex review", captured["body"])
 
+    def test_reviewer_role_resolves_to_literal_model_in_freeze_request_and_marker(self):
+        captured = {}
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            state = common.ensure_project_state_dir(root)
+            (state / "profile.yml").write_text(
+                "schema: waystone-profile-1\nbindings:\n"
+                "  reviewer: {execution: forked-subagent, backend: 'claude:opus-4.1'}\n")
+            ctx = {
+                "repo": "o/r", "pr": 3, "head": "a" * 40, "base_sha": "b" * 40,
+                "base": "main", "bundle": {
+                    "head": "a" * 40, "base_sha": "b" * 40, "bodies": []},
+                "policy": common.normalize_config({
+                    "version": 1, "project": "x", "review": {
+                        "mode": "pr", "reviewers": ["codex", "role:reviewer"]}}),
+            }
+
+            def fake_gh(_root, *args):
+                captured["body"] = args[args.index("--body") + 1]
+                return (0, "")
+
+            saved = (review.pr_context, review._gh)
+            review.pr_context = lambda _root, _pr: ctx
+            review._gh = fake_gh
+            try:
+                self.assertEqual(review.freeze(root, 3, "2026-07-15-l2-a"), 0)
+            finally:
+                review.pr_context, review._gh = saved
+
+        self.assertIn("Macro reviewer(s) — opus-4.1", captured["body"])
+        self.assertNotIn("role:reviewer", captured["body"])
+        cycle = review.parse_markers(captured["body"], "review-cycle")[0]
+        self.assertEqual(cycle["reviewers"], ["codex", "opus-4.1"])
+
+    def test_reviewer_role_resolves_before_facts_and_role_marker_is_rejected(self):
+        head = "c" * 40
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            state = common.ensure_project_state_dir(root)
+            (state / "profile.yml").write_text(
+                "schema: waystone-profile-1\nbindings:\n"
+                "  reviewer: {execution: external-runner, backend: 'claude:opus-4.1'}\n")
+            cfg = common.normalize_config({
+                "version": 1, "project": "x",
+                "review": {"reviewers": ["role:reviewer"]},
+            })
+            bundle = {
+                "head": head, "base_sha": "", "bodies": self._bodies(
+                    head, reviewer="opus-4.1"),
+                "reviews": [], "checks": [], "state": "OPEN", "is_draft": False,
+                "base": "main", "merge_state": "CLEAN",
+            }
+            facts = review.facts_from_bundle(bundle, cfg, None, root=root)
+            self.assertTrue(facts["pro_result_at_head"])
+
+            bundle["bodies"] = self._bodies(head, reviewer="role:reviewer")
+            facts = review.facts_from_bundle(bundle, cfg, None, root=root)
+            self.assertFalse(facts["pro_result_at_head"])
+
+    def test_reviewer_role_without_profile_binding_fails_loud(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            state = common.ensure_project_state_dir(root)
+            (state / "profile.yml").write_text(
+                "schema: waystone-profile-1\nbindings:\n"
+                "  implementer: {execution: external-runner, backend: 'codex:gpt'}\n")
+            with self.assertRaisesRegex(
+                    common.WorkflowError, "profile has no binding for role 'reviewer'"):
+                review.resolve_reviewers(root, ["role:reviewer"])
+
+    def test_review_cli_reports_missing_reviewer_binding_without_traceback(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / ".waystone.yml").write_text("version: 1\nproject: x\n")
+            (root / "tasks.yaml").write_text("version: 1\nproject: x\ntasks: []\n")
+            state = common.ensure_project_state_dir(root)
+            (state / "profile.yml").write_text(
+                "schema: waystone-profile-1\nbindings:\n"
+                "  implementer: {execution: external-runner, backend: 'codex:gpt'}\n")
+            ctx = {
+                "repo": "o/r", "pr": 3, "head": "a" * 40, "base_sha": "b" * 40,
+                "base": "main", "bundle": {
+                    "head": "a" * 40, "base_sha": "b" * 40, "bodies": []},
+                "policy": common.normalize_config({
+                    "version": 1, "project": "x", "review": {
+                        "mode": "pr", "reviewers": ["role:reviewer"]}}),
+            }
+            original = review.pr_context
+            review.pr_context = lambda _root, _pr: ctx
+            err = io.StringIO()
+            try:
+                with contextlib.redirect_stderr(err):
+                    rc = review.main(["freeze", "--pr", "3", str(root)])
+            finally:
+                review.pr_context = original
+            self.assertEqual(rc, 1)
+            self.assertIn("profile has no binding for role 'reviewer'", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
+
 
 PASS = dict(cycle_fresh=True, require_ci=True, ci="passing", want_codex=True, codex_fresh=True,
             findings_resolved=True, want_pro=True, pro_result_at_head=True, open_blockers=[],
@@ -1389,8 +1491,7 @@ class ConfigTests(unittest.TestCase):
         self.assertFalse(literal["pro_result_at_head"])
         with self.assertRaisesRegex(
                 common.WorkflowError,
-                "role references require the L2 reviewer resolver; "
-                "use a literal reviewer name for now"):
+                "role:reviewer must be resolved from the profile before classification"):
             review.classify([], current_head, macro_reviewers=("role:reviewer",))
 
 
@@ -1541,6 +1642,38 @@ class RoundCloseTests(unittest.TestCase):
             self.assertTrue((root / "ROADMAP.md").is_file())
             head = git(root, "rev-parse", "HEAD").stdout.strip()
             self.assertIn(f"last_round_commit: {head}", (root / ".waystone.yml").read_text())
+
+    def test_close_exposes_resolved_reviewer_identity_for_request_render(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._setup(root, (
+                "version: 1\nproject: x\nreview:\n  reviewers: ['role:reviewer']\n"
+                "state:\n  last_round_commit: null\n"))
+            _write_profile(root, (
+                "schema: waystone-profile-1\nbindings:\n"
+                "  reviewer: {execution: forked-subagent, backend: 'claude:opus-4.1'}\n"))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = round.close(
+                    root, "2026-07-15-l2-a", done=["feat/alpha"], touched=[], commit="HEAD")
+            self.assertEqual(rc, 0)
+            self.assertIn("review reviewers = opus-4.1", out.getvalue())
+            self.assertNotIn("role:reviewer", out.getvalue())
+
+    def test_close_role_reviewer_without_binding_fails_before_write(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._setup(root, (
+                "version: 1\nproject: x\nreview:\n  reviewers: ['role:reviewer']\n"
+                "state:\n  last_round_commit: null\n"))
+            _write_profile(root)
+            before = (root / "tasks.yaml").read_bytes()
+            self.assertEqual(round.close(
+                root, "2026-07-15-l2-a", done=["feat/alpha"], touched=[], commit="HEAD"), 1)
+            self.assertEqual((root / "tasks.yaml").read_bytes(), before)
 
     def test_close_replaces_all_primary_files_atomically(self):
         with tempfile.TemporaryDirectory() as d:
@@ -4448,6 +4581,14 @@ class DelegateProfileTests(unittest.TestCase):
             )
             standard = schema["$defs"]["binding"]["properties"]["execution"]["oneOf"][0]
             self.assertEqual(standard["enum"], list(delegate.PROFILE_EXECUTIONS))
+            self.assertEqual(
+                set(delegate.WAYSTONE_EXECUTABLE_EXECUTIONS)
+                | set(delegate.HOST_GUIDED_EXECUTIONS),
+                set(delegate.PROFILE_EXECUTIONS),
+            )
+            self.assertFalse(
+                set(delegate.WAYSTONE_EXECUTABLE_EXECUTIONS)
+                & set(delegate.HOST_GUIDED_EXECUTIONS))
             for role in delegate.PROFILE_ROLES:
                 self.assertEqual(
                     self._schema_role_executions(schema, role),
@@ -4504,7 +4645,7 @@ class DelegateProfileTests(unittest.TestCase):
         profile = {"bindings": {"implementer": {
             "execution": "clean-subagent", "backend": "claude:sonnet"}}}
         with self.assertRaisesRegex(
-                delegate.WorkflowError, "schema-valid but not executable"):
+                delegate.WorkflowError, "host-guided"):
             delegate._resolve_binding(profile, "implementer", Path("/project"))
 
     def test_missing_role_binding_raises(self):
@@ -4525,10 +4666,26 @@ class DelegateProfileTests(unittest.TestCase):
         with self.assertRaises(delegate.WorkflowError):
             delegate._resolve_binding(profile, "implementer", Path("/project"))
 
-    def test_non_codex_backend_not_implemented(self):
+    def test_external_runner_backend_tokens_are_explicit(self):
         with self.assertRaises(delegate.WorkflowError):
-            delegate._runner_model("claude:sonnet")
+            delegate._runner_model("gemini:pro")
+        self.assertEqual(delegate._runner_model("claude:sonnet"), "sonnet")
         self.assertEqual(delegate._runner_model("codex:gpt-5.4-codex"), "gpt-5.4-codex")
+
+    def test_profile_schema_documents_waystone_executable_vs_host_guided(self):
+        schema = _json.loads(
+            (SCRIPTS.parent / "templates" / "profile-schema.json").read_text())
+        description = schema["$defs"]["binding"]["properties"]["execution"]["description"]
+        self.assertIn("waystone-executable", description)
+        self.assertIn("host-guided", description)
+
+    def test_claude_verifier_binding_selects_claude_transport(self):
+        profile = {"bindings": {"verifier": {
+            "execution": "external-runner", "backend": "claude:sonnet",
+            "entry": "adversarial-review"}}}
+        binding = delegate._resolve_verifier_binding(profile, Path("/project"))
+        self.assertEqual(binding["execution"], "claude-cli")
+        self.assertEqual(binding["backend"], "claude:sonnet")
 
     def test_invalid_effort_field_is_rejected(self):
         profile = {"bindings": {"implementer": {
@@ -4656,7 +4813,7 @@ class DelegatePacketTests(unittest.TestCase):
 
 
 class DelegateRunTests(unittest.TestCase):
-    """0.8.0 M1 §§4-10 — full run flow with a fake (monkeypatched) codex runner. Never invokes codex."""
+    """Full run flow with injected Codex/Claude runners; never invokes a real runner."""
 
     def _project(self, d) -> tuple[Path, Path]:
         root = Path(d) / "repo"
@@ -4691,6 +4848,19 @@ class DelegateRunTests(unittest.TestCase):
             return _run_with_home(home, lambda: delegate.run_delegation(root, task, "implementer", accept or []))
         finally:
             delegate._run_codex = orig
+
+    def _run_claude_backend(self, root, home, fake, task="feat/xyz", accept=None):
+        _write_profile(root, (
+            "schema: waystone-profile-1\nbindings:\n"
+            "  implementer: {execution: external-runner, backend: 'claude:sonnet'}\n"))
+        orig = delegate._run_claude
+        delegate._run_claude = fake
+        try:
+            return _run_with_home(
+                home, lambda: delegate.run_delegation(
+                    root, task, "implementer", accept or []))
+        finally:
+            delegate._run_claude = orig
 
     def _record_dir(self, root, home):
         return _run_with_home(home, lambda: sorted(delegate._delegations_dir(root).iterdir())[-1])
@@ -4732,6 +4902,76 @@ class DelegateRunTests(unittest.TestCase):
             # result ref exists
             self.assertTrue(git(root, "rev-parse", "--verify",
                                 f"refs/waystone/delegations/{rec.name}-result").returncode == 0)
+
+    def test_claude_runner_injected_success_and_delta_warning(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            root, home = self._project(d)
+            report = "verification: []\nlimitations: []\nrisks: []\nescalations: []\n"
+            fake = self._fake_runner({"impl.py": "claude\n"}, report=report)
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                rc = self._run_claude_backend(root, home, fake)
+            self.assertEqual(rc, 0)
+            self.assertIn("waystone warn:", err.getvalue())
+            self.assertIn("Bash can still access the network", err.getvalue())
+            rec = self._record_dir(root, home)
+            contract = yaml.safe_load((rec / "artifact" / "contract.yaml").read_text())
+            self.assertEqual(contract["runner"]["backend"], "claude:sonnet")
+            exp = _json.loads((rec / "exposure.json").read_text())
+            self.assertEqual(exp["sandbox"], "none")
+
+    def test_claude_runner_injected_failure_preserves_failed_runner(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            root, home = self._project(d)
+            fake = self._fake_runner({"impl.py": "partial\n"}, rc=9)
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(delegate.WorkflowError):
+                    self._run_claude_backend(root, home, fake)
+            rec = self._record_dir(root, home)
+            self.assertEqual(delegate._read_status(rec)["state"], "failed-runner")
+
+    def test_claude_runner_missing_report_uses_shared_contract_path(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            root, home = self._project(d)
+            fake = self._fake_runner({"impl.py": "no report\n"}, report=None)
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(self._run_claude_backend(root, home, fake), 0)
+            rec = self._record_dir(root, home)
+            contract = yaml.safe_load((rec / "artifact" / "contract.yaml").read_text())
+            self.assertIs(contract["delegate_report"]["present"], False)
+
+    def test_run_claude_transport_is_injectable_and_confined(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            prompt = root / "prompt.txt"
+            prompt.write_text("implement")
+            calls = []
+
+            def transport(cmd, **kwargs):
+                calls.append((cmd, kwargs))
+                kwargs["stdout"].write('{"type":"result","result":"done"}\n')
+                return subprocess.CompletedProcess(cmd, 0)
+
+            rc, _duration = delegate._run_claude(
+                root, "sonnet", prompt, root, runner=transport)
+            self.assertEqual(rc, 0)
+            cmd, kwargs = calls[0]
+            self.assertEqual(cmd[:4], ["claude", "-p", "--model", "sonnet"])
+            for flag in ("--safe-mode", "--strict-mcp-config", "--no-chrome",
+                         "--allowedTools", "--disallowedTools", "--no-session-persistence"):
+                self.assertIn(flag, cmd)
+            self.assertIn("WebFetch", cmd[cmd.index("--disallowedTools") + 1])
+            self.assertEqual(Path(kwargs["cwd"]), root)
+            self.assertEqual((root / "last_message.md").read_text(), "done")
 
     def test_cli_prepares_slow_inputs_before_claim_lock_and_revalidates_inside(self):
         import contextlib
@@ -7222,6 +7462,68 @@ class DelegateVerifyTests(unittest.TestCase):
             return fn()
         finally:
             delegate._run_companion = orig
+
+    def _with_claude_verifier(self, fake, fn):
+        orig = delegate._run_claude_verifier
+        delegate._run_claude_verifier = fake
+        try:
+            return fn()
+        finally:
+            delegate._run_claude_verifier = orig
+
+    def test_claude_verifier_transport_and_schema_artifact(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            root, home, rec, _worktree, _plugin = self._setup(d, committed=False)
+            _write_profile(root, (
+                "schema: waystone-profile-1\nbindings:\n"
+                "  implementer: {execution: external-runner, backend: 'codex:gpt'}\n"
+                "  verifier: {execution: external-runner, backend: 'claude:sonnet', "
+                "entry: adversarial-review}\n"))
+            payload = {
+                "summary": "checked", "findings": [], "limitations": [],
+            }
+            calls = []
+
+            def fake(worktree, model, focus, record_dir):
+                calls.append((worktree, model, focus, record_dir))
+                return (0, _json.dumps(payload))
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = _run_with_home(home, lambda: self._with_claude_verifier(
+                    fake, lambda: delegate.verify_delegation(root, rec.name)))
+            self.assertEqual(rc, 0)
+            self.assertEqual(calls[0][1], "sonnet")
+            artifact = _json.loads((rec / "artifact" / "verify-1.json").read_text())
+            self.assertEqual(artifact["transport"], "claude-print:read-only")
+            self.assertEqual(artifact["backend"], "claude:sonnet")
+            self.assertEqual(artifact["payload"], payload)
+
+    def test_run_claude_verifier_transport_is_injectable_and_read_only(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            calls = []
+            payload = {"summary": "ok", "findings": [], "limitations": []}
+
+            def transport(cmd, **kwargs):
+                calls.append((cmd, kwargs))
+                wrapped = {"type": "result", "structured_output": payload}
+                return subprocess.CompletedProcess(cmd, 0, stdout=_json.dumps(wrapped), stderr="")
+
+            rc, output = delegate._run_claude_verifier(
+                root, "sonnet", "review", root, runner=transport)
+            self.assertEqual(rc, 0)
+            self.assertEqual(_json.loads(output), payload)
+            cmd, kwargs = calls[0]
+            self.assertIn("--json-schema", cmd)
+            self.assertIn("--permission-mode", cmd)
+            self.assertEqual(cmd[cmd.index("--permission-mode") + 1], "dontAsk")
+            denied = cmd[cmd.index("--disallowedTools") + 1]
+            for tool in ("Edit", "Write", "WebFetch", "WebSearch"):
+                self.assertIn(tool, denied)
+            self.assertEqual(Path(kwargs["cwd"]), root)
 
     def test_success_normalizes_committed_delegate_and_preserves_labels(self):
         with tempfile.TemporaryDirectory() as d:

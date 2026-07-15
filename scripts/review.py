@@ -90,6 +90,10 @@ def _nonempty_str(v: object) -> bool:
     return isinstance(v, str) and bool(v.strip())
 
 
+def _literal_reviewer(v: object) -> bool:
+    return _nonempty_str(v) and not str(v).startswith("role:")
+
+
 def marker_valid(m: dict) -> bool:
     """Type-strict schema gate. `cycle: true`, `review_cycle: 1.0`, `reviewed_sha: <not-40-hex>`,
     `decision_required: {}`, `resolved: "yes"` etc. are all rejected here (ignored), never coerced.
@@ -97,10 +101,13 @@ def marker_valid(m: dict) -> bool:
     k = m.get("_kind")
     if k == "review-cycle":
         return (_is_cycle(m.get("cycle")) and _is_sha(m.get("target_sha"))
-                and (m.get("base_sha") is None or _is_sha(m.get("base_sha"))))
+                and (m.get("base_sha") is None or _is_sha(m.get("base_sha")))
+                and (m.get("reviewers") is None or (
+                    _is_strlist(m.get("reviewers"))
+                    and all(_literal_reviewer(value) for value in m["reviewers"]))))
     if k == "review-result":
         return (_is_cycle(m.get("review_cycle")) and _is_sha(m.get("reviewed_sha"))
-                and _nonempty_str(m.get("reviewer")) and _nonempty_str(m.get("verdict"))
+                and _literal_reviewer(m.get("reviewer")) and _nonempty_str(m.get("verdict"))
                 and _is_strlist(m.get("decision_required", [])))
     if k == "findings":
         return _is_cycle(m.get("cycle")) and type(m.get("resolved")) is bool
@@ -181,8 +188,7 @@ def classify(markers: list[dict], current_head: str, macro_reviewers: tuple = ()
     if any(isinstance(reviewer, str) and reviewer.startswith("role:")
            for reviewer in macro_reviewers):
         raise WorkflowError(
-            "role references require the L2 reviewer resolver; "
-            "use a literal reviewer name for now")
+            "role:reviewer must be resolved from the profile before classification")
 
     def at(m: dict) -> str:
         return m.get("_at") or ""
@@ -436,11 +442,40 @@ def ci_state(bundle: dict) -> str:
     return "failing"
 
 
-def facts_from_bundle(bundle: dict, cfg: dict, repo: str | None) -> dict:
+def resolve_reviewers(root: Path, configured: list[str] | tuple[str, ...]) -> list[str]:
+    """Resolve `role:reviewer` to the reviewer's literal backend model identity."""
+    if not any(reviewer == "role:reviewer" for reviewer in configured):
+        return list(configured)
+    import delegate
+
+    profile, _fingerprint = delegate._load_profile(root)
+    bindings = profile.get("bindings")
+    binding = bindings.get("reviewer") if isinstance(bindings, dict) else None
+    if not isinstance(binding, dict):
+        raise WorkflowError(
+            f"review.reviewers uses 'role:reviewer' but profile has no binding for role "
+            f"'reviewer' at {delegate._profile_path(root)}")
+    delegate._validate_profile_binding("reviewer", binding)
+    backend = binding["backend"]
+    _runner, separator, model = backend.partition(":")
+    if not separator or not model:
+        raise WorkflowError(f"reviewer binding backend has no literal model identity: {backend!r}")
+    resolved = [model if reviewer == "role:reviewer" else reviewer for reviewer in configured]
+    if any(reviewer.startswith("role:") for reviewer in resolved):
+        raise WorkflowError("review reviewer identities must be literal after profile resolution")
+    return resolved
+
+
+def facts_from_bundle(bundle: dict, cfg: dict, repo: str | None,
+                      *, root: Path | None = None) -> dict:
     owner = (repo.split("/", 1)[0] if repo else "")
     approvers = tuple({owner, *cfg["review"].get("approvers", [])} - {""})
     operators = tuple({owner, *cfg["review"].get("operators", [])} - {""})
-    macro = tuple(r for r in cfg["review"]["reviewers"] if r != "codex")
+    configured = cfg["review"]["reviewers"]
+    if any(reviewer == "role:reviewer" for reviewer in configured) and root is None:
+        raise WorkflowError("reviewer role resolution requires the project root")
+    reviewers = resolve_reviewers(root, configured) if root is not None else list(configured)
+    macro = tuple(r for r in reviewers if r != "codex")
     markers = parse_bodies(bundle["bodies"])
     # Codex signals must be bound to the exact head AND post-date the latest freeze — so a re-freeze
     # (new cycle/base, same head) can't reuse a Codex review from a previous cycle. The newest
@@ -521,7 +556,7 @@ def freeze(root: Path, pr: int, round_id: str | None) -> int:
     base_sha = bundle.get("base_sha", "")
     markers = parse_bodies(bundle["bodies"])
     n = next_cycle_number(markers)
-    reviewers = policy["review"]["reviewers"]
+    reviewers = resolve_reviewers(root, policy["review"]["reviewers"])
     marker = emit_marker("review-cycle", {
         "round_id": round_id or "(unset)", "cycle": n, "target_sha": head,
         "base_sha": base_sha, "reviewers": reviewers,
@@ -551,7 +586,7 @@ def status(root: Path, pr: int | None) -> int:
         if ctx["policy"] is None:
             print("review status: cannot read the base-branch policy at the PR base SHA.", file=sys.stderr)
             return 1
-        facts = facts_from_bundle(ctx["bundle"], ctx["policy"], ctx["repo"])
+        facts = facts_from_bundle(ctx["bundle"], ctx["policy"], ctx["repo"], root=root)
         print(f"PR #{pr} review status ({facts['pr_state']}{', DRAFT' if facts['is_draft'] else ''}):")
         print(f"  current head:   {facts['current_head'][:12]}")
         print(f"  latest cycle:   {facts['latest_cycle']} (frozen {str(facts['frozen_sha'])[:12]})")
@@ -679,16 +714,20 @@ def main(argv: list[str]) -> int:
     except (WorkflowError, OSError) as e:
         print(f"waystone review: migration failed: {e}", file=sys.stderr)
         return 1
-    if sub == "ingest":
-        return ingest(root, _opt(rest, "--round"), reviewer=_opt(rest, "--reviewer"),
-                      force="--force" in rest)
-    pr_s = _opt(rest, "--pr")
-    if sub == "freeze":
-        if not pr_s:
-            print("review freeze: --pr N is required", file=sys.stderr)
-            return 1
-        return freeze(root, int(pr_s), _opt(rest, "--round"))
-    return status(root, int(pr_s) if pr_s else None)
+    try:
+        if sub == "ingest":
+            return ingest(root, _opt(rest, "--round"), reviewer=_opt(rest, "--reviewer"),
+                          force="--force" in rest)
+        pr_s = _opt(rest, "--pr")
+        if sub == "freeze":
+            if not pr_s:
+                print("review freeze: --pr N is required", file=sys.stderr)
+                return 1
+            return freeze(root, int(pr_s), _opt(rest, "--round"))
+        return status(root, int(pr_s) if pr_s else None)
+    except WorkflowError as e:
+        print(f"waystone review: {e}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

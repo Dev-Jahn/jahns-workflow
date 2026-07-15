@@ -160,12 +160,18 @@ def close(root: Path, round_id: str, done: list[str], touched: list[str], commit
     import tempfile
     import yaml
     import roadmap
+    import review
     import validate
 
     if not ROUND_RE.match(round_id):
         print(f"round close: --round must match YYYY-MM-DD-<slug>, got {round_id!r}", file=sys.stderr)
         return 1
     cfg = load_config(root)
+    try:
+        review_reviewers = review.resolve_reviewers(root, cfg["review"]["reviewers"])
+    except WorkflowError as e:
+        print(f"round close: cannot resolve review request reviewers — {e}", file=sys.stderr)
+        return 1
     cfg_path = root / ".waystone.yml"
     tasks_path = root / "tasks.yaml"
 
@@ -276,6 +282,7 @@ def close(root: Path, round_id: str, done: list[str], touched: list[str], commit
     print(f"round {round_id} closed: {len(done)} done, {len(set(done + touched))} stamped; "
           f"watermark {(prev_wm[:12] if prev_wm else '(root)')} → {full[:12]}")
     print(f"  review diff base = {prev_wm or '(root)'}  (previous round tip; head = {full})")
+    print(f"  review reviewers = {', '.join(review_reviewers)}")
 
     # Boundary warnings remain advisory. Unlike exposure (part of the transaction above), a warning
     # engine failure is visible but does not invalidate a close whose policy record is durable.
