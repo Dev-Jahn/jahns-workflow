@@ -95,6 +95,7 @@ def _paths_main(argv: list[str]) -> int:
             "overlay": _resolved(overlay._overlay_dir(root)),
             "exposure": _resolved(overlay._exposure_dir(root)),
             "profile": _resolved(delegate._profile_path(root)),
+            "project_improve": _resolved(common.project_state_path(root) / "improve"),
         })
 
     if as_json:
@@ -215,6 +216,8 @@ def _migrate_command_project(argv: list[str]) -> None:
     """Run lazy Phase 2 for the project addressed by this CLI invocation, including explicit paths."""
     candidates = [Path.cwd()]
     group, rest = argv[0], argv[1:]
+    if group == "improve" and "--user-wide" in rest:
+        return
     if "--root" in rest:
         index = rest.index("--root")
         if index + 1 < len(rest):

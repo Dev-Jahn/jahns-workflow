@@ -818,6 +818,7 @@ class WaystoneStorageCliTests(unittest.TestCase):
             self.assertEqual(paths["overlay"], str(state / "overlay"))
             self.assertEqual(paths["exposure"], str(state / "exposure"))
             self.assertEqual(paths["profile"], str(state / "profile.yml"))
+            self.assertEqual(paths["project_improve"], str(state / "improve"))
             self.assertFalse(state.exists())
             rc, human, err = self._capture(
                 home, Path(d), ["paths", "--root", str(root)])
@@ -3084,16 +3085,19 @@ class ImproveScopeTests(unittest.TestCase):
         ])
 
     @staticmethod
-    def _run(home: Path, cwd: Path, argv: list[str]) -> int:
+    def _run(home: Path, cwd: Path, argv: list[str], *, dispatcher: bool = False) -> int:
         import contextlib
         import io
         import os
+        import waystone
 
         previous = Path.cwd()
         try:
             os.chdir(cwd)
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                return _run_with_home(home, lambda: improve.main(argv))
+                entry = (lambda: waystone.main(["improve", *argv])) if dispatcher else (
+                    lambda: improve.main(argv))
+                return _run_with_home(home, entry)
         finally:
             os.chdir(previous)
 
@@ -3128,7 +3132,8 @@ class ImproveScopeTests(unittest.TestCase):
             sentinel.write_text("legacy-user-wide")
 
             self.assertEqual(self._run(
-                home, alpha, ["trace", "--source", str(source), "--host", "claude"]), 0)
+                home, alpha, ["trace", "--source", str(source), "--host", "claude"],
+                dispatcher=True), 0)
             project_out = alpha / ".waystone" / "improve"
             rows = self._rows(project_out / "sessions.jsonl")
             self.assertEqual([row["project"] for row in rows], [self._claude_slug(alpha)])
@@ -3164,9 +3169,14 @@ class ImproveScopeTests(unittest.TestCase):
             project_out.mkdir(parents=True)
             sentinel = project_out / "sentinel"
             sentinel.write_text("project-only")
+            legacy = (home / ".claude" / "waystone.pre-0.9" / "start_here" /
+                      f"{common._project_slug(alpha)}.md")
+            legacy.parent.mkdir(parents=True)
+            legacy.write_text("must-stay-user-wide-ignored")
 
             self.assertEqual(self._run(home, alpha, [
-                "trace", "--user-wide", "--source", str(source), "--host", "claude"]), 0)
+                "trace", "--user-wide", "--source", str(source), "--host", "claude"],
+                dispatcher=True), 0)
             machine = home / ".waystone" / "improve"
             rows = self._rows(machine / "sessions.jsonl")
             self.assertEqual(
@@ -3178,6 +3188,8 @@ class ImproveScopeTests(unittest.TestCase):
             self.assertTrue((machine / "decisions.jsonl").is_file())
             self.assertEqual(set(project_out.iterdir()), {sentinel})
             self.assertEqual(sentinel.read_text(), "project-only")
+            self.assertTrue(legacy.is_file())
+            self.assertFalse((alpha / ".waystone" / "start-here.md").exists())
 
     def test_review_and_evidence_sources_follow_mode_scope(self):
         with tempfile.TemporaryDirectory() as d:
