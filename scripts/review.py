@@ -132,6 +132,18 @@ def write_pr_freeze_binding(root: Path, round_id: str, pr: int, cycle: int,
         "mode": "pr", "canonical_store": "local-freeze-evidence",
         "at": datetime.now(timezone.utc).isoformat(),
     }
+    contract_fields = {
+        key: value for key, value in row.items() if key != "at"
+    }
+    for existing in sorted(directory.glob(f"{round_id}-freeze-{cycle}.binding*.json")):
+        try:
+            previous = json.loads(existing.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if (isinstance(previous, dict)
+                and {key: value for key, value in previous.items() if key != "at"}
+                == contract_fields):
+            return existing
     base = directory / f"{round_id}-freeze-{cycle}.binding.json"
     path = base
     number = 2
@@ -361,6 +373,7 @@ def classify(markers: list[dict], current_head: str, macro_reviewers: tuple = ()
         "current_head": current_head,
         "latest_cycle": cyc,
         "round_id": (lc or {}).get("round_id"),
+        "profile_fingerprint": (lc or {}).get("profile_fingerprint"),
         "frozen_sha": frozen,
         "frozen_base": frozen_base,
         "cycle_conflict": conflict,
@@ -754,6 +767,22 @@ def status(root: Path, pr: int | None) -> int:
         print(f"  pro result@head:{facts['pro_result_at_head']}  ({facts['n_results']} result(s))")
         print(f"  findings resolved: {facts['findings_resolved']}")
         print(f"  approved@head:  {facts['approved_at_head']}  ({facts['n_approvals']} approval(s))")
+        round_id = facts.get("round_id")
+        if (isinstance(round_id, str) and round_id and round_id != "(unset)"
+                and _is_cycle(facts.get("latest_cycle"))
+                and _is_sha(facts.get("frozen_sha"))
+                and _is_sha(facts.get("frozen_base"))
+                and _is_strlist(facts.get("reviewers"))
+                and facts.get("cycle_conflict") is False):
+            try:
+                write_pr_freeze_binding(
+                    root, round_id, pr, facts["latest_cycle"], facts["frozen_sha"],
+                    facts["frozen_base"], facts["reviewers"],
+                    facts.get("profile_fingerprint"), ctx["policy"]["reviews_dir"])
+            except (OSError, WorkflowError) as e:
+                print(f"review status: trusted PR cycle could not be recorded locally: {e}",
+                      file=sys.stderr)
+                return 1
         event = completed_pr_feedback_event(facts, pr)
         if event is not None:
             try:

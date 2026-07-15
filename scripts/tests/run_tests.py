@@ -12,6 +12,7 @@ and config review-mode validation. No network / no gh required.
 """
 from __future__ import annotations
 
+import hashlib
 import subprocess
 import sys
 import tempfile
@@ -3870,16 +3871,16 @@ class ImproveMetricsTests(unittest.TestCase):
              "task_context": {"session_id": "s1"},
              "findings": [{"round": "r1", "type": "correctness", "status": "REAL"}],
              "delegations": [{"did": "d1", "state": "applied"}],
-             "acceptance": {"at": "2026-07-15T03:00:00Z", "resolved": True,
+             "acceptance": {"accepted_at": "2026-07-15T03:00:00Z", "resolved": True,
                             "provenance": "explicit"}},
             {"project": "demo", "task_id": "feat/opportunity",
              "task_context": {"session_id": "s2"}, "findings": [], "delegations": [],
-             "acceptance": {"at": None, "resolved": False,
+             "acceptance": {"accepted_at": None, "resolved": False,
                             "provenance": "current-task-state-approximation"}},
             {"project": "demo", "task_id": "fix/env",
              "task_context": {"session_id": None}, "findings": [],
              "delegations": [{"did": "d2", "state": "failed-env"}],
-             "acceptance": {"at": None, "resolved": False,
+             "acceptance": {"accepted_at": None, "resolved": False,
                             "provenance": "current-task-state-approximation"}},
             {"coverage": {"warning_observations": [{
                 "project": "demo", "coverage": {"warnings_file_present": True},
@@ -5930,6 +5931,10 @@ def _write_apply_verdict(rec):
     """Install a valid verdict fixture for tests whose subject is the apply mechanics, not judging."""
     packet = yaml.safe_load((rec / "packet.yaml").read_text())
     exposure = _json.loads((rec / "exposure.json").read_text())
+    verify_paths = delegate._verify_paths(rec)
+    verify_number = (delegate._artifact_number(verify_paths[-1], "verify")
+                     if verify_paths else None)
+    contract = yaml.safe_load((rec / "artifact" / "contract.yaml").read_text())
     verdict = {
         "schema": "waystone-verdict-1",
         "decision": "apply",
@@ -5940,10 +5945,12 @@ def _write_apply_verdict(rec):
         "warnings_seen": [],
         "rationale": "apply mechanics fixture",
         "limitations": [],
-        "at": "2026-07-15T00:00:00+00:00",
+        "judged_at": "2026-07-15T00:00:00+00:00",
         "provenance": "main-session",
-        "verify_number": None,
+        "verify_number": verify_number,
         "profile_fingerprint": exposure["profile_fingerprint"],
+        "artifact_digests": delegate._current_artifact_digests(
+            rec, contract, verify_number),
     }
     (rec / "artifact" / "verdict-1.json").write_text(
         _json.dumps(verdict, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -6044,10 +6051,10 @@ class DelegateApplyTests(unittest.TestCase):
                     fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
                     return False
 
-            def checked_apply(project, did, override_no_verdict_reason=None):
+            def checked_apply(project, did):
                 self.assertTrue(assert_held(common.project_lock_path(project)))
                 self.assertTrue(assert_held(rec / "record.lock"))
-                return original_apply(project, did, override_no_verdict_reason)
+                return original_apply(project, did)
 
             delegate.apply_delegation = checked_apply
             delegate.hold_lock = recording_lock
@@ -6148,7 +6155,7 @@ class DelegateApplyTests(unittest.TestCase):
             self.assertFalse(wt.exists())
             self.assertTrue((rec / "exposure.json").exists())  # record preserved
 
-    def test_apply_requires_verdict_and_override_no_verdict_records_reason(self):
+    def test_apply_requires_verdict_and_forbids_no_verdict_override(self):
         import contextlib
         import io
 
@@ -6167,10 +6174,9 @@ class DelegateApplyTests(unittest.TestCase):
                     "apply", rec.name, "--root", str(root), "--override-no-verdict"])), 1)
             self.assertEqual(_run_with_home(home, lambda: delegate.main([
                 "apply", rec.name, "--root", str(root), "--override-no-verdict",
-                "--reason", "emergency owner approval"])), 0)
-            transition = delegate._read_status(rec)["at_transitions"][-1]
-            self.assertEqual(transition["reason"], "emergency owner approval")
-            self.assertEqual(transition["overrides"], ["no-verdict"])
+                "--reason", "emergency owner approval"])), 1)
+            self.assertEqual(delegate._read_status(rec)["state"], "needs-review")
+            self.assertFalse((root / "impl.py").exists())
 
     def test_apply_uses_latest_verdict_and_rejects_discard_decision(self):
         import contextlib
@@ -6425,6 +6431,7 @@ class DelegateVerdictTests(unittest.TestCase):
             "payload": {"summary": "reviewed", "findings": findings or [], "limitations": []},
             "profile_fingerprint": exposure["profile_fingerprint"],
             "base_sha": contract["base_sha"], "result_sha": contract["result_sha"],
+            "patch_sha256": contract["patch_sha256"],
             "effective_tool_policy": {
                 "tools": ["codex-exec"], "sandbox": "read-only", "bash": False,
                 "filesystem_postcondition": "git-status+untracked-content-unchanged",
@@ -6439,7 +6446,8 @@ class DelegateVerdictTests(unittest.TestCase):
         user_input = _json.loads((templates / "verdict-input-schema.json").read_text())
         self.assertEqual(stored["properties"]["schema"]["const"], "waystone-verdict-1")
         self.assertIn("agent_checks", user_input["required"])
-        for field in ("at", "provenance", "verify_number", "profile_fingerprint"):
+        for field in ("judged_at", "provenance", "verify_number", "profile_fingerprint",
+                      "artifact_digests"):
             self.assertIn(field, stored["required"])
             self.assertNotIn(field, user_input["properties"])
         with tempfile.TemporaryDirectory() as d:
@@ -6485,7 +6493,11 @@ class DelegateVerdictTests(unittest.TestCase):
             self.assertEqual(verdict["provenance"], "main-session")
             self.assertEqual(verdict["verify_number"], 1)
             self.assertEqual(verdict["profile_fingerprint"], exposure["profile_fingerprint"])
-            self.assertIn("at", verdict)
+            self.assertIn("judged_at", verdict)
+            self.assertEqual(
+                set(verdict["artifact_digests"]),
+                {"contract_sha256", "patch_sha256", "verify_sha256"})
+            self.assertIsNotNone(verdict["artifact_digests"]["verify_sha256"])
             contract = yaml.safe_load((rec / "artifact" / "contract.yaml").read_text())
             self.assertNotIn("verdict", contract)  # contract has no verdict
 
@@ -6590,6 +6602,7 @@ class DelegateVerdictTests(unittest.TestCase):
             "payload": {"summary": "reviewed", "findings": [], "limitations": []},
             "profile_fingerprint": "sha256:123456789abc",
             "base_sha": "a" * 40, "result_sha": "b" * 40,
+            "patch_sha256": "sha256:" + "c" * 64,
             "effective_tool_policy": {"tools": ["synthetic"]},
         }
         cases = (
@@ -8270,13 +8283,19 @@ class ImproveL2BTests(unittest.TestCase):
             record = root / ".waystone" / "delegations" / "did-1"
             (record / "artifact").mkdir(parents=True)
             (record / "exposure.json").write_text(_json.dumps({"task_id": "fix/verdict"}))
-            (record / "status.json").write_text(_json.dumps({"state": "applied"}))
+            (record / "status.json").write_text(_json.dumps({
+                "state": "applied", "accepted_at": "2026-07-02T01:00:00+00:00",
+            }))
             (record / "artifact" / "verdict-1.json").write_text(_json.dumps({
                 "schema": "waystone-verdict-1", "decision": "apply",
                 "decided_by": "main-session", "criteria": [], "agent_checks": [],
                 "warnings_seen": [], "rationale": "accepted", "limitations": [],
-                "at": "2026-07-02T00:00:00+00:00", "provenance": "main-session",
+                "judged_at": "2026-07-02T00:00:00+00:00", "provenance": "main-session",
                 "verify_number": None, "profile_fingerprint": None,
+                "artifact_digests": {
+                    "contract_sha256": "sha256:" + "a" * 64,
+                    "patch_sha256": None, "verify_sha256": None,
+                },
             }))
             exposure = root / ".waystone" / "exposure"
             exposure.mkdir(parents=True)
@@ -8292,7 +8311,7 @@ class ImproveL2BTests(unittest.TestCase):
             self.assertEqual(first, (out / "evidence.jsonl").read_bytes())
             rows = {row["task_id"]: row for row in self._evidence_rows(out / "evidence.jsonl")
                     if row.get("task_id")}
-            self.assertEqual(rows["fix/verdict"]["acceptance"]["event"], "delegation-verdict")
+            self.assertEqual(rows["fix/verdict"]["acceptance"]["event"], "delegation-apply")
             self.assertEqual(rows["fix/verdict"]["acceptance"]["provenance"], "explicit")
             self.assertEqual(rows["fix/round"]["acceptance"]["event"], "round-close")
             self.assertEqual(rows["fix/fallback"]["acceptance"]["provenance"],
@@ -8316,8 +8335,12 @@ class ImproveL2BAdversarialTests(unittest.TestCase):
             "schema": "waystone-verdict-1", "decision": decision,
             "decided_by": "main-session", "criteria": [], "agent_checks": [],
             "warnings_seen": [], "rationale": "main accepted", "limitations": [],
-            "at": at, "provenance": "main-session", "verify_number": None,
+            "judged_at": at, "provenance": "main-session", "verify_number": None,
             "profile_fingerprint": None,
+            "artifact_digests": {
+                "contract_sha256": "sha256:" + "a" * 64,
+                "patch_sha256": None, "verify_sha256": None,
+            },
         }
 
     @staticmethod
@@ -8379,8 +8402,14 @@ class ImproveL2BAdversarialTests(unittest.TestCase):
             loaded = delegate.load_canonical_verdict(bad)
             self.assertEqual(loaded["decision"], "apply")
             acceptance, skipped = improve._latest_verdict_acceptance(record)
-            self.assertEqual(acceptance["event"], "delegation-verdict")
+            self.assertIsNone(acceptance)
             self.assertEqual(skipped, 0)
+            (record / "status.json").write_text(_json.dumps({
+                "state": "applied", "accepted_at": "2026-07-02T01:00:00+00:00",
+            }))
+            acceptance, skipped = improve._latest_verdict_acceptance(record)
+            self.assertEqual(acceptance["event"], "delegation-apply")
+            self.assertEqual(acceptance["accepted_at"], "2026-07-02T01:00:00+00:00")
 
     def test_f3_latest_reclose_exposure_and_verdict_kind_authority(self):
         exposures = [
@@ -8397,13 +8426,13 @@ class ImproveL2BAdversarialTests(unittest.TestCase):
         self.assertEqual(improve._round_session_binding("r2", same_time)[:2],
                          ("ten", "explicit"))
         task = {"status": "done", "round": "r1"}
-        delegations = [{"did": "d1", "acceptance": {
-            "event": "delegation-verdict", "at": "2026-07-02T00:00:00+00:00",
-            "decision": "apply", "resolved": True, "provenance": "explicit",
+        delegations = [{"did": "d1", "judgment": {
+            "event": "delegation-verdict", "judged_at": "2026-07-02T00:00:00+00:00",
+            "decision": "apply", "resolved": False, "provenance": "explicit",
         }}]
         self.assertEqual(
             improve._task_acceptance(task, delegations, exposures)["event"],
-            "delegation-verdict")
+            "round-close")
 
     def test_f4_conflicting_warning_context_is_quarantined(self):
         warning = {
@@ -11116,6 +11145,12 @@ class L2CAdversarialFixTests(unittest.TestCase):
             _write_apply_verdict(rec)
             index, errors = overlay._delegation_evidence_index(root)
             self.assertEqual(errors, 0)
+            self.assertIs(index["feat/xyz"][0]["positive"], False)
+            self.assertEqual(index["feat/xyz"][0]["evidence_kind"],
+                             "unresolved-apply-judgment")
+            _run_with_home(home, lambda: delegate.apply_delegation(root, rec.name))
+            index, errors = overlay._delegation_evidence_index(root)
+            self.assertEqual(errors, 0)
             self.assertIs(index["feat/xyz"][0]["positive"], True)
 
             verdict_path = rec / "artifact" / "verdict-1.json"
@@ -11391,6 +11426,8 @@ class L2DPolicyMachineTests(unittest.TestCase):
                 "event": "evaluation", "delta_status": "observing",
                 "policy_identity": {"layer": "project", "id": delta_id},
                 "origin_delta_id": delta_id, "message": "evaluated", "context": {},
+                "params_fingerprint": overlay._policy_params_fingerprint(
+                    rule, dict(overlay.RULES[rule].get("default_params") or {})),
             }])
 
     def test_maturity_is_deterministic_recorded_and_recommendations_stay_allowed(self):
@@ -11706,6 +11743,8 @@ class L2DAdversarialFindingTests(unittest.TestCase):
             "rule": rule, "event": "evaluation", "delta_status": "observing",
             "policy_identity": {"layer": "project", "id": delta_id},
             "origin_delta_id": delta_id,
+            "params_fingerprint": overlay._policy_params_fingerprint(
+                rule, dict(overlay.RULES[rule].get("default_params") or {})),
             "message": "rule evaluated at workflow boundary",
             "context": {"evaluable": True, "fired": False, "coverage_reason": None},
         }
@@ -12238,6 +12277,303 @@ class L3GapClosureAcceptanceTests(unittest.TestCase):
             events, _coverage = improve._staleness_change_events(root, before)
             self.assertIn("current-config-fingerprint-mismatch", {reason for _at, reason in events})
 
+    def test_f1_run_records_patch_digest_and_apply_rejects_post_verdict_replacement(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _deleg_project(d)
+            _deleg_run(root, home, _deleg_fake({"impl.py": "x\n"}))
+            rec = _latest_rec(root, home)
+            contract = yaml.safe_load((rec / "artifact" / "contract.yaml").read_text())
+            patch_path = rec / "artifact" / "changes.patch"
+            self.assertEqual(
+                contract["patch_sha256"],
+                "sha256:" + hashlib.sha256(patch_path.read_bytes()).hexdigest(),
+            )
+            _write_apply_verdict(rec)
+            original = patch_path.read_bytes()
+            replaced = original.replace(b"+x\n", b"+tampered\n")
+            self.assertNotEqual(replaced, original)
+            patch_path.write_bytes(replaced)
+            with self.assertRaisesRegex(common.WorkflowError, "digest"):
+                _run_with_home(home, lambda: delegate.apply_delegation(root, rec.name))
+            self.assertFalse((root / "impl.py").exists())
+
+    def test_f1_verify_proves_base_plus_patch_matches_result_and_pre_digest_cannot_apply(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _deleg_project(d)
+            _write_profile(root, (
+                'schema: waystone-profile-1\nbindings:\n'
+                '  implementer: {execution: external-runner, backend: "codex:gpt-test"}\n'
+                '  verifier: {backend: "codex:gpt-test", entry: adversarial-review}\n'
+            ))
+            plugin = home / "codex-plugin"
+            (plugin / "scripts").mkdir(parents=True)
+            (plugin / "scripts" / "codex-companion.mjs").write_text("// fixture\n")
+            registry = home / ".claude" / "plugins" / "installed_plugins.json"
+            registry.parent.mkdir(parents=True)
+            registry.write_text(_json.dumps({"plugins": {"codex@openai-codex": [
+                {"installPath": str(plugin)}]}}))
+            _deleg_run(root, home, _deleg_fake({"impl.py": "x\n"}))
+            rec = _latest_rec(root, home)
+            contract_path = rec / "artifact" / "contract.yaml"
+            contract = yaml.safe_load(contract_path.read_text())
+            contract["result_sha"] = contract["base_sha"]
+            contract_path.write_text(yaml.safe_dump(contract, sort_keys=False))
+            with self.assertRaisesRegex(common.WorkflowError, "result_sha"):
+                _run_with_home(home, lambda: delegate.verify_delegation(root, rec.name))
+            self.assertEqual(list((rec / "artifact").glob("verify-*.json")), [])
+
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _deleg_project(d)
+            _deleg_run(root, home, _deleg_fake({"impl.py": "x\n"}))
+            rec = _latest_rec(root, home)
+            _write_apply_verdict(rec)
+            contract_path = rec / "artifact" / "contract.yaml"
+            contract = yaml.safe_load(contract_path.read_text())
+            contract.pop("patch_sha256", None)
+            contract_path.write_text(yaml.safe_dump(contract, sort_keys=False))
+            with self.assertRaisesRegex(common.WorkflowError, "pre-digest record"):
+                _run_with_home(home, lambda: delegate.apply_delegation(root, rec.name))
+
+    def test_f1_apply_rechecks_contract_and_verify_artifact_digests(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _deleg_project(d)
+            _write_profile(root, (
+                'schema: waystone-profile-1\nbindings:\n'
+                '  implementer: {execution: external-runner, backend: "codex:gpt-test"}\n'
+                '  verifier: {backend: "codex:gpt-test", entry: adversarial-review}\n'
+            ))
+            _deleg_run(root, home, _deleg_fake({"impl.py": "x\n"}))
+            rec = _latest_rec(root, home)
+            contract_path = rec / "artifact" / "contract.yaml"
+            contract_bytes = contract_path.read_bytes()
+            contract = yaml.safe_load(contract_bytes)
+            exposure = _json.loads((rec / "exposure.json").read_text())
+            verify_path = rec / "artifact" / "verify-1.json"
+            verify = {
+                "schema": "waystone-verify-1", "at": "2026-07-15T00:00:00+00:00",
+                "transport": "codex-exec:read-only", "backend": "codex:gpt-test",
+                "provenance": "independent-verifier",
+                "payload": {"summary": "reviewed", "findings": [], "limitations": []},
+                "profile_fingerprint": exposure["profile_fingerprint"],
+                "base_sha": contract["base_sha"], "result_sha": contract["result_sha"],
+                "patch_sha256": contract["patch_sha256"],
+                "effective_tool_policy": {"tools": ["synthetic"]},
+            }
+            verify_path.write_text(_json.dumps(verify) + "\n")
+            verify_bytes = verify_path.read_bytes()
+            _write_apply_verdict(rec)
+
+            verify_path.write_bytes(verify_bytes + b" \n")
+            with self.assertRaisesRegex(common.WorkflowError, "verify artifact digest"):
+                _run_with_home(home, lambda: delegate.apply_delegation(root, rec.name))
+            verify_path.write_bytes(verify_bytes)
+            contract_path.write_bytes(contract_bytes + b"\n# replaced after verdict\n")
+            with self.assertRaisesRegex(common.WorkflowError, "contract digest"):
+                _run_with_home(home, lambda: delegate.apply_delegation(root, rec.name))
+            self.assertFalse((root / "impl.py").exists())
+
+    def test_f2_promote_user_requires_exact_candidate_evaluations(self):
+        with tempfile.TemporaryDirectory() as d:
+            base, home = Path(d), Path(d) / "home"
+            home.mkdir()
+            source = base / "source"
+            source.mkdir()
+            root, _unused = _deleg_project(source)
+            other = base / "other"
+            other.mkdir()
+            machine = _run_with_home(home, common.machine_dir)
+            machine.mkdir(parents=True, exist_ok=True)
+            (machine / "projects.json").write_text(_json.dumps({"projects": [
+                {"name": "source", "path": str(root.resolve()), "aliases": []},
+                {"name": "other", "path": str(other.resolve()), "aliases": []},
+            ]}))
+            delta_id = "verification_debt/exact-candidate"
+            rule = "done-without-evidence-v1"
+            delta = _run_with_home(home, lambda: overlay.add_delta(
+                root, delta_id, rule=rule, summary="candidate",
+                candidate_scope="user_candidate"))
+            fingerprint = common.canonical_payload_hash({
+                "rule": rule, "params": delta.get("params") or {},
+            })
+
+            def observation(project: Path, *, identity: dict, event: str,
+                            origin: str | None, status: str = "observing",
+                            params_fingerprint: str = fingerprint) -> None:
+                path = project / ".waystone" / "overlay" / "warnings.jsonl"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                row = {
+                    "at": "2026-07-15T00:00:00+00:00", "boundary": "check",
+                    "rule": rule, "event": event, "delta_status": status,
+                    "policy_identity": identity, "params_fingerprint": params_fingerprint,
+                    "message": "evaluated", "context": {},
+                }
+                if origin is not None:
+                    row["origin_delta_id"] = origin
+                with path.open("a", encoding="utf-8") as stream:
+                    stream.write(_json.dumps(row) + "\n")
+
+            observation(root, identity={"layer": "project", "id": delta_id},
+                        event="evaluation", origin=delta_id)
+            observation(other, identity={"layer": "base", "id": f"base/{rule}"},
+                        event="evaluation", origin=None)
+            observation(other, identity={"layer": "project", "id": delta_id},
+                        event="evaluation", origin=delta_id, status="suspended")
+            observation(other, identity={"layer": "project", "id": "other/candidate"},
+                        event="evaluation", origin="other/candidate")
+            observation(other, identity={"layer": "project", "id": delta_id},
+                        event="evaluation", origin=delta_id,
+                        params_fingerprint="sha256:" + "0" * 64)
+            candidate_fire = other / ".waystone" / "overlay" / "warnings.jsonl"
+            with candidate_fire.open("a", encoding="utf-8") as stream:
+                stream.write(_json.dumps({
+                    "at": "2026-07-15T00:01:00+00:00", "boundary": "check",
+                    "rule": rule, "event": "fire", "delta_status": "observing",
+                    "policy_identity": {"layer": "project", "id": delta_id},
+                    "origin_delta_id": delta_id, "params_fingerprint": fingerprint,
+                    "message": "fired", "context": {},
+                }) + "\n")
+            with self.assertRaisesRegex(common.WorkflowError, "1 distinct project"):
+                _run_with_home(home, lambda: overlay.promote_user(root, delta_id))
+
+    def test_f3_materialization_ids_are_stable_unique_and_composition_rejects_duplicate_identity(self):
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _deleg_project(d)
+            ids = ("verification_debt/first", "verification_debt/second")
+            for delta_id in ids:
+                _run_with_home(home, lambda delta_id=delta_id: overlay.add_delta(
+                    root, delta_id, rule="delegation-verification-evidence-v1",
+                    summary="candidate"))
+                delta = overlay.load_delta(root, delta_id)
+                delta["replay"] = {"fires": 1, "opportunities": 1, "fire_rate": 1.0}
+                overlay._write_delta(root, delta)
+                _run_with_home(home, lambda delta_id=delta_id: overlay.materialize(
+                    root, delta_id, consent_recorded=True))
+            document = yaml.safe_load((root / "docs" / "waystone-policy.yaml").read_text())
+            policy_ids = [row["id"] for row in document["policies"]]
+            self.assertEqual(len(policy_ids), 2)
+            self.assertEqual(len(set(policy_ids)), 2)
+            composed = _run_with_home(home, lambda: overlay.compose_policy(root))
+            identities = [
+                (policy["identity"]["layer"], policy["identity"]["id"])
+                for layer in composed["layers"] for policy in layer["policies"]
+            ]
+            self.assertEqual(len(identities), len(set(identities)))
+            self.assertTrue(all(row["identity"] != row["shadowed_by"]
+                                for row in composed["shadowed"]))
+            project_policies = composed["layers"][2]["policies"]
+            self.assertEqual({row["source_kind"] for row in project_policies},
+                             {"overlay", "committed"})
+            by_source = {
+                source: {(row["identity"]["layer"], row["identity"]["id"])
+                         for row in project_policies if row["source_kind"] == source}
+                for source in ("overlay", "committed")
+            }
+            self.assertTrue(by_source["overlay"].isdisjoint(by_source["committed"]))
+            warning_rows = {
+                policy["source_kind"]: overlay._emit(
+                    root, "test", policy, policy["rule"], policy["status"],
+                    "evaluation", "attribution", {})
+                for policy in project_policies
+            }
+            self.assertEqual(warning_rows["overlay"]["policy_source_kind"], "overlay")
+            self.assertEqual(warning_rows["committed"]["policy_source_kind"], "committed")
+            self.assertNotEqual(
+                warning_rows["overlay"]["policy_identity"],
+                warning_rows["committed"]["policy_identity"],
+            )
+
+            duplicate = overlay._strict_delta_directory(
+                overlay._deltas_dir(root), layer="project", source_kind="overlay")[0]
+            with mock.patch.object(overlay, "_load_project_policy", return_value=[duplicate]):
+                with self.assertRaisesRegex(common.WorkflowError, "duplicate policy identity"):
+                    _run_with_home(home, lambda: overlay.compose_policy(root))
+
+    def test_f4_status_recovers_trusted_pr_contract_and_improve_projects_reviewer_identity(self):
+        from unittest import mock
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / ".waystone.yml").write_text(
+                "version: 1\nproject: demo\nreviews_dir: docs/reviews\n"
+                "review:\n  mode: pr\n  reviewers: [macro-reviewer]\n"
+                "  operators: [owner]\n  approvers: [owner]\n")
+            target, base_sha = "a" * 40, "b" * 40
+            marker = review.emit_marker("review-cycle", {
+                "round_id": "2026-07-15-trusted", "cycle": 3,
+                "target_sha": target, "base_sha": base_sha,
+                "reviewers": ["macro-reviewer"],
+                "profile_fingerprint": "sha256:profile",
+            })
+            bundle = {
+                "bodies": [{"body": marker, "author": "owner",
+                            "at": "2026-07-15T00:00:00Z"}],
+                "reviews": [], "head": target, "base_sha": base_sha,
+                "state": "OPEN", "is_draft": False, "checks": [],
+                "base": "main", "merge_state": "CLEAN",
+            }
+            policy = common.normalize_config(yaml.safe_load((root / ".waystone.yml").read_text()))
+            context = {"repo": "owner/repo", "pr": 9, "bundle": bundle,
+                       "head": target, "base_sha": base_sha, "base": "main",
+                       "policy": policy}
+            with mock.patch.object(review, "pr_context", return_value=context), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(review.status(root, 9), 0)
+            sidecars = improve._round_review_sidecars(root / "docs" / "reviews")
+            self.assertIn("2026-07-15-trusted", sidecars)
+            rows = improve._project_review_rows("demo", root, policy)
+            row = next(item for item in rows if item["round_id"] == "2026-07-15-trusted")
+            self.assertEqual(row["review_cycle"], 3)
+            self.assertEqual(row["reviewers"], ["macro-reviewer"])
+            self.assertEqual(row["review_profile_fingerprint"], "sha256:profile")
+            self.assertEqual(row["review_binding_provenance"], "explicit")
+
+    def test_f5_apply_judgment_is_unresolved_until_applied_and_acceptance_uses_applied_transition(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _deleg_project(d)
+            _deleg_run(root, home, _deleg_fake({"impl.py": "x\n"}))
+            rec = _latest_rec(root, home)
+            _write_apply_verdict(rec)
+            verdict = _json.loads((rec / "artifact" / "verdict-1.json").read_text())
+            self.assertIn("judged_at", verdict)
+            self.assertNotIn("at", verdict)
+            index, errors = overlay._delegation_evidence_index(root)
+            self.assertEqual(errors, 0)
+            self.assertIs(index["feat/xyz"][0]["positive"], False)
+            self.assertEqual(index["feat/xyz"][0]["evidence_kind"],
+                             "unresolved-apply-judgment")
+            (root / "impl.py").write_text("live conflict\n")
+            with self.assertRaisesRegex(common.WorkflowError, "live tree has drifted"):
+                _run_with_home(home, lambda: delegate.apply_delegation(root, rec.name))
+            self.assertEqual(delegate._read_status(rec)["state"], "needs-review")
+            index, errors = overlay._delegation_evidence_index(root)
+            self.assertEqual(errors, 0)
+            self.assertIs(index["feat/xyz"][0]["positive"], False)
+            (root / "impl.py").unlink()
+            _run_with_home(home, lambda: delegate.apply_delegation(root, rec.name))
+            status = delegate._read_status(rec)
+            self.assertEqual(status["state"], "applied")
+            self.assertIsNotNone(common.parse_iso_timestamp(status["accepted_at"]))
+            index, errors = overlay._delegation_evidence_index(root)
+            self.assertEqual(errors, 0)
+            self.assertIs(index["feat/xyz"][0]["positive"], True)
+
+    def test_f5_discard_judgment_never_overrides_direct_round_close_acceptance(self):
+        task = {"status": "done", "round": "r1"}
+        delegations = [{"did": "d1", "acceptance": {
+            "event": "delegation-verdict", "judged_at": "2026-07-15T01:00:00Z",
+            "decision": "discard", "resolved": False, "provenance": "explicit",
+        }}]
+        exposures = {"r1": {
+            "round_id": "r1", "at": "2026-07-15T02:00:00Z", "_file": "round-r1.json",
+        }}
+        acceptance = improve._task_acceptance(task, delegations, exposures)
+        self.assertEqual(acceptance["event"], "round-close")
+        self.assertEqual(acceptance["accepted_at"], "2026-07-15T02:00:00Z")
+
     def test_fresh_missing_reviews_and_decisions_is_bootstrap_not_degraded(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d) / "repo"
@@ -12259,7 +12595,11 @@ class L3GapClosureAcceptanceTests(unittest.TestCase):
             "rule": "delegation-verification-evidence-v1", "status": "observing", "params": {},
         })
         self.assertNotIn("origin_delta_id", candidate)
-        self.assertEqual(candidate["id"], "delegation-verification-evidence")
+        self.assertRegex(candidate["id"], r"^delegation-verification-evidence-[0-9a-f]{12}$")
+        self.assertEqual(candidate, overlay._materialized_candidate(Path("/tmp/project"), {
+            "id": "verification_debt/local-name", "title": "changed display text",
+            "rule": "delegation-verification-evidence-v1", "status": "observing", "params": {},
+        }))
         self.assertNotIn("verification_debt/local-name", _json.dumps(candidate))
         self.assertEqual(candidate["summary"],
                          "Project policy for delegation verification evidence.")

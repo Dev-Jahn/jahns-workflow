@@ -666,29 +666,16 @@ def _registered_canonical_roots(root: Path) -> list[Path]:
     return roots
 
 
-def _exposure_observes_rule(root: Path, rule: str) -> bool:
-    paths = sorted(_exposure_dir(root).glob("*.json"))
-    delegations = project_state_path(root) / "delegations"
-    if delegations.is_dir():
-        paths.extend(sorted(delegations.glob("*/exposure.json")))
-    for path in paths:
-        try:
-            row = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            continue
-        composition = row.get("policy_composition") if isinstance(row, dict) else None
-        if not isinstance(composition, dict):
-            continue
-        if any(isinstance(policy, dict) and policy.get("rule") == rule
-               for policy in composition.get("effective") or []):
-            return True
-    return False
+def _policy_params_fingerprint(rule: str, params: dict) -> str:
+    return canonical_payload_hash({"rule": rule, "params": params})
 
 
-def _warnings_observe_rule(root: Path, rule: str) -> bool:
+def _warnings_observe_candidate(root: Path, delta: dict) -> bool:
     path = _warnings_path(root)
     if not path.is_file():
         return False
+    identity = {"layer": "project", "id": delta["id"]}
+    fingerprint = _policy_params_fingerprint(delta["rule"], dict(delta.get("params") or {}))
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeDecodeError):
@@ -698,23 +685,21 @@ def _warnings_observe_rule(root: Path, rule: str) -> bool:
             row = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if (isinstance(row, dict) and row.get("rule") == rule
-                and row.get("event") in ("evaluation", "fire")
+        if (isinstance(row, dict) and row.get("rule") == delta["rule"]
+                and row.get("event") == "evaluation"
+                and row.get("delta_status") in ACTIVE_STATUSES
+                and row.get("policy_identity") == identity
+                and row.get("origin_delta_id") == delta["id"]
+                and row.get("params_fingerprint") == fingerprint
                 and parse_iso_timestamp(row.get("at")) is not None):
             return True
     return False
 
 
-def _derived_observed_projects(root: Path, rule: str, *, require_registered: bool) -> list[str]:
-    try:
-        projects = _registered_canonical_roots(root)
-    except WorkflowError:
-        if require_registered:
-            raise
-        return []
+def _derived_observed_projects(root: Path, delta: dict) -> list[str]:
+    projects = _registered_canonical_roots(root)
     return sorted(str(project) for project in projects
-                  if _warnings_observe_rule(project, rule)
-                  or _exposure_observes_rule(project, rule))
+                  if _warnings_observe_candidate(project, delta))
 
 
 def _promote_user_locked(root: Path, delta_id: str) -> dict:
@@ -723,7 +708,7 @@ def _promote_user_locked(root: Path, delta_id: str) -> dict:
         raise WorkflowError(
             f"delta {delta_id} candidate_scope is {delta.get('candidate_scope')!r}; "
             "promote-user requires user_candidate")
-    projects = _derived_observed_projects(root, delta["rule"], require_registered=True)
+    projects = _derived_observed_projects(root, delta)
     if len(projects) < 2:
         raise WorkflowError(
             f"delta {delta_id} has evidence from {len(projects)} distinct project(s); "
@@ -1013,6 +998,16 @@ def compose_policy(root: Path, round_id: str | None = None) -> dict:
     local = _strict_delta_directory(_deltas_dir(root), layer="project", source_kind="overlay")
     committed = _load_project_policy(root)
     round_policies = _load_round_overrides(root, round_id)
+    identities: dict[tuple[str, str], dict] = {}
+    for policy in (*base, *user, *local, *committed, *round_policies):
+        identity = policy.get("identity")
+        key = (identity.get("layer"), identity.get("id")) if isinstance(identity, dict) else None
+        if key is None or not all(isinstance(value, str) and value for value in key):
+            raise WorkflowError("policy composition contains an invalid policy identity")
+        if key in identities:
+            raise WorkflowError(
+                f"duplicate policy identity {key[0]}:{key[1]} in policy composition")
+        identities[key] = policy
     conflicts: list[dict] = []
     shadowed: list[dict] = []
 
@@ -1079,6 +1074,8 @@ def compose_policy(root: Path, round_id: str | None = None) -> dict:
                 })
             effective_by_rule[policy["rule"]] = policy
 
+    if any(row["identity"] == row["shadowed_by"] for row in shadowed):
+        raise WorkflowError("policy composition produced a self-shadow identity")
     return {
         "schema": "waystone-policy-composition-1", "round_id": round_id,
         "layers": [
@@ -1157,8 +1154,12 @@ def _write_materialization_mapping(root: Path, delta: dict, candidate: dict) -> 
 def _materialized_candidate(root: Path, delta: dict) -> dict:
     del root
     summary = f"Project policy for {re.sub(r'-v[0-9]+$', '', delta['rule']).replace('-', ' ')}."
+    identity_hash = canonical_payload_hash({
+        "origin_delta_id": delta["id"], "rule": delta["rule"],
+        "params": dict(delta.get("params") or {}),
+    })
     return {
-        "id": _neutral_policy_id(delta["rule"]),
+        "id": f"{_neutral_policy_id(delta['rule'])}-{identity_hash[:12]}",
         "rule": delta["rule"], "stage": delta["status"],
         "params": dict(delta.get("params") or {}), "summary": summary,
     }
@@ -1282,10 +1283,9 @@ def add_delta(root: Path, delta_id: str, *, rule: str, summary: str, pointers=No
         "params": dict(RULES[rule].get("default_params") or {}),
         "scope": {"pslug": pslug, "root": str(Path(root).resolve())},
         "candidate_scope": candidate_scope,
-        # Derived only from registered canonical project roots with durable rule observations.
-        # `observed_in` remains an ignored compatibility argument so older library callers cannot
-        # forge the promotion gate while they migrate away from it.
-        "observed_in": _derived_observed_projects(root, rule, require_registered=False),
+        # A new composite identity cannot have prior observations. Promotion derives observed_in
+        # later from exact durable evaluation rows; the compatibility argument stays ignored.
+        "observed_in": [],
         "evidence": {"source": source, "rec_id": rec_id, "summary": summary,
                      "pointers": list(pointers or [])},
         "expected_effect": expected_effect,
@@ -1603,7 +1603,10 @@ def _emit(root: Path, boundary: str, policy: dict, rule: str, delta_status: str,
     """Append a warnings row; warning-stage fires and every policy conflict are visible on stderr."""
     identity = policy["identity"]
     row = {"at": _now_iso(), "boundary": boundary, "policy_identity": identity, "rule": rule,
-           "delta_status": delta_status, "event": event, "message": message, "context": context}
+           "delta_status": delta_status, "event": event, "message": message, "context": context,
+           "params_fingerprint": _policy_params_fingerprint(
+               rule, dict(policy.get("params") or {})),
+           "policy_source_kind": policy.get("source_kind")}
     if isinstance(policy.get("origin_delta_id"), str):
         row["origin_delta_id"] = policy["origin_delta_id"]
     _append_warning(root, row)
@@ -2045,6 +2048,9 @@ def _delegation_evidence_index(root: Path) -> tuple[dict[str, list[dict]], int]:
         evidence = {"delegation_id": record.name, "evaluable": True, "positive": False,
                     "evidence_kind": "no-apply-verdict", "coverage_reason": None}
         try:
+            status = json.loads((record / "status.json").read_text(encoding="utf-8"))
+            if not isinstance(status, dict) or not isinstance(status.get("state"), str):
+                raise WorkflowError("invalid delegation status")
             latest = delegate.latest_canonical_verdict(record)
             if latest is not None:
                 _path, verdict = latest
@@ -2060,10 +2066,14 @@ def _delegation_evidence_index(root: Path) -> tuple[dict[str, list[dict]], int]:
                     satisfied = (bool(verdict_criteria) and exact
                                  and all(item.get("met") is True and bool(item.get("evidence"))
                                          for item in verdict_criteria))
-                    evidence["positive"] = satisfied
+                    applied = status["state"] == "applied"
+                    evidence["positive"] = satisfied and applied
                     evidence["evidence_kind"] = (
-                        "satisfied-apply-verdict" if satisfied else "unmet-apply-verdict")
-        except (WorkflowError, KeyError, TypeError):
+                        "satisfied-apply-verdict" if satisfied and applied
+                        else "unresolved-apply-judgment" if not applied
+                        else "unmet-apply-verdict")
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError,
+                WorkflowError, KeyError, TypeError):
             evidence = {"delegation_id": record.name, "evaluable": False, "positive": False,
                         "coverage_reason": "delegation-evidence-invalid", "evaluation_errors": 1}
         index.setdefault(task_id, []).append(evidence)

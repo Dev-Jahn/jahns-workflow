@@ -947,22 +947,37 @@ def _round_session_binding(round_id: str, exposures: list[dict] | dict[str, dict
     return {"provenance": "unknown"}, "unknown", reason
 
 
-def _review_sha_binding(request_file: Path | None, round_id: str, mode: str,
-                        sidecars: list[dict]) -> tuple[str | None, str | None, str, str | None, str | None]:
+def _review_binding(request_file: Path | None, round_id: str, mode: str,
+                    sidecars: list[dict]) -> dict:
+    def result(target_sha=None, base_sha=None, provenance="unknown", reason=None, source=None,
+               *, cycle=None, reviewers=None, profile_fingerprint=None) -> dict:
+        return {
+            "target_sha": target_sha, "base_sha": base_sha,
+            "review_cycle": cycle, "reviewers": reviewers,
+            "review_profile_fingerprint": profile_fingerprint,
+            "review_binding_provenance": provenance,
+            "review_binding_reason": reason, "review_binding_source": source,
+        }
+
     if mode == "pr":
         pr_sidecars = [row for row in sidecars if row.get("mode") == "pr"]
         if not pr_sidecars:
-            return None, None, "unknown", "missing-pr-freeze-sidecar", None
+            return result(reason="missing-pr-freeze-sidecar")
         latest_cycle = max(row["cycle"] for row in pr_sidecars)
         cycle_rows = [row for row in pr_sidecars if row["cycle"] == latest_cycle]
-        bindings = {(row["target_sha"], row["base_sha"]) for row in cycle_rows}
+        bindings = {(
+            row["target_sha"], row["base_sha"], tuple(row["reviewers"]),
+            row.get("profile_fingerprint"), row["pr"],
+        ) for row in cycle_rows}
         if len(bindings) != 1:
-            return None, None, "unknown", "conflicting-pr-freeze-sidecars", None
+            return result(reason="conflicting-pr-freeze-sidecars")
         latest = max(cycle_rows, key=lambda row: (row["at"], row["_file"]))
-        return (latest["target_sha"], latest["base_sha"], "explicit", None,
-                "pr-freeze-sidecar")
+        return result(
+            latest["target_sha"], latest["base_sha"], "explicit", None,
+            "pr-freeze-sidecar", cycle=latest_cycle, reviewers=list(latest["reviewers"]),
+            profile_fingerprint=latest.get("profile_fingerprint"))
     if request_file is None:
-        return None, None, "unknown", "missing-review-request", None
+        return result(reason="missing-review-request")
     import review
 
     packet_binding = review.parse_packet_request_binding(request_file)
@@ -975,28 +990,44 @@ def _review_sha_binding(request_file: Path | None, round_id: str, mode: str,
 
         latest = max(sidecars, key=sidecar_order)
         if packet_binding is None:
-            return None, None, "unknown", "missing-structured-reviewing-line", None
+            return result(reason="missing-structured-reviewing-line")
         if packet_binding != (latest["target_sha"], latest.get("base_sha")):
-            return None, None, "unknown", "request-binding-sidecar-mismatch", None
-        return (latest["target_sha"], latest.get("base_sha"), "explicit", None,
-                "round-request-sidecar")
+            return result(reason="request-binding-sidecar-mismatch")
+        return result(
+            latest["target_sha"], latest.get("base_sha"), "explicit", None,
+            "round-request-sidecar", reviewers=list(latest.get("reviewers") or []))
     try:
         text = request_file.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
-        return None, None, "unknown", "unreadable-review-request", None
+        return result(reason="unreadable-review-request")
     valid = [marker for marker in review.parse_markers(text, "review-cycle")
              if review.marker_valid(marker)]
     markers = [marker for marker in valid if marker.get("round_id") == round_id]
     if not markers:
         reason = "round-mismatched-review-marker" if valid else "missing-valid-review-cycle-marker"
-        return None, None, "unknown", reason, None
+        return result(reason=reason)
     latest_cycle = max(marker["cycle"] for marker in markers)
     bindings = {(marker.get("target_sha"), marker.get("base_sha"))
                 for marker in markers if marker["cycle"] == latest_cycle}
     if len(bindings) != 1:
-        return None, None, "unknown", "conflicting-review-cycle-markers", None
+        return result(reason="conflicting-review-cycle-markers")
     target_sha, base_sha = next(iter(bindings))
-    return target_sha, base_sha, "explicit", None, "round-bound-request-marker"
+    latest = max((marker for marker in markers if marker["cycle"] == latest_cycle),
+                 key=lambda marker: marker.get("_at") or "")
+    return result(
+        target_sha, base_sha, "explicit", None, "round-bound-request-marker",
+        cycle=latest_cycle,
+        reviewers=list(latest["reviewers"]) if isinstance(latest.get("reviewers"), list) else None,
+        profile_fingerprint=latest.get("profile_fingerprint"))
+
+
+def _review_sha_binding(request_file: Path | None, round_id: str, mode: str,
+                        sidecars: list[dict]) -> tuple[str | None, str | None, str, str | None, str | None]:
+    """Compatibility projection for callers that only consume the historical SHA tuple."""
+    binding = _review_binding(request_file, round_id, mode, sidecars)
+    return tuple(binding[key] for key in (
+        "target_sha", "base_sha", "review_binding_provenance",
+        "review_binding_reason", "review_binding_source"))
 
 
 def _round_review_sidecars(rdir: Path) -> dict[str, list[dict]]:
@@ -1096,8 +1127,7 @@ def _project_review_rows(name: str, root: Path, cfg: dict) -> list[dict]:
             counts[f["severity"] if f["severity"] in SEVERITIES else "unknown"] += 1
         req = request_files.get(rid)
         mode = (cfg.get("review") or {}).get("mode", "packet")
-        target_sha, base_sha, review_provenance, review_reason, review_source = (
-            _review_sha_binding(req, rid, mode, request_sidecars.get(rid, [])))
+        review_binding = _review_binding(req, rid, mode, request_sidecars.get(rid, []))
         session_id, session_provenance, session_reason = _round_session_binding(
             rid, latest_round_exposures)
         rows.append({
@@ -1107,11 +1137,7 @@ def _project_review_rows(name: str, root: Path, cfg: dict) -> list[dict]:
             "round_at": (latest_round_exposures.get(rid) or {}).get("at"),
             "request_file": str(req) if req else None,
             "feedback_file": str(fb) if fb else None,
-            "target_sha": target_sha,
-            "base_sha": base_sha,
-            "review_binding_provenance": review_provenance,
-            "review_binding_reason": review_reason,
-            "review_binding_source": review_source,
+            **review_binding,
             "session_id": session_id,
             "round_session_provenance": session_provenance,
             "round_session_reason": session_reason,
@@ -1233,7 +1259,7 @@ def _load_record_mapping(path: Path, kind: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def _latest_verdict_acceptance(record: Path) -> tuple[dict | None, int]:
+def _latest_verdict_judgment(record: Path) -> tuple[dict | None, int]:
     import delegate
 
     try:
@@ -1244,10 +1270,32 @@ def _latest_verdict_acceptance(record: Path) -> tuple[dict | None, int]:
         return None, 0
     _path, verdict = latest
     return {
-        "event": "delegation-verdict", "at": verdict["at"],
-        "decision": verdict["decision"], "resolved": verdict["decision"] == "apply",
+        "event": "delegation-verdict", "judged_at": verdict["judged_at"],
+        "decision": verdict["decision"],
         "decided_by": verdict["decided_by"], "provenance": "explicit",
     }, 0
+
+
+def _delegation_acceptance(status: dict, judgment: dict | None) -> dict | None:
+    accepted_at = status.get("accepted_at")
+    if (status.get("state") != "applied" or judgment is None
+            or judgment.get("decision") != "apply"
+            or parse_iso_timestamp(accepted_at) is None):
+        return None
+    return {
+        "event": "delegation-apply", "accepted_at": accepted_at,
+        "judged_at": judgment["judged_at"], "decision": "apply", "resolved": True,
+        "decided_by": judgment["decided_by"], "provenance": "explicit",
+    }
+
+
+def _latest_verdict_acceptance(record: Path) -> tuple[dict | None, int]:
+    """Compatibility helper: only an applied transition can project acceptance."""
+    judgment, skipped = _latest_verdict_judgment(record)
+    if skipped:
+        return None, skipped
+    status = _load_record_mapping(Path(record) / "status.json", "json")
+    return (_delegation_acceptance(status or {}, judgment), 0)
 
 
 def _verification_run_projection(record: Path) -> tuple[list[dict], int]:
@@ -1293,7 +1341,7 @@ def _project_delegation_rows(root: Path) -> tuple[list[dict], int, int, int]:
             skipped += 1
             continue
         report = (contract or {}).get("delegate_report") or {}
-        acceptance, verdict_skipped = _latest_verdict_acceptance(record)
+        judgment, verdict_skipped = _latest_verdict_judgment(record)
         verdicts_invalid += verdict_skipped
         verification_runs, verify_skipped = _verification_run_projection(record)
         verification_artifacts_invalid += verify_skipped
@@ -1308,6 +1356,13 @@ def _project_delegation_rows(root: Path) -> tuple[list[dict], int, int, int]:
         }
         if verification_runs:
             row["verification_runs"] = verification_runs
+        if judgment is not None:
+            judgment["resolved"] = (
+                judgment["decision"] == "discard"
+                or (status.get("state") == "applied" and parse_iso_timestamp(
+                    status.get("accepted_at")) is not None))
+            row["judgment"] = judgment
+        acceptance = _delegation_acceptance(status, judgment)
         if acceptance is not None:
             row["acceptance"] = acceptance
         rows.append(row)
@@ -1365,6 +1420,8 @@ def _load_warning_rows(root: Path) -> tuple[list[dict], int, bool]:
             "at": row["at"], "boundary": row["boundary"], "rule": row["rule"],
             "event": row["event"], "policy_identity": identity,
             "origin_delta_id": row.get("origin_delta_id"),
+            "params_fingerprint": row.get("params_fingerprint"),
+            "policy_source_kind": row.get("policy_source_kind"),
             "delta_status": row.get("delta_status"),
             "context": row.get("context") if isinstance(row.get("context"), dict) else {},
             "source_pointer": f"{path}:{line_number}",
@@ -1950,21 +2007,25 @@ def _round_exposure_projection(task: dict, exposures: list[dict] | dict[str, dic
 
 def _task_acceptance(task: dict, delegations: list[dict],
                      exposures: list[dict] | dict[str, dict]) -> dict:
-    # Event-kind authority, not wall-clock order: main's canonical delegation verdict is the final
-    # acceptance event (§17-1). A later re-close cannot compete with it.
-    verdicts = [dict(delegation["acceptance"], delegation_id=delegation["did"])
-                for delegation in delegations if isinstance(delegation.get("acceptance"), dict)]
-    if verdicts:
-        return max(verdicts, key=lambda row: (row["at"], row.get("delegation_id") or ""))
+    applied = [dict(delegation["acceptance"], delegation_id=delegation["did"])
+               for delegation in delegations
+               if isinstance(delegation.get("acceptance"), dict)
+               and delegation["acceptance"].get("event") == "delegation-apply"
+               and delegation["acceptance"].get("resolved") is True
+               and parse_iso_timestamp(delegation["acceptance"].get("accepted_at")) is not None]
+    if applied:
+        return max(applied, key=lambda row: (
+            row["accepted_at"], row.get("delegation_id") or ""))
     latest = exposures if isinstance(exposures, dict) else _latest_round_exposures(exposures)
     exposure = latest.get(task.get("round"))
     if task.get("status") in ("done", "dropped") and exposure is not None:
         return {
-            "event": "round-close", "at": exposure["at"], "resolved": True,
+            "event": "round-close", "accepted_at": exposure["at"], "resolved": True,
             "round_id": exposure["round_id"], "provenance": "explicit",
         }
     return {
-        "event": None, "at": None, "resolved": task.get("status") in ("done", "dropped"),
+        "event": None, "accepted_at": None,
+        "resolved": task.get("status") in ("done", "dropped"),
         "provenance": "current-task-state-approximation",
     }
 
@@ -3319,7 +3380,7 @@ def _quality_metrics(reviews: list[dict] | None,
         baselines: list[tuple[str, object, str]] = []
         for row in _evidence_task_rows(evidence):
             acceptance = row.get("acceptance") or {}
-            accepted_at = parse_iso_timestamp(acceptance.get("at"))
+            accepted_at = parse_iso_timestamp(acceptance.get("accepted_at"))
             if (acceptance.get("provenance") != "explicit"
                     or acceptance.get("resolved") is not True or accepted_at is None):
                 if acceptance.get("resolved") is True:

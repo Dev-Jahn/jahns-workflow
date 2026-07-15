@@ -664,6 +664,8 @@ def _set_state(record_dir: Path, state: str, *, env: dict | None = None, error: 
         transition["overrides"] = overrides
     st.setdefault("at_transitions", []).append(transition)
     st["state"] = state
+    if state == "applied":
+        st["accepted_at"] = transition["at"]
     if env is not None:
         st["env"] = env
     if error is not None:
@@ -791,6 +793,23 @@ def _diff_patch(cwd: Path, base: str, result: str) -> bytes:
     if p.returncode != 0:
         raise WorkflowError(f"git diff failed: {p.stderr.decode('utf-8', 'replace').strip()}")
     return p.stdout
+
+
+def _sha256_bytes(content: bytes) -> str:
+    return "sha256:" + hashlib.sha256(content).hexdigest()
+
+
+def _artifact_bytes(path: Path, label: str) -> bytes:
+    if path.is_symlink() or not path.is_file():
+        raise WorkflowError(f"{label} must be a regular file: {path}")
+    try:
+        return path.read_bytes()
+    except OSError as e:
+        raise WorkflowError(f"cannot read {label} {path}: {e}") from e
+
+
+def _artifact_digest(path: Path, label: str) -> str:
+    return _sha256_bytes(_artifact_bytes(path, label))
 
 
 def _active_overlays(root: Path, composition: dict | None = None) -> list[dict]:
@@ -995,6 +1014,7 @@ def _run_claimed(root: Path, plan: dict, did: str, record_dir: Path) -> int:
             "base_sha": base_sha, "result_sha": result_sha,
             "changed_files": changed,
             "patch_file": "changes.patch" if not empty else None,
+            "patch_sha256": _sha256_bytes(patch) if not empty else None,
             "empty": empty,
             "delegate_report": report,
             "env": env_rec,
@@ -1246,7 +1266,13 @@ def _validate_verify_contract(rec: Path, contract: dict, exposure: dict) -> Path
     if contract["base_sha"] != snapshot_sha:
         raise WorkflowError(
             "delegation contract field base_sha does not match exposure field base.snapshot_sha")
+    if "patch_sha256" not in contract:
+        raise WorkflowError(
+            "delegation is a pre-digest record; apply is forbidden and only discard is allowed")
     if contract["empty"]:
+        if contract.get("patch_file") is not None or contract["patch_sha256"] is not None:
+            raise WorkflowError(
+                "empty delegation contract must have null patch_file and patch_sha256")
         return None
     patch_name = contract.get("patch_file")
     if (not isinstance(patch_name, str) or not patch_name
@@ -1257,6 +1283,12 @@ def _validate_verify_contract(rec: Path, contract: dict, exposure: dict) -> Path
     if not patch.is_file():
         raise WorkflowError(
             f"delegation contract field patch_file does not exist when empty is false: {patch}")
+    patch_digest = contract.get("patch_sha256")
+    if not isinstance(patch_digest, str) or re.fullmatch(
+            r"sha256:[0-9a-f]{64}", patch_digest) is None:
+        raise WorkflowError("delegation contract field patch_sha256 must be a sha256 digest")
+    if _artifact_digest(patch, "delegation patch") != patch_digest:
+        raise WorkflowError("delegation patch digest does not match contract patch_sha256")
     return patch
 
 
@@ -1273,6 +1305,18 @@ def _normalize_verify_worktree(worktree: Path, contract: dict, patch: Path | Non
         if rc != 0:
             raise WorkflowError(
                 f"verify worktree normalization failed at git apply: {err or out or f'rc {rc}'}")
+    tmpdir = tempfile.mkdtemp(prefix="waystone-verify-tree-")
+    try:
+        env = {"GIT_INDEX_FILE": str(Path(tmpdir) / "index")}
+        _git_out(worktree, "read-tree", "HEAD", env=env)
+        _git_out(worktree, "add", "-A", "--", ".", ":(exclude).waystone-uv-cache", env=env)
+        actual_tree = _git_out(worktree, "write-tree", env=env)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    expected_tree = _git_out(worktree, "rev-parse", f"{contract['result_sha']}^{{tree}}")
+    if actual_tree != expected_tree:
+        raise WorkflowError(
+            "verify worktree normalization result does not match contract result_sha")
 
 
 def _verify_focus(rec: Path, contract: dict) -> str:
@@ -1508,8 +1552,8 @@ def _validate_verdict_fields(verdict: dict, *, stored: bool) -> None:
         elif item.get("gate") not in (None, "blocker"):
             raise WorkflowError(f"verdict overrides[{index}].gate must be blocker")
     if stored:
-        if not isinstance(verdict.get("at"), str) or not verdict["at"].strip():
-            raise WorkflowError("stored verdict at must be non-empty")
+        if not isinstance(verdict.get("judged_at"), str) or not verdict["judged_at"].strip():
+            raise WorkflowError("stored verdict judged_at must be non-empty")
         if verdict.get("provenance") != "main-session":
             raise WorkflowError("stored verdict provenance must be main-session")
         verify_number = verdict.get("verify_number")
@@ -1518,6 +1562,17 @@ def _validate_verdict_fields(verdict: dict, *, stored: bool) -> None:
         fingerprint = verdict.get("profile_fingerprint")
         if fingerprint is not None and not isinstance(fingerprint, str):
             raise WorkflowError("stored verdict profile_fingerprint must be string|null")
+        digests = verdict.get("artifact_digests")
+        if not isinstance(digests, dict) or set(digests) != {
+                "contract_sha256", "patch_sha256", "verify_sha256"}:
+            raise WorkflowError(
+                "stored verdict artifact_digests must contain contract, patch, and verify digests")
+        for field in ("contract_sha256", "patch_sha256", "verify_sha256"):
+            value = digests[field]
+            if value is not None and (not isinstance(value, str)
+                                      or re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None):
+                raise WorkflowError(
+                    f"stored verdict artifact_digests.{field} must be a sha256 digest or null")
 
 
 def _validate_verdict_input(verdict: dict) -> None:
@@ -1557,7 +1612,8 @@ def _validate_verify_artifact(path: Path, artifact: dict) -> None:
 
     required = {
         "schema", "at", "transport", "backend", "provenance", "payload",
-        "profile_fingerprint", "base_sha", "result_sha", "effective_tool_policy",
+        "profile_fingerprint", "base_sha", "result_sha", "patch_sha256",
+        "effective_tool_policy",
     }
     if set(artifact) != required:
         invalid("envelope fields do not match waystone-verify-1")
@@ -1575,6 +1631,10 @@ def _validate_verify_artifact(path: Path, artifact: dict) -> None:
         if not isinstance(artifact.get(field), str) or re.fullmatch(
                 r"[0-9a-fA-F]{40}", artifact[field]) is None:
             invalid(f"{field} must be a 40-hex sha")
+    patch_digest = artifact.get("patch_sha256")
+    if patch_digest is not None and (not isinstance(patch_digest, str)
+                                     or re.fullmatch(r"sha256:[0-9a-f]{64}", patch_digest) is None):
+        invalid("patch_sha256 must be a sha256 digest or null")
     policy = artifact.get("effective_tool_policy")
     if not isinstance(policy, dict) or not policy:
         invalid("effective_tool_policy must be a non-empty object")
@@ -1653,6 +1713,14 @@ def _verdict_gate_context(rec: Path, did: str, verdict: dict) -> dict:
     verify_artifacts = _verify_artifacts(rec)
     verify_number = max(verify_artifacts) if verify_artifacts else None
     verify_artifact = verify_artifacts.get(verify_number) if verify_number is not None else None
+    contract = _load_contract(rec)
+    exposure = _load_exposure(rec)
+    _validate_verify_contract(rec, contract, exposure)
+    if verify_artifact is not None and any(
+            verify_artifact[field] != contract[field]
+            for field in ("base_sha", "result_sha", "patch_sha256")):
+        raise WorkflowError(
+            "latest verify artifact base/result/patch digest does not match the delegation contract")
     if verification_required and verify_artifact is None:
         raise WorkflowError(
             "verdict requires at least one verify-N.json because the run recorded verification_required")
@@ -1670,6 +1738,7 @@ def _verdict_gate_context(rec: Path, did: str, verdict: dict) -> dict:
         "verification_required": verification_required,
         "verify_artifacts": verify_artifacts,
         "verify_number": verify_number,
+        "contract": contract,
         "blockers": blockers,
     }
 
@@ -1737,6 +1806,98 @@ def _write_verdict_artifact(rec: Path, verdict: dict) -> Path:
             n = _artifact_number(paths[-1], "verdict") + 1 if paths else 1
         except OSError as e:
             raise _RefusedWrite(f"cannot write verdict artifact {out}: {e}") from e
+
+
+def _current_artifact_digests(rec: Path, contract: dict, verify_number: int | None) -> dict:
+    patch_digest = None
+    if contract.get("empty") is False:
+        patch_digest = _artifact_digest(
+            rec / "artifact" / str(contract.get("patch_file")), "delegation patch")
+    verify_digest = None
+    if verify_number is not None:
+        verify_digest = _artifact_digest(
+            rec / "artifact" / f"verify-{verify_number}.json", "verify artifact")
+    return {
+        "contract_sha256": _artifact_digest(
+            rec / "artifact" / "contract.yaml", "delegation contract"),
+        "patch_sha256": patch_digest,
+        "verify_sha256": verify_digest,
+    }
+
+
+def _assert_digest_record(rec: Path) -> None:
+    contract = _load_contract(rec)
+    if "patch_sha256" not in contract:
+        raise WorkflowError(
+            "delegation is a pre-digest record; apply is forbidden and only discard is allowed")
+    verdict_paths = _verdict_paths(rec)
+    if verdict_paths:
+        raw = _load_json_object(verdict_paths[-1], "verdict artifact")
+        if "artifact_digests" not in raw or "judged_at" not in raw:
+            raise WorkflowError(
+                "delegation is a pre-digest record; apply is forbidden and only discard is allowed")
+
+
+def _revalidate_apply_digest_chain(rec: Path, verdict: dict) -> tuple[dict, bytes]:
+    contract_path = rec / "artifact" / "contract.yaml"
+    contract_bytes = _artifact_bytes(contract_path, "delegation contract")
+    try:
+        contract = yaml.safe_load(contract_bytes)
+    except yaml.YAMLError as e:
+        raise WorkflowError(f"corrupt contract.yaml in delegation record: {contract_path} ({e})")
+    if not isinstance(contract, dict):
+        raise WorkflowError(f"corrupt contract.yaml in delegation record: {contract_path}")
+    if "patch_sha256" not in contract:
+        raise WorkflowError(
+            "delegation is a pre-digest record; apply is forbidden and only discard is allowed")
+    digests = verdict["artifact_digests"]
+    if _sha256_bytes(contract_bytes) != digests["contract_sha256"]:
+        raise WorkflowError("delegation contract digest changed after verdict")
+    patch_path = _validate_verify_contract(rec, contract, _load_exposure(rec))
+    patch_bytes = b"" if patch_path is None else _artifact_bytes(patch_path, "delegation patch")
+    current_patch_digest = None if patch_path is None else _sha256_bytes(patch_bytes)
+    if current_patch_digest != digests["patch_sha256"]:
+        raise WorkflowError("delegation patch digest changed after verdict")
+
+    verify_paths = _verify_paths(rec)
+    latest_verify = _artifact_number(verify_paths[-1], "verify") if verify_paths else None
+    if latest_verify != verdict["verify_number"]:
+        raise WorkflowError(
+            "verify artifact set changed after verdict; record a new verdict")
+    if latest_verify is None:
+        if digests["verify_sha256"] is not None:
+            raise WorkflowError("verdict verify digest is inconsistent with no verify artifact")
+    else:
+        verify_path = rec / "artifact" / f"verify-{latest_verify}.json"
+        verify_bytes = _artifact_bytes(verify_path, "verify artifact")
+        if _sha256_bytes(verify_bytes) != digests["verify_sha256"]:
+            raise WorkflowError("verify artifact digest changed after verdict")
+        try:
+            verify_artifact = json.loads(verify_bytes)
+        except json.JSONDecodeError as e:
+            raise WorkflowError(f"cannot read verify artifact {verify_path}: {e}") from e
+        if not isinstance(verify_artifact, dict):
+            raise WorkflowError(f"verify artifact must be a JSON object: {verify_path}")
+        _validate_verify_artifact(verify_path, verify_artifact)
+        if any(verify_artifact[field] != contract[field]
+               for field in ("base_sha", "result_sha", "patch_sha256")):
+            raise WorkflowError(
+                "verify artifact base/result/patch digest does not match the delegation contract")
+    return contract, patch_bytes
+
+
+def _git_apply_bytes(root: Path, patch: bytes) -> tuple[int, str, str]:
+    try:
+        process = subprocess.run(
+            ["git", "-C", str(root), "apply", "-"], input=patch,
+            capture_output=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 127, "", str(e)
+    return (
+        process.returncode,
+        process.stdout.decode("utf-8", "replace").strip(),
+        process.stderr.decode("utf-8", "replace").strip(),
+    )
 
 
 def _blocker_overrides(input_overrides: list[dict], blockers: list[tuple[int, dict]],
@@ -1812,10 +1973,12 @@ def record_verdict(root: Path, did: str, input_path: Path, *,
         raise WorkflowError("verdict overrides[] is only valid with --override-blocker")
 
     _load_exposure(rec)  # verdict remains bound to a complete delegation record
-    verdict["at"] = _now_iso()
+    verdict["judged_at"] = _now_iso()
     verdict["provenance"] = "main-session"
     verdict["verify_number"] = verify_number
     verdict["profile_fingerprint"] = current_fingerprint
+    verdict["artifact_digests"] = _current_artifact_digests(
+        rec, context["contract"], verify_number)
     if recorded_overrides:
         verdict["overrides"] = recorded_overrides
     _validate_verdict_gates(rec, did, verdict)
@@ -1886,6 +2049,7 @@ def verify_delegation(root: Path, did: str) -> int:
         "provenance": "independent-verifier", "payload": payload,
         "profile_fingerprint": fingerprint,
         "base_sha": contract["base_sha"], "result_sha": contract["result_sha"],
+        "patch_sha256": contract["patch_sha256"],
         "effective_tool_policy": _effective_verifier_tool_policy(binding),
     }
     _validate_verify_artifact(rec / "artifact" / "verify-pending.json", artifact)
@@ -1958,7 +2122,7 @@ def _latest_verdict(rec: Path) -> dict | None:
     return latest[1] if latest is not None else None
 
 
-def apply_delegation(root: Path, did: str, override_no_verdict_reason: str | None = None) -> int:
+def apply_delegation(root: Path, did: str) -> int:
     """Accept a delegation onto the live tree with plain `git apply` (§12/R2 — not 3-way). An empty
     patch is a no-op success. On drift the apply fails atomically (no partial write) and state stays
     needs-review; the raw git rc never leaks (exit 1)."""
@@ -1967,18 +2131,13 @@ def apply_delegation(root: Path, did: str, override_no_verdict_reason: str | Non
     state = _read_status(rec).get("state")
     if state != "needs-review":
         raise WorkflowError(f"delegation {did} is {state} — only a needs-review delegation can be applied")
+    _assert_digest_record(rec)
     verdict = _latest_verdict(rec)
     if verdict is None:
-        if override_no_verdict_reason is None:
-            raise WorkflowError("no verdict recorded — run 'waystone delegate verdict' first")
-        if not override_no_verdict_reason.strip():
-            raise WorkflowError("--override-no-verdict --reason must be non-empty")
-    else:
-        _validate_verdict_gates(rec, did, verdict)
-        if verdict["decision"] != "apply":
-            raise WorkflowError(f"latest verdict decision is {verdict['decision']} — refusing apply")
-        if override_no_verdict_reason is not None:
-            raise WorkflowError("--override-no-verdict is only valid when no verdict exists")
+        raise WorkflowError("no verdict recorded — run 'waystone delegate verdict' first")
+    _validate_verdict_gates(rec, did, verdict)
+    if verdict["decision"] != "apply":
+        raise WorkflowError(f"latest verdict decision is {verdict['decision']} — refusing apply")
     contract = _load_contract(rec)
     packet = _load_packet(rec)
     boundary_context = {"delegation_id": did, "task_id": contract.get("task_id")}
@@ -1986,17 +2145,15 @@ def apply_delegation(root: Path, did: str, override_no_verdict_reason: str | Non
     if isinstance(packet_round, str):
         boundary_context["round_id"] = packet_round
     _warn_boundary(root, "delegate-apply", boundary_context)
+    contract, patch_bytes = _revalidate_apply_digest_chain(rec, verdict)
     if not contract.get("empty"):
-        rc, out, err = _git(root, "apply", str(rec / "artifact" / "changes.patch"))
+        rc, out, err = _git_apply_bytes(root, patch_bytes)
         if rc != 0:
             raise WorkflowError(
                 f"cannot apply {did}: live tree has drifted from the delegation base — commit/stash "
                 f"your changes and retry, or resolve the patch manually\n{err or out}")
     _cleanup(root, did, preserve_refs=True)
-    if override_no_verdict_reason is None:
-        _set_state(rec, "applied")
-    else:
-        _set_state(rec, "applied", reason=override_no_verdict_reason, overrides=["no-verdict"])
+    _set_state(rec, "applied")
     print(f"applied {did}" + (" (empty patch — no-op)" if contract.get("empty") else ""))
     return 0
 
@@ -2207,22 +2364,16 @@ def _cli_show(rest: list[str]) -> int:
 
 
 def _cli_apply(rest: list[str]) -> int:
-    pos, opts = _parse_opts(
-        rest, value=("root", "reason"), boolean=("override-no-verdict",))
+    pos, opts = _parse_opts(rest, value=("root",))
     if not pos:
         raise WorkflowError("apply requires a <delegation-id>")
-    if opts.get("override-no-verdict") and not opts.get("reason"):
-        raise WorkflowError("--override-no-verdict requires --reason")
-    if opts.get("reason") and not opts.get("override-no-verdict"):
-        raise WorkflowError("apply --reason is only valid with --override-no-verdict")
     root = _resolve_root(opts.get("root"))
     # Required nested order: registry -> project -> record. Apply mutates the live tree, so it must
     # serialize with round close/task mutations for the whole record check -> git apply -> state span.
     with hold_lock(project_lock_path(root)):
         rec = _load_delegation(root, pos[0])
         with hold_lock(rec / "record.lock"):
-            return apply_delegation(
-                root, pos[0], opts.get("reason") if opts.get("override-no-verdict") else None)
+            return apply_delegation(root, pos[0])
 
 
 def _cli_discard(rest: list[str]) -> int:
