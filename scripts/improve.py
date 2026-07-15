@@ -8,6 +8,7 @@
   waystone improve trace   [--source DIR]... [--project SLUG]... [--out DIR] [--user-wide]
   waystone improve reviews [--out DIR] [--user-wide]
   waystone improve audit   [--in DIR] [--user-wide]
+  waystone improve metrics [--in DIR] [--user-wide]
   waystone improve decide  <rec-id> accept|reject [--title T] [--note N] [--out DIR] [--user-wide]
 
 `trace` walks each source (default `$CLAUDE_CONFIG_DIR/projects`, else `~/.claude/projects`),
@@ -29,9 +30,13 @@ re-implements review ingest) into --out:
   facts.json            versioned lenses, each carrying rule id + provenance + <=5 evidence pointers;
                         missing inputs are reported in `skipped_lenses`.
 
+`metrics` aggregates the audit projections into the four design §15 metric groups, appends a
+timestamped longitudinal snapshot, and adds at most five aggregate/pointer facts to `facts.json`:
+  metrics.jsonl         named metrics with denominator, coverage, provenance, first-measured version,
+                        and a factual comparison with the previous same-scope snapshot.
+
 `decide` appends the user's accept/reject on one recommendation to an append-only log (out dir default
-= trace's --out); it is the only `improve` output that carries a timestamp (a user-action log, not a
-derived projection):
+= trace's --out); `decide` and longitudinal `metrics` are the timestamped improve outputs:
   decisions.jsonl       {rec_id, decision, at (ISO-8601), title?, note?} per line; re-decisions append
                         (history preserved, latest row for a rec_id wins). rec_id must be
                         <lens>/<kebab-gist>.
@@ -45,6 +50,7 @@ is never stored; only bounded 120-char `head` snippets for evidence pointers.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -1072,6 +1078,7 @@ def _project_review_rows(name: str, root: Path, cfg: dict) -> list[dict]:
             "project": name,
             "root": str(root),
             "round_id": rid,
+            "round_at": (latest_round_exposures.get(rid) or {}).get("at"),
             "request_file": str(req) if req else None,
             "feedback_file": str(fb) if fb else None,
             "target_sha": target_sha,
@@ -2908,6 +2915,697 @@ def run_audit(in_dir: Path, lens_scope: str | None = None,
     return facts
 
 
+# ================================================================== metrics (§15)
+# Metrics are deterministic over the projection bytes. The append timestamp records the measurement
+# event; `now` is injectable so the complete snapshot is reproducible in tests. Comparisons are
+# factual numeric differences only and never interpreted as policy effects (§7 / §17-5).
+_METRIC_INPUTS = {
+    "sessions": ("sessions.jsonl", "jsonl"),
+    "delegations": ("delegations.jsonl", "jsonl"),
+    "parse_coverage": ("parse_coverage.json", "json-object"),
+    "reviews": ("reviews.jsonl", "jsonl"),
+    "reviews_coverage": ("reviews_coverage.json", "json-object"),
+    "evidence": ("evidence.jsonl", "jsonl"),
+    "warnings": ("evidence_warnings.jsonl", "jsonl"),
+    "adaptive_feedback": ("adaptive_feedback.json", "json"),
+    "decisions": ("decisions.jsonl", "jsonl"),
+}
+
+_METRIC_FIRST_MEASURED = {
+    "quality.finding_recurrence_rate": "0.8.0",
+    "quality.reopen_count": "0.8.0",
+    "quality.remediation_round_burden": "0.8.0",
+    "quality.post_acceptance_defect_rate": "0.8.0",
+    "delegation_effectiveness.completion_rate": "0.7.0",
+    "delegation_effectiveness.useful_artifact_rate": "0.8.0",
+    "delegation_effectiveness.adaptive_before_after_trend": "0.8.0",
+    "delegation_effectiveness.opportunity_adjusted_useful_artifact_rate": "0.8.0",
+    "reproducibility_environment.environment_failure_rate": "0.8.0",
+    "reproducibility_environment.ad_hoc_manifest_mutation_fire_rate": "0.8.0",
+    "reproducibility_environment.acceptance_reproducibility": "0.8.0",
+    "governance.guard_fire_rate": "0.8.0",
+    "governance.guard_conflict_count": "0.8.0",
+    "governance.decision_acceptance_rate": "0.7.0",
+    "governance.decision_rejection_rate": "0.7.0",
+    "governance.rejected_materialization_suppression_rate": "0.8.0",
+    "governance.waiver_rate": "0.9.0",
+    "governance.hard_block_rate": "0.9.0",
+}
+
+
+def _metric_record(key: str, value, numerator, denominator, coverage: dict,
+                   provenance: str, unavailable_reason: str | None = None) -> dict:
+    record = {
+        "value": value,
+        "numerator": numerator,
+        "denominator": denominator,
+        "coverage": coverage,
+        "provenance": provenance,
+        "first_measured_version": _METRIC_FIRST_MEASURED[key],
+    }
+    if unavailable_reason is not None:
+        record["unavailable_reason"] = unavailable_reason
+    return record
+
+
+def _unavailable_metric(key: str, reason: str, coverage: dict,
+                        *, numerator=None, denominator=None) -> dict:
+    return _metric_record(
+        key, None, numerator, denominator, coverage, "unavailable", reason)
+
+
+def _rate_metric(key: str, numerator: int, denominator: int, coverage: dict,
+                 provenance: str, empty_reason: str) -> dict:
+    if denominator <= 0:
+        return _unavailable_metric(
+            key, empty_reason, coverage, numerator=numerator, denominator=denominator)
+    return _metric_record(
+        key, _ratio(numerator, denominator), numerator, denominator, coverage, provenance)
+
+
+def _load_metric_inputs(in_dir: Path) -> tuple[dict[str, object], dict[str, dict], str]:
+    data: dict[str, object] = {}
+    coverage: dict[str, dict] = {}
+    fingerprint = hashlib.sha256()
+    for key, (filename, kind) in sorted(_METRIC_INPUTS.items()):
+        path = in_dir / filename
+        fingerprint.update(filename.encode("utf-8") + b"\0")
+        if not path.is_file():
+            fingerprint.update(b"<missing>\0")
+            coverage[filename] = {"present": False, "valid": False, "rows": 0}
+            continue
+        try:
+            raw = path.read_bytes()
+            fingerprint.update(raw + b"\0")
+            loaded = (json.loads(raw) if kind in ("json", "json-object") else [
+                json.loads(line) for line in raw.decode("utf-8").splitlines() if line.strip()
+            ])
+            expected_type = dict if kind == "json-object" else list
+            if not isinstance(loaded, expected_type):
+                raise ValueError("metric input has the wrong shape")
+            data[key] = loaded
+            coverage[filename] = {
+                "present": True, "valid": True,
+                "rows": len(loaded) if isinstance(loaded, list) else 1,
+            }
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            coverage[filename] = {"present": True, "valid": False, "rows": 0}
+    return data, coverage, fingerprint.hexdigest()
+
+
+def _load_metric_decisions(path: Path) -> tuple[list[dict], dict]:
+    if not path.is_file():
+        return [], {"present": False, "valid": False, "rows": 0, "rows_skipped": 0}
+    rows: list[dict] = []
+    skipped = 0
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return [], {"present": True, "valid": False, "rows": 0, "rows_skipped": 1}
+    for line_number, line in enumerate(lines, 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            skipped += 1
+            continue
+        if (not isinstance(row, dict) or not isinstance(row.get("rec_id"), str)
+                or row.get("decision") not in ("accept", "reject")
+                or parse_iso_timestamp(row.get("at")) is None):
+            skipped += 1
+            continue
+        rows.append({**row, "_line": line_number})
+    rows.sort(key=lambda row: (
+        parse_iso_timestamp(row["at"]), row["rec_id"], row["_line"]))
+    return rows, {
+        "present": True, "valid": True, "rows": len(rows), "rows_skipped": skipped,
+    }
+
+
+def _quality_metrics(reviews: list[dict] | None,
+                     evidence: list[dict] | None) -> dict[str, dict]:
+    group = "quality"
+    if reviews is None:
+        missing = {"reviews.jsonl": "missing-or-invalid"}
+        return {
+            name: _unavailable_metric(f"{group}.{name}", "reviews projection unavailable", missing)
+            for name in ("finding_recurrence_rate", "reopen_count",
+                         "remediation_round_burden", "post_acceptance_defect_rate")
+        }
+
+    type_rounds: dict[tuple[str, str], set[str]] = {}
+    total_findings = verified_typed = unknown_type = non_real = 0
+    reopen_by_task: dict[tuple[str, str], int] = {}
+    remediation_by_task: dict[tuple[str, str], set[str]] = {}
+    review_events: list[tuple[str, object, str]] = []
+    review_rounds_with_time = review_rounds_without_time = 0
+    for review_row in reviews:
+        if not isinstance(review_row, dict):
+            continue
+        project = str(review_row.get("project") or "")
+        round_id = review_row.get("round_id")
+        round_at = parse_iso_timestamp(review_row.get("round_at"))
+        if round_at is None:
+            review_rounds_without_time += 1
+        else:
+            review_rounds_with_time += 1
+        for finding in review_row.get("findings") or []:
+            if not isinstance(finding, dict):
+                continue
+            total_findings += 1
+            finding_type = finding.get("type")
+            if finding.get("status") == "REAL" and finding_type in FINDING_TYPES:
+                verified_typed += 1
+                if isinstance(round_id, str):
+                    type_rounds.setdefault((project, finding_type), set()).add(round_id)
+                if round_at is not None:
+                    review_events.append((project, round_at, finding_type))
+            elif finding.get("status") == "REAL":
+                unknown_type += 1
+            else:
+                non_real += 1
+            task_id = (finding.get("id") if finding.get("source") == "task"
+                       else finding.get("task_id"))
+            if not isinstance(task_id, str) or not task_id:
+                continue
+            task_key = (project, task_id)
+            reopen_count = finding.get("reopen_count")
+            if type(reopen_count) is int and reopen_count >= 0:
+                reopen_by_task[task_key] = max(reopen_by_task.get(task_key, 0), reopen_count)
+            fixing_rounds = finding.get("fixing_rounds")
+            if isinstance(fixing_rounds, list) and all(
+                    isinstance(value, str) for value in fixing_rounds):
+                remediation_by_task.setdefault(task_key, set()).update(fixing_rounds)
+
+    type_round_observations = sum(len(rounds) for rounds in type_rounds.values())
+    recurrences = sum(max(len(rounds) - 1, 0) for rounds in type_rounds.values())
+    recurrence_coverage = {
+        "findings_total": total_findings,
+        "verified_real_typed": verified_typed,
+        "verified_real_unknown_type_excluded": unknown_type,
+        "non_real_excluded": non_real,
+        "taxonomy_type_round_observations": type_round_observations,
+        "rule": "same-type-across-rounds-v1",
+    }
+    recurrence = _rate_metric(
+        f"{group}.finding_recurrence_rate", recurrences, type_round_observations,
+        recurrence_coverage, "inferred", "no verified REAL taxonomy type-round observations")
+
+    reopen_denominator = len(reopen_by_task)
+    reopen_total = sum(reopen_by_task.values())
+    reopen_coverage = {
+        "findings_total": total_findings,
+        "finding_tasks_with_reopen_history": reopen_denominator,
+    }
+    reopen = (_metric_record(
+        f"{group}.reopen_count", reopen_total, reopen_total, reopen_denominator,
+        reopen_coverage, "observed") if reopen_denominator else _unavailable_metric(
+            f"{group}.reopen_count", "no finding task reopen history", reopen_coverage,
+            numerator=0, denominator=0))
+
+    remediation_denominator = len(remediation_by_task)
+    remediation_rounds = sum(len(rounds) for rounds in remediation_by_task.values())
+    remediation_coverage = {
+        "findings_total": total_findings,
+        "finding_tasks_with_remediation_history": remediation_denominator,
+    }
+    remediation = (_metric_record(
+        f"{group}.remediation_round_burden",
+        _ratio(remediation_rounds, remediation_denominator), remediation_rounds,
+        remediation_denominator, remediation_coverage, "observed")
+        if remediation_denominator else _unavailable_metric(
+            f"{group}.remediation_round_burden", "no finding task remediation history",
+            remediation_coverage, numerator=0, denominator=0))
+
+    post_coverage = {
+        "review_rounds_with_observed_at": review_rounds_with_time,
+        "review_rounds_without_observed_at": review_rounds_without_time,
+        "accepted_task_type_baselines": 0,
+        "acceptance_bindings_excluded": 0,
+    }
+    if evidence is None:
+        post = _unavailable_metric(
+            f"{group}.post_acceptance_defect_rate", "evidence projection unavailable",
+            post_coverage)
+    else:
+        baselines: list[tuple[str, object, str]] = []
+        for row in _evidence_task_rows(evidence):
+            acceptance = row.get("acceptance") or {}
+            accepted_at = parse_iso_timestamp(acceptance.get("at"))
+            if (acceptance.get("provenance") != "explicit"
+                    or acceptance.get("resolved") is not True or accepted_at is None):
+                if acceptance.get("resolved") is True:
+                    post_coverage["acceptance_bindings_excluded"] += 1
+                continue
+            types = sorted({finding.get("type") for finding in row.get("findings") or []
+                            if finding.get("status") == "REAL"
+                            and finding.get("type") in FINDING_TYPES})
+            if not types:
+                post_coverage["acceptance_bindings_excluded"] += 1
+                continue
+            for finding_type in types:
+                baselines.append((str(row.get("project") or ""), accepted_at, finding_type))
+        post_coverage["accepted_task_type_baselines"] = len(baselines)
+        post_defects = sum(any(
+            event_project == project and event_type == finding_type and event_at > accepted_at
+            for event_project, event_at, event_type in review_events)
+            for project, accepted_at, finding_type in baselines)
+        post = _rate_metric(
+            f"{group}.post_acceptance_defect_rate", post_defects, len(baselines), post_coverage,
+            "observed", "no explicit accepted task/type baselines")
+    return {
+        "finding_recurrence_rate": recurrence,
+        "reopen_count": reopen,
+        "remediation_round_burden": remediation,
+        "post_acceptance_defect_rate": post,
+    }
+
+
+def _delegation_metrics(sessions: list[dict] | None, delegations: list[dict] | None,
+                        evidence: list[dict] | None,
+                        adaptive: list[dict] | None) -> dict[str, dict]:
+    group = "delegation_effectiveness"
+    if delegations is None:
+        completion = _unavailable_metric(
+            f"{group}.completion_rate", "delegations projection unavailable",
+            {"delegations.jsonl": "missing-or-invalid"})
+    else:
+        known_status = [row.get("status") for row in delegations
+                        if isinstance(row, dict) and isinstance(row.get("status"), str)]
+        completed = sum(status == "completed" for status in known_status)
+        completion = _rate_metric(
+            f"{group}.completion_rate", completed, len(known_status),
+            {"delegations_total": len(delegations),
+             "delegations_with_observed_status": len(known_status),
+             "status_unknown_excluded": len(delegations) - len(known_status)},
+            "observed", "no delegations with observed completion status")
+
+    task_rows = _evidence_task_rows(evidence or [])
+    evidence_delegations = [delegation for row in task_rows
+                            for delegation in (row.get("delegations") or [])
+                            if isinstance(delegation, dict)]
+    known_states = [delegation.get("state") for delegation in evidence_delegations
+                    if isinstance(delegation.get("state"), str)]
+    useful = sum(state == "applied" for state in known_states)
+    useful_coverage = {
+        "evidence_available": evidence is not None,
+        "delegations_total": len(evidence_delegations),
+        "delegations_with_observed_state": len(known_states),
+        "state_unknown_excluded": len(evidence_delegations) - len(known_states),
+    }
+    useful_artifact = (_rate_metric(
+        f"{group}.useful_artifact_rate", useful, len(known_states), useful_coverage,
+        "observed", "no delegations with observed artifact disposition")
+        if evidence is not None else _unavailable_metric(
+            f"{group}.useful_artifact_rate", "evidence projection unavailable", useful_coverage))
+
+    if sessions is None or evidence is None:
+        opportunity = _unavailable_metric(
+            f"{group}.opportunity_adjusted_useful_artifact_rate",
+            "sessions or evidence projection unavailable",
+            {"sessions_available": sessions is not None, "evidence_available": evidence is not None})
+    else:
+        lens = _lens_delegation_opportunity(sessions, evidence)
+        candidates = sum(row.get("candidates", 0) for row in lens["per_project"].values())
+        delegated_tasks = sum(bool(row.get("delegations")) for row in task_rows)
+        applied_tasks = sum(any(delegation.get("state") == "applied"
+                                for delegation in row.get("delegations") or [])
+                            for row in task_rows)
+        denominator = candidates + delegated_tasks
+        opportunity = _rate_metric(
+            f"{group}.opportunity_adjusted_useful_artifact_rate", applied_tasks, denominator,
+            {"opportunity_lens_rule": lens["rule"], "inferred_candidates": candidates,
+             "observed_delegated_tasks": delegated_tasks,
+             "lens_coverage": lens.get("coverage", {})},
+            "inferred", "no observed or inferred delegation opportunities")
+
+    adaptive_deltas: list[dict] = []
+    for row in adaptive or []:
+        facts = row.get("facts") if isinstance(row, dict) else None
+        if isinstance(facts, dict):
+            adaptive_deltas.extend(delta for delta in facts.get("deltas") or []
+                                   if isinstance(delta, dict))
+    before_opportunities = sum((delta.get("before") or {}).get("opportunities", 0)
+                               for delta in adaptive_deltas)
+    after_opportunities = sum((delta.get("after") or {}).get("opportunities", 0)
+                              for delta in adaptive_deltas)
+    before_fires = sum((delta.get("before") or {}).get("fires", 0)
+                       for delta in adaptive_deltas)
+    after_fires = sum((delta.get("after") or {}).get("fires", 0)
+                      for delta in adaptive_deltas)
+    before_recurrences = sum(sum(
+        value for value in ((delta.get("before") or {}).get("finding_recurrences") or {}).values()
+        if type(value) is int) for delta in adaptive_deltas)
+    after_recurrences = sum(sum(
+        value for value in ((delta.get("after") or {}).get("finding_recurrences") or {}).values()
+        if type(value) is int) for delta in adaptive_deltas)
+    adaptive_coverage = {
+        "adaptive_feedback_available": adaptive is not None,
+        "policy_deltas": len(adaptive_deltas),
+        "causal_claims": False,
+        "interpretation_boundary": "firing-rate-and-finding-recurrence-trends-only",
+    }
+    if adaptive is None or not adaptive_deltas:
+        adaptive_trend = _unavailable_metric(
+            f"{group}.adaptive_before_after_trend", "adaptive feedback observations unavailable",
+            adaptive_coverage)
+    else:
+        before_rate = (_ratio(before_fires, before_opportunities)
+                       if before_opportunities else None)
+        after_rate = (_ratio(after_fires, after_opportunities)
+                      if after_opportunities else None)
+        rate_delta = (round(after_rate - before_rate, 4)
+                      if before_rate is not None and after_rate is not None else None)
+        adaptive_trend = _metric_record(
+            f"{group}.adaptive_before_after_trend",
+            {"fire_rate": {"before": before_rate, "after": after_rate, "delta": rate_delta},
+             "finding_recurrences": {"before": before_recurrences,
+                                     "after": after_recurrences,
+                                     "delta": after_recurrences - before_recurrences}},
+            {"before_fires": before_fires, "after_fires": after_fires,
+             "before_finding_recurrences": before_recurrences,
+             "after_finding_recurrences": after_recurrences},
+            {"before_opportunities": before_opportunities,
+             "after_opportunities": after_opportunities,
+             "policy_deltas": len(adaptive_deltas)},
+            adaptive_coverage, "observed")
+    return {
+        "completion_rate": completion,
+        "useful_artifact_rate": useful_artifact,
+        "adaptive_before_after_trend": adaptive_trend,
+        "opportunity_adjusted_useful_artifact_rate": opportunity,
+    }
+
+
+def _warning_source_coverage(evidence: list[dict] | None,
+                             warnings: list[dict] | None) -> tuple[bool, dict]:
+    observations = (_evidence_coverage(evidence or []).get("warning_observations") or [])
+    present_projects = sum(
+        (row.get("coverage") or {}).get("warnings_file_present") is True
+        for row in observations if isinstance(row, dict))
+    absent_projects = sum(
+        (row.get("coverage") or {}).get("warnings_file_present") is False
+        for row in observations if isinstance(row, dict))
+    known = warnings is not None and (present_projects > 0 or bool(warnings))
+    return known, {
+        "normalized_warning_rows": len(warnings or []),
+        "projects_with_warning_source": present_projects,
+        "projects_without_warning_source": absent_projects,
+        "warning_source_coverage_known": bool(observations),
+    }
+
+
+def _environment_metrics(evidence: list[dict] | None,
+                         warnings: list[dict] | None) -> dict[str, dict]:
+    group = "reproducibility_environment"
+    task_rows = _evidence_task_rows(evidence or [])
+    delegations = [delegation for row in task_rows for delegation in row.get("delegations") or []
+                   if isinstance(delegation, dict)]
+    known_states = [delegation.get("state") for delegation in delegations
+                    if isinstance(delegation.get("state"), str)]
+    failed = sum(state == "failed-env" for state in known_states)
+    env_coverage = {
+        "evidence_available": evidence is not None,
+        "delegations_total": len(delegations),
+        "delegations_with_observed_state": len(known_states),
+    }
+    environment_failure = (_rate_metric(
+        f"{group}.environment_failure_rate", failed, len(known_states), env_coverage,
+        "observed", "no delegations with observed environment outcome")
+        if evidence is not None else _unavailable_metric(
+            f"{group}.environment_failure_rate", "evidence projection unavailable", env_coverage))
+
+    warning_known, mutation_coverage = _warning_source_coverage(evidence, warnings)
+    mutation_rows = [row for row in warnings or [] if isinstance(row, dict)
+                     and row.get("event") == "evaluation"
+                     and row.get("rule") == "env-manifest-mutation-v1"]
+    evaluable = [row for row in mutation_rows
+                 if isinstance((row.get("context") or {}).get("fired"), bool)]
+    mutation_fires = sum((row.get("context") or {}).get("fired") is True for row in evaluable)
+    mutation_coverage.update({
+        "rule": "env-manifest-mutation-v1",
+        "evaluation_rows": len(mutation_rows),
+        "evaluable_rows": len(evaluable),
+        "unevaluable_rows": len(mutation_rows) - len(evaluable),
+    })
+    if not warning_known:
+        mutation = _unavailable_metric(
+            f"{group}.ad_hoc_manifest_mutation_fire_rate",
+            "normalized warning source unavailable", mutation_coverage)
+    else:
+        mutation = _rate_metric(
+            f"{group}.ad_hoc_manifest_mutation_fire_rate", mutation_fires, len(evaluable),
+            mutation_coverage, "observed", "no evaluable env-manifest-mutation opportunities")
+
+    reproducibility = _unavailable_metric(
+        f"{group}.acceptance_reproducibility",
+        "verify rerun comparison data unavailable",
+        {"verify_rerun_pairs": 0, "comparison_source_available": False})
+    return {
+        "environment_failure_rate": environment_failure,
+        "ad_hoc_manifest_mutation_fire_rate": mutation,
+        "acceptance_reproducibility": reproducibility,
+    }
+
+
+def _governance_metrics(evidence: list[dict] | None, warnings: list[dict] | None,
+                        decisions: list[dict], decision_coverage: dict,
+                        adaptive: list[dict] | None) -> dict[str, dict]:
+    group = "governance"
+    warning_known, warning_coverage = _warning_source_coverage(evidence, warnings)
+    evaluation_rows = [row for row in warnings or [] if isinstance(row, dict)
+                       and row.get("event") == "evaluation"]
+    evaluable = [row for row in evaluation_rows
+                 if isinstance((row.get("context") or {}).get("fired"), bool)]
+    fires = sum((row.get("context") or {}).get("fired") is True for row in evaluable)
+    fire_coverage = {**warning_coverage, "evaluation_rows": len(evaluation_rows),
+                     "evaluable_rows": len(evaluable),
+                     "unevaluable_rows": len(evaluation_rows) - len(evaluable)}
+    guard_fire = (_rate_metric(
+        f"{group}.guard_fire_rate", fires, len(evaluable), fire_coverage,
+        "observed", "no evaluable guard opportunities") if warning_known else
+        _unavailable_metric(
+            f"{group}.guard_fire_rate", "normalized warning source unavailable", fire_coverage))
+    conflicts = sum(isinstance(row, dict) and row.get("event") == "conflict"
+                    for row in warnings or [])
+    conflict_coverage = {**warning_coverage, "warning_records": len(warnings or [])}
+    guard_conflict = (_metric_record(
+        f"{group}.guard_conflict_count", conflicts, conflicts, len(warnings or []),
+        conflict_coverage, "observed") if warning_known else _unavailable_metric(
+            f"{group}.guard_conflict_count", "normalized warning source unavailable",
+            conflict_coverage))
+
+    latest: dict[str, dict] = {}
+    for decision in decisions:
+        latest[decision["rec_id"]] = decision
+    accepted = sum(row["decision"] == "accept" for row in latest.values())
+    rejected = sum(row["decision"] == "reject" for row in latest.values())
+    decision_denominator = len(latest)
+    decision_metric_coverage = {
+        **decision_coverage, "effective_recommendations": decision_denominator,
+        "history_rows_superseded": len(decisions) - decision_denominator,
+    }
+    if not decision_coverage["present"] or not decision_coverage["valid"]:
+        decision_acceptance = _unavailable_metric(
+            f"{group}.decision_acceptance_rate", "decisions log unavailable",
+            decision_metric_coverage)
+        decision_rejection = _unavailable_metric(
+            f"{group}.decision_rejection_rate", "decisions log unavailable",
+            decision_metric_coverage)
+    else:
+        decision_acceptance = _rate_metric(
+            f"{group}.decision_acceptance_rate", accepted, decision_denominator,
+            decision_metric_coverage, "observed", "no effective recommendation decisions")
+        decision_rejection = _rate_metric(
+            f"{group}.decision_rejection_rate", rejected, decision_denominator,
+            decision_metric_coverage, "observed", "no effective recommendation decisions")
+
+    rejected_materializations = 0
+    adaptive_coverage_known = adaptive is not None and bool(adaptive)
+    for row in adaptive or []:
+        facts = row.get("facts") if isinstance(row, dict) else None
+        coverage = facts.get("coverage") if isinstance(facts, dict) else None
+        if not isinstance(coverage, dict):
+            adaptive_coverage_known = False
+            continue
+        conflicts_by_reason = coverage.get("accept_delta_conflicts") or {}
+        value = conflicts_by_reason.get("delta-from-rejected-rec", 0)
+        if type(value) is int and value >= 0:
+            rejected_materializations += value
+        else:
+            adaptive_coverage_known = False
+    suppression_coverage = {
+        "adaptive_feedback_available": adaptive is not None,
+        "adaptive_conflict_coverage_known": adaptive_coverage_known,
+        "rejected_effective_decisions": rejected,
+        "rejected_materialization_conflicts": rejected_materializations,
+        "causal_basis": "direct-rejection-materialization-contract",
+    }
+    if not adaptive_coverage_known:
+        suppression = _unavailable_metric(
+            f"{group}.rejected_materialization_suppression_rate",
+            "adaptive rejection/materialization coverage unavailable", suppression_coverage)
+    else:
+        suppressed = max(rejected - rejected_materializations, 0)
+        suppression = _rate_metric(
+            f"{group}.rejected_materialization_suppression_rate", suppressed, rejected,
+            suppression_coverage, "observed", "no rejected effective decisions")
+
+    enforce_coverage = {"source_available": False, "enforce_arc_shipped": False}
+    waiver = _unavailable_metric(
+        f"{group}.waiver_rate", "enforce arc not shipped", enforce_coverage)
+    hard_block = _unavailable_metric(
+        f"{group}.hard_block_rate", "enforce arc not shipped", enforce_coverage)
+    return {
+        "guard_fire_rate": guard_fire,
+        "guard_conflict_count": guard_conflict,
+        "decision_acceptance_rate": decision_acceptance,
+        "decision_rejection_rate": decision_rejection,
+        "rejected_materialization_suppression_rate": suppression,
+        "waiver_rate": waiver,
+        "hard_block_rate": hard_block,
+    }
+
+
+def _load_metric_snapshots(path: Path) -> list[tuple[int, dict]]:
+    if not path.is_file():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError) as e:
+        raise WorkflowError(f"metrics history unreadable: {path} ({type(e).__name__})") from e
+    snapshots: list[tuple[int, dict]] = []
+    for line_number, line in enumerate(lines, 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as e:
+            raise WorkflowError(f"metrics history corrupt at {path}:{line_number}") from e
+        if (not isinstance(row, dict) or row.get("schema") != "waystone-improve-metrics-1"
+                or row.get("scope") not in (PROJECT_LENS_SCOPE, USER_HABIT_LENS_SCOPE)
+                or not isinstance(row.get("metrics"), dict)
+                or parse_iso_timestamp(row.get("at")) is None):
+            raise WorkflowError(f"metrics history corrupt at {path}:{line_number}")
+        snapshots.append((line_number, row))
+    return snapshots
+
+
+def _metric_comparison(metrics: dict, previous: tuple[int, dict] | None) -> dict:
+    if previous is None:
+        return {"previous_snapshot": None, "changes": {}, "causal_claims": False}
+    previous_line, previous_snapshot = previous
+    changes: dict[str, dict] = {}
+    for group_name, group in sorted(metrics.items()):
+        previous_group = previous_snapshot["metrics"].get(group_name) or {}
+        for metric_name, metric in sorted(group.items()):
+            current_value = metric.get("value")
+            previous_value = (previous_group.get(metric_name) or {}).get("value")
+            delta = None
+            if (type(current_value) in (int, float)
+                    and type(previous_value) in (int, float)):
+                delta = round(current_value - previous_value, 4)
+            changes[f"{group_name}.{metric_name}"] = {
+                "previous": previous_value, "current": current_value, "delta": delta,
+            }
+    return {
+        "previous_snapshot": {
+            "at": previous_snapshot["at"], "line": previous_line,
+            "input_fingerprint": previous_snapshot["input_coverage"]["fingerprint"],
+        },
+        "changes": changes,
+        "causal_claims": False,
+    }
+
+
+def _metrics_facts(snapshot: dict, line_number: int) -> dict:
+    available = unavailable = 0
+    for group in snapshot["metrics"].values():
+        for metric in group.values():
+            if metric["provenance"] == "unavailable":
+                unavailable += 1
+            else:
+                available += 1
+    comparable = [
+        (name, change) for name, change in sorted(snapshot["comparison"]["changes"].items())
+        if type(change.get("delta")) in (int, float)
+    ]
+    facts = [{
+        "kind": "aggregate", "available_metrics": available,
+        "unavailable_metrics": unavailable,
+        "positive_changes": sum(change["delta"] > 0 for _name, change in comparable),
+        "negative_changes": sum(change["delta"] < 0 for _name, change in comparable),
+        "unchanged": sum(change["delta"] == 0 for _name, change in comparable),
+    }]
+    facts.extend({"kind": "longitudinal-change", "metric": name, **change}
+                 for name, change in comparable[:2])
+    facts.append({"kind": "current-snapshot", "pointer": f"metrics.jsonl:{line_number}"})
+    previous = snapshot["comparison"]["previous_snapshot"]
+    if previous is not None:
+        facts.append({"kind": "previous-snapshot",
+                      "pointer": f"metrics.jsonl:{previous['line']}"})
+    return {
+        "schema": "waystone-improve-metrics-facts-1",
+        "causal_claims": False,
+        "facts": facts,
+    }
+
+
+def run_metrics(in_dir: Path, lens_scope: str,
+                *, now: datetime | None = None) -> dict:
+    if lens_scope not in (PROJECT_LENS_SCOPE, USER_HABIT_LENS_SCOPE):
+        raise WorkflowError(f"unknown improve metrics scope: {lens_scope!r}")
+    facts_path = in_dir / "facts.json"
+    try:
+        facts = json.loads(facts_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise WorkflowError(f"facts unavailable or corrupt: {facts_path} ({type(e).__name__})") from e
+    if not isinstance(facts, dict):
+        raise WorkflowError(f"facts unavailable or corrupt: {facts_path} (wrong shape)")
+
+    data, input_coverage, fingerprint = _load_metric_inputs(in_dir)
+    decisions, decision_coverage = _load_metric_decisions(in_dir / "decisions.jsonl")
+    input_coverage["decisions.jsonl"] = decision_coverage
+    input_coverage["facts.json"] = {
+        "present": True, "valid": True,
+        "audit_inputs": facts.get("inputs") if isinstance(facts.get("inputs"), dict) else {},
+        "skipped_lenses": len(facts.get("skipped_lenses") or []),
+    }
+    metrics = {
+        "quality": _quality_metrics(data.get("reviews"), data.get("evidence")),
+        "delegation_effectiveness": _delegation_metrics(
+            data.get("sessions"), data.get("delegations"), data.get("evidence"),
+            data.get("adaptive_feedback")),
+        "reproducibility_environment": _environment_metrics(
+            data.get("evidence"), data.get("warnings")),
+        "governance": _governance_metrics(
+            data.get("evidence"), data.get("warnings"), decisions, decision_coverage,
+            data.get("adaptive_feedback")),
+    }
+    measured_at = now or datetime.now(timezone.utc)
+    if measured_at.tzinfo is None or measured_at.utcoffset() is None:
+        raise WorkflowError("metrics measurement time must be timezone-aware")
+    metrics_path = in_dir / "metrics.jsonl"
+    history = _load_metric_snapshots(metrics_path)
+    previous = next((entry for entry in reversed(history)
+                     if entry[1]["scope"] == lens_scope), None)
+    snapshot = {
+        "schema": "waystone-improve-metrics-1",
+        "at": measured_at.astimezone(timezone.utc).isoformat(),
+        "scope": lens_scope,
+        "input_coverage": {"fingerprint": fingerprint, "sources": input_coverage},
+        "metrics": metrics,
+    }
+    snapshot["comparison"] = _metric_comparison(metrics, previous)
+    line_number = len(history) + 1
+    with metrics_path.open("a", encoding="utf-8") as stream:
+        stream.write(_dumps(snapshot) + "\n")
+    facts["metrics"] = _metrics_facts(snapshot, line_number)
+    write_text_atomic(facts_path, _dumps(facts) + "\n")
+    return snapshot
+
+
 # ================================================================== decide (§11)
 # Append-only record of the user's accept/reject on each improve recommendation. Unlike the trace/
 # reviews/audit projections (byte-identical across re-runs), this is a user-action log, so an ISO-8601
@@ -3160,6 +3858,40 @@ def _cli_audit(argv: list[str], project_root: Path | None, user_wide: bool) -> i
     return 0
 
 
+def _cli_metrics(argv: list[str], project_root: Path | None, user_wide: bool) -> int:
+    try:
+        inp = _parse_single_opt(argv, "--in")
+        in_dir = _residence_checked(inp, "--in", project_root, user_wide)
+        residence = _scope_improve_dir(project_root, user_wide).resolve()
+        if in_dir != residence:
+            raise WorkflowError(
+                f"metrics history must live at {residence / 'metrics.jsonl'}, got {in_dir}")
+    except WorkflowError as e:
+        print(f"waystone improve metrics: {e}", file=sys.stderr)
+        return 1
+    if not in_dir.is_dir() or not (in_dir / "facts.json").is_file():
+        print(f"waystone improve metrics: audit facts do not exist in {in_dir} "
+              "(run `waystone improve audit` first)", file=sys.stderr)
+        return 1
+    try:
+        _prepare_project_output(project_root, user_wide)
+        scope = USER_HABIT_LENS_SCOPE if user_wide else PROJECT_LENS_SCOPE
+        snapshot = run_metrics(in_dir, scope)
+    except WorkflowError as e:
+        print(f"waystone improve metrics: {e}", file=sys.stderr)
+        return 1
+    except OSError as e:
+        print(f"waystone improve metrics: cannot write outputs — {e}", file=sys.stderr)
+        return 2
+    available = sum(
+        metric["provenance"] != "unavailable"
+        for group in snapshot["metrics"].values() for metric in group.values())
+    print(f"waystone improve metrics: {available} available metric(s), "
+          f"{len(_METRIC_FIRST_MEASURED) - available} unavailable "
+          f"-> {in_dir / 'metrics.jsonl'}")
+    return 0
+
+
 def _parse_decide_args(argv: list[str]) -> tuple[str, str, str | None, str | None, str | None]:
     positionals: list[str] = []
     title = note = out = None
@@ -3215,13 +3947,14 @@ def _cli_decide(argv: list[str], project_root: Path | None, user_wide: bool) -> 
 
 def main(argv: list[str]) -> int:
     if not argv:
-        print("waystone improve: expected subcommand (trace|reviews|evidence|audit|decide)\n" + __doc__,
+        print("waystone improve: expected subcommand "
+              "(trace|reviews|evidence|audit|metrics|decide)\n" + __doc__,
               file=sys.stderr)
         return 1
     sub, rest = argv[0], argv[1:]
-    if sub not in ("trace", "reviews", "evidence", "audit", "decide"):
+    if sub not in ("trace", "reviews", "evidence", "audit", "metrics", "decide"):
         print(f"waystone improve: unknown subcommand {sub!r} "
-              f"(expected trace|reviews|evidence|audit|decide)\n" + __doc__,
+              f"(expected trace|reviews|evidence|audit|metrics|decide)\n" + __doc__,
               file=sys.stderr)
         return 1
     if rest.count("--user-wide") > 1:
@@ -3252,6 +3985,8 @@ def main(argv: list[str]) -> int:
         return _cli_evidence(rest, project_root, user_wide)
     if sub == "audit":
         return _cli_audit(rest, project_root, user_wide)
+    if sub == "metrics":
+        return _cli_metrics(rest, project_root, user_wide)
     if sub == "decide":
         return _cli_decide(rest, project_root, user_wide)
     raise AssertionError("unreachable improve subcommand")

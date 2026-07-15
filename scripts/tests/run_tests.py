@@ -3833,6 +3833,205 @@ class ImproveDecideTests(unittest.TestCase):
             self.assertEqual(len(self._lines(default_log)), 1)  # default log untouched by the override
 
 
+class ImproveMetricsTests(unittest.TestCase):
+    """L3-1 G9: named metric groups, honest nulls, and longitudinal snapshots."""
+
+    @staticmethod
+    def _fixture(out: Path) -> None:
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "facts.json").write_text(_json.dumps({
+            "generated_from": "fixture", "inputs": {}, "skipped_lenses": [], "lenses": [],
+        }))
+        _write_jsonl(out / "sessions.jsonl", [
+            {"project": "demo", "kind": "main", "session_id": "s1",
+             "tools": {"by_category": {"file_write": 1, "shell": 1}},
+             "retry_loops": {"count": 0}, "context_heavy": {"max_result_bytes": 0},
+             "usage": {"input": 10}},
+            {"project": "demo", "kind": "main", "session_id": "s2",
+             "tools": {"by_category": {"file_write": 5, "shell": 1}},
+             "retry_loops": {"count": 0}, "context_heavy": {"max_result_bytes": 0},
+             "usage": {"input": 10}},
+        ])
+        _write_jsonl(out / "delegations.jsonl", [
+            {"project": "demo", "status": "completed"},
+            {"project": "demo", "status": "failed"},
+        ])
+        _write_jsonl(out / "reviews.jsonl", [
+            {"project": "demo", "round_id": "r1", "round_at": "2026-07-15T01:00:00Z",
+             "findings": [{"id": "f1", "task_id": "fix/one", "type": "correctness",
+                           "status": "REAL", "source": "triage", "fixing_rounds": ["fix-r1"],
+                           "reopen_count": 1}]},
+            {"project": "demo", "round_id": "r2", "round_at": "2026-07-15T04:00:00Z",
+             "findings": [{"id": "f2", "task_id": "fix/two", "type": "correctness",
+                           "status": "REAL", "source": "triage"}]},
+        ])
+        _write_jsonl(out / "evidence.jsonl", [
+            {"project": "demo", "task_id": "fix/one",
+             "task_context": {"session_id": "s1"},
+             "findings": [{"round": "r1", "type": "correctness", "status": "REAL"}],
+             "delegations": [{"did": "d1", "state": "applied"}],
+             "acceptance": {"at": "2026-07-15T03:00:00Z", "resolved": True,
+                            "provenance": "explicit"}},
+            {"project": "demo", "task_id": "feat/opportunity",
+             "task_context": {"session_id": "s2"}, "findings": [], "delegations": [],
+             "acceptance": {"at": None, "resolved": False,
+                            "provenance": "current-task-state-approximation"}},
+            {"project": "demo", "task_id": "fix/env",
+             "task_context": {"session_id": None}, "findings": [],
+             "delegations": [{"did": "d2", "state": "failed-env"}],
+             "acceptance": {"at": None, "resolved": False,
+                            "provenance": "current-task-state-approximation"}},
+            {"coverage": {"warning_observations": [{
+                "project": "demo", "coverage": {"warnings_file_present": True},
+            }]}}
+        ])
+        _write_jsonl(out / "evidence_warnings.jsonl", [
+            {"project": "demo", "event": "evaluation", "rule": "env-manifest-mutation-v1",
+             "context": {"fired": True}},
+            {"project": "demo", "event": "evaluation", "rule": "done-without-evidence-v1",
+             "context": {"fired": False}},
+            {"project": "demo", "event": "conflict", "rule": "done-without-evidence-v1",
+             "context": {}},
+        ])
+        (out / "adaptive_feedback.json").write_text(_json.dumps([{
+            "project": "demo", "facts": {
+                "deltas": [{
+                    "before": {"fires": 1, "opportunities": 2,
+                               "finding_recurrences": {"scope": 1}},
+                    "after": {"fires": 1, "opportunities": 4,
+                              "finding_recurrences": {"scope": 0}},
+                }],
+                "decision_follow_through": {"accepted": 1, "materialized": 1,
+                                             "accepted_without_delta": 0,
+                                             "rejected_decisions": 1},
+                "coverage": {"accept_delta_conflicts": {}},
+            },
+        }]))
+        _write_jsonl(out / "decisions.jsonl", [
+            {"rec_id": "scope/accept", "decision": "accept", "at": "2026-07-15T01:00:00Z"},
+            {"rec_id": "scope/reject", "decision": "reject", "at": "2026-07-15T02:00:00Z"},
+        ])
+
+    @staticmethod
+    def _metric(snapshot: dict, group: str, name: str) -> dict:
+        return snapshot["metrics"][group][name]
+
+    def test_four_groups_longitudinal_comparison_and_facts_bound(self):
+        from datetime import datetime, timezone
+
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d)
+            self._fixture(out)
+            first = improve.run_metrics(
+                out, improve.PROJECT_LENS_SCOPE,
+                now=datetime(2026, 7, 15, 5, tzinfo=timezone.utc))
+            self.assertEqual(set(first["metrics"]), {
+                "quality", "delegation_effectiveness",
+                "reproducibility_environment", "governance",
+            })
+            recurrence = self._metric(first, "quality", "finding_recurrence_rate")
+            self.assertEqual((recurrence["numerator"], recurrence["denominator"],
+                              recurrence["value"]), (1, 2, 0.5))
+            self.assertEqual(self._metric(first, "quality", "reopen_count")["value"], 1)
+            self.assertEqual(
+                self._metric(first, "quality", "post_acceptance_defect_rate")["value"], 1.0)
+            self.assertEqual(
+                self._metric(first, "delegation_effectiveness", "completion_rate")["value"], 0.5)
+            self.assertEqual(
+                self._metric(first, "delegation_effectiveness", "useful_artifact_rate")["value"],
+                0.5)
+            self.assertEqual(self._metric(
+                first, "delegation_effectiveness",
+                "opportunity_adjusted_useful_artifact_rate")["denominator"], 3)
+            self.assertEqual(self._metric(
+                first, "reproducibility_environment", "environment_failure_rate")["value"], 0.5)
+            self.assertEqual(self._metric(
+                first, "reproducibility_environment",
+                "ad_hoc_manifest_mutation_fire_rate")["value"], 1.0)
+            self.assertEqual(
+                self._metric(first, "governance", "decision_rejection_rate")["value"], 0.5)
+            self.assertEqual(self._metric(
+                first, "governance", "rejected_materialization_suppression_rate")["value"], 1.0)
+
+            reviews = [_json.loads(line) for line in
+                       (out / "reviews.jsonl").read_text().splitlines()]
+            reviews.append({
+                "project": "demo", "round_id": "r3", "round_at": "2026-07-15T06:00:00Z",
+                "findings": [{"id": "f3", "type": "correctness", "status": "REAL",
+                              "source": "triage"}],
+            })
+            _write_jsonl(out / "reviews.jsonl", reviews)
+            second = improve.run_metrics(
+                out, improve.PROJECT_LENS_SCOPE,
+                now=datetime(2026, 7, 15, 7, tzinfo=timezone.utc))
+            change = second["comparison"]["changes"]["quality.finding_recurrence_rate"]
+            self.assertEqual(change, {"previous": 0.5, "current": 0.6667, "delta": 0.1667})
+            self.assertEqual(len((out / "metrics.jsonl").read_text().splitlines()), 2)
+            facts = _json.loads((out / "facts.json").read_text())
+            self.assertLessEqual(len(facts["metrics"]["facts"]), 5)
+            self.assertIs(facts["metrics"]["causal_claims"], False)
+
+    def test_unavailable_is_null_with_reason_and_denominator(self):
+        from datetime import datetime, timezone
+
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d)
+            out.joinpath("facts.json").write_text(_json.dumps({
+                "generated_from": "fixture", "inputs": {}, "skipped_lenses": [], "lenses": [],
+            }))
+            snapshot = improve.run_metrics(
+                out, improve.PROJECT_LENS_SCOPE,
+                now=datetime(2026, 7, 15, tzinfo=timezone.utc))
+            for group in snapshot["metrics"].values():
+                for metric in group.values():
+                    self.assertIn("denominator", metric)
+                    self.assertIn("coverage", metric)
+                    self.assertIn(metric["provenance"], ("observed", "inferred", "unavailable"))
+                    self.assertIn("first_measured_version", metric)
+                    if metric["value"] is None:
+                        self.assertEqual(metric["provenance"], "unavailable")
+                        self.assertTrue(metric["unavailable_reason"])
+            for name in ("waiver_rate", "hard_block_rate"):
+                metric = self._metric(snapshot, "governance", name)
+                self.assertIsNone(metric["value"])
+                self.assertEqual(metric["unavailable_reason"], "enforce arc not shipped")
+            self.assertIsNone(self._metric(
+                snapshot, "reproducibility_environment", "acceptance_reproducibility")["value"])
+
+    def test_same_inputs_and_clock_are_byte_stable(self):
+        from datetime import datetime, timezone
+
+        with tempfile.TemporaryDirectory() as d:
+            left, right = Path(d) / "left", Path(d) / "right"
+            self._fixture(left)
+            self._fixture(right)
+            now = datetime(2026, 7, 15, 5, tzinfo=timezone.utc)
+            improve.run_metrics(left, improve.PROJECT_LENS_SCOPE, now=now)
+            improve.run_metrics(right, improve.PROJECT_LENS_SCOPE, now=now)
+            self.assertEqual((left / "metrics.jsonl").read_bytes(),
+                             (right / "metrics.jsonl").read_bytes())
+
+    def test_cli_user_wide_uses_machine_improve_residence(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d) / "home"
+            out = home / ".waystone" / "improve"
+            out.mkdir(parents=True)
+            (out / "facts.json").write_text(_json.dumps({
+                "generated_from": "fixture", "inputs": {}, "skipped_lenses": [], "lenses": [],
+            }))
+
+            def run():
+                with contextlib.redirect_stdout(io.StringIO()):
+                    return improve.main(["metrics", "--user-wide"])
+
+            self.assertEqual(_run_with_home(home, run), 0)
+            snapshot = _json.loads((out / "metrics.jsonl").read_text().splitlines()[0])
+            self.assertEqual(snapshot["scope"], improve.USER_HABIT_LENS_SCOPE)
+
+
 class ImproveScopeTests(unittest.TestCase):
     """0.9.0-a C3: project-first improve storage, scope isolation, and user-wide opt-in."""
 
