@@ -16,7 +16,10 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
-from common import git_branch_info, git_full_sha, load_config, load_tasks, migrate_project_state, next_actionable, project_state_path, resume_path, start_here_path  # noqa: E402
+from common import (  # noqa: E402
+    git_branch_info, git_full_sha, hold_lock, load_config, load_tasks, migrate_project_state,
+    next_actionable, project_lock_path, project_state_path, resume_path, start_here_path,
+)
 
 MAX_CHARS = 8000
 MAX_TASK_LINES = 8
@@ -141,7 +144,8 @@ def main() -> int:
     root = Path(sys.argv[1]).resolve()
     codex_host = os.environ.get("WAYSTONE_HOST") == "codex"
     try:
-        migrate_project_state(root)
+        with hold_lock(project_lock_path(root), timeout=3):
+            migrate_project_state(root)
     except Exception as e:  # noqa: BLE001 — migration must never suppress SessionStart JSON
         print(f"waystone session migration warning: {e}", file=sys.stderr)
     try:

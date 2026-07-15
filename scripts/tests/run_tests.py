@@ -6310,7 +6310,10 @@ class ContractInjectTests(unittest.TestCase):
             rc, ctx = self._context(module, root, home)
             self.assertEqual(rc, 0)
             self.assertIn("no profile", ctx)
-            self.assertFalse((root / ".waystone").exists())
+            self.assertEqual(
+                {path.name for path in (root / ".waystone").iterdir()},
+                {".gitignore", "lock"},
+            )
             original = module.CONTRACT_PATH
             module.CONTRACT_PATH = Path(d) / "missing-contract.md"
             try:
@@ -7186,6 +7189,36 @@ class MigrationV2HookTests(unittest.TestCase):
             self.assertIn("migration exploded", err)
             self.assertIn("migration", err.lower())
 
+    def test_hook_lock_timeout_warns_but_always_emits_json_context(self):
+        import contextlib
+
+        module = self._module()
+        with tempfile.TemporaryDirectory() as d:
+            root, home = self._project(Path(d))
+            original = getattr(module, "hold_lock", None)
+            seen = {}
+
+            @contextlib.contextmanager
+            def blocked(path, timeout=None):
+                seen["path"] = path
+                seen["timeout"] = timeout
+                raise common.WorkflowError("synthetic project lock timeout")
+                yield
+
+            module.hold_lock = blocked
+            try:
+                rc, payload, err = self._run_context(module, root, home)
+            finally:
+                if original is None:
+                    del module.hold_lock
+                else:
+                    module.hold_lock = original
+            self.assertEqual(rc, 0)
+            self.assertEqual(payload["hookSpecificOutput"]["hookEventName"], "SessionStart")
+            self.assertEqual(seen["timeout"], 3)
+            self.assertEqual(seen["path"].resolve(), common.project_lock_path(root).resolve())
+            self.assertIn("synthetic project lock timeout", err)
+
 
 class MigrationTests(unittest.TestCase):
     def test_home_data_dir_moves_at_dispatcher_entry(self):
@@ -7410,6 +7443,21 @@ class CodexHookTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertIn("violates the workflow convention", result.stderr)
             self.assertEqual((root / "ROADMAP.md").read_bytes(), before)
+
+    def test_tasks_guard_lock_timeout_warns_skips_regen_and_exits_zero(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self._project(d)
+            payload = {
+                "tool_name": "Edit", "cwd": str(root),
+                "tool_input": {"file_path": str(root / "tasks.yaml")},
+            }
+            before = (root / "ROADMAP.md").read_bytes()
+            with common.hold_lock(common.project_lock_path(root), timeout=0.2):
+                result = self._guard(root, payload)
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual((root / "ROADMAP.md").read_bytes(), before)
+            self.assertIn("lock", result.stderr.lower())
+            self.assertIn("skipping ROADMAP regeneration", result.stderr)
 
     def test_session_context_names_host_instruction_file(self):
         import contextlib

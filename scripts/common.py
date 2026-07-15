@@ -137,6 +137,9 @@ def registry_path(home: Path | None = None) -> Path:
 # Any nested acquisition must follow this single order: registry -> project -> record. Never acquire
 # in reverse. Locking belongs to CLI/hook entry points; library functions below remain lock-free so
 # composed verbs such as round close cannot deadlock themselves on flock's non-reentrant semantics.
+# Intentionally unlocked (§2.4): warnings/decisions JSONL use one O_APPEND write; improve outputs are
+# reproducible; SSOT views inherit round close's project lock (standalone regeneration is idempotent);
+# start-here follows its single-writer round-close convention.
 def registry_lock_path(home: Path | None = None) -> Path:
     return machine_dir(home) / "registry.lock"
 
