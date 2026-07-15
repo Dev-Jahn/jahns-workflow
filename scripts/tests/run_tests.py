@@ -10374,6 +10374,12 @@ class MigrationTests(unittest.TestCase):
         ):
             self.assertIn(marker, text)
         self.assertIn("always write", text.lower())
+        for surface in (
+            "waystone consent record install.agents accept",
+            "waystone consent record install.hooks accept",
+            "waystone install agents", "waystone install hooks", "left\nuncommitted",
+        ):
+            self.assertIn(surface, text)
 
 
 class M2DocsTests(unittest.TestCase):
@@ -10392,16 +10398,20 @@ class M2DocsTests(unittest.TestCase):
         escalation = text.split("## Escalation table", 1)[1].split("## ", 1)[0]
         rows = [line for line in escalation.splitlines()
                 if line.startswith("| ") and line.split("|", 2)[1].strip().isdigit()]
-        self.assertEqual(len(rows), 9)
+        self.assertEqual(len(rows), 10)
         for meaning in (
             "owner-authored", "profile is missing", "unresolved blocker", "Two run attempts",
             "after one retry", "Apply drift", "runner failure is deterministic",
-            "waystone warn conflict", "user explicitly requested review",
+            "waystone warn conflict", "--allow-unsandboxed-runner --reason",
+            "user explicitly requested review",
         ):
             self.assertIn(meaning, escalation)
         self.assertIn("These are the only escalation cases. Otherwise, do not ask", escalation)
         self.assertIn("When a verifier binding exists, always run it", text)
         self.assertIn("Allow at most two total run attempts", text)
+        self.assertIn("implementer` + `external-runner", text)
+        self.assertIn("waystone task set <task-id> --scope-add", text)
+        self.assertIn("host's native main-session", text)
 
     def test_delegate_report_summarizes_warnings_without_internal_delta_ids(self):
         text = (SCRIPTS.parent / "skills" / "delegate" / "SKILL.md").read_text()
@@ -10412,17 +10422,27 @@ class M2DocsTests(unittest.TestCase):
         self.assertIn("verdict-input-schema.json", text)
         self.assertIn("verdict-schema.json", text)
 
-    def test_improve_skill_has_finite_materialization_map_and_tune_gate(self):
+    def test_improve_skill_has_current_lenses_metrics_and_consent_flows(self):
         text = (SCRIPTS.parent / "skills" / "improve" / "SKILL.md").read_text()
         self.assertIn("Step 3.5", text)
         self.assertIn("verification_debt/*", text)
         self.assertIn("delegation-verification-evidence-v1", text)
         self.assertIn("review_association/*", text)
         self.assertIn("round-close-open-findings-v1", text)
-        self.assertIn("rounds_with_feedback >= 5", text)
-        self.assertIn("findings_total >= 20", text)
-        self.assertIn("Tune", text)
+        for lens in (
+            "delegation_opportunity", "worker_scope_drift", "warn_friction",
+            "env_unpreparedness", "adaptive_feedback", "finding_concentration",
+        ):
+            self.assertIn(f"`{lens}`", text)
+        self.assertIn("recommendation_tier: always-allowed", text)
+        self.assertIn("evidence-strength label", text)
+        self.assertIn("waystone improve metrics", text)
+        self.assertIn("unavailable_reason", text)
+        self.assertIn("previous/current/delta", text)
         self.assertIn("waystone overlay add", text)
+        self.assertIn("waystone overlay promote-user", text)
+        self.assertIn("waystone consent record materialize accept", text)
+        self.assertIn("waystone overlay materialize", text)
         self.assertIn("Never write delta JSON", text)
         self.assertIn("prevented", text)
         self.assertIn("improved", text)
@@ -10433,10 +10453,18 @@ class M2DocsTests(unittest.TestCase):
         for surface in (
             "waystone paths", "waystone project", "waystone overlay", "waystone check",
             "waystone improve evidence", "waystone delegate verify", "waystone delegate verdict",
+            "waystone task set <id> --scope-add <prefix>", "waystone improve metrics",
+            "waystone overlay compose", "waystone overlay promote-user",
+            "waystone overlay materialize", "waystone consent record", "waystone install",
         ):
             self.assertIn(f"`{surface}`", readme)
+        self.assertIn("**v0.10 — Bind & Compose**", readme)
+        self.assertIn("Implemented — current release", readme)
         import waystone
-        for surface in ("improve", "evidence", "delegate", "verify", "overlay", "check"):
+        for surface in (
+            "improve", "evidence", "metrics", "delegate", "verify", "overlay", "promote-user",
+            "materialize", "compose", "consent", "install", "scope-add", "check",
+        ):
             self.assertIn(surface, waystone.__doc__)
         for surface in ("paths", "project"):
             self.assertIn(surface, waystone.__doc__)
@@ -10460,6 +10488,12 @@ class M2DocsTests(unittest.TestCase):
             "{project_root}/.waystone/overlay/", "{project_root}/.waystone/exposure/",
             "{project_root}/.waystone/improve/evidence.jsonl", "~/.waystone/",
             "~/.waystone/cache/", ".pre-0.9", "git clean -fdx", "waystone paths",
+            "~/.waystone/overlay/", ".waystone/maturity.json", ".waystone/consents.jsonl",
+            ".waystone/improve/metrics.jsonl", "docs/waystone-policy.yaml", "scope:",
+            "waystone task set <id> --scope-add", "{layer, id}", "waystone overlay compose",
+            "waystone overlay promote-user", "waystone consent record",
+            "waystone overlay materialize", "waystone install agents",
+            "waystone improve metrics", "unavailable_reason", "tri-state",
         ):
             self.assertIn(phrase, text)
 

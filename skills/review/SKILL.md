@@ -41,6 +41,11 @@ Besides the byte-exact copy, ingest **appends** (never edits the verbatim body) 
 skeleton*: if the reply has `JW-GPT-NNN` finding blocks it builds a table, else it notes "triage the
 verbatim reply directly". Then read `<reviews_dir>/<round-id>-feedback.md` to triage.
 
+Relay any review-ingest adaptive-rule output with tri-state wording: **fired**, **did not fire
+(evaluable)**, or **unevaluable (<coverage reason>)**. Never turn an unevaluable result into a
+non-fire. A `waystone warn conflict` line remains a policy conflict with a least-restrictive effective
+stage; it is separate from the finding verdicts below and from a rule fire.
+
 If ingest reports `no review at /tmp/review.md`, tell the user to save the reply first
 (`cat > /tmp/review.md`, paste, `Ctrl-D`) and stop.
 

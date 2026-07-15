@@ -83,7 +83,8 @@ guard the merge; suits repos that already work through PRs with a `@codex` bot).
    with a YAML comment documenting the optional task fields (`deps`, `milestone`, `round`,
    `anchor` — §-anchor of the SSOT section the task governs — `severity`,
    `origin`, `branch`, `notes`, `ruling` — the user's decision on a `decision/...` task,
-   `result` — a recorded measurement/outcome, `lane` — `{branch, base_sha, depends_on}` for
+   `result` — a recorded measurement/outcome, `scope` — repo-relative path-prefix list maintained
+   with `waystone task set <id> --scope-add`, `lane` — `{branch, base_sha, depends_on}` for
    parallel worktree lanes, verified by `waystone lanes verify`).
 3. Missing directories for adr/reviews/progress-archive; `docs/CONVENTIONS.md` as a verbatim copy of `$WAYSTONE_PLUGIN_ROOT/references/conventions.md`; an ADR-0000 from `$WAYSTONE_PLUGIN_ROOT/templates/adr.md` recording "adopted waystone" (so the numbering and format are established by example).
 4. If no PROGRESS file exists, create one with a one-line header pointing at tasks.yaml/ROADMAP.
@@ -139,10 +140,29 @@ waystone project register <project-root>
 
 This feeds `/waystone:status` in Claude Code or `$waystone:status` in Codex.
 
+## Step 8.5 — Optionally install managed agents or hooks
+
+Ask one host-native question offering the managed project agent, the project boundary hooks, both,
+or neither. This is optional and must not change the result of initialization when declined. For
+each surface the user accepts, record the consent first and then install it:
+
+```bash
+waystone consent record install.agents accept --context kind=agents --root <project-root>
+waystone install agents --root <project-root>
+
+waystone consent record install.hooks accept --context kind=hooks --root <project-root>
+waystone install hooks --root <project-root>
+```
+
+The install commands refuse to overwrite an existing target. Every installed managed file is left
+uncommitted together with the rest of init output; do not use consent or installation as permission
+to commit it.
+
 ## Step 9 — Report
 
 Leave all changes **uncommitted** for user review. Report in the user's configured language:
-what was created vs adapted, the config mapping, memory changes, and next steps (commit
+what was created vs adapted, the config mapping, memory changes, any managed agent/hook consent and
+uncommitted install, and next steps (commit
 suggestion `docs: adopt waystone harness`; start working; close rounds with
 `/waystone:round` in Claude Code or `$waystone:round` in Codex). Generated document content (PROGRESS, ADR-0000) is written in the
 user's configured response language; `docs/CONVENTIONS.md` stays a verbatim copy.

@@ -7,7 +7,7 @@
 
 Groups:
   validate [tasks.yaml]              validate the task registry
-  task     list|show|add|set|drop|archive ...  structured registry access (don't read/edit it raw)
+  task     list|show|add|set|drop|archive ...  structured registry access (`set --scope-add` for boundaries)
   roadmap  [root]                    regenerate ROADMAP.md
   ssot     split|digest|check [root] SSOT generated views
   status   [--project N]             cross-project dashboard
@@ -15,7 +15,7 @@ Groups:
   review   freeze|status|ingest ...  SHA-bound review cycles (PR mode); ingest = byte-exact reply copy
   approve  --pr N --sha X            SHA-bound human approval
   round    merge --pr N ...          deterministic merge guard
-  improve  trace|reviews|evidence|audit|decide ...  project logs + reviews + task-id evidence / decisions
+  improve  trace|reviews|evidence|audit|metrics|decide ...  project evidence, metrics, and decisions
   delegate run|status|show|verify|verdict|apply|discard ...  worktree runner + evidence-gated verdict
   overlay  add|...|promote-user|override|materialize|compose ...  four-layer adaptive policy
   consent  record <surface> <choice> ...  append a standard project-local consent event
