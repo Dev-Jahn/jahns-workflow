@@ -26,7 +26,7 @@ re-implements review ingest) into --out:
 
 `audit` reads ONLY the four projection artifacts above (never raw logs) from --in (default = trace's
 --out) and emits deterministic per-lens facts (no model interpretation — that is the skill's job):
-  facts.json            8 lenses, each carrying rule id + provenance + <=5 evidence pointers;
+  facts.json            versioned lenses, each carrying rule id + provenance + <=5 evidence pointers;
                         missing inputs are reported in `skipped_lenses`.
 
 `decide` appends the user's accept/reject on one recommendation to an append-only log (out dir default
@@ -71,6 +71,7 @@ from cclog import (  # noqa: E402
 from common import (  # noqa: E402
     SEVERITIES,
     WorkflowError,
+    delegation_scope_drift,
     ensure_project_state_dir,
     find_project_root,
     has_project_config,
@@ -85,6 +86,8 @@ from common import (  # noqa: E402
 
 HEAD_LEN = 120
 CONTEXT_HEAVY_BYTES = 100 * 1024
+DELEGATION_DIRECT_WORK_MIN = 5
+DELEGATION_CONTEXT_TOKENS_MIN = 100_000
 PROJECT_LENS_SCOPE = "project"
 USER_HABIT_LENS_SCOPE = "user-habit"
 FINDING_TYPES = (
@@ -99,8 +102,13 @@ LENS_SCOPES = {
     "retry_loops": frozenset({PROJECT_LENS_SCOPE, USER_HABIT_LENS_SCOPE}),
     "context_heavy": frozenset({PROJECT_LENS_SCOPE, USER_HABIT_LENS_SCOPE}),
     "delegation_pattern": frozenset({USER_HABIT_LENS_SCOPE}),
+    "delegation_opportunity": frozenset({PROJECT_LENS_SCOPE}),
+    "worker_scope_drift": frozenset({PROJECT_LENS_SCOPE}),
+    "warn_friction": frozenset({PROJECT_LENS_SCOPE}),
     "error_landscape": frozenset({PROJECT_LENS_SCOPE}),
+    "env_unpreparedness": frozenset({PROJECT_LENS_SCOPE}),
     "review_association": frozenset({PROJECT_LENS_SCOPE}),
+    "finding_concentration": frozenset({PROJECT_LENS_SCOPE}),
     "coverage_caveats": frozenset({PROJECT_LENS_SCOPE, USER_HABIT_LENS_SCOPE}),
     "evidence_link": frozenset({PROJECT_LENS_SCOPE}),
 }
@@ -124,6 +132,14 @@ _BUILD_RE = re.compile(
 )
 _LINT_RE = re.compile(r"\bruff\b|\bflake8\b|\beslint\b")
 _TYPECHECK_RE = re.compile(r"\bmypy\b|\btsc\b|\btypecheck\b|\bpyright\b|\bty check\b")
+_ENV_ERROR_SIGNATURES = (
+    ("python-module-missing", re.compile(r"\bModuleNotFoundError\b|\bNo module named\b", re.I)),
+    ("js-module-missing", re.compile(r"\bERR_MODULE_NOT_FOUND\b|\bCannot find module\b", re.I)),
+    ("dependency-resolution-failed", re.compile(
+        r"\bNo matching distribution found\b|\bCould not find a version that satisfies\b"
+        r"|\bfailed to select a version for\b", re.I)),
+    ("command-not-found", re.compile(r"\bcommand not found\b|\bexecutable file not found\b", re.I)),
+)
 
 
 def classify_verification(command: str) -> str | None:
@@ -202,6 +218,26 @@ def _detect_retry_loops(bash_calls: list[dict], result_by_tuid: dict[str, dict])
     loops = [c for c in chains if c["runs"] >= 3]
     examples = [{"line": c["line"], "head": c["head"]} for c in loops[:5]]
     return len(loops), examples
+
+
+def _env_error_facts(tool_results: list[dict]) -> dict:
+    signatures: Counter = Counter()
+    examples: list[dict] = []
+    for result in tool_results:
+        if result.get("is_error") is not True:
+            continue
+        text = "\n".join(part for part in (
+            result.get("content_text"), result.get("stderr_head")) if isinstance(part, str))
+        for name, pattern in _ENV_ERROR_SIGNATURES:
+            if not pattern.search(text):
+                continue
+            signatures[name] += 1
+            if len(examples) < 5:
+                examples.append({"line": result.get("ordinal"), "signature": name})
+    return {
+        "signatures": dict(sorted(signatures.items())), "examples": examples,
+        "provenance": "inferred", "rule": "env-error-signature-v1",
+    }
 
 
 # ------------------------------------------------------------- per-file builders
@@ -352,6 +388,7 @@ def _build_session(path: Path, kind: str, session_kind: str, scope: dict, parsed
         "tools": {"by_category": dict(sorted(tool_counts.items())),
                   "provenance": "inferred", "rule": "tool-category-v1"},
         "errors": {"api": api_err, "tool": tool_err, "parse": parse_err},
+        "env_unpreparedness": _env_error_facts(tool_results),
         "delegations": len(spawn_calls),
         "verification": {"runs": verify_runs, "failed": verify_failed,
                          "rule": "verify-cmd-v2", "provenance": "inferred", "examples": verify_examples},
@@ -454,10 +491,14 @@ def _cwd_belongs_to_project(cwd, project_roots: tuple[Path, ...]) -> bool | None
 
 def run_trace(sources: list[Path], projects: set[str], out_dir: Path,
               host: str = "claude", project_root: Path | None = None) -> dict:
-    canonical_root = project_root.resolve() if project_root is not None else None
-    project_roots = resolve_project_paths(canonical_root) if canonical_root is not None else ()
+    project_roots = resolve_project_paths(project_root) if project_root is not None else ()
+    canonical_root = project_roots[0] if project_roots else None
+    project_name = load_config(canonical_root).get("project") if canonical_root is not None else None
+    if canonical_root is not None and (not isinstance(project_name, str) or not project_name.strip()):
+        raise WorkflowError(f"project config has no non-empty project name: {canonical_root}")
     if host == "codex":
-        return _run_codex_trace(sources, projects, out_dir, canonical_root, project_roots)
+        return _run_codex_trace(
+            sources, projects, out_dir, canonical_root, project_roots, project_name=project_name)
     if host != "claude":
         raise WorkflowError(f"trace host must be claude|codex, got {host!r}")
     # A Claude slug is lossy, so project mode scans every candidate and attributes only by parsed
@@ -520,6 +561,9 @@ def run_trace(sources: list[Path], projects: set[str], out_dir: Path,
                 reason = "cwd_unknown" if membership is None else "cwd_outside_project"
                 project_exclusions[reason].append(str(path))
                 continue
+            row["project"] = project_name
+            for delegation in dels:
+                delegation["project"] = project_name
         session_rows.append(row)
         delegation_rows.extend(dels)
 
@@ -573,7 +617,8 @@ def run_trace(sources: list[Path], projects: set[str], out_dir: Path,
 
 def _run_codex_trace(sources: list[Path], projects: set[str], out_dir: Path,
                      project_root: Path | None = None,
-                     project_roots: tuple[Path, ...] = ()) -> dict:
+                     project_roots: tuple[Path, ...] = (),
+                     project_name: str | None = None) -> dict:
     """Project Codex rollouts through the same session/delegation schema as Claude trace."""
     files = codexlog.discover(sources)
     files_by_kind: Counter = Counter()
@@ -620,6 +665,9 @@ def _run_codex_trace(sources: list[Path], projects: set[str], out_dir: Path,
                 reason = "cwd_unknown" if membership is None else "cwd_outside_project"
                 project_exclusions[reason].append(str(path))
                 continue
+            row["project"] = project_name
+            for delegation in delegations:
+                delegation["project"] = project_name
         files_by_kind[kind] += 1
         session_rows.append(row)
         delegation_rows.extend(delegations)
@@ -690,6 +738,18 @@ def _run_codex_trace(sources: list[Path], projects: set[str], out_dir: Path,
 _TRIAGE_HEADING = "## Findings (triage skeleton"
 _FINDING_ID_RE = re.compile(r"JW-GPT-\d+")
 _VERDICT_RE = re.compile(r"\b(REAL|REJECTED|NEEDS-RULING)\b", re.IGNORECASE)
+_FINDING_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_.-])((?:\.?[A-Za-z0-9_.-]+/)+(?:[A-Za-z0-9_.-]+))(?::\d+(?::\d+)?)?")
+
+
+def _finding_paths(value: str) -> list[str]:
+    paths: set[str] = set()
+    without_urls = re.sub(r"\b[a-z][a-z0-9+.-]*://\S+", "", value, flags=re.I)
+    for match in _FINDING_PATH_RE.finditer(without_urls):
+        path = match.group(1).removeprefix("./")
+        if "://" not in path and ".." not in path.split("/"):
+            paths.add(path)
+    return sorted(paths)
 
 
 def _parse_triage(feedback_text: str) -> list[dict]:
@@ -734,8 +794,14 @@ def _parse_triage(feedback_text: str) -> list[dict]:
             vm = _VERDICT_RE.search(verdict)
             status = vm.group(1).upper() if vm else None
         task_id = cell("task id", 4).strip().strip("`")
-        out.append({"id": m.group(0), "severity": severity, "type": finding_type, "status": status,
-                    "task_id": task_id or None})
+        finding = {"id": m.group(0), "severity": severity, "type": finding_type, "status": status,
+                   "task_id": task_id or None}
+        paths = _finding_paths(cell("evidence", 3))
+        if paths:
+            finding["paths"] = paths
+            finding["path_provenance"] = "inferred"
+            finding["path_rule"] = "triage-evidence-path-v1"
+        out.append(finding)
     return out
 
 
@@ -771,10 +837,66 @@ def _finding_tasks_by_round(root: Path) -> dict[str, list[dict]]:
                 "severity": severity,
                 "type": "unknown",
                 "status": t.get("status"),
+                "round": t.get("round"),
+                "session_id": t.get("session_id"),
+                "anchor": t.get("anchor"),
                 "source": "task",
                 "provenance": "explicit" if severity else "unknown",
             })
     return by_round
+
+
+def _round_exposure_rows(root: Path) -> tuple[list[dict], int]:
+    rows: list[dict] = []
+    skipped = 0
+    directory = project_state_path(root) / "exposure"
+    if not directory.is_dir():
+        return rows, skipped
+    for path in sorted(directory.glob("round-*.json")):
+        try:
+            row = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            skipped += 1
+            continue
+        if (not isinstance(row, dict) or row.get("schema") != "waystone-round-exposure-1"
+                or not isinstance(row.get("round_id"), str)
+                or not isinstance(row.get("at"), str)):
+            skipped += 1
+            continue
+        rows.append({**row, "_file": str(path)})
+    rows.sort(key=lambda row: (row["at"], row["round_id"], row["_file"]))
+    return rows, skipped
+
+
+def _round_session_binding(round_id: str, exposures: list[dict]) -> tuple[object, str, str | None]:
+    matches = [row for row in exposures if row.get("round_id") == round_id]
+    session_ids = {row.get("session_id") for row in matches if isinstance(row.get("session_id"), str)}
+    if len(session_ids) == 1:
+        return next(iter(session_ids)), "explicit", None
+    reason = "missing-round-exposure" if not matches else "round-session-unavailable-or-conflicting"
+    return {"provenance": "unknown"}, "unknown", reason
+
+
+def _review_sha_binding(request_file: Path | None) -> tuple[str | None, str | None, str, str | None]:
+    if request_file is None:
+        return None, None, "unknown", "missing-review-request"
+    try:
+        text = request_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None, None, "unknown", "unreadable-review-request"
+    import review
+
+    markers = [marker for marker in review.parse_markers(text, "review-cycle")
+               if review.marker_valid(marker)]
+    if not markers:
+        return None, None, "unknown", "missing-valid-review-cycle-marker"
+    latest_cycle = max(marker["cycle"] for marker in markers)
+    bindings = {(marker.get("target_sha"), marker.get("base_sha"))
+                for marker in markers if marker["cycle"] == latest_cycle}
+    if len(bindings) != 1:
+        return None, None, "unknown", "conflicting-review-cycle-markers"
+    target_sha, base_sha = next(iter(bindings))
+    return target_sha, base_sha, "explicit", None
 
 
 def _project_review_rows(name: str, root: Path, cfg: dict) -> list[dict]:
@@ -787,6 +909,7 @@ def _project_review_rows(name: str, root: Path, cfg: dict) -> list[dict]:
         for p in sorted(rdir.glob("*-feedback.md")):
             feedback_files[p.stem[: -len("-feedback")]] = p
     tasks_by_round = _finding_tasks_by_round(root)
+    round_exposures, _exposures_skipped = _round_exposure_rows(root)
     round_ids = sorted(set(request_files) | set(feedback_files) | set(tasks_by_round))
 
     rows: list[dict] = []
@@ -808,6 +931,11 @@ def _project_review_rows(name: str, root: Path, cfg: dict) -> list[dict]:
                     "source": "triage",
                     "provenance": "explicit" if f["severity"] else "unknown",
                 }
+                if f.get("paths"):
+                    entry.update({
+                        "paths": f["paths"], "path_provenance": f["path_provenance"],
+                        "path_rule": f["path_rule"],
+                    })
                 # dedup: a triage row whose task-id cell names a task that also joins via origin is
                 # ONE finding — keep the triage row (triage severity), annotate its task_id, and drop
                 # the separate task finding so it is not double-counted
@@ -823,12 +951,22 @@ def _project_review_rows(name: str, root: Path, cfg: dict) -> list[dict]:
         for f in findings:
             counts[f["severity"] if f["severity"] in SEVERITIES else "unknown"] += 1
         req = request_files.get(rid)
+        target_sha, base_sha, review_provenance, review_reason = _review_sha_binding(req)
+        session_id, session_provenance, session_reason = _round_session_binding(
+            rid, round_exposures)
         rows.append({
             "project": name,
             "root": str(root),
             "round_id": rid,
             "request_file": str(req) if req else None,
             "feedback_file": str(fb) if fb else None,
+            "target_sha": target_sha,
+            "base_sha": base_sha,
+            "review_binding_provenance": review_provenance,
+            "review_binding_reason": review_reason,
+            "session_id": session_id,
+            "round_session_provenance": session_provenance,
+            "round_session_reason": session_reason,
             "findings": findings,
             "counts": counts,
         })
@@ -840,8 +978,8 @@ def _registry_path() -> Path:
     return registry_path()
 
 
-def _project_entry(root: Path) -> dict:
-    root = root.resolve()
+def _project_entry(root: Path, source: Path | None = None) -> dict:
+    root = resolve_project_paths(root, source)[0]
     try:
         name = load_config(root).get("project")
     except (OSError, yaml.YAMLError, ValueError) as e:
@@ -855,7 +993,7 @@ def run_reviews(registry_path: Path, out_dir: Path, project_root: Path | None = 
     entries: list = []
     generated_from = str(registry_path)
     if project_root is not None:
-        entries = [_project_entry(project_root)]
+        entries = [_project_entry(project_root, registry_path)]
         generated_from = str(project_root.resolve())
     elif registry_path.is_file():
         # a MISSING registry is a fresh install (0 projects, exit 0); an EXISTING but corrupt one is
@@ -877,13 +1015,14 @@ def run_reviews(registry_path: Path, out_dir: Path, project_root: Path | None = 
     rows: list[dict] = []
     scanned: list[str] = []
     skipped: list[dict] = []
+    round_exposures_skipped = 0
     for entry in entries:
         name = entry.get("name") or "(unnamed)"
         path = entry.get("path")
         if not path:  # remote-only registry entry — no local tree to read review artifacts from
             skipped.append({"project": name, "reason": "no local path (remote-only registry entry)"})
             continue
-        root = Path(path).expanduser()
+        root = resolve_project_paths(Path(path).expanduser(), registry_path)[0]
         if not has_project_config(root):
             skipped.append({"project": name, "reason": "project root or .waystone.yml inaccessible"})
             continue
@@ -892,6 +1031,7 @@ def run_reviews(registry_path: Path, out_dir: Path, project_root: Path | None = 
         except (OSError, yaml.YAMLError, ValueError) as e:
             skipped.append({"project": name, "reason": f"config unreadable: {type(e).__name__}"})
             continue
+        round_exposures_skipped += _round_exposure_rows(root)[1]
         rows.extend(_project_review_rows(name, root, cfg))
         scanned.append(name)
 
@@ -901,6 +1041,17 @@ def run_reviews(registry_path: Path, out_dir: Path, project_root: Path | None = 
         "projects_total": len(entries),
         "projects_scanned": sorted(scanned),
         "projects_skipped": sorted(skipped, key=lambda s: s["project"]),
+        "review_sha_bindings_unknown": sum(
+            1 for row in rows if row.get("review_binding_provenance") == "unknown"),
+        "round_session_bindings_unknown": sum(
+            1 for row in rows if row.get("round_session_provenance") == "unknown"),
+        "review_binding_unknown_reasons": dict(sorted(Counter(
+            row.get("review_binding_reason") for row in rows
+            if row.get("review_binding_provenance") == "unknown").items())),
+        "round_session_unknown_reasons": dict(sorted(Counter(
+            row.get("round_session_reason") for row in rows
+            if row.get("round_session_provenance") == "unknown").items())),
+        "round_exposures_skipped": round_exposures_skipped,
         "row_totals": {"reviews": len(rows), "findings": sum(len(r["findings"]) for r in rows)},
     }
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -924,38 +1075,211 @@ def _registry_entries(registry_path: Path) -> list[dict]:
     return [e for e in reg.get("projects", []) if isinstance(e, dict)]
 
 
-def _project_delegation_rows(root: Path) -> tuple[list[dict], int]:
-    """Task-linked delegation evidence for one project. A missing contract is a definite absence of
-    delegate-side verification evidence; corrupt exposure/status records are skipped and counted."""
-    import delegate
+def _load_record_mapping(path: Path, kind: str) -> dict | None:
+    try:
+        text = path.read_text(encoding="utf-8")
+        data = yaml.safe_load(text) if kind == "yaml" else json.loads(text)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, yaml.YAMLError):
+        return None
+    return data if isinstance(data, dict) else None
 
+
+def _latest_verdict_acceptance(record: Path) -> tuple[dict | None, int]:
+    candidates: list[tuple[int, Path]] = []
+    for path in (record / "artifact").glob("verdict-*.json"):
+        match = re.fullmatch(r"verdict-([1-9]\d*)\.json", path.name)
+        if match:
+            candidates.append((int(match.group(1)), path))
+    if not candidates:
+        return None, 0
+    _number, path = max(candidates)
+    verdict = _load_record_mapping(path, "json")
+    if (verdict is None or verdict.get("decision") not in ("apply", "discard")
+            or not isinstance(verdict.get("at"), str)):
+        return None, 1
+    return {
+        "event": "delegation-verdict", "at": verdict["at"],
+        "decision": verdict["decision"], "resolved": verdict["decision"] == "apply",
+        "provenance": "explicit",
+    }, 0
+
+
+def _project_delegation_rows(root: Path) -> tuple[list[dict], int]:
+    """Project task-linked delegation facts parsed directly from immutable/local record files."""
     rows: list[dict] = []
     skipped = 0
-    for did, rec in delegate._iter_delegations(root):
-        try:
-            exposure = delegate._load_exposure(rec)
-            status = delegate._read_status_raw(rec)
-        except WorkflowError:
+    directory = project_state_path(root) / "delegations"
+    if not directory.is_dir():
+        return rows, skipped
+    for record in sorted(directory.iterdir()):
+        if not record.is_dir() or not ((record / "claim.json").exists()
+                                      or (record / "exposure.json").exists()):
+            continue
+        exposure = _load_record_mapping(record / "exposure.json", "json")
+        status = _load_record_mapping(record / "status.json", "json")
+        if (exposure is None or status is None or not isinstance(exposure.get("task_id"), str)):
             skipped += 1
             continue
-        if not isinstance(status, dict) or not exposure.get("task_id"):
+        contract_path = record / "artifact" / "contract.yaml"
+        contract = _load_record_mapping(contract_path, "yaml") if contract_path.is_file() else None
+        if contract_path.is_file() and contract is None:
             skipped += 1
             continue
-        verification_present = False
-        if (rec / "artifact" / "contract.yaml").is_file():
-            try:
-                contract = delegate._load_contract(rec)
-            except WorkflowError:
-                skipped += 1
-                continue
-            report = contract.get("delegate_report") or {}
-            verification_present = report.get("present") is True and bool(report.get("verification"))
-        rows.append({
-            "task_id": exposure["task_id"], "did": did, "state": status.get("state"),
-            "verification_present": verification_present,
-        })
-    rows.sort(key=lambda r: r["did"])
+        report = (contract or {}).get("delegate_report") or {}
+        acceptance, verdict_skipped = _latest_verdict_acceptance(record)
+        skipped += verdict_skipped
+        row = {
+            "task_id": exposure["task_id"], "did": record.name, "state": status.get("state"),
+            "verification_present": (
+                report.get("present") is True and bool(report.get("verification"))),
+            "scope_drift": delegation_scope_drift(record),
+            "env": status.get("env") or (contract or {}).get("env"),
+            "overlays_active": exposure.get("overlays") if isinstance(exposure.get("overlays"), list) else [],
+            "binding": exposure.get("binding") if isinstance(exposure.get("binding"), dict) else None,
+        }
+        if acceptance is not None:
+            row["acceptance"] = acceptance
+        rows.append(row)
+    rows.sort(key=lambda row: row["did"])
     return rows, skipped
+
+
+def _project_task_rows(root: Path) -> list[dict]:
+    documents = [load_tasks(root)]
+    archive = root / "tasks.archive.yaml"
+    if archive.is_file():
+        archived = load_yaml(archive)
+        if not isinstance(archived, dict):
+            raise ValueError("tasks.archive.yaml is not an object")
+        documents.append(archived)
+    tasks: dict[str, dict] = {}
+    for document in documents:
+        for task in document.get("tasks", []) or []:
+            if isinstance(task, dict) and isinstance(task.get("id"), str):
+                tasks.setdefault(task["id"], task)
+    return [tasks[task_id] for task_id in sorted(tasks)]
+
+
+def _load_warning_rows(root: Path) -> tuple[list[dict], int, bool]:
+    path = project_state_path(root) / "overlay" / "warnings.jsonl"
+    if not path.is_file():
+        return [], 0, False
+    rows: list[dict] = []
+    skipped = 0
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return [], 1, True
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            skipped += 1
+            continue
+        if (not isinstance(row, dict) or not all(isinstance(row.get(field), str)
+                for field in ("at", "boundary", "rule", "event"))):
+            skipped += 1
+            continue
+        rows.append({
+            "at": row["at"], "boundary": row["boundary"], "rule": row["rule"],
+            "event": row["event"], "delta_id": row.get("delta_id"),
+            "delta_status": row.get("delta_status"),
+            "context": row.get("context") if isinstance(row.get("context"), dict) else {},
+        })
+    rows.sort(key=lambda row: (
+        row["at"], row["boundary"], row["rule"], row["event"], str(row.get("delta_id"))))
+    return rows, skipped, True
+
+
+def _warning_observation(name: str, warnings: list[dict], warnings_skipped: int,
+                         warnings_present: bool, exposures: list[dict],
+                         exposures_skipped: int) -> dict:
+    by_rule: dict[str, Counter] = {}
+    by_boundary: dict[str, Counter] = {}
+    by_rule_boundary: dict[tuple[str, str], Counter] = {}
+    counted = [row for row in warnings if row["event"] in ("fire", "conflict")]
+    for row in counted:
+        by_rule.setdefault(row["rule"], Counter())[row["event"]] += 1
+        by_boundary.setdefault(row["boundary"], Counter())[row["event"]] += 1
+        by_rule_boundary.setdefault((row["rule"], row["boundary"]), Counter())[row["event"]] += 1
+
+    rounds: list[dict] = []
+    previous_at: str | None = None
+    for exposure in exposures:
+        selected = [row for row in counted
+                    if (previous_at is None or row["at"] > previous_at)
+                    and row["at"] <= exposure["at"]]
+        rounds.append({
+            "round_id": exposure["round_id"], "closed_at": exposure["at"],
+            "fire": sum(row["event"] == "fire" for row in selected),
+            "conflict": sum(row["event"] == "conflict" for row in selected),
+        })
+        previous_at = exposure["at"]
+    outside = sum(1 for row in counted if not exposures or row["at"] > exposures[-1]["at"])
+    normalize = lambda groups: {key: {event: groups[key].get(event, 0)
+                                      for event in ("conflict", "fire")}
+                                for key in sorted(groups)}
+    cross: dict[str, dict] = {}
+    for (rule, boundary), counts in sorted(by_rule_boundary.items()):
+        cross.setdefault(rule, {})[boundary] = {
+            event: counts.get(event, 0) for event in ("conflict", "fire")}
+    return {
+        "project": name, "records": len(warnings),
+        "fire": sum(row["event"] == "fire" for row in counted),
+        "conflict": sum(row["event"] == "conflict" for row in counted),
+        "by_rule": normalize(by_rule), "by_boundary": normalize(by_boundary),
+        "by_rule_boundary": cross,
+        "recent_rounds": rounds[-5:],
+        "coverage": {
+            "warnings_file_present": warnings_present, "warning_rows_skipped": warnings_skipped,
+            "round_exposures_skipped": exposures_skipped,
+            "warnings_outside_closed_rounds": outside,
+            "round_intervals_unavailable": not bool(exposures),
+        },
+    }
+
+
+def _warning_task_ids(warning: dict, did_to_task: dict[str, str]) -> set[str]:
+    context = warning.get("context") or {}
+    task_ids: set[str] = set()
+    if isinstance(context.get("task_id"), str):
+        task_ids.add(context["task_id"])
+    if isinstance(context.get("task_ids"), list):
+        task_ids.update(task for task in context["task_ids"] if isinstance(task, str))
+    did = context.get("delegation_id")
+    if isinstance(did, str) and did in did_to_task:
+        task_ids.add(did_to_task[did])
+    return task_ids
+
+
+def _round_exposure_projection(task: dict, exposures: list[dict]) -> dict | None:
+    matches = [row for row in exposures if row.get("round_id") == task.get("round")]
+    if not matches:
+        return None
+    latest = matches[-1]
+    return {key: latest.get(key) for key in (
+        "round_id", "at", "session_id", "head_sha", "overlays_active", "bindings")}
+
+
+def _task_acceptance(task: dict, delegations: list[dict], exposures: list[dict]) -> dict:
+    events = [dict(delegation["acceptance"], delegation_id=delegation["did"])
+              for delegation in delegations if isinstance(delegation.get("acceptance"), dict)]
+    if task.get("status") in ("done", "dropped"):
+        matches = [row for row in exposures if row.get("round_id") == task.get("round")]
+        if matches:
+            events.append({
+                "event": "round-close", "at": matches[0]["at"], "resolved": True,
+                "round_id": matches[0]["round_id"], "provenance": "explicit",
+            })
+    if events:
+        return sorted(events, key=lambda row: (
+            row["at"], row["event"], row.get("delegation_id") or ""))[-1]
+    return {
+        "event": None, "at": None, "resolved": task.get("status") in ("done", "dropped"),
+        "provenance": "current-task-state-approximation",
+    }
 
 
 def run_evidence(registry_path: Path, out_dir: Path, projects: set[str],
@@ -964,7 +1288,7 @@ def run_evidence(registry_path: Path, out_dir: Path, projects: set[str],
     identical registry/files yield byte-identical evidence.jsonl (S10)."""
     generated_from = str(registry_path)
     if project_root is not None:
-        entries = [_project_entry(project_root)]
+        entries = [_project_entry(project_root, registry_path)]
         generated_from = str(project_root.resolve())
     else:
         entries = _registry_entries(registry_path)
@@ -975,6 +1299,9 @@ def run_evidence(registry_path: Path, out_dir: Path, projects: set[str],
     skipped: list[dict] = []
     unlinked = delegation_skipped = 0
     finding_total = delegation_total = 0
+    warning_observations: list[dict] = []
+    warning_rows_skipped = round_exposures_skipped = 0
+    task_session_unknown = acceptance_approximations = 0
 
     for entry in entries:
         name = entry.get("name") or "(unnamed)"
@@ -982,23 +1309,44 @@ def run_evidence(registry_path: Path, out_dir: Path, projects: set[str],
         if not path:
             skipped.append({"project": name, "reason": "no local path (remote-only registry entry)"})
             continue
-        root = Path(path).expanduser()
+        root = resolve_project_paths(Path(path).expanduser(), registry_path)[0]
         if not has_project_config(root):
             skipped.append({"project": name, "reason": "project root or .waystone.yml inaccessible"})
             continue
         try:
             cfg = load_config(root)
             reviews = _project_review_rows(name, root, cfg)
-            task_statuses = {
-                t.get("id"): t.get("status")
-                for t in (load_tasks(root).get("tasks") or [])
-                if isinstance(t, dict) and t.get("id")
-            }
+            project_tasks = _project_task_rows(root)
+            tasks_by_id = {task["id"]: task for task in project_tasks}
+            task_statuses = {task_id: task.get("status")
+                             for task_id, task in tasks_by_id.items()}
         except (OSError, yaml.YAMLError, ValueError) as e:
             skipped.append({"project": name, "reason": f"project unreadable: {type(e).__name__}"})
             continue
 
+        exposures, exposure_skipped = _round_exposure_rows(root)
+        warnings, warning_skipped, warnings_present = _load_warning_rows(root)
+        warning_rows_skipped += warning_skipped
+        round_exposures_skipped += exposure_skipped
+        warning_observations.append(_warning_observation(
+            name, warnings, warning_skipped, warnings_present, exposures, exposure_skipped))
+
         by_task: dict[str, dict] = {}
+        for task_id, task in tasks_by_id.items():
+            session_id = task.get("session_id") if isinstance(task.get("session_id"), str) else None
+            if session_id is None:
+                task_session_unknown += 1
+            by_task[task_id] = {
+                "task_id": task_id, "project": name, "findings": [], "delegations": [],
+                "join_key": "task-id", "provenance": "explicit",
+                "task_status": task.get("status"),
+                "task_context": {
+                    "round": task.get("round"), "session_id": session_id,
+                    "acceptance_criteria": len(task.get("accept") or [])
+                        if isinstance(task.get("accept"), list) else 0,
+                    "anchor": task.get("anchor"),
+                },
+            }
         for review in reviews:
             for finding in review.get("findings") or []:
                 task_id = (finding.get("id") if finding.get("source") == "task"
@@ -1010,6 +1358,8 @@ def run_evidence(registry_path: Path, out_dir: Path, projects: set[str],
                     "task_id": task_id, "project": name, "findings": [], "delegations": [],
                     "join_key": "task-id", "provenance": "explicit",
                     "task_status": task_statuses.get(task_id),
+                    "task_context": {"round": None, "session_id": None,
+                                     "acceptance_criteria": 0, "anchor": None},
                 })
                 row["findings"].append({
                     "round": review.get("round_id"), "severity": finding.get("severity"),
@@ -1020,14 +1370,22 @@ def run_evidence(registry_path: Path, out_dir: Path, projects: set[str],
         delegations, n_skipped = _project_delegation_rows(root)
         delegation_skipped += n_skipped
         for delegation in delegations:
-            task_id = delegation.pop("task_id")
+            task_id = delegation["task_id"]
             row = by_task.setdefault(task_id, {
                 "task_id": task_id, "project": name, "findings": [], "delegations": [],
                 "join_key": "task-id", "provenance": "explicit",
                 "task_status": task_statuses.get(task_id),
+                "task_context": {"round": None, "session_id": None,
+                                 "acceptance_criteria": 0, "anchor": None},
             })
-            row["delegations"].append(delegation)
+            row["delegations"].append({key: value for key, value in delegation.items()
+                                       if key != "task_id"})
             delegation_total += 1
+        did_to_task = {delegation["did"]: delegation["task_id"] for delegation in delegations}
+        warning_refs: dict[str, list[dict]] = {}
+        for warning in warnings:
+            for task_id in _warning_task_ids(warning, did_to_task):
+                warning_refs.setdefault(task_id, []).append(warning)
         for row in by_task.values():
             row["findings"].sort(
                 key=lambda f: (
@@ -1035,6 +1393,14 @@ def run_evidence(registry_path: Path, out_dir: Path, projects: set[str],
                     str(f.get("type")),
                 ))
             row["delegations"].sort(key=lambda x: x["did"])
+            task = tasks_by_id.get(row["task_id"], {})
+            row["acceptance"] = _task_acceptance(task, row["delegations"], exposures)
+            if row["acceptance"]["provenance"] == "current-task-state-approximation":
+                acceptance_approximations += 1
+            row["route_guard"] = {
+                "round_exposure": _round_exposure_projection(task, exposures),
+                "warning_refs": warning_refs.get(row["task_id"], []),
+            }
             task_rows.append(row)
         scanned.append(name)
 
@@ -1046,6 +1412,11 @@ def run_evidence(registry_path: Path, out_dir: Path, projects: set[str],
         "projects_skipped": sorted(skipped, key=lambda s: s["project"]),
         "unlinked_findings": unlinked,
         "delegations_skipped": delegation_skipped,
+        "warning_rows_skipped": warning_rows_skipped,
+        "round_exposures_skipped": round_exposures_skipped,
+        "task_session_unknown": task_session_unknown,
+        "acceptance_approximations": acceptance_approximations,
+        "warning_observations": sorted(warning_observations, key=lambda row: row["project"]),
         "row_totals": {"tasks": len(task_rows), "findings": finding_total,
                        "delegations": delegation_total},
     }
@@ -1057,9 +1428,9 @@ def run_evidence(registry_path: Path, out_dir: Path, projects: set[str],
 
 
 # ================================================================== audit (§9)
-# Deterministic facts over the four projection artifacts ONLY (never raw logs — layer separation).
+# Deterministic facts over projection artifacts ONLY (never raw logs — layer separation).
 # Each lens carries a versioned rule id + provenance; <=5 examples with evidence pointers. No model
-# interpretation. round<->session mapping is left provenance:"unknown" (no timestamp heuristics).
+# interpretation. round<->session joins use only recorded session ids; missing bindings stay unknown.
 _AUDIT_INPUTS = {
     "sessions": "sessions.jsonl",
     "delegations": "delegations.jsonl",
@@ -1232,6 +1603,146 @@ def _lens_delegation_pattern(delegations: list[dict]) -> dict:
     return _lens("delegation_pattern", "delegation-pattern-v2", "explicit", per, examples)
 
 
+def _evidence_task_rows(rows: list[dict]) -> list[dict]:
+    return [row for row in rows if isinstance(row, dict) and isinstance(row.get("task_id"), str)]
+
+
+def _evidence_coverage(rows: list[dict]) -> dict:
+    for row in reversed(rows):
+        if isinstance(row, dict) and isinstance(row.get("coverage"), dict):
+            return row["coverage"]
+    return {}
+
+
+def _lens_delegation_opportunity(sessions: list[dict], evidence_rows: list[dict]) -> dict:
+    session_index: dict[tuple[str, str], list[dict]] = {}
+    for session in sessions:
+        if isinstance(session.get("session_id"), str):
+            session_index.setdefault(
+                (session.get("project") or "", session["session_id"]), []).append(session)
+    task_rows = _evidence_task_rows(evidence_rows)
+    task_sessions: Counter = Counter()
+    for row in task_rows:
+        context = row.get("task_context") or {}
+        if isinstance(context.get("session_id"), str):
+            task_sessions[(row.get("project") or "", context["session_id"])] += 1
+
+    coverage = Counter()
+    per: dict[str, dict] = {}
+    candidates: list[dict] = []
+    evaluated_by_project: Counter = Counter()
+    for row in task_rows:
+        project = row.get("project") or ""
+        context = row.get("task_context") or {}
+        session_id = context.get("session_id")
+        if not isinstance(session_id, str):
+            coverage["task_session_unknown"] += 1
+            continue
+        key = (project, session_id)
+        if task_sessions[key] != 1:
+            coverage["ambiguous_task_session"] += 1
+            continue
+        matches = session_index.get(key, [])
+        if len(matches) != 1:
+            coverage["session_not_found" if not matches else "ambiguous_trace_session"] += 1
+            continue
+        session = matches[0]
+        if session.get("kind") != "main":
+            coverage["non_main_session"] += 1
+            continue
+        if row.get("delegations"):
+            coverage["already_delegated"] += 1
+            continue
+        file_write = _cat(session, "file_write")
+        shell = _cat(session, "shell")
+        direct_work = file_write + shell
+        retries = (session.get("retry_loops") or {}).get("count", 0)
+        max_result_bytes = (session.get("context_heavy") or {}).get("max_result_bytes", 0)
+        input_tokens = (session.get("usage") or {}).get("input", 0)
+        evaluated_by_project[project] += 1
+        triggered_by = []
+        if direct_work >= DELEGATION_DIRECT_WORK_MIN:
+            triggered_by.append("direct-work-size")
+        if retries > 0:
+            triggered_by.append("retry")
+        if max_result_bytes > CONTEXT_HEAVY_BYTES or input_tokens >= DELEGATION_CONTEXT_TOKENS_MIN:
+            triggered_by.append("context-cost")
+        if file_write <= 0 or not triggered_by:
+            coverage["burden_signal_absent"] += 1
+            continue
+        candidates.append({
+            "project": project, "task_id": row["task_id"], "session_id": session_id,
+            "file_write": file_write, "shell": shell, "direct_work": direct_work,
+            "retry_loops": retries, "max_result_bytes": max_result_bytes,
+            "input_tokens": input_tokens,
+            "acceptance_criteria": context.get("acceptance_criteria", 0),
+            "triggered_by": triggered_by, "provenance": "inferred",
+        })
+    candidates.sort(key=lambda row: (row["project"], row["task_id"], row["session_id"]))
+    candidate_counts = Counter(row["project"] for row in candidates)
+    for project in sorted({row.get("project") or "" for row in task_rows}):
+        per[project] = {
+            "tasks_evaluated": evaluated_by_project[project],
+            "candidates": candidate_counts[project],
+        }
+    examples = [{key: row[key] for key in (
+        "project", "task_id", "session_id", "direct_work", "retry_loops", "max_result_bytes")}
+        for row in candidates[:5]]
+    return _lens(
+        "delegation_opportunity", "delegation-opportunity-v1", "inferred", per, examples,
+        candidates=candidates, coverage=dict(sorted(coverage.items())),
+        thresholds={"direct_work_min": DELEGATION_DIRECT_WORK_MIN,
+                    "context_input_tokens_min": DELEGATION_CONTEXT_TOKENS_MIN,
+                    "context_result_bytes_gt": CONTEXT_HEAVY_BYTES})
+
+
+def _lens_worker_scope_drift(evidence_rows: list[dict]) -> dict:
+    per: dict[str, dict] = {}
+    examples: list[dict] = []
+    for project, rows in _by_project(_evidence_task_rows(evidence_rows)).items():
+        evaluations: list[tuple[dict, dict]] = []
+        coverage: Counter = Counter()
+        for row in rows:
+            for delegation in row.get("delegations") or []:
+                drift = delegation.get("scope_drift") or {}
+                if drift.get("evaluable") is not True:
+                    coverage[drift.get("coverage_reason") or "scope-drift-unavailable"] += 1
+                    continue
+                evaluations.append((delegation, drift))
+                if drift.get("outside_scope") and len(examples) < 5:
+                    examples.append({
+                        "project": project, "task_id": row["task_id"],
+                        "did": delegation.get("did"), "outside_scope": drift["outside_scope"],
+                    })
+        per[project] = {
+            "delegations_evaluable": len(evaluations),
+            "delegations_drifted": sum(bool(drift.get("outside_scope"))
+                                       for _delegation, drift in evaluations),
+            "changed_files": sum(len(drift.get("changed_files") or [])
+                                 for _delegation, drift in evaluations),
+            "outside_files": sum(len(drift.get("outside_scope") or [])
+                                 for _delegation, drift in evaluations),
+            "coverage": dict(sorted(coverage.items())),
+        }
+    return _lens("worker_scope_drift", "worker-scope-drift-v1", "inferred", per, examples)
+
+
+def _lens_warn_friction(evidence_rows: list[dict]) -> dict:
+    observations = _evidence_coverage(evidence_rows).get("warning_observations") or []
+    per = {
+        row["project"]: {key: row[key] for key in (
+            "records", "fire", "conflict", "by_rule", "by_boundary", "by_rule_boundary",
+            "recent_rounds", "coverage")}
+        for row in observations if isinstance(row, dict) and isinstance(row.get("project"), str)
+    }
+    examples = []
+    for project, facts in sorted(per.items()):
+        for row in facts["recent_rounds"]:
+            if row["fire"] or row["conflict"]:
+                examples.append({"project": project, **row})
+    return _lens("warn_friction", "warn-friction-v1", "explicit", per, examples)
+
+
 def _lens_error_landscape(sessions: list[dict]) -> dict:
     def err(s: dict, k: str) -> int:
         return (s.get("errors") or {}).get(k, 0)
@@ -1254,6 +1765,53 @@ def _lens_error_landscape(sessions: list[dict]) -> dict:
                  "api": err(s, "api"), "tool": err(s, "tool"), "parse": err(s, "parse")}
                 for s in top if total(s) > 0]
     return _lens("error_landscape", "error-landscape-v1", "explicit", per, examples)
+
+
+def _lens_env_unpreparedness(sessions: list[dict], evidence_rows: list[dict]) -> dict:
+    projects = {session.get("project") or "" for session in sessions}
+    task_rows = _evidence_task_rows(evidence_rows)
+    projects.update(row.get("project") or "" for row in task_rows)
+    per: dict[str, dict] = {}
+    examples: list[dict] = []
+    session_groups = _by_project(sessions)
+    evidence_groups = _by_project(task_rows)
+    for project in sorted(projects):
+        signatures: Counter = Counter()
+        sessions_with_signatures = 0
+        sessions_without_projection = 0
+        for session in session_groups.get(project, []):
+            facts = session.get("env_unpreparedness")
+            if not isinstance(facts, dict):
+                sessions_without_projection += 1
+                continue
+            current = facts.get("signatures") or {}
+            if current:
+                sessions_with_signatures += 1
+            for signature, count in current.items():
+                if isinstance(signature, str) and isinstance(count, int):
+                    signatures[signature] += count
+            for example in facts.get("examples") or []:
+                if len(examples) < 5:
+                    examples.append({"project": project, "session_id": session.get("session_id"),
+                                     **example})
+        delegations = [delegation for row in evidence_groups.get(project, [])
+                       for delegation in (row.get("delegations") or [])]
+        failed_env = [delegation for delegation in delegations
+                      if delegation.get("state") == "failed-env"]
+        for delegation in failed_env:
+            if len(examples) < 5:
+                examples.append({"project": project, "did": delegation.get("did"),
+                                 "env": delegation.get("env")})
+        per[project] = {
+            "sessions": len(session_groups.get(project, [])),
+            "sessions_with_dependency_signatures": sessions_with_signatures,
+            "dependency_error_signatures": dict(sorted(signatures.items())),
+            "env_prep_failures": len(failed_env),
+            "coverage": {"sessions_without_signature_projection": sessions_without_projection},
+        }
+    return _lens(
+        "env_unpreparedness", "env-unpreparedness-v1", "inferred", per, examples,
+        signal_provenance={"env_prep": "explicit", "dependency_signatures": "inferred"})
 
 
 def _lens_review_association(reviews: list[dict]) -> dict:
@@ -1284,6 +1842,103 @@ def _lens_review_association(reviews: list[dict]) -> dict:
     return _lens("review_association", "review-association-v2", "explicit", per, examples)
 
 
+def _session_role(session: dict) -> str:
+    if session.get("kind") == "main":
+        return "main"
+    meta = session.get("agent_meta") or {}
+    if isinstance(meta.get("agentType"), str) and meta["agentType"]:
+        return meta["agentType"]
+    if isinstance(session.get("kind"), str) and session["kind"]:
+        return session["kind"]
+    return "unknown"
+
+
+def _lens_finding_concentration(reviews: list[dict], sessions: list[dict]) -> dict:
+    session_index: dict[tuple[str, str], list[dict]] = {}
+    for session in sessions:
+        if isinstance(session.get("session_id"), str):
+            session_index.setdefault(
+                (session.get("project") or "", session["session_id"]), []).append(session)
+    per: dict[str, dict] = {}
+    examples: list[dict] = []
+    for project, rows in _by_project(reviews).items():
+        by_role: Counter = Counter()
+        by_area: Counter = Counter()
+        by_task: Counter = Counter()
+        type_rounds: dict[str, set[str]] = {}
+        type_occurrences: Counter = Counter()
+        unknown_type = rejected_type = unknown_task = unknown_area = unknown_role = 0
+        round_session_unknown = 0
+        for row in rows:
+            findings = row.get("findings") or []
+            session_id = row.get("session_id")
+            matches = (session_index.get((project, session_id), [])
+                       if isinstance(session_id, str) else [])
+            role = _session_role(matches[0]) if len(matches) == 1 else "unknown"
+            if role == "unknown":
+                round_session_unknown += 1
+            for finding in findings:
+                finding_type = finding.get("type", "unknown")
+                if finding.get("status") == "REJECTED":
+                    rejected_type += 1
+                elif finding_type in FINDING_TYPES:
+                    type_occurrences[finding_type] += 1
+                    if isinstance(row.get("round_id"), str):
+                        type_rounds.setdefault(finding_type, set()).add(row["round_id"])
+                else:
+                    unknown_type += 1
+                by_role[role] += 1
+                if role == "unknown":
+                    unknown_role += 1
+                task_id = (finding.get("id") if finding.get("source") == "task"
+                           else finding.get("task_id"))
+                if isinstance(task_id, str) and task_id:
+                    by_task[task_id] += 1
+                else:
+                    unknown_task += 1
+                areas = sorted({path.split("/", 1)[0] for path in (finding.get("paths") or [])
+                                if isinstance(path, str) and path})
+                if not areas:
+                    unknown_area += 1
+                for area in areas:
+                    by_area[area] += 1
+                if len(examples) < 5:
+                    examples.append({
+                        "project": project, "round_id": row.get("round_id"),
+                        "finding_id": finding.get("id"), "type": finding_type,
+                        "task_id": task_id, "role": role,
+                        "project_areas": areas or ["unknown"],
+                    })
+        recurring = []
+        for finding_type in sorted(type_rounds):
+            round_ids = sorted(type_rounds[finding_type])
+            if len(round_ids) > 1:
+                recurring.append({
+                    "type": finding_type, "rounds": round_ids,
+                    "occurrences": type_occurrences[finding_type],
+                    "recurrences": len(round_ids) - 1,
+                })
+        per[project] = {
+            "rounds": len(rows),
+            "findings_total": sum(len(row.get("findings") or []) for row in rows),
+            "by_task": dict(sorted(by_task.items())),
+            "by_role": dict(sorted(by_role.items())),
+            "by_project_area": dict(sorted(by_area.items())),
+            "recurring_types": recurring,
+            "unknown_type_excluded": unknown_type,
+            "rejected_type_excluded": rejected_type,
+            "unknown_task": unknown_task,
+            "unknown_project_area": unknown_area,
+            "unknown_role": unknown_role,
+            "round_session_unknown": round_session_unknown,
+        }
+    return _lens(
+        "finding_concentration", "finding-concentration-v1", "inferred", per, examples,
+        recurrence_rule="same-type-across-rounds-v1",
+        signal_provenance={"taxonomy": "explicit", "role": "explicit-or-unknown",
+                           "project_area": "inferred"})
+
+
 def _lens_coverage_caveats(coverage: dict) -> dict:
     summary = {
         "parser_version": coverage.get("parser_version"),
@@ -1309,9 +1964,12 @@ def _lens_evidence_link(rows: list[dict]) -> dict:
         joined = [r for r in prows if r.get("findings") and r.get("delegations")]
         unverified_with_open_severe = 0
         for row in joined:
+            acceptance = row.get("acceptance") or {}
+            resolved = acceptance.get("resolved") if isinstance(acceptance, dict) else None
             open_severe = (
-                row.get("task_status") is not None
-                and row["task_status"] not in ("done", "dropped")
+                ((resolved is False) if isinstance(resolved, bool) else (
+                    row.get("task_status") is not None
+                    and row["task_status"] not in ("done", "dropped")))
                 and any(f.get("severity") in ("blocker", "major")
                         and f.get("status") != "REJECTED"
                         for f in row.get("findings") or []))
@@ -1328,6 +1986,11 @@ def _lens_evidence_link(rows: list[dict]) -> dict:
             "tasks_with_delegations": sum(1 for r in prows if r.get("delegations")),
             "tasks_joined": len(joined),
             "unverified_delegations_with_open_severe_findings": unverified_with_open_severe,
+            "acceptance_event_bound_tasks": sum(
+                (r.get("acceptance") or {}).get("provenance") == "explicit" for r in prows),
+            "acceptance_status_approximation_tasks": sum(
+                (r.get("acceptance") or {}).get("provenance")
+                == "current-task-state-approximation" for r in prows),
         }
     return _lens(
         "evidence_link", "evidence-link-v1", "explicit", per, examples,
@@ -1350,34 +2013,52 @@ def run_audit(in_dir: Path, lens_scope: str | None = None) -> dict:
                 ok = False
         present[key] = ok
 
+    evidence_path = in_dir / "evidence.jsonl"
+    if evidence_path.is_file():
+        try:
+            data["evidence"] = _load_jsonl(evidence_path)
+            present["evidence"] = True
+        except (OSError, json.JSONDecodeError):
+            present["evidence"] = False
+    else:
+        present["evidence"] = False
+
     lens_specs = [
-        ("main_direct_work", "sessions", lambda: _lens_main_direct_work(data["sessions"])),
-        ("verification_debt", "sessions", lambda: _lens_verification_debt(data["sessions"])),
-        ("retry_loops", "sessions", lambda: _lens_retry_loops(data["sessions"])),
-        ("context_heavy", "sessions", lambda: _lens_context_heavy(data["sessions"])),
-        ("delegation_pattern", "delegations", lambda: _lens_delegation_pattern(data["delegations"])),
-        ("error_landscape", "sessions", lambda: _lens_error_landscape(data["sessions"])),
-        ("review_association", "reviews", lambda: _lens_review_association(data["reviews"])),
-        ("coverage_caveats", "parse_coverage", lambda: _lens_coverage_caveats(data["parse_coverage"])),
+        ("main_direct_work", ("sessions",), lambda: _lens_main_direct_work(data["sessions"])),
+        ("verification_debt", ("sessions",), lambda: _lens_verification_debt(data["sessions"])),
+        ("retry_loops", ("sessions",), lambda: _lens_retry_loops(data["sessions"])),
+        ("context_heavy", ("sessions",), lambda: _lens_context_heavy(data["sessions"])),
+        ("delegation_pattern", ("delegations",),
+         lambda: _lens_delegation_pattern(data["delegations"])),
+        ("delegation_opportunity", ("sessions", "evidence"),
+         lambda: _lens_delegation_opportunity(data["sessions"], data["evidence"])),
+        ("worker_scope_drift", ("evidence",),
+         lambda: _lens_worker_scope_drift(data["evidence"])),
+        ("warn_friction", ("evidence",), lambda: _lens_warn_friction(data["evidence"])),
+        ("error_landscape", ("sessions",), lambda: _lens_error_landscape(data["sessions"])),
+        ("env_unpreparedness", ("sessions",),
+         lambda: _lens_env_unpreparedness(data["sessions"], data.get("evidence", []))),
+        ("review_association", ("reviews",), lambda: _lens_review_association(data["reviews"])),
+        ("finding_concentration", ("reviews",),
+         lambda: _lens_finding_concentration(data["reviews"], data.get("sessions", []))),
+        ("coverage_caveats", ("parse_coverage",),
+         lambda: _lens_coverage_caveats(data["parse_coverage"])),
     ]
     if lens_scope is not None:
         lens_specs = [spec for spec in lens_specs if lens_scope in LENS_SCOPES[spec[0]]]
     lenses: list[dict] = []
     skipped: list[dict] = []
-    for name, req, builder in lens_specs:
-        if present.get(req):
+    for name, requirements, builder in lens_specs:
+        missing = [requirement for requirement in requirements if not present.get(requirement)]
+        if not missing:
             lenses.append(builder())
         else:
-            skipped.append({"lens": name, "reason": f"missing {_AUDIT_INPUTS[req]}"})
-    evidence_path = in_dir / "evidence.jsonl"
-    if (lens_scope is None or lens_scope in LENS_SCOPES["evidence_link"]) and evidence_path.is_file():
-        try:
-            evidence_rows = _load_jsonl(evidence_path)
-        except (OSError, json.JSONDecodeError):
-            evidence_rows = None
-        if evidence_rows is not None:
-            lenses.append(_lens_evidence_link(evidence_rows))
-            present["evidence"] = True
+            names = [(_AUDIT_INPUTS.get(requirement) or "evidence.jsonl")
+                     for requirement in missing]
+            skipped.append({"lens": name, "reason": f"missing {', '.join(names)}"})
+    if ((lens_scope is None or lens_scope in LENS_SCOPES["evidence_link"])
+            and present["evidence"]):
+        lenses.append(_lens_evidence_link(data["evidence"]))
     lenses.sort(key=lambda x: x["lens"])
     skipped.sort(key=lambda x: x["lens"])
 
