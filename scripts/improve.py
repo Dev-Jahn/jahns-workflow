@@ -86,6 +86,9 @@ HEAD_LEN = 120
 CONTEXT_HEAVY_BYTES = 100 * 1024
 PROJECT_LENS_SCOPE = "project"
 USER_HABIT_LENS_SCOPE = "user-habit"
+FINDING_TYPES = (
+    "correctness", "scope", "architecture", "verification", "reproducibility", "reporting",
+)
 
 # Lens selection is mode policy, separate from the unchanged lens calculations below. Cross-scope
 # lenses run over only the projection directory selected by that mode.
@@ -686,30 +689,48 @@ _VERDICT_RE = re.compile(r"\b(REAL|REJECTED|NEEDS-RULING)\b", re.IGNORECASE)
 
 
 def _parse_triage(feedback_text: str) -> list[dict]:
-    """Structured findings from the appended triage table only. Severity is read from the table
-    cell (explicit) or left None (unknown) — never keyword-guessed from prose. Returns
-    [{id, severity, status, task_id}] where status is the triage verdict (REAL/REJECTED/NEEDS-RULING)
-    or None, and task_id is the linked task-id cell (used to dedup against the finding-derived task)."""
+    """Structured findings from the appended triage table only. Severity and optional taxonomy
+    type are read from named table cells, never guessed from prose. A missing, blank, or
+    noncanonical type is ``unknown`` (invariant #11)."""
     idx = feedback_text.rfind(_TRIAGE_HEADING)
     if idx < 0:
         return []
     out: list[dict] = []
+    columns: dict[str, int] | None = None
     for line in feedback_text[idx:].splitlines():
         line = line.strip()
         if not line.startswith("|"):
             continue
         cells = [c.strip() for c in line.strip("|").split("|")]
+        if cells and cells[0].strip().lower() == "finding":
+            columns = {}
+            for index, cell in enumerate(cells):
+                name = re.sub(r"\s+", " ", cell.strip().lower())
+                if name.startswith("verdict"):
+                    name = "verdict"
+                elif name in ("task", "task-id"):
+                    name = "task id"
+                columns[name] = index
+            continue
         m = _FINDING_ID_RE.search(cells[0]) if cells else None
         if not m:
             continue  # header row, separator row, or a non-finding table line
-        sev = cells[1].strip().strip("`").lower() if len(cells) > 1 else ""
+
+        def cell(name: str, fallback: int | None = None) -> str:
+            position = columns.get(name) if columns is not None else fallback
+            return cells[position] if position is not None and position < len(cells) else ""
+
+        sev = cell("severity", 1).strip().strip("`").lower()
         severity = sev if sev in SEVERITIES else None
+        raw_type = cell("type").strip().strip("`").lower()
+        finding_type = raw_type if raw_type in FINDING_TYPES else "unknown"
         status = None
-        if len(cells) > 2:
-            vm = _VERDICT_RE.search(cells[2])
+        verdict = cell("verdict", 2)
+        if verdict:
+            vm = _VERDICT_RE.search(verdict)
             status = vm.group(1).upper() if vm else None
-        task_id = cells[4].strip().strip("`") if len(cells) > 4 else ""
-        out.append({"id": m.group(0), "severity": severity, "status": status,
+        task_id = cell("task id", 4).strip().strip("`")
+        out.append({"id": m.group(0), "severity": severity, "type": finding_type, "status": status,
                     "task_id": task_id or None})
     return out
 
@@ -744,6 +765,7 @@ def _finding_tasks_by_round(root: Path) -> dict[str, list[dict]]:
             by_round.setdefault(rid, []).append({
                 "id": t.get("id"),
                 "severity": severity,
+                "type": "unknown",
                 "status": t.get("status"),
                 "source": "task",
                 "provenance": "explicit" if severity else "unknown",
@@ -777,7 +799,8 @@ def _project_review_rows(name: str, root: Path, cfg: dict) -> list[dict]:
                 text = ""
             for f in _parse_triage(text):
                 entry = {
-                    "id": f["id"], "severity": f["severity"], "status": f["status"],
+                    "id": f["id"], "severity": f["severity"], "type": f["type"],
+                    "status": f["status"],
                     "source": "triage",
                     "provenance": "explicit" if f["severity"] else "unknown",
                 }
@@ -986,7 +1009,7 @@ def run_evidence(registry_path: Path, out_dir: Path, projects: set[str],
                 })
                 row["findings"].append({
                     "round": review.get("round_id"), "severity": finding.get("severity"),
-                    "status": finding.get("status"),
+                    "status": finding.get("status"), "type": finding.get("type", "unknown"),
                 })
                 finding_total += 1
 
@@ -1003,7 +1026,10 @@ def run_evidence(registry_path: Path, out_dir: Path, projects: set[str],
             delegation_total += 1
         for row in by_task.values():
             row["findings"].sort(
-                key=lambda f: (str(f.get("round")), str(f.get("severity")), str(f.get("status"))))
+                key=lambda f: (
+                    str(f.get("round")), str(f.get("severity")), str(f.get("status")),
+                    str(f.get("type")),
+                ))
             row["delegations"].sort(key=lambda x: x["did"])
             task_rows.append(row)
         scanned.append(name)

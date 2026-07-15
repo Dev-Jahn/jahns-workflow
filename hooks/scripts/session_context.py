@@ -31,28 +31,40 @@ CONTRACT_PATH = Path(__file__).resolve().parents[2] / "references" / "main-contr
 MIGRATION_LOCK_TIMEOUT = 3.0
 
 
-def _routing_line(root: Path) -> str:
+def _routing_block(root: Path) -> list[str]:
+    """Render the static profile as a bounded routing policy. Missing profile means no block;
+    SessionStart never invents bindings. The two decision lines are §9's eight routing questions
+    compressed into stable propositions, not runtime model introspection."""
     import delegate
 
     path = delegate._profile_path(root)
     if not path.is_file():
-        return "routing: no profile — waystone delegate will guide setup"
+        return []
     try:
         profile, _fingerprint = delegate._load_profile(root)
         bindings = profile.get("bindings")
         if not isinstance(bindings, dict):
             raise ValueError("bindings is not a mapping")
-        roles = sorted(bindings, key=lambda role: (role != "implementer", role))
-        rendered = []
-        for role in roles:
+        lines = ["routing policy: static profile bindings"]
+        for role in delegate.PROFILE_ROLES:
+            if role not in bindings:
+                continue
             binding = bindings[role]
             if isinstance(binding, dict) and isinstance(binding.get("backend"), str):
-                rendered.append(f"{role}→{binding['backend']}")
-        if not rendered:
+                execution = delegate._canonical_execution(role, binding)
+                line = f"  {role}→{binding['backend']} [{execution}]"
+                if isinstance(binding.get("use_for"), str):
+                    line += f" — {binding['use_for']}"
+                lines.append(line)
+        if len(lines) == 1:
             raise ValueError("no readable bindings")
-        return "routing: " + " · ".join(rendered)
+        lines.extend([
+            "  choose: reasoning · context inheritance · independent perspective · bounded scope",
+            "  weigh: repetitive tools · retry cost · independent verification · budget sensitivity",
+        ])
+        return lines[:12]
     except Exception:  # noqa: BLE001 — one damaged live input must not break SessionStart
-        return "routing: — unreadable"
+        return ["routing policy: — unreadable"]
 
 
 def _overlay_line(root: Path) -> str:
@@ -129,7 +141,7 @@ def _operating_contract(root: Path) -> list[str]:
         if not constitution:
             return []
         lines = ["◆ OPERATING CONTRACT (waystone)", *constitution.splitlines(),
-                 _routing_line(root), _overlay_line(root)]
+                 *_routing_block(root), _overlay_line(root)]
         live = "live: " + _delegation_summary(root)
         evidence = _evidence_summary(root)
         if evidence:

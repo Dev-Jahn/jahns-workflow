@@ -49,6 +49,31 @@ _VERDICT_INPUT_SCHEMA_PATH = (
     Path(__file__).resolve().parent.parent / "templates" / "verdict-input-schema.json")
 _VERDICT_SCHEMA_PATH = Path(__file__).resolve().parent.parent / "templates" / "verdict-schema.json"
 _EFFORT_VALUES = ("none", "minimal", "low", "medium", "high", "xhigh")
+PROFILE_ROLES = ("main", "orchestrator", "implementer", "clerk", "verifier", "reviewer")
+PROFILE_EXECUTIONS = (
+    "main-session", "clean-subagent", "forked-subagent",
+    "deterministic-workflow", "external-runner",
+)
+# §8.2 role/execution semantics. A listed pair is schema-valid, not necessarily shipped by a
+# consumer. In particular, verifier/reviewer exclude main-session and context-forked execution so
+# their independent/read-only responsibility is not silently weakened. main/orchestrator/clerk
+# bindings have no L1 executor: SessionStart routing injection is their only current consumer.
+VALID_ROLE_EXECUTIONS = {
+    "main": ("main-session",),
+    "orchestrator": (
+        "main-session", "clean-subagent", "forked-subagent", "deterministic-workflow",
+    ),
+    "implementer": (
+        "clean-subagent", "forked-subagent", "deterministic-workflow", "external-runner",
+    ),
+    "clerk": (
+        "clean-subagent", "forked-subagent", "deterministic-workflow", "external-runner",
+    ),
+    "verifier": ("clean-subagent", "deterministic-workflow", "external-runner"),
+    "reviewer": ("clean-subagent", "deterministic-workflow", "external-runner"),
+}
+_BACKEND_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*:[^\s:]+$")
+_LEGACY_VERIFIER_EXECUTIONS = ("codex-cli", "codex-companion")
 
 # lockfile -> (prep command, kind), first match wins (S7). None env_prep in config falls through here.
 _LOCKFILE_DETECT = (
@@ -63,8 +88,9 @@ _PROFILE_EXAMPLE = (
     "schema: waystone-profile-1\n"
     "bindings:\n"
     "  implementer: {execution: external-runner, backend: \"codex:gpt-5.6-sol\", effort: xhigh}\n"
-    "  verifier: {backend: \"codex:gpt-5.6-sol\", "
+    "  verifier: {execution: external-runner, backend: \"codex:gpt-5.6-sol\", "
     "entry: adversarial-review}\n"
+    "  reviewer: {execution: external-runner, backend: \"codex:gpt-5.6-sol\"}\n"
 )
 
 
@@ -206,6 +232,66 @@ def _now_iso() -> str:
 
 
 # ---- profile / binding (§11 — fail-loud, no default-model guessing) -----------
+def _canonical_execution(role: str, binding: dict) -> str:
+    execution = binding.get("execution")
+    # v0.9 verifier profiles omitted execution or carried the derived transport name. Preserve
+    # those files while normalizing their role/execution axis to external-runner.
+    if role == "verifier" and (execution is None or execution in _LEGACY_VERIFIER_EXECUTIONS):
+        return "external-runner"
+    if execution not in PROFILE_EXECUTIONS:
+        raise WorkflowError(
+            f"binding execution {execution!r} must be one of {', '.join(PROFILE_EXECUTIONS)}")
+    return execution
+
+
+def _validate_profile_binding(role: str, binding: object) -> str:
+    if role not in PROFILE_ROLES:
+        raise WorkflowError(
+            f"profile binding role {role!r} must be one of {', '.join(PROFILE_ROLES)}")
+    if not isinstance(binding, dict):
+        raise WorkflowError(f"profile binding for role {role!r} must be a mapping")
+    unknown = set(binding) - {"execution", "backend", "use_for", "effort", "entry"}
+    if unknown:
+        raise WorkflowError(
+            f"profile binding for role {role!r} has unknown field(s): {', '.join(sorted(unknown))}")
+    execution = _canonical_execution(role, binding)
+    if execution not in VALID_ROLE_EXECUTIONS[role]:
+        raise WorkflowError(
+            f"binding execution {execution!r} is not valid for role {role!r}; valid: "
+            f"{', '.join(VALID_ROLE_EXECUTIONS[role])}")
+    backend = binding.get("backend")
+    if not isinstance(backend, str) or not _BACKEND_RE.fullmatch(backend):
+        raise WorkflowError(f"binding backend must be '<runner>:<model>', got {backend!r}")
+    use_for = binding.get("use_for")
+    if use_for is not None and (
+            not isinstance(use_for, str) or not use_for.strip() or "\n" in use_for
+            or "\r" in use_for):
+        raise WorkflowError("binding field use_for must be one non-empty line")
+    effort = binding.get("effort")
+    if effort is not None and (not isinstance(effort, str) or effort not in _EFFORT_VALUES):
+        raise WorkflowError(
+            f"binding field effort must be one of {', '.join(_EFFORT_VALUES)}, got {effort!r}")
+    entry = binding.get("entry")
+    if entry is not None and not isinstance(entry, str):
+        raise WorkflowError(f"binding field entry must be a string, got {entry!r}")
+    return execution
+
+
+def _validate_profile(profile: dict, path: Path) -> None:
+    schema = profile.get("schema")
+    if schema is not None and schema not in ("waystone-profile-1", "jw-profile-1"):
+        raise WorkflowError(
+            f"profile {path} schema must be 'waystone-profile-1' (or legacy 'jw-profile-1'), "
+            f"got {schema!r}")
+    bindings = profile.get("bindings")
+    if not isinstance(bindings, dict):
+        raise WorkflowError(f"profile {path} bindings must be a mapping")
+    if not bindings:
+        raise WorkflowError(f"profile {path} bindings must contain at least one role")
+    for role, binding in bindings.items():
+        _validate_profile_binding(role, binding)
+
+
 def _load_profile(root: Path) -> tuple[dict, str]:
     """Load the project's profile.yml and its byte fingerprint. Raises WorkflowError with a
     creation guide if the file is absent (the harness never guesses a default model)."""
@@ -216,9 +302,13 @@ def _load_profile(root: Path) -> tuple[dict, str]:
             f"{_profile_example()}")
     raw = path.read_bytes()
     fingerprint = "sha256:" + hashlib.sha256(raw).hexdigest()[:12]
-    data = yaml.safe_load(raw.decode("utf-8")) or {}
+    try:
+        data = yaml.safe_load(raw.decode("utf-8")) or {}
+    except (UnicodeDecodeError, yaml.YAMLError) as e:
+        raise WorkflowError(f"profile {path} is unreadable/unparseable: {e}") from e
     if not isinstance(data, dict):
         raise WorkflowError(f"profile {path} is not a mapping")
+    _validate_profile(data, path)
     return data, fingerprint
 
 
@@ -230,19 +320,16 @@ def _resolve_binding(profile: dict, role: str, root: Path) -> dict:
         raise WorkflowError(
             f"profile has no binding for role {role!r} — add it to {_profile_path(root)}, e.g.:\n\n"
             f"{_profile_example()}")
-    execution = b.get("execution")
+    execution = _validate_profile_binding(role, b)
     backend = b.get("backend")
-    if execution != "external-runner":
-        raise WorkflowError(f"binding execution {execution!r} not implemented in M1 (only 'external-runner')")
-    if not isinstance(backend, str) or ":" not in backend or not backend.split(":", 1)[1]:
-        raise WorkflowError(f"binding backend must be '<runner>:<model>', got {backend!r}")
+    if role != "implementer" or execution != "external-runner":
+        raise WorkflowError(
+            f"binding {role!r}/{execution!r} is schema-valid but not executable by delegate run "
+            "(only implementer/external-runner is shipped)")
     binding = {"role": role, "execution": execution, "backend": backend, "source": "profile"}
-    if "effort" in b:
-        effort = b["effort"]
-        if not isinstance(effort, str) or effort not in _EFFORT_VALUES:
-            raise WorkflowError(
-                f"binding field effort must be one of {', '.join(_EFFORT_VALUES)}, got {effort!r}")
-        binding["effort"] = effort
+    for field in ("effort", "use_for"):
+        if field in b:
+            binding[field] = b[field]
     return binding
 
 
@@ -254,9 +341,14 @@ def _resolve_verifier_binding(profile: dict, root: Path) -> dict:
         raise WorkflowError(
             f"profile has no binding for role 'verifier' — add it to {_profile_path(root)}, e.g.:\n\n"
             f"{_profile_example()}")
+    canonical = _validate_profile_binding("verifier", b)
+    if canonical != "external-runner":
+        raise WorkflowError(
+            f"binding 'verifier'/{canonical!r} is schema-valid but not executable by the verifier "
+            "consumer (only verifier/external-runner is shipped)")
     execution = b.get("execution")
     derived = "codex-cli" if os.environ.get("WAYSTONE_HOST") == "codex" else "codex-companion"
-    if execution is None:
+    if execution is None or execution == "external-runner":
         execution = derived
     elif execution == derived:
         print(
@@ -581,7 +673,10 @@ def _write_exposure(record_dir, did, root, packet, task_id, head_sha, base_sha, 
         "binding": binding,
         "profile_fingerprint": fingerprint,
         "sandbox": "workspace-write",
-        "overlays": overlays, "guards": None, "waivers": [],
+        "overlays": overlays,
+        # Adapt & Enforce has not shipped: null/[] are the truthful effective values until that arc
+        # supplies enforceable guards and recorded waivers.
+        "guards": None, "waivers": [],
     }
     path = record_dir / "exposure.json"
     if path.exists():

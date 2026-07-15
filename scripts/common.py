@@ -1242,6 +1242,14 @@ def normalize_config(cfg: dict | None) -> dict:
         raise ValueError(f"review.mode must be 'packet' or 'pr', got {rv['mode']!r}")
     if not (isinstance(rv["reviewers"], list) and all(isinstance(r, str) for r in rv["reviewers"])):
         raise ValueError("review.reviewers must be a list of strings")
+    invalid_role_refs = [
+        reviewer for reviewer in rv["reviewers"]
+        if reviewer.startswith("role:") and reviewer != "role:reviewer"
+    ]
+    if invalid_role_refs:
+        raise ValueError(
+            "review.reviewers role references must be exactly 'role:reviewer'; "
+            f"got {invalid_role_refs[0]!r}")
     if not isinstance(rv["require_ci"], bool):
         raise ValueError("review.require_ci must be a boolean")
     if not (isinstance(rv["approvers"], list) and all(isinstance(a, str) for a in rv["approvers"])):

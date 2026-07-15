@@ -18,6 +18,8 @@ Usage (also `waystone round close`):
 """
 from __future__ import annotations
 
+import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -185,6 +187,7 @@ def close(root: Path, round_id: str, done: list[str], touched: list[str], commit
 
     orig_tasks_text = tasks_path.read_text(encoding="utf-8")
     text = orig_tasks_text
+    session_id = os.environ.get("CLAUDE_CODE_SESSION_ID") or None
     data0 = yaml.safe_load(text) or {}
     by_id = {t.get("id"): t for t in data0.get("tasks", []) if isinstance(t, dict)}
     # done tasks must have all deps done — evaluated against the FINAL state (a dependency closed
@@ -206,6 +209,9 @@ def close(root: Path, round_id: str, done: list[str], touched: list[str], commit
             text = set_task_field(text, tid, "status", "done")
         for tid in dict.fromkeys(done + touched):
             text = set_task_field(text, tid, "round", round_id)
+            # tasks.yaml is the round registry: bind every round-stamped entry to the host session.
+            # An absent env value is recorded as YAML null; no timestamp/path heuristic is invented.
+            text = set_task_field(text, tid, "session_id", json.dumps(session_id))
     except (KeyError, WorkflowError) as e:
         print(f"round close: {e}", file=sys.stderr)
         return 1
@@ -239,6 +245,12 @@ def close(root: Path, round_id: str, done: list[str], touched: list[str], commit
         if cfg.get("ssot"):
             import ssot
             ssot.regenerate(root)  # one full regen; raises WorkflowError (caught below) not sys.exit
+        try:
+            import overlay
+            overlay.write_round_exposure(
+                root, round_id, git_full_sha(root, "HEAD"), full, session_id=session_id)
+        except Exception as e:  # noqa: BLE001 — exposure is part of the close transaction
+            raise WorkflowError(f"round exposure not recorded: {e}") from e
     except Exception as e:  # noqa: BLE001 — any failure must roll every written artifact back
         write_text_atomic(tasks_path, orig_tasks_text)
         write_text_atomic(cfg_path, ctext)
@@ -265,15 +277,8 @@ def close(root: Path, round_id: str, done: list[str], touched: list[str], commit
           f"watermark {(prev_wm[:12] if prev_wm else '(root)')} → {full[:12]}")
     print(f"  review diff base = {prev_wm or '(root)'}  (previous round tip; head = {full})")
 
-    # M2 §9/§6: record the round exposure and evaluate overlay warns at the round-close boundary.
-    # Both are best-effort — an exposure/warn failure must NOT roll back an already-completed close
-    # (S11/S5). The exposure guard names its failure so it stays visible.
-    try:
-        import overlay
-        overlay.write_round_exposure(root, round_id, git_full_sha(root, "HEAD"), full)
-    except Exception as e:  # noqa: BLE001
-        print(f"round close: round exposure not recorded ({e}) — close still succeeded",
-              file=sys.stderr)
+    # Boundary warnings remain advisory. Unlike exposure (part of the transaction above), a warning
+    # engine failure is visible but does not invalidate a close whose policy record is durable.
     try:
         import overlay
         overlay.evaluate_boundary(

@@ -1242,7 +1242,7 @@ class WaystoneStorageCliTests(unittest.TestCase):
             rc, _out, err = self._capture(home, root, ["project", "register", str(root)])
             self.assertEqual((rc, err), (0, ""))
             self.assertEqual(_json.loads(registry.read_text())["projects"], [
-                *existing, {"name": "new", "path": str(root.resolve())},
+                *existing, {"name": "new", "path": str(root.resolve()), "aliases": []},
             ])
 
     def test_project_register_duplicate_is_idempotent(self):
@@ -1264,8 +1264,42 @@ class WaystoneStorageCliTests(unittest.TestCase):
             self.assertIn("already registered", second_out)
             self.assertEqual(registry.read_bytes(), first_bytes)
             self.assertEqual(_json.loads(first_bytes)["projects"], [
-                {"name": "demo", "path": str(root.resolve())},
+                {"name": "demo", "path": str(root.resolve()), "aliases": []},
             ])
+
+    def test_project_alias_roundtrip_is_idempotent(self):
+        import json as _json
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "repo"
+            alias = Path(d) / "old-checkout"
+            root.mkdir()
+            (root / ".waystone.yml").write_text("version: 1\nproject: demo\n")
+            (root / "tasks.yaml").write_text("version: 1\nproject: demo\ntasks: []\n")
+            home = Path(d) / "home"
+            home.mkdir()
+
+            rc, _out, err = self._capture(
+                home, root, ["project", "register", str(root)])
+            self.assertEqual((rc, err), (0, ""))
+            rc, out, err = self._capture(home, root, [
+                "project", "alias", str(alias), "--root", str(root),
+            ])
+            self.assertEqual((rc, err), (0, ""))
+            self.assertIn("alias added", out)
+            registry = home / ".waystone" / "projects.json"
+            first = registry.read_bytes()
+            self.assertEqual(_json.loads(first)["projects"], [{
+                "name": "demo", "path": str(root.resolve()),
+                "aliases": [str(alias.resolve())],
+            }])
+
+            rc, out, err = self._capture(home, root, [
+                "project", "alias", str(alias), "--root", str(root),
+            ])
+            self.assertEqual((rc, err), (0, ""))
+            self.assertIn("already aliases", out)
+            self.assertEqual(registry.read_bytes(), first)
 
 
 class ConfigTests(unittest.TestCase):
@@ -1312,6 +1346,16 @@ class ConfigTests(unittest.TestCase):
             self._cfg("version: 1\nproject: x\ndelegation:\n  env_prep: notalist\n")
         with self.assertRaises(ValueError):
             self._cfg("version: 1\nproject: x\ndelegation:\n  env_prep:\n    - 42\n")
+
+    def test_reviewers_accept_literal_models_and_reviewer_role_reference(self):
+        cfg = self._cfg(
+            "version: 1\nproject: x\nreview:\n"
+            "  reviewers: [codex, gpt-5.5-pro, 'role:reviewer']\n")
+        self.assertEqual(
+            cfg["review"]["reviewers"], ["codex", "gpt-5.5-pro", "role:reviewer"])
+        with self.assertRaisesRegex(ValueError, "role:reviewer"):
+            self._cfg(
+                "version: 1\nproject: x\nreview:\n  reviewers: ['role:implementer']\n")
 
 
 
@@ -3110,7 +3154,8 @@ class ImproveReviewsTests(unittest.TestCase):
             # task_id; the separate fix/thing task finding is NOT emitted (dedup)
             self.assertEqual(byid["JW-GPT-001"],
                              {"id": "JW-GPT-001", "severity": "blocker", "status": "REAL",
-                              "source": "triage", "provenance": "explicit", "task_id": "fix/thing"})
+                              "type": "unknown", "source": "triage", "provenance": "explicit",
+                              "task_id": "fix/thing"})
             self.assertNotIn("fix/thing", byid)  # deduped into JW-GPT-001, not a second finding
             self.assertEqual(byid["JW-GPT-002"]["status"], "REJECTED")
             self.assertEqual(byid["JW-GPT-002"]["severity"], "minor")
@@ -3136,6 +3181,26 @@ class ImproveReviewsTests(unittest.TestCase):
         self.assertEqual([f["id"] for f in findings], ["JW-GPT-001", "JW-GPT-002", "JW-GPT-003"])
         # a feedback body with NO appended skeleton yields nothing
         self.assertEqual(improve._parse_triage("just prose, no table\n### JW-GPT-9 — x"), [])
+
+    def test_triage_type_column_accepts_taxonomy_and_preserves_unknown(self):
+        feedback = """## Findings (triage skeleton v2)
+
+| finding | severity | type | verdict | evidence | task id |
+|---|---|---|---|---|---|
+| JW-GPT-101 — typed | major | architecture | REAL | ev | fix/typed |
+| JW-GPT-102 — blank | minor | | REJECTED | ev | |
+| JW-GPT-103 — noncanonical | blocker | performance | NEEDS-RULING | ev | |
+"""
+        findings = improve._parse_triage(feedback)
+        self.assertEqual(improve.FINDING_TYPES, (
+            "correctness", "scope", "architecture", "verification",
+            "reproducibility", "reporting",
+        ))
+        self.assertEqual([finding["type"] for finding in findings], [
+            "architecture", "unknown", "unknown",
+        ])
+        self.assertEqual(findings[0]["task_id"], "fix/typed")
+        self.assertEqual(findings[0]["status"], "REAL")
 
     def test_byte_identical_reruns(self):
         with tempfile.TemporaryDirectory() as d:
@@ -4220,8 +4285,7 @@ class DelegateProfileTests(unittest.TestCase):
             with self.assertRaises(delegate.WorkflowError) as cm:
                 _run_with_home(home, lambda: delegate._load_profile(root))
             self.assertIn(str(root / ".waystone" / "profile.yml"), str(cm.exception))
-            self.assertIn("verifier: {backend:", str(cm.exception))
-            self.assertNotIn("verifier: {execution:", str(cm.exception))
+            self.assertIn("verifier: {execution: external-runner, backend:", str(cm.exception))
 
     def test_resolve_binding_ok_and_fingerprint(self):
         with tempfile.TemporaryDirectory() as d:
@@ -4235,6 +4299,50 @@ class DelegateProfileTests(unittest.TestCase):
             self.assertEqual(b["backend"], "codex:gpt-5.4-codex")
             self.assertEqual(b["execution"], "external-runner")
             self.assertEqual(b["source"], "profile")
+
+    def test_profile_schema_accepts_all_six_roles_and_open_runner_tokens(self):
+        import json as _json
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "repo"
+            root.mkdir()
+            _write_profile(root, (
+                "schema: waystone-profile-1\nbindings:\n"
+                "  main: {execution: main-session, backend: 'claude:opus'}\n"
+                "  orchestrator: {execution: deterministic-workflow, backend: 'claude:opus'}\n"
+                "  implementer: {execution: external-runner, backend: 'codex:gpt'}\n"
+                "  clerk: {execution: forked-subagent, backend: 'local-runner:small'}\n"
+                "  verifier: {execution: clean-subagent, backend: 'gemini:pro'}\n"
+                "  reviewer: {execution: external-runner, backend: 'future.runner:model'}\n"
+            ))
+            profile, _fingerprint = delegate._load_profile(root)
+            self.assertEqual(set(profile["bindings"]), set(delegate.PROFILE_ROLES))
+            schema = _json.loads(
+                (SCRIPTS.parent / "templates" / "profile-schema.json").read_text())
+            self.assertEqual(
+                set(schema["properties"]["bindings"]["properties"]),
+                set(delegate.PROFILE_ROLES),
+            )
+            self.assertEqual(schema["$defs"]["binding"]["properties"]["execution"]["enum"],
+                             list(delegate.PROFILE_EXECUTIONS))
+
+    def test_role_execution_combination_violation_fails_loud(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "repo"
+            root.mkdir()
+            _write_profile(root, (
+                "schema: waystone-profile-1\nbindings:\n"
+                "  main: {execution: external-runner, backend: 'codex:gpt'}\n"
+            ))
+            with self.assertRaisesRegex(delegate.WorkflowError, "not valid for role 'main'"):
+                delegate._load_profile(root)
+
+    def test_schema_valid_but_unimplemented_execution_fails_loud(self):
+        profile = {"bindings": {"implementer": {
+            "execution": "clean-subagent", "backend": "claude:sonnet"}}}
+        with self.assertRaisesRegex(
+                delegate.WorkflowError, "schema-valid but not executable"):
+            delegate._resolve_binding(profile, "implementer", Path("/project"))
 
     def test_missing_role_binding_raises(self):
         with tempfile.TemporaryDirectory() as d:
@@ -4278,6 +4386,24 @@ class DelegateProfileTests(unittest.TestCase):
             if old_host is not None:
                 os.environ["WAYSTONE_HOST"] = old_host
         self.assertEqual(binding["execution"], "codex-companion")
+
+    def test_verifier_external_runner_axis_preserves_codex_transport(self):
+        import os
+
+        profile = {"bindings": {"verifier": {
+            "execution": "external-runner", "backend": "codex:x",
+            "entry": "adversarial-review"}}}
+        old_host = os.environ.get("WAYSTONE_HOST")
+        os.environ["WAYSTONE_HOST"] = "codex"
+        try:
+            binding = delegate._resolve_verifier_binding(profile, Path("/project"))
+        finally:
+            if old_host is None:
+                os.environ.pop("WAYSTONE_HOST", None)
+            else:
+                os.environ["WAYSTONE_HOST"] = old_host
+        self.assertEqual(binding["execution"], "codex-cli")
+        self.assertEqual(binding["backend"], "codex:x")
 
     def test_matching_verifier_execution_warns_and_is_accepted(self):
         import contextlib
@@ -6404,10 +6530,13 @@ class BoundaryWarnTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root, home = _round_review_project(d)
             orig_import = builtins.__import__
+            overlay_imports = {"count": 0}
 
             def fake_import(name, *args, **kwargs):
                 if name == "overlay":
-                    raise ImportError("synthetic overlay import failure")
+                    overlay_imports["count"] += 1
+                    if overlay_imports["count"] > 1:
+                        raise ImportError("synthetic overlay import failure")
                 return orig_import(name, *args, **kwargs)
 
             err = io.StringIO()
@@ -6493,8 +6622,7 @@ class DelegateExposureOverlayTests(unittest.TestCase):
 
 
 class RoundExposureTests(unittest.TestCase):
-    """0.8.0 M2 §9 — round exposure record written at close (schema, re-close suffix, profile null,
-    record-failure keeps close succeeding)."""
+    """Round exposure is immutable, session-bound, and required for a successful close."""
 
     def _exposure_dir(self, root, home):
         return _run_with_home(home, lambda: overlay._exposure_dir(root))
@@ -6569,7 +6697,7 @@ class RoundExposureTests(unittest.TestCase):
             self.assertEqual(target.read_text(), "sentinel\n")
             self.assertEqual(path.name, "round-race-2.json")
 
-    def test_exposure_failure_keeps_close_success(self):
+    def test_exposure_failure_fails_close_and_rolls_back_registry(self):
         with tempfile.TemporaryDirectory() as d:
             root, home = _round_review_project(d)
             orig = overlay.write_round_exposure
@@ -6583,8 +6711,53 @@ class RoundExposureTests(unittest.TestCase):
                         root, "2026-01-02-close", done=["chore/close-me"], touched=[], commit="HEAD"))
             finally:
                 overlay.write_round_exposure = orig
-            self.assertEqual(rc, 0)  # close still succeeds (S11)
+            self.assertEqual(rc, 1)
             self.assertIn("exposure", err.getvalue().lower())
+            task = common.load_tasks(root)["tasks"][0]
+            self.assertEqual(task["status"], "active")
+            self.assertNotIn("round", task)
+
+    def test_session_id_is_recorded_in_registry_and_exposure(self):
+        import contextlib
+        import io
+        import os
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _round_review_project(d)
+            session_id = "11111111-2222-3333-4444-555555555555"
+            with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": session_id}), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                rc = _run_with_home(home, lambda: round.close(
+                    root, "2026-01-02-close", done=["chore/close-me"],
+                    touched=[], commit="HEAD"))
+            self.assertEqual(rc, 0)
+            task = common.load_tasks(root)["tasks"][0]
+            self.assertEqual(task["session_id"], session_id)
+            exposure = _json.loads(
+                (self._exposure_dir(root, home) / "round-2026-01-02-close.json").read_text())
+            self.assertEqual(exposure["session_id"], session_id)
+
+    def test_absent_session_id_is_recorded_as_null(self):
+        import contextlib
+        import io
+        import os
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _round_review_project(d)
+            with mock.patch.dict(os.environ, {}, clear=False), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+                rc = _run_with_home(home, lambda: round.close(
+                    root, "2026-01-02-close", done=["chore/close-me"],
+                    touched=[], commit="HEAD"))
+            self.assertEqual(rc, 0)
+            task = common.load_tasks(root)["tasks"][0]
+            self.assertIsNone(task["session_id"])
+            exposure = _json.loads(
+                (self._exposure_dir(root, home) / "round-2026-01-02-close.json").read_text())
+            self.assertIsNone(exposure["session_id"])
 
 
 class ReplayTests(unittest.TestCase):
@@ -6741,9 +6914,11 @@ class EvidenceTests(unittest.TestCase):
             self.assertEqual(sorted(task_rows), ["feat/deleg-only", "fix/open", "fix/task-only"])
             # source=triage uses task_id; source=task uses id. Both become the same task_id field.
             self.assertEqual(task_rows["fix/open"]["findings"], [
-                {"round": "2026-01-01-r1", "severity": "blocker", "status": "REAL"}])
+                {"round": "2026-01-01-r1", "severity": "blocker", "status": "REAL",
+                 "type": "unknown"}])
             self.assertEqual(task_rows["fix/task-only"]["findings"], [
-                {"round": "2026-01-01-r1", "severity": "major", "status": "done"}])
+                {"round": "2026-01-01-r1", "severity": "major", "status": "done",
+                 "type": "unknown"}])
             self.assertEqual(task_rows["fix/open"]["delegations"], [
                 {"did": "did-unverified", "state": "needs-review", "verification_present": False}])
             self.assertTrue(task_rows["feat/deleg-only"]["delegations"][0]["verification_present"])
@@ -6806,7 +6981,8 @@ class EvidenceTests(unittest.TestCase):
             _run_with_home(home, lambda: improve.run_evidence(registry, out, set()))
             rows = {r["task_id"]: r for r in self._rows(out) if "task_id" in r}
             self.assertEqual(rows["feat/deleg-only"]["findings"], [{
-                "round": "2026-01-01-r1", "severity": "major", "status": "NEEDS-RULING"}])
+                "round": "2026-01-01-r1", "severity": "major", "status": "NEEDS-RULING",
+                "type": "unknown"}])
             facts = improve.run_audit(out)
             lens = next(x for x in facts["lenses"] if x["lens"] == "evidence_link")
             self.assertEqual(lens["per_project"]["proj-a"]["tasks_joined"], 2)
@@ -7100,8 +7276,8 @@ class DelegateVerifyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root, home, rec, worktree, plugin = self._setup(d)
             for verifier, needle in (
-                ("{execution: external-runner, backend: \"codex:x\", entry: adversarial-review}",
-                 "conflicts with WAYSTONE_HOST-derived"),
+                ("{execution: clean-subagent, backend: \"codex:x\", entry: adversarial-review}",
+                 "schema-valid but not executable"),
                 ("{execution: codex-companion, backend: \"codex:x\", entry: review}",
                  "entry 'review' not implemented in M2"),
             ):
@@ -7350,6 +7526,28 @@ class ContractInjectTests(unittest.TestCase):
             self.assertIn("needs-review delegations 2 (did-one did-two)", ctx)
             self.assertIn("unverified+finding tasks 1", ctx)
 
+    def test_routing_policy_renders_all_axes_questions_and_is_bounded(self):
+        module = self._module()
+        with tempfile.TemporaryDirectory() as d:
+            root, _home = self._project(d)
+            _write_profile(root, (
+                "schema: waystone-profile-1\nbindings:\n"
+                "  reviewer: {execution: external-runner, backend: 'gemini:pro', "
+                "use_for: 'adversarial diff review'}\n"
+                "  main: {execution: main-session, backend: 'claude:opus'}\n"
+            ))
+            block = module._routing_block(root)
+            self.assertLessEqual(len(block), 12)
+            rendered = "\n".join(block)
+            self.assertIn("main→claude:opus [main-session]", rendered)
+            self.assertIn(
+                "reviewer→gemini:pro [external-runner] — adversarial diff review", rendered)
+            for term in (
+                    "reasoning", "context inheritance", "independent perspective", "bounded scope",
+                    "repetitive tools", "retry cost", "independent verification",
+                    "budget sensitivity"):
+                self.assertIn(term, rendered)
+
     def test_machine_only_evidence_is_not_reported_as_project_evidence(self):
         module = self._module()
         with tempfile.TemporaryDirectory() as d:
@@ -7367,13 +7565,13 @@ class ContractInjectTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertNotIn("unverified+finding tasks", ctx)
 
-    def test_profile_absent_is_explicit_and_constitution_absence_omits_block(self):
+    def test_profile_absence_omits_routing_block_and_constitution_absence_omits_contract(self):
         module = self._module()
         with tempfile.TemporaryDirectory() as d:
             root, home = self._project(d)
             rc, ctx = self._context(module, root, home)
             self.assertEqual(rc, 0)
-            self.assertIn("no profile", ctx)
+            self.assertNotIn("routing policy", ctx)
             self.assertEqual(
                 {path.name for path in (root / ".waystone").iterdir()},
                 {".gitignore", "lock"},

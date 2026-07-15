@@ -20,7 +20,7 @@ Groups:
   overlay  add|list|show|promote|demote|suspend|retire|replay ...  project-local adaptive warn deltas
   check    [--root DIR]               evaluate active overlay deltas at an explicit boundary (never blocks)
   paths    [--root DIR] [--json]      show resolved machine and project storage paths
-  project  register|unregister|list ...  manage the cross-project registry
+  project  register|unregister|alias|list ...  manage the cross-project registry
 
 Existing hook/skill call sites that invoke sibling scripts directly keep working; this is an
 additive convenience front door (GPT review: consolidate under one `waystone` CLI).
@@ -118,6 +118,12 @@ def _load_registry(path: Path) -> dict:
     projects = registry.get("projects", [])
     if not isinstance(projects, list):
         raise common.WorkflowError(f"registry has wrong shape (`projects` must be a list): {path}")
+    for entry in projects:
+        if isinstance(entry, dict) and "aliases" in entry:
+            aliases = entry["aliases"]
+            if not isinstance(aliases, list) or not all(isinstance(alias, str) for alias in aliases):
+                raise common.WorkflowError(
+                    f"registry entry `aliases` must be a list of paths: {path}")
     registry["projects"] = projects
     return registry
 
@@ -147,14 +153,32 @@ def _entry_path(entry: object) -> Path | None:
     return Path(entry["path"]).expanduser().resolve()
 
 
+def _entry_aliases(entry: object) -> list[Path]:
+    if not isinstance(entry, dict):
+        return []
+    aliases = entry.get("aliases", [])
+    if not isinstance(aliases, list) or not all(isinstance(alias, str) for alias in aliases):
+        raise common.WorkflowError("registry entry `aliases` must be a list of paths")
+    return [Path(alias).expanduser().resolve() for alias in aliases]
+
+
 def _project_main(argv: list[str]) -> int:
-    if not argv or argv[0] not in ("register", "unregister", "list"):
-        print("waystone project: expected register <path>, unregister <path>, or list", file=sys.stderr)
+    if not argv or argv[0] not in ("register", "unregister", "alias", "list"):
+        print(
+            "waystone project: expected register <path>, unregister <path>, "
+            "alias <path> --root <root>, or list",
+            file=sys.stderr,
+        )
         return 1
     command, rest = argv[0], argv[1:]
     if command == "list":
         if rest:
             print("waystone project list: takes no arguments", file=sys.stderr)
+            return 1
+    elif command == "alias":
+        if len(rest) != 3 or rest[1] != "--root":
+            print(
+                "waystone project alias: expected <path> --root <root>", file=sys.stderr)
             return 1
     elif len(rest) != 1:
         print(f"waystone project {command}: expected one path", file=sys.stderr)
@@ -177,6 +201,32 @@ def _project_main(argv: list[str]) -> int:
             return 0
 
         requested = Path(rest[0]).expanduser().resolve()
+        if command == "alias":
+            root = common.find_project_root(Path(rest[2]).expanduser())
+            if root is None:
+                raise common.WorkflowError(f"no waystone project found from {rest[2]}")
+            root = root.resolve()
+            target = next((entry for entry in projects if _entry_path(entry) == root), None)
+            if target is None:
+                raise common.WorkflowError(
+                    f"canonical project root is not registered: {root}; register it first")
+            if requested == root:
+                raise common.WorkflowError(f"alias is already the canonical project path: {root}")
+            for entry in projects:
+                if _entry_path(entry) == requested:
+                    raise common.WorkflowError(
+                        f"alias path is another project's canonical path: {requested}")
+                if requested in _entry_aliases(entry):
+                    if entry is target:
+                        print(f"already aliases: {requested}\t{root}")
+                        return 0
+                    raise common.WorkflowError(f"alias path is already registered elsewhere: {requested}")
+            target["aliases"] = sorted(
+                [*map(str, _entry_aliases(target)), str(requested)])
+            _write_registry(path, registry)
+            print(f"alias added: {requested}\t{root}")
+            return 0
+
         if command == "register":
             root = common.find_project_root(requested)
             if root is None:
@@ -192,7 +242,7 @@ def _project_main(argv: list[str]) -> int:
             if any(_entry_path(entry) == root for entry in projects):
                 print(f"already registered: {name}\t{root}")
                 return 0
-            projects.append({"name": name, "path": str(root)})
+            projects.append({"name": name, "path": str(root), "aliases": []})
             _write_registry(path, registry)
             print(f"registered: {name}\t{root}")
             return 0

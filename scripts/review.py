@@ -618,10 +618,10 @@ def ingest(root: Path, round_id: str | None, src: Path = INBOX, reviewer: str | 
     # --- appended triage skeleton (beneath the verbatim body, which is never edited) ---
     lines = ["", "", "---", "", "## Findings (triage skeleton — verify each before registering)", ""]
     if findings:
-        lines.append("| finding | severity | verdict (REAL/REJECTED/NEEDS-RULING) | evidence | task id |")
-        lines.append("|---|---|---|---|---|")
+        lines.append("| finding | severity | type | verdict (REAL/REJECTED/NEEDS-RULING) | evidence | task id |")
+        lines.append("|---|---|---|---|---|---|")
         for f in findings:
-            lines.append(f"| {f['id']} — {f['title']} | {f['severity']} |  |  |  |")
+            lines.append(f"| {f['id']} — {f['title']} | {f['severity']} |  |  |  |  |")
     else:
         lines.append("_No `JW-GPT-NNN` finding blocks parsed — triage the verbatim reply directly._")
     appended = ("\n".join(lines) + "\n").encode("utf-8")

@@ -558,10 +558,9 @@ def _profile_summary(root: Path) -> tuple[str | None, dict | None]:
     """(profile_fingerprint, {role: backend}) from the delegation profile, or (None, None) when it is
     absent — a round closes without any delegation, so the harness never guesses bindings."""
     import delegate
-    try:
-        profile, fp = delegate._load_profile(root)
-    except WorkflowError:
+    if not delegate._profile_path(root).is_file():
         return None, None
+    profile, fp = delegate._load_profile(root)
     bindings: dict[str, str] = {}
     for role, b in (profile.get("bindings") or {}).items():
         if isinstance(b, dict) and isinstance(b.get("backend"), str):
@@ -569,17 +568,21 @@ def _profile_summary(root: Path) -> tuple[str | None, dict | None]:
     return fp, (bindings or None)
 
 
-def write_round_exposure(root: Path, round_id: str, head_sha: str | None, watermark: str | None):
+def write_round_exposure(root: Path, round_id: str, head_sha: str | None, watermark: str | None,
+                         session_id: str | None = None):
     """Immutable per-round exposure record written at close (§9/#4). A re-close of the same round-id
     gets a `-2`/`-3` suffix (H4 precedent — existing records are never overwritten)."""
     _ensure_project_state_or_refuse(root)
     fp, bindings = _profile_summary(root)
     exposure = {
         "schema": "waystone-round-exposure-1", "round_id": round_id, "at": _now_iso(),
+        "session_id": session_id,
         "project": {"pslug": _project_slug(root), "root": str(Path(root).resolve())},
         "head_sha": head_sha, "config_watermark": watermark,
         "profile_fingerprint": fp, "bindings": bindings,
         "overlays_active": [{"id": d["id"], "status": d["status"]} for d in active_deltas(root)],
+        # Adapt & Enforce has not shipped: null means no effective guard engine and [] means no
+        # recorded waivers. These are truthful contract values, not missing-data fallbacks.
         "guards": None, "waivers": [],
     }
     edir = _exposure_dir(root)
@@ -596,6 +599,13 @@ def write_round_exposure(root: Path, round_id: str, head_sha: str | None, waterm
         except FileExistsError:
             p = base.with_name(f"{base.stem}-{n}{base.suffix}")
             n += 1
+        except BaseException:
+            # open('x') made this path ours; a failed write must not leave a partial immutable record.
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
+            raise
 
 
 # ---- CLI (hand-rolled parsing; {0,1,2} exit contract) --------------------------
