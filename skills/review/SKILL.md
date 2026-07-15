@@ -34,12 +34,23 @@ deterministic ingest, which copies `/tmp/review.md` byte-exact into the feedback
 metadata header and consumes the drop-file:
 
 ```bash
-waystone review ingest . --round <round-id> --reviewer "<model, e.g. gpt-5.5-pro>"
+waystone review ingest . --round <round-id> --reviewer "<resolved reviewer backend>"
 ```
+
+Resolve `review.reviewers` first. When it contains `role:reviewer` (the new-project default), read
+the `reviewer` binding from `{project_root}/.waystone/profile.yml` and pass its literal backend as
+`<resolved reviewer backend>`. If the project intentionally keeps a legacy literal reviewer list,
+pass that configured literal. Never invent a backend when the role binding is missing; follow the
+CLI's fail-loud guidance to add the binding or explicitly retain literal reviewers.
 
 Besides the byte-exact copy, ingest **appends** (never edits the verbatim body) a *finding triage
 skeleton*: if the reply has `JW-GPT-NNN` finding blocks it builds a table, else it notes "triage the
 verbatim reply directly". Then read `<reviews_dir>/<round-id>-feedback.md` to triage.
+
+Relay any review-ingest adaptive-rule output with tri-state wording: **fired**, **did not fire
+(evaluable)**, or **unevaluable (<coverage reason>)**. Never turn an unevaluable result into a
+non-fire. A `waystone warn conflict` line remains a policy conflict with a least-restrictive effective
+stage; it is separate from the finding verdicts below and from a rule fire.
 
 If ingest reports `no review at /tmp/review.md`, tell the user to save the reply first
 (`cat > /tmp/review.md`, paste, `Ctrl-D`) and stop.
@@ -56,11 +67,15 @@ Reviewer findings are claims, not facts. For each distinct finding:
    - `REAL` — confirmed against evidence,
    - `REJECTED` — demonstrably wrong (state the evidence),
    - `NEEDS-RULING` — turns on an SSOT interpretation → register a `decision/...` task instead of acting.
-2. Register each REAL finding via the CLI — `waystone task add <fix|perf|docs>/<slug> . --title "..." --severity <blocker|major|minor> --origin review-<round-id> [--anchor §...]` — not by editing `tasks.yaml`. The add is validated and comment-preserving.
+2. Assign exactly one taxonomy type to every finding: `correctness`, `scope`, `architecture`,
+   `verification`, `reproducibility`, or `reporting`. Use `unknown` only when the evidence cannot
+   support one of those six after verification, and write the concrete reason in the evidence cell.
+   A blank type is not a completed triage row.
+3. Register each REAL finding via the CLI — `waystone task add <fix|perf|docs>/<slug> . --title "..." --severity <blocker|major|minor> --origin review-<round-id> [--anchor §...]` — not by editing `tasks.yaml`. The add is validated and comment-preserving.
 
 If ingest parsed a `JW-GPT-NNN` triage-skeleton table, fill each row (in the user's configured
-language; quoted reviewer text verbatim): verdict → evidence → task id. A free-form reply has no
-such rows — triage each finding in the verbatim body directly (verdict → evidence → register REAL
+language; quoted reviewer text verbatim): verdict → taxonomy type → evidence/reason → task id. A free-form reply has no
+such rows — triage each finding in the verbatim body directly (verdict → taxonomy type → evidence → register REAL
 ones).
 
 ## Step 4 — Report

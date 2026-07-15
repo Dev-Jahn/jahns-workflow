@@ -14,7 +14,7 @@ import sys
 import tempfile
 import time
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
@@ -133,6 +133,71 @@ def ensure_project_state_dir(root: Path) -> Path:
     return state
 
 
+def consent_path(root: Path) -> Path:
+    """Project-local append-only consent event log."""
+    return project_state_path(root) / "consents.jsonl"
+
+
+def canonical_payload_hash(payload: object) -> str:
+    """SHA-256 over the unique compact JSON encoding used to bind consent to a candidate."""
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def content_hash(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def record_consent(root: Path, surface: str, choice: str, context: dict | None = None) -> dict:
+    """Append one standard consent event after the host has presented the choice to the user."""
+    if not isinstance(surface, str) or not surface.strip():
+        raise WorkflowError("consent surface must be a non-empty string")
+    if not isinstance(choice, str) or not choice.strip():
+        raise WorkflowError("consent choice must be a non-empty string")
+    if context is None:
+        context = {}
+    if (not isinstance(context, dict)
+            or any(not isinstance(key, str) or not isinstance(value, (str, int, float, bool, type(None)))
+                   for key, value in context.items())):
+        raise WorkflowError("consent context must be a flat object with scalar values")
+    row = {
+        "surface": surface.strip(), "choice": choice.strip(),
+        "at": datetime.now(timezone.utc).isoformat(), "context": dict(sorted(context.items())),
+    }
+    ensure_project_state_dir(root)
+    with consent_path(root).open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+    return row
+
+
+def has_accepted_consent(root: Path, surface: str, context: dict) -> bool:
+    """Whether the latest valid event for an exact surface/context pair is an acceptance."""
+    path = consent_path(root)
+    if not path.is_file():
+        return False
+    latest = None
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError) as e:
+        raise WorkflowError(f"consent log unreadable: {path} ({e})") from e
+    expected = dict(sorted(context.items()))
+    for line_number, line in enumerate(lines, 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as e:
+            raise WorkflowError(f"corrupt consent log {path}:{line_number} ({e})") from e
+        if (not isinstance(row, dict) or not isinstance(row.get("surface"), str)
+                or not isinstance(row.get("choice"), str) or not isinstance(row.get("at"), str)
+                or not isinstance(row.get("context"), dict)):
+            raise WorkflowError(f"corrupt consent log {path}:{line_number}")
+        if row["surface"] == surface and row["context"] == expected:
+            latest = row
+    return latest is not None and latest["choice"] == "accept"
+
+
 def worktrees_cache_dir(home: Path | None = None) -> Path:
     return machine_dir(home) / "cache" / "worktrees"
 
@@ -141,14 +206,19 @@ def registry_path(home: Path | None = None) -> Path:
     return machine_dir(home) / "projects.json"
 
 
-# Any nested acquisition must follow this single order: registry -> project -> record. Never acquire
-# in reverse. Locking belongs to CLI/hook entry points; library functions below remain lock-free so
-# composed verbs such as round close cannot deadlock themselves on flock's non-reentrant semantics.
+# Any nested acquisition must follow this single order: registry -> overlay -> project -> record.
+# Never acquire in reverse. Locking normally belongs to CLI/hook entry points; the cross-project
+# promote-user transaction owns all three leading locks itself because its evidence read and user
+# overlay write must be one machine-wide snapshot.
 # Intentionally unlocked (§2.4): warnings/decisions JSONL use one O_APPEND write; improve outputs are
 # reproducible; SSOT views inherit round close's project lock (standalone regeneration is idempotent);
 # start-here follows its single-writer round-close convention.
 def registry_lock_path(home: Path | None = None) -> Path:
     return machine_dir(home) / "registry.lock"
+
+
+def overlay_lock_path(home: Path | None = None) -> Path:
+    return machine_dir(home) / "overlay.lock"
 
 
 def project_lock_path(root: Path) -> Path:
@@ -289,7 +359,183 @@ def _read_registry(path: Path) -> dict:
     if not isinstance(registry, dict) or not isinstance(registry.get("projects", []), list):
         raise WorkflowError(f"migration registry has wrong shape: {path}")
     registry.setdefault("projects", [])
+    validate_registry_path_uniqueness(registry["projects"], path)
     return registry
+
+
+def _normalized_registry_path(value: str, source: Path, label: str) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        raise WorkflowError(f"registry {label} is not absolute: {source} ({value!r})")
+    return path.resolve()
+
+
+def registry_entry_paths(entry: object, source: Path) -> tuple[Path, ...]:
+    """Return one local registry entry's normalized canonical+alias identity set."""
+    if not isinstance(entry, dict):
+        raise WorkflowError(f"registry entry is not an object: {source}")
+    aliases = entry.get("aliases", [])
+    if not isinstance(aliases, list) or not all(
+            isinstance(alias, str) and alias for alias in aliases):
+        raise WorkflowError(f"registry entry aliases must be a list of non-empty paths: {source}")
+    raw_path = entry.get("path")
+    if not isinstance(raw_path, str) or not raw_path:
+        if aliases:
+            raise WorkflowError(f"registry aliases require a canonical path: {source}")
+        return ()
+    canonical = _normalized_registry_path(raw_path, source, "canonical path")
+    normalized_aliases = tuple(
+        _normalized_registry_path(alias, source, "alias path") for alias in aliases)
+    return (canonical, *normalized_aliases)
+
+
+def validate_registry_path_uniqueness(projects: list, source: Path) -> None:
+    """Fail loud unless every normalized canonical or alias path has one registry owner."""
+    owners: dict[Path, str] = {}
+    for index, entry in enumerate(projects):
+        label = (entry.get("name") if isinstance(entry, dict) else None) or f"entry {index}"
+        for position, path in enumerate(registry_entry_paths(entry, source)):
+            kind = "canonical" if position == 0 else "alias"
+            owner = f"{label!r} {kind}"
+            if path in owners:
+                raise WorkflowError(
+                    f"registry path {path} already belongs to {owners[path]}; "
+                    f"cannot also assign it to {owner}")
+            owners[path] = owner
+
+
+def resolve_project_paths(project_root: Path, source: Path | None = None) -> tuple[Path, ...]:
+    """Resolve a logical project's canonical+alias roots; an unregistered root resolves to itself."""
+    path = registry_path() if source is None else source
+    registry = _read_registry(path)
+    wanted = Path(project_root).expanduser().resolve()
+    for entry in registry["projects"]:
+        identities = registry_entry_paths(entry, path)
+        if wanted in identities:
+            return identities
+    return (wanted,)
+
+
+def _record_scope_path(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip().strip("`'\"")
+    candidate = re.sub(r":\d+(?::\d+)?$", "", candidate)
+    if candidate.startswith("./"):
+        candidate = candidate[2:]
+    if (not candidate or candidate.startswith(("/", "~")) or "://" in candidate
+            or "\\" in candidate or any(part == ".." for part in candidate.split("/"))
+            or any(char.isspace() for char in candidate)):
+        return None
+    return candidate
+
+
+def normalize_scope_prefix(value: object) -> str | None:
+    """Canonical repo-relative prefix for task.scope and packet.declared_scope."""
+    if not isinstance(value, str):
+        return None
+    path = value.strip()
+    if path.startswith("./"):
+        path = path[2:]
+    if (not path or path.startswith(("/", "~")) or ":" in path or "\\" in path
+            or any(part in ("", "..") for part in path.rstrip("/").split("/"))
+            or any(char.isspace() for char in path) or any(char in path for char in "*?[")):
+        return None
+    return path.rstrip("/") or None
+
+
+def canonical_scope_prefixes(value: object) -> list[str]:
+    """Validate structured scope without mining any natural-language field."""
+    if not isinstance(value, list):
+        raise WorkflowError("scope must be a list of repo-relative path prefixes")
+    out: list[str] = []
+    for index, raw in enumerate(value):
+        path = normalize_scope_prefix(raw)
+        if path is None:
+            raise WorkflowError(
+                f"scope[{index}] must be a repo-relative path prefix without glob, '..', URL, or whitespace")
+        if path not in out:
+            out.append(path)
+    return out
+
+
+def parse_iso_timestamp(value: object) -> datetime | None:
+    """Parse a timezone-qualified ISO-8601 timestamp; return None for ambiguous/invalid input."""
+    if not isinstance(value, str) or "T" not in value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None and parsed.utcoffset() is not None else None
+
+
+def _packet_declared_scope(packet: dict) -> tuple[list[str], str]:
+    try:
+        paths = canonical_scope_prefixes(packet.get("declared_scope"))
+    except WorkflowError:
+        return [], "unknown"
+    return (paths, "explicit") if paths else ([], "unknown")
+
+
+def _path_in_declared_scope(path: str, declared: list[str]) -> bool:
+    for scope in declared:
+        if path == scope or path.startswith(scope + "/"):
+            return True
+    return False
+
+
+def delegation_scope_drift(record_dir: Path) -> dict:
+    """Compare one delegation packet's declared path scope with its computed changed files.
+
+    The record directory is the whole interface so live boundary rules can reuse the same calculation.
+    Only packet.declared_scope is consumed. Notes, anchors, commands, URLs, and acceptance text are
+    never interpreted as paths; absent structured scope remains unknown.
+    """
+    packet_path = Path(record_dir) / "packet.yaml"
+    contract_path = Path(record_dir) / "artifact" / "contract.yaml"
+    base = {
+        "rule": "packet-declared-scope-v2", "evaluable": False, "provenance": "unknown",
+        "fired": False, "declared_scope": [], "changed_files": [], "outside_scope": [],
+    }
+    for path, label in ((packet_path, "packet"), (contract_path, "contract")):
+        if not path.is_file():
+            return {**base, "coverage_reason": f"missing-{label}"}
+    try:
+        packet = yaml.safe_load(packet_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+        return {**base, "coverage_reason": "unreadable-packet"}
+    try:
+        contract = yaml.safe_load(contract_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+        return {**base, "coverage_reason": "unreadable-contract"}
+    if not isinstance(packet, dict):
+        return {**base, "coverage_reason": "invalid-packet"}
+    if not isinstance(contract, dict):
+        return {**base, "coverage_reason": "invalid-contract"}
+
+    declared, provenance = _packet_declared_scope(packet)
+    if not declared:
+        return {**base, "coverage_reason": "scope-unknown"}
+    raw_changed = contract.get("changed_files")
+    if not isinstance(raw_changed, list):
+        return {**base, "declared_scope": declared, "provenance": provenance,
+                "coverage_reason": "invalid-changed-files"}
+    changed: list[str] = []
+    for row in raw_changed:
+        path = _record_scope_path(row.get("path") if isinstance(row, dict) else None)
+        if path is None:
+            return {**base, "declared_scope": declared, "provenance": provenance,
+                    "coverage_reason": "invalid-changed-files"}
+        changed.append(path)
+    changed = sorted(set(changed))
+    outside = [path for path in changed if not _path_in_declared_scope(path, declared)]
+    return {
+        "rule": "packet-declared-scope-v2", "evaluable": True, "provenance": provenance,
+        "fired": bool(outside),
+        "declared_scope": declared, "changed_files": changed, "outside_scope": outside,
+        "coverage_reason": None,
+    }
 
 
 def _registry_key(entry: object, source: Path) -> tuple[str, str]:
@@ -412,6 +658,7 @@ def _merge_registries(sources: list[tuple[str, Path]], destination: Path) -> lis
                 f"({key[0]}={key[1]!r})",
                 file=sys.stderr,
             )
+    validate_registry_path_uniqueness(merged, destination)
     if merged != registry["projects"] or (not destination.exists() and merged):
         registry["projects"] = merged
         write_text_atomic(destination, json.dumps(registry, ensure_ascii=False, indent=2) + "\n")
@@ -1231,6 +1478,8 @@ def normalize_config(cfg: dict | None) -> dict:
     if not isinstance(rv, dict):
         raise ValueError("review: must be a mapping (mode/reviewers/require_ci/approvers/operators)")
     rv.setdefault("mode", "packet")  # packet | pr
+    # `waystone:init` writes role:reviewer explicitly for new projects. A config created by an
+    # older release may omit the field entirely, so preserve that release's implicit literals.
     rv.setdefault("reviewers", ["codex", "gpt-5.5-pro"])
     rv.setdefault("require_ci", False)
     rv.setdefault("approvers", [])  # extra trusted approver logins beyond the repo owner
@@ -1242,6 +1491,14 @@ def normalize_config(cfg: dict | None) -> dict:
         raise ValueError(f"review.mode must be 'packet' or 'pr', got {rv['mode']!r}")
     if not (isinstance(rv["reviewers"], list) and all(isinstance(r, str) for r in rv["reviewers"])):
         raise ValueError("review.reviewers must be a list of strings")
+    invalid_role_refs = [
+        reviewer for reviewer in rv["reviewers"]
+        if reviewer.startswith("role:") and reviewer != "role:reviewer"
+    ]
+    if invalid_role_refs:
+        raise ValueError(
+            "review.reviewers role references must be exactly 'role:reviewer'; "
+            f"got {invalid_role_refs[0]!r}")
     if not isinstance(rv["require_ci"], bool):
         raise ValueError("review.require_ci must be a boolean")
     if not (isinstance(rv["approvers"], list) and all(isinstance(a, str) for a in rv["approvers"])):
@@ -1250,11 +1507,22 @@ def normalize_config(cfg: dict | None) -> dict:
         raise ValueError("review.operators must be a list of strings")
     dl = cfg.setdefault("delegation", {})
     if not isinstance(dl, dict):
-        raise ValueError("delegation: must be a mapping (env_prep)")
+        raise ValueError("delegation: must be a mapping (enabled/env_prep)")
+    dl.setdefault("enabled", True)
+    if not isinstance(dl["enabled"], bool):
+        raise ValueError("delegation.enabled must be a boolean")
     dl.setdefault("env_prep", None)  # None -> lockfile auto-detection at delegation time (no sandbox knob, R7)
     ep = dl["env_prep"]
     if ep is not None and not (isinstance(ep, list) and all(isinstance(x, str) for x in ep)):
         raise ValueError("delegation.env_prep must be a list of shell command strings")
+    policy = cfg.setdefault("policy", {})
+    if not isinstance(policy, dict):
+        raise ValueError("policy: must be a mapping (start_level)")
+    # Before start_level had a runtime consumer, omitted fields still emitted warning-stage stderr.
+    # Preserve that behavior for existing projects; init writes an explicit user choice for new ones.
+    policy.setdefault("start_level", "warn-allowed")
+    if policy["start_level"] not in ("observe-only", "warn-allowed"):
+        raise ValueError("policy.start_level must be 'observe-only' or 'warn-allowed'")
     return cfg
 
 

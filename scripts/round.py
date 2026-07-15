@@ -18,6 +18,8 @@ Usage (also `waystone round close`):
 """
 from __future__ import annotations
 
+import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -26,7 +28,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import (  # noqa: E402
-    ROUND_RE, WorkflowError, find_project_root, git_full_sha, hold_lock, load_config,
+    ROUND_RE, WorkflowError, canonical_scope_prefixes, find_project_root, git_full_sha, hold_lock, load_config,
     migrate_project_state, project_lock_path, write_text_atomic,
 )
 
@@ -151,19 +153,78 @@ def _parse_ids(s: str | None) -> list[str]:
     return [x.strip() for x in (s or "").split(",") if x.strip()]
 
 
-def close(root: Path, round_id: str, done: list[str], touched: list[str], commit: str) -> int:
+def _parse_route_notes(values: list[str]) -> list[dict]:
+    """Parse repeatable ``role,execution,backend`` host-guided route observations."""
+    import delegate
+
+    routes = []
+    for value in values:
+        parts = [part.strip() for part in value.split(",")]
+        if len(parts) != 3 or any(not part for part in parts):
+            raise WorkflowError(
+                "--route-note must be role,execution,backend (backend is <runner>:<model>)")
+        role, execution, backend = parts
+        if role not in delegate.PROFILE_ROLES:
+            raise WorkflowError(
+                f"--route-note role must be one of {', '.join(delegate.PROFILE_ROLES)}")
+        if execution not in delegate.HOST_GUIDED_EXECUTIONS:
+            raise WorkflowError(
+                "--route-note records host-guided execution only; external-runner is already "
+                "recorded by delegate exposure")
+        delegate._validate_profile_binding(
+            role, {"execution": execution, "backend": backend})
+        routes.append({
+            "role": role, "execution": execution, "backend": backend,
+            "provenance": "main-session",
+        })
+    unique = {(row["role"], row["execution"], row["backend"]): row for row in routes}
+    return [unique[key] for key in sorted(unique)]
+
+
+def _validate_recorded_routes(root: Path, routes: list[dict]) -> None:
+    if not routes:
+        return
+    import delegate
+
+    profile, _fingerprint = delegate._load_profile(root)
+    bindings = profile.get("bindings") or {}
+    for route in routes:
+        binding = bindings.get(route["role"])
+        if not isinstance(binding, dict):
+            raise WorkflowError(
+                f"--route-note role {route['role']!r} has no profile binding")
+        execution = delegate._validate_profile_binding(route["role"], binding)
+        if (execution, binding.get("backend")) != (route["execution"], route["backend"]):
+            raise WorkflowError(
+                f"--route-note {route['role']} route does not match the current profile binding")
+
+
+def close(root: Path, round_id: str, done: list[str], touched: list[str], commit: str,
+          routes: list[dict] | None = None) -> int:
     """Fail-closed: resolve the commit and confirm the watermark slot up front, apply edits in
     memory and validate BEFORE writing anything, then write tasks.yaml → views → watermark."""
     import shutil
     import tempfile
     import yaml
     import roadmap
+    import review
     import validate
 
     if not ROUND_RE.match(round_id):
         print(f"round close: --round must match YYYY-MM-DD-<slug>, got {round_id!r}", file=sys.stderr)
         return 1
     cfg = load_config(root)
+    routes = list(routes or [])
+    try:
+        _validate_recorded_routes(root, routes)
+    except WorkflowError as e:
+        print(f"round close: cannot record host-guided route — {e}", file=sys.stderr)
+        return 1
+    try:
+        review_reviewers = review.resolve_reviewers(root, cfg["review"]["reviewers"])
+    except WorkflowError as e:
+        print(f"round close: cannot resolve review request reviewers — {e}", file=sys.stderr)
+        return 1
     cfg_path = root / ".waystone.yml"
     tasks_path = root / "tasks.yaml"
 
@@ -172,7 +233,11 @@ def close(root: Path, round_id: str, done: list[str], touched: list[str], commit
     if full is None:
         print(f"round close: --commit {commit!r} does not resolve to a commit", file=sys.stderr)
         return 1
+    head_sha = full if commit == "HEAD" else git_full_sha(root, "HEAD")
     ctext = cfg_path.read_text(encoding="utf-8")
+    prev_raw = (cfg.get("state") or {}).get("last_round_commit")
+    prev_wm = git_full_sha(root, str(prev_raw)) if prev_raw else None
+    created_event_paths: list[Path] = []
     try:
         ctext_new = set_config_scalar(ctext, "last_round_commit", full, section="state")
     except KeyError:
@@ -185,8 +250,12 @@ def close(root: Path, round_id: str, done: list[str], touched: list[str], commit
 
     orig_tasks_text = tasks_path.read_text(encoding="utf-8")
     text = orig_tasks_text
+    session_id = (os.environ.get("CLAUDE_CODE_SESSION_ID")
+                  or os.environ.get("CODEX_THREAD_ID") or None)
     data0 = yaml.safe_load(text) or {}
     by_id = {t.get("id"): t for t in data0.get("tasks", []) if isinstance(t, dict)}
+    done_transitions = [task_id for task_id in done
+                        if by_id.get(task_id, {}).get("status") != "done"]
     # done tasks must have all deps done — evaluated against the FINAL state (a dependency closed
     # in the SAME round counts), so closing a dependency and its dependent together is allowed.
     final_done = {tid for tid, t in by_id.items() if t.get("status") == "done"} | set(done)
@@ -206,6 +275,9 @@ def close(root: Path, round_id: str, done: list[str], touched: list[str], commit
             text = set_task_field(text, tid, "status", "done")
         for tid in dict.fromkeys(done + touched):
             text = set_task_field(text, tid, "round", round_id)
+            # tasks.yaml is the round registry: bind every round-stamped entry to the host session.
+            # An absent env value is recorded as YAML null; no timestamp/path heuristic is invented.
+            text = set_task_field(text, tid, "session_id", json.dumps(session_id))
     except (KeyError, WorkflowError) as e:
         print(f"round close: {e}", file=sys.stderr)
         return 1
@@ -217,6 +289,23 @@ def close(root: Path, round_id: str, done: list[str], touched: list[str], commit
         for e in errs[:10]:
             print(f"  - {e}", file=sys.stderr)
         return 2
+    final_data = yaml.safe_load(text) or {}
+    final_by_id = {task.get("id"): task for task in final_data.get("tasks", [])
+                   if isinstance(task, dict)}
+    task_scopes: dict[str, list[str]] = {}
+    task_scope_coverage: dict[str, str] = {}
+    for task_id in dict.fromkeys(done + touched):
+        raw_scope = final_by_id.get(task_id, {}).get("scope")
+        if raw_scope in (None, []):
+            task_scope_coverage[task_id] = "task-scope-unknown"
+            continue
+        try:
+            task_scopes[task_id] = canonical_scope_prefixes(raw_scope)
+        except WorkflowError:
+            task_scope_coverage[task_id] = "task-scope-invalid"
+        else:
+            task_scope_coverage[task_id] = (
+                "explicit" if task_scopes[task_id] else "task-scope-unknown")
 
     # --- commit phase (all preflight checks passed): write with rollback ---
     # ROADMAP.render reads tasks.yaml from disk, so the new registry must be written first. If any
@@ -232,6 +321,7 @@ def close(root: Path, round_id: str, done: list[str], touched: list[str], commit
         gen_backup = Path(tempfile.mkdtemp(prefix="waystone-ssot-bak-")) / "g"
         shutil.copytree(gen_dir, gen_backup)
 
+    round_exposure = None
     try:
         write_text_atomic(tasks_path, text)
         write_text_atomic(cfg_path, ctext_new)
@@ -239,6 +329,20 @@ def close(root: Path, round_id: str, done: list[str], touched: list[str], commit
         if cfg.get("ssot"):
             import ssot
             ssot.regenerate(root)  # one full regen; raises WorkflowError (caught below) not sys.exit
+        try:
+            import overlay
+            exposure_path, round_exposure = overlay.write_round_exposure(
+                root, round_id, head_sha, full, session_id=session_id,
+                base_sha=prev_wm, task_scopes=task_scopes,
+                task_scope_coverage=task_scope_coverage, done_task_ids=done_transitions,
+                routes=routes)
+            created_event_paths.append(exposure_path)
+            binding_path = review.write_round_request_binding(
+                root, round_id, full, prev_wm, review_reviewers,
+                mode=(cfg.get("review") or {}).get("mode", "packet"))
+            created_event_paths.append(binding_path)
+        except Exception as e:  # noqa: BLE001 — exposure is part of the close transaction
+            raise WorkflowError(f"round exposure/request binding not recorded: {e}") from e
     except Exception as e:  # noqa: BLE001 — any failure must roll every written artifact back
         write_text_atomic(tasks_path, orig_tasks_text)
         write_text_atomic(cfg_path, ctext)
@@ -250,6 +354,8 @@ def close(root: Path, round_id: str, done: list[str], touched: list[str], commit
             shutil.rmtree(gen_dir, ignore_errors=True)
             if gen_existed:
                 shutil.copytree(gen_backup, gen_dir)
+        for event_path in reversed(created_event_paths):
+            event_path.unlink(missing_ok=True)
         if gen_backup is not None:
             shutil.rmtree(gen_backup.parent, ignore_errors=True)
         print(f"round close: closeout failed mid-write and was rolled back — {e}", file=sys.stderr)
@@ -260,26 +366,26 @@ def close(root: Path, round_id: str, done: list[str], touched: list[str], commit
     # report the watermark move so the review request can name the diff base (prev tip → this tip).
     # `prev_wm` is the watermark BEFORE this close advanced it — the previous round's tip; resolve it
     # to a full sha (it may be stored short) so it can be copied verbatim as the review base.
-    prev_wm = git_full_sha(root, str(prev_raw)) if (prev_raw := (cfg.get("state") or {}).get("last_round_commit")) else None
     print(f"round {round_id} closed: {len(done)} done, {len(set(done + touched))} stamped; "
           f"watermark {(prev_wm[:12] if prev_wm else '(root)')} → {full[:12]}")
     print(f"  review diff base = {prev_wm or '(root)'}  (previous round tip; head = {full})")
+    print(f"  review reviewers = {', '.join(review_reviewers)}")
 
-    # M2 §9/§6: record the round exposure and evaluate overlay warns at the round-close boundary.
-    # Both are best-effort — an exposure/warn failure must NOT roll back an already-completed close
-    # (S11/S5). The exposure guard names its failure so it stays visible.
+    # Boundary warnings remain advisory. Unlike exposure (part of the transaction above), a warning
+    # engine failure is visible but does not invalidate a close whose policy record is durable.
     try:
         import overlay
-        overlay.write_round_exposure(root, round_id, git_full_sha(root, "HEAD"), full)
+        try:
+            overlay.evaluate_boundary(
+                root, "round-close", {"round_id": round_id, "closing_task_ids": done,
+                                      "task_ids": list(dict.fromkeys(done + touched)),
+                                      "round_record": round_exposure})
+        finally:
+            # A round override applies through its close boundary, then expires even when the
+            # advisory evaluator reports an internal failure.
+            overlay.expire_round_overrides(root, round_id)
     except Exception as e:  # noqa: BLE001
-        print(f"round close: round exposure not recorded ({e}) — close still succeeded",
-              file=sys.stderr)
-    try:
-        import overlay
-        overlay.evaluate_boundary(
-            root, "round-close", {"round_id": round_id, "closing_task_ids": done})
-    except Exception as e:  # noqa: BLE001
-        print(f"round close: overlay warning unavailable ({e}) — close still succeeded",
+        print(f"round close: overlay warning/override expiry unavailable ({e}) — close still succeeded",
               file=sys.stderr)
     return 0
 
@@ -293,7 +399,19 @@ def main() -> int:
 
     def opt(name):
         return rest[rest.index(name) + 1] if name in rest and rest.index(name) < len(rest) - 1 else None
-    positional = [a for a in rest if not a.startswith("--") and (rest.index(a) == 0 or rest[rest.index(a) - 1] not in ("--round", "--done", "--touched", "--commit"))]
+
+    def repeated(name):
+        values = []
+        for index, value in enumerate(rest):
+            if value == name:
+                if index + 1 >= len(rest) or rest[index + 1].startswith("--"):
+                    raise WorkflowError(f"{name} requires a value")
+                values.append(rest[index + 1])
+        return values
+
+    value_flags = ("--round", "--done", "--touched", "--commit", "--route-note")
+    positional = [a for i, a in enumerate(rest) if not a.startswith("--")
+                  and (i == 0 or rest[i - 1] not in value_flags)]
     root = Path(positional[0]).resolve() if positional else find_project_root(Path.cwd())
     if root is None:
         print("round: no initialized project", file=sys.stderr)
@@ -303,13 +421,14 @@ def main() -> int:
         print("round close: --round <id> is required", file=sys.stderr)
         return 1
     try:
+        routes = _parse_route_notes(repeated("--route-note"))
         # Phase-2 migration is a separate pre-verb span; close then owns one project-lock span from
         # preflight through exposure/warn recording. Nested libraries must not acquire it again.
         with hold_lock(project_lock_path(root)):
             migrate_project_state(root)
         with hold_lock(project_lock_path(root)):
             return close(root, round_id, _parse_ids(opt("--done")),
-                         _parse_ids(opt("--touched")), opt("--commit") or "HEAD")
+                         _parse_ids(opt("--touched")), opt("--commit") or "HEAD", routes)
     except WorkflowError as e:
         print(e, file=sys.stderr)
         return 1

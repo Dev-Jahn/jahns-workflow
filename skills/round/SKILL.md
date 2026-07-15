@@ -37,16 +37,27 @@ titles; set `anchor:` to the governing SSOT §-anchor when known) — rather tha
 registry. Unresolved questions for the user become `decision/...` tasks; when a `decision/...` is
 answered, record the ruling with `waystone task set <id> ruling "..."`.
 
-An implementation task can be delegated to an external runner with `waystone delegate run <task-id>` — it
-runs in an isolated worktree cut from a snapshot of your current tree and comes back as a reviewable
-patch you `apply` or `discard` (the guided flow arrives in a later milestone).
+Before handing off nontrivial work, resolve the profile with `waystone paths --root <project-root>`
+and follow the selected role's `execution`/`backend`. Use `waystone delegate run <task-id>` only for
+an `implementer` bound to `external-runner`. For `clean-subagent`, `forked-subagent`,
+`deterministic-workflow`, or `main-session`, use the host's native execution mechanism instead and
+preserve the role attribution. When exact path scope is derivable, record it first with repeated
+`waystone task set <task-id> --scope-add "<repo-relative-prefix>"` calls. Whichever route ran, include
+the task in this round's `--done` or `--touched` set and record its role/execution/backend and result
+in PROGRESS.
 
 Then close the round in one atomic, deterministic step instead of hand-editing each field:
 
 ```bash
 waystone round close . --round <round-id> \
-    --done <comma-ids that fully passed> --touched <comma-ids worked but not done>
+    --done <comma-ids that fully passed> --touched <comma-ids worked but not done> \
+    --route-note <role>,<execution>,<backend>
 ```
+
+Repeat `--route-note` once for each host-guided role actually used in the round. Do not record an
+external-runner here; delegation exposure already records it. The close command validates every
+note against the current profile and stores it in the immutable round exposure. If no host-guided
+route was used, omit the flag; downstream role attribution remains unknown rather than guessed.
 
 `round close` flips the `--done` tasks to `done`, stamps `round:` on every worked task, validates
 the registry, regenerates `ROADMAP.md` (and SSOT views if configured), and advances
@@ -54,6 +65,11 @@ the registry, regenerates `ROADMAP.md` (and SSOT views if configured), and advan
 A `gate/...` task goes in `--done` only if the bar actually passed (link evidence in PROGRESS).
 If `round close` reports the registry invalid, fix the reported issues before continuing.
 If lanes were used this round, first verify them: `waystone lanes verify .`.
+
+Relay adaptive-rule results with tri-state wording: **fired**, **did not fire (evaluable)**, or
+**unevaluable (<coverage reason>)**. Never call an unevaluable rule a non-fire. Keep a
+`waystone warn conflict` line labeled as a policy conflict whose effective stage was resolved
+least-restrictively; do not relabel it as a rule fire.
 
 Then keep the registry small: `waystone task archive .` relocates old
 done/dropped tasks into `tasks.archive.yaml` once the registry crosses a size threshold (it keeps

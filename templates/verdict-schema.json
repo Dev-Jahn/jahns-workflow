@@ -11,10 +11,11 @@
     "warnings_seen",
     "rationale",
     "limitations",
-    "at",
+    "judged_at",
     "provenance",
     "verify_number",
-    "profile_fingerprint"
+    "profile_fingerprint",
+    "artifact_digests"
   ],
   "properties": {
     "schema": {
@@ -89,9 +90,29 @@
         }
       }
     },
-    "at": {"type": "string"},
+    "judged_at": {"type": "string"},
     "provenance": {"const": "main-session"},
     "verify_number": {"type": ["integer", "null"], "minimum": 1},
-    "profile_fingerprint": {"type": ["string", "null"]}
+    "profile_fingerprint": {"type": ["string", "null"]},
+    "artifact_digests": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_sha256", "patch_sha256", "verify_sha256"],
+      "properties": {
+        "contract_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "patch_sha256": {
+          "oneOf": [
+            {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+            {"type": "null"}
+          ]
+        },
+        "verify_sha256": {
+          "oneOf": [
+            {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+            {"type": "null"}
+          ]
+        }
+      }
+    }
   }
 }

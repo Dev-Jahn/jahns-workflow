@@ -38,6 +38,21 @@ the ID. A task that governs a specific SSOT section also carries an `anchor:` fi
 (§-anchor string such as `"SSOT §5.6"`) — it documents the binding section, surfaces in the
 roadmap view, and scopes review findings, so set it whenever the binding section is known.
 
+When the intended file boundary is known, a task also carries `scope:` as a YAML list of
+repo-relative path prefixes:
+
+```yaml
+scope:
+  - scripts
+  - hooks/scripts/session_context.py
+```
+
+Add prefixes through repeatable `waystone task set <id> --scope-add "<prefix>"` calls. A prefix has
+no glob, absolute/home path, URL, `..`, backslash, colon, or whitespace; a trailing slash is
+normalized away. Delegation scope drift compares this declared list with the harness-computed
+changed-file list. If the scope cannot be derived without guessing, leave it unknown: that result is
+unevaluable, not evidence that no drift occurred.
+
 **Banned:** bare letter-number codenames (`P0`, `E3`, `Q1`, `T7`, `P-3`, …) as identifiers of
 work. They collide across projects and decay into noise. (Domain terms inside prose are fine.)
 
@@ -73,6 +88,7 @@ Used on review findings (a `severity:` field on the task, never part of the ID):
 | Work log | `PROGRESS.md` | current rounds + pointers; older months archived to `docs/progress/` |
 | Decisions | ADR dir | MADR-lite template |
 | External reviews | reviews dir | request packet + verbatim feedback + triage, per round |
+| Committed project policy | `docs/waystone-policy.yaml` | sanitized, consent-materialized policy only; normal reviewed Git content |
 | Agent memory | `~/.claude/projects/<project>/memory/` | pointers and non-derivable facts only — never duplicate SSOT/PROGRESS content |
 
 Status lives in exactly one place (`tasks.yaml` + PROGRESS). CLAUDE.md and memory link to it
@@ -89,6 +105,10 @@ task is `done` only when the bar actually passed, with evidence linked in PROGRE
 A review means "reviewer R examined tree SHA X" — it is always bound to a commit, never to a
 filename or a round id alone. No review is requested against an unpushed HEAD.
 
+Newly initialized projects set `review.reviewers: [role:reviewer]` and resolve that role through the
+local profile. Existing configs with literal reviewer backends remain compatible. A missing role
+binding fails loud and names the literal-list compatibility form; it is never model-guessed.
+
 - **packet mode**: a round closes, is pushed, and `round` writes one markdown review request
   (`<reviews_dir>/<round-id>-request.md`) naming the reviewed branch/HEAD + diff base. A web reviewer
   reads the repo over git (connector, zip, or clone) and returns a domain review; `waystone review ingest`
@@ -96,7 +116,8 @@ filename or a round id alone. No review is requested against an unpushed HEAD.
   which the model verifies (REAL/REJECTED/NEEDS-RULING) and registers. No bundle, no reviewer kit, no
   per-reply identity marker — the request names the SHA, and the reviewer reads the live tree.
 - **pr mode**: each round opens a PR; `review freeze` stamps the current head as cycle N (an
-  immutable target recorded as a PR-comment marker). A review is identified by
+  immutable target recorded as a PR-comment marker and a round-bound local SHA sidecar consumed by
+  improve without a GitHub re-query). A review is identified by
   `(reviewer, cycle, reviewed_sha)`. Remediation produces a new head → the cycle goes stale →
   re-freeze (cycle N+1) so reviewers re-examine the new SHA. Merge is decided by the computed
   gate (`round merge`), not by judgement: it blocks unless the cycle is fresh, the required
@@ -184,30 +205,75 @@ transport from the current host. A binding may set `effort` to `none`, `minimal`
 `high`, or `xhigh`; when omitted, the Codex configuration default is left untouched. Use
 `waystone paths` to inspect every resolved residence.
 
+The role key, `execution`, and `backend` are all routing inputs. `waystone delegate run` starts only
+an `implementer` bound to `external-runner`; `main-session`, `clean-subagent`, `forked-subagent`, and
+`deterministic-workflow` are executed by the host and attributed back to their role in the round.
+Every route first checks the eight policy questions in `templates/routing-policy.yaml`. An external
+run records the budget-sensitivity judgment in packet `routing_note` with main-session provenance;
+an actually used host-guided route is recorded by repeatable `round close --route-note
+<role>,<execution>,<backend>`. Without that note, improve keeps host-guided role attribution unknown.
+The `claude:<model>` external implementer has no structural filesystem/process/network sandbox and
+is refused unless the user explicitly consents to
+`--allow-unsandboxed-runner --reason <why>`.
+
 ## 9. Adaptive overlays, warnings, and evidence
 
 Adaptive policy is project-local and evidence-bearing:
 
+- **Four layers compose explicitly.** Built-in base, user overlay (`~/.waystone/overlay/`), project
+  overlay plus committed `docs/waystone-policy.yaml`, and current-round override compose in
+  round > project > user > base order. Inspect the result with `waystone overlay compose
+  [--round <round-id>]`. Every policy is identified by the composite identity `{layer, id}`; a bare
+  delta id is not globally unique across layers. Same-scope conflicts resolve least-restrictively.
+  At project scope, a committed policy wins over a conflicting local overlay and the shadowed entry
+  remains visible.
 - **Exposure is recorded at execution time.** Delegation and round exposure records capture the
-  active profile binding and overlays that governed that event; they do not infer retrospective
-  policy.
+  active profile binding and overlays that governed that event; round exposure also fingerprints the
+  full project config, committed policy, and routing policy for deterministic re-review staleness.
+  They do not infer retrospective policy.
 - **Evidence does not become a causal claim.** `waystone improve evidence` joins review findings and
   delegation records only through their explicit `task-id`. Unlinked findings remain reported as
   provenance unknown. Shadow replay reports only how often a rule *would have fired*; the
   **estimated nuisance rate** stays null until examples are labeled, and replay never claims a
   prevented defect or benefit.
-- **Warnings are non-blocking.** `observing` records rule fires without stderr; `warning` records and
-  prints them. Neither a fire nor an evaluation error changes the host command's exit code. Promotion
-  to warning requires replay; enforcement is not part of this lifecycle.
+- **Warnings are non-blocking and evaluation is tri-state.** `observing` records rule fires without
+  stderr; `warning` records and prints them. Relay an outcome as fired, did-not-fire while evaluable,
+  or unevaluable with its coverage reason; an unevaluable result is never a non-fire. Neither a fire
+  nor an evaluation error changes the host command's exit code. Promotion to warning requires replay;
+  enforcement is not part of this lifecycle.
+- **High-risk skipped review is explicit.** The skipped-close rule fires after its configured streak,
+  or on the first skipped close whose round diff file count or open-blocker count reaches its
+  configured threshold. Historical exposures without risk inputs keep that subcondition unknown;
+  the independently evaluable consecutive-close condition still replays.
 - **Relaxation is always open.** A delta may be demoted, suspended, or retired without a promotion
   gate. If active deltas conflict on the same rule, the effective stage is **least-restrictive** and
   the conflict is recorded as evidence for the next improve cycle.
+- **User promotion is evidence-gated.** `waystone overlay promote-user <delta-id>` derives its
+  `observed_in` projects from registered canonical roots and requires evidence in at least two
+  distinct projects. A refusal is reported as-is; evidence is never supplied by a flag or hand edit.
+- **Committed materialization is separately consented.** After replay and user review, record
+  `waystone consent record materialize accept --context origin_delta_id=<delta-id>`, then run
+  `waystone overlay materialize <delta-id>`. The resulting `docs/waystone-policy.yaml` contains only
+  a neutral rule-derived id, sanitized rule/stage/params, and a rule-derived one-line description.
+  Delta ids and behavior evidence stay out of the committed file; the delta-to-policy mapping remains
+  under `.waystone/overlay/`. The policy is left uncommitted and committed only after user review.
 
 Project-mode artifacts remain project-local and are never committed: deltas and warning events under
 `{project_root}/.waystone/overlay/`, per-event policy exposure under
-`{project_root}/.waystone/exposure/`, and the deterministic join projection at
-`{project_root}/.waystone/improve/evidence.jsonl`. Only explicit `--user-wide` analysis writes its
-cross-project user-habit projection under `~/.waystone/improve/`.
+`{project_root}/.waystone/exposure/`, maturity state at `{project_root}/.waystone/maturity.json`,
+consent events at `{project_root}/.waystone/consents.jsonl`, and improve artifacts including
+`{project_root}/.waystone/improve/evidence.jsonl` and
+`{project_root}/.waystone/improve/metrics.jsonl`. `waystone improve metrics` appends a named,
+provenance-bearing snapshot and factual same-scope comparison; unavailable metrics retain an
+`unavailable_reason` instead of becoming zero. Snapshots include severe recurrence,
+verification-finding trend, main direct work/context inflow, repeated warnings, retained deltas, and
+same-delegation verify-run judgment-set reproducibility. Only explicit `--user-wide` analysis writes its
+cross-project user-habit projection and longitudinal metrics under `~/.waystone/improve/`.
+
+Managed project files are also consent-gated: show the exact target, effect, and delete-to-rollback
+path before recording `install.agents` or `install.hooks` acceptance with `waystone consent record`,
+then run `waystone install agents` or `waystone install hooks`.
+These installs refuse overwrite and remain uncommitted for review.
 
 ## 10. Storage tiers, backup, and cleanup
 
@@ -215,13 +281,19 @@ Run `waystone paths` before backup or cleanup so `$WAYSTONE_HOME` and the active
 resolved rather than guessed.
 
 - **Project state — `{project_root}/.waystone/`.** This directory is self-ignored and uncommitted.
-  `git clean -fdx` deletes it. Back up non-reproducible decisions (`improve/decisions.jsonl`) and
-  delegation audit records before destructive cleanup; regenerable projections and resume state
-  do not need backup.
+  `git clean -fdx` deletes it. Before destructive cleanup, back up delegation audit records,
+  append-only `improve/decisions.jsonl`, `improve/metrics.jsonl`, and `consents.jsonl`, plus overlay
+  deltas and `maturity.json` when their history matters. Regenerable trace/review/evidence/audit
+  projections and resume state do not need backup.
 - **Machine state — `~/.waystone/`.** This holds the project registry and opt-in user-wide improve
-  state. Back it up; `$WAYSTONE_HOME` may resolve this tier elsewhere.
+  state, including promoted user policy under `overlay/` and user-wide longitudinal metrics under
+  `improve/metrics.jsonl`. Back it up before deleting or moving the tier; `$WAYSTONE_HOME` may
+  resolve it elsewhere.
 - **Cache — `~/.waystone/cache/`.** It is safe to delete when no delegation is running; Waystone
   recreates it as needed.
+- **Committed/project-managed files.** `docs/waystone-policy.yaml` is ordinary Git content and is
+  protected by repository backup. Managed agents/hooks are created uncommitted; review and commit
+  them explicitly or remove them before cleanup. Neither consent nor install performs a commit.
 - **Migration seeds — `.pre-0.9`.** Preserve legacy `.pre-0.9` roots. They remain the source for
   lazy project-state migration and profile seeding; cleanup is intentionally outside the 0.9
   migration.

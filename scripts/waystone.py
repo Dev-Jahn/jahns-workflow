@@ -7,7 +7,7 @@
 
 Groups:
   validate [tasks.yaml]              validate the task registry
-  task     list|show|add|set|drop|archive ...  structured registry access (don't read/edit it raw)
+  task     list|show|add|set|drop|archive ...  structured registry access (`set --scope-add` for boundaries)
   roadmap  [root]                    regenerate ROADMAP.md
   ssot     split|digest|check [root] SSOT generated views
   status   [--project N]             cross-project dashboard
@@ -15,12 +15,14 @@ Groups:
   review   freeze|status|ingest ...  SHA-bound review cycles (PR mode); ingest = byte-exact reply copy
   approve  --pr N --sha X            SHA-bound human approval
   round    merge --pr N ...          deterministic merge guard
-  improve  trace|reviews|evidence|audit|decide ...  project logs + reviews + task-id evidence / decisions
+  improve  trace|reviews|evidence|audit|metrics|decide ...  project evidence, metrics, and decisions
   delegate run|status|show|verify|verdict|apply|discard ...  worktree runner + evidence-gated verdict
-  overlay  add|list|show|promote|demote|suspend|retire|replay ...  project-local adaptive warn deltas
+  overlay  add|...|promote-user|override|materialize|compose ...  four-layer adaptive policy
+  consent  record <surface> <choice> ...  append a standard project-local consent event
+  install  agents|hooks [--consent-recorded] ...  consent-gated managed project files
   check    [--root DIR]               evaluate active overlay deltas at an explicit boundary (never blocks)
   paths    [--root DIR] [--json]      show resolved machine and project storage paths
-  project  register|unregister|list ...  manage the cross-project registry
+  project  register|unregister|alias|list ...  manage the cross-project registry
 
 Existing hook/skill call sites that invoke sibling scripts directly keep working; this is an
 additive convenience front door (GPT review: consolidate under one `waystone` CLI).
@@ -106,6 +108,143 @@ def _paths_main(argv: list[str]) -> int:
     return 0
 
 
+def _command_root(value: str | None) -> Path:
+    start = Path(value).expanduser() if value is not None else Path.cwd()
+    root = common.find_project_root(start)
+    if root is None:
+        raise common.WorkflowError(f"no waystone project found from {start.resolve()}")
+    return root
+
+
+def _consent_main(argv: list[str]) -> int:
+    if len(argv) < 3 or argv[0] != "record":
+        print("waystone consent: expected record <surface> <choice> [--context key=value] [--root DIR]",
+              file=sys.stderr)
+        return 1
+    surface, choice = argv[1:3]
+    context: dict[str, str] = {}
+    root_value = None
+    rest = argv[3:]
+    i = 0
+    try:
+        while i < len(rest):
+            if rest[i] in ("--context", "--root") and i + 1 < len(rest):
+                value = rest[i + 1]
+                if rest[i] == "--root":
+                    if root_value is not None:
+                        raise common.WorkflowError("--root may be passed only once")
+                    root_value = value
+                else:
+                    key, separator, item = value.partition("=")
+                    if not separator or not key or key in context:
+                        raise common.WorkflowError(
+                            "--context requires a unique non-empty key=value")
+                    context[key] = item
+                i += 2
+            else:
+                raise common.WorkflowError(f"unexpected argument {rest[i]!r}")
+        root = _command_root(root_value)
+        with common.hold_lock(common.project_lock_path(root)):
+            if surface == "materialize":
+                import overlay
+
+                delta_id = context.get("origin_delta_id") or context.get("rule_id")
+                if not isinstance(delta_id, str) or not delta_id:
+                    raise common.WorkflowError(
+                        "materialize consent requires --context origin_delta_id=<delta-id>")
+                context = overlay.materialize_consent_context(root, delta_id)
+            elif surface in ("install.agents", "install.hooks"):
+                kind = surface.partition(".")[2]
+                if context and context != {"kind": kind}:
+                    raise common.WorkflowError(
+                        f"{surface} consent context is derived; pass only --context kind={kind}")
+                context, _source, _target, _payload = _install_candidate(root, kind)
+            row = common.record_consent(root, surface, choice, context)
+    except common.WorkflowError as e:
+        print(f"waystone consent record: {e}", file=sys.stderr)
+        return 1
+    except OSError as e:
+        print(f"waystone consent record: cannot append consent — {e}", file=sys.stderr)
+        return 2
+    print(f"recorded consent {row['surface']}={row['choice']} -> {common.consent_path(root)}")
+    return 0
+
+
+_INSTALL_TARGETS = {
+    "agents": ("waystone-operator-agent.md", Path(".claude/agents/waystone-operator.md")),
+    "hooks": ("waystone-boundary-hook.json", Path(".claude/settings.json")),
+}
+
+
+def _install_candidate(root: Path, kind: str) -> tuple[dict, Path, Path, bytes]:
+    template_name, relative_target = _INSTALL_TARGETS[kind]
+    source = HERE.parent / "templates" / template_name
+    target = root / relative_target
+    if os.path.lexists(target):
+        raise common.WorkflowError(f"refusing to overwrite existing managed install target {target}")
+    try:
+        payload = source.read_bytes()
+    except OSError as e:
+        raise common.WorkflowError(f"cannot read managed install template {source}: {e}") from e
+    template_hash = common.content_hash(payload)
+    candidate = {
+        "kind": kind, "target_path": str(target.resolve()), "stage": "install",
+        "template_hash": template_hash,
+    }
+    context = {**candidate, "candidate_hash": common.canonical_payload_hash(candidate)}
+    return context, source, target, payload
+
+
+def _install_main(argv: list[str]) -> int:
+    if not argv or argv[0] not in _INSTALL_TARGETS:
+        print("waystone install: expected agents|hooks [--consent-recorded] [--root DIR]",
+              file=sys.stderr)
+        return 1
+    kind = argv[0]
+    root_value = None
+    consent_recorded = False
+    rest = argv[1:]
+    i = 0
+    try:
+        while i < len(rest):
+            if rest[i] == "--root" and i + 1 < len(rest):
+                if root_value is not None:
+                    raise common.WorkflowError("--root may be passed only once")
+                root_value = rest[i + 1]
+                i += 2
+            elif rest[i] == "--consent-recorded":
+                if consent_recorded:
+                    raise common.WorkflowError("--consent-recorded may be passed only once")
+                consent_recorded = True
+                i += 1
+            else:
+                raise common.WorkflowError(f"unexpected argument {rest[i]!r}")
+        root = _command_root(root_value)
+        surface = f"install.{kind}"
+        with common.hold_lock(common.project_lock_path(root)):
+            context, source, target, payload = _install_candidate(root, kind)
+            if consent_recorded:
+                common.record_consent(root, surface, "accept", context)
+            if not common.has_accepted_consent(root, surface, context):
+                raise common.WorkflowError(
+                    f"consent is required; record `{surface}` acceptance or pass --consent-recorded")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with target.open("xb") as stream:
+                    stream.write(payload)
+            except BaseException:
+                target.unlink(missing_ok=True)
+                raise
+    except common.WorkflowError as e:
+        print(f"waystone install {kind}: {e}", file=sys.stderr)
+        return 1
+    except OSError as e:
+        print(f"waystone install {kind}: cannot install managed file — {e}", file=sys.stderr)
+        return 2
+    print(f"installed {kind}: {target} (left uncommitted)")
+    return 0
+
+
 def _load_registry(path: Path) -> dict:
     if not path.is_file():
         return {"projects": []}
@@ -118,6 +257,13 @@ def _load_registry(path: Path) -> dict:
     projects = registry.get("projects", [])
     if not isinstance(projects, list):
         raise common.WorkflowError(f"registry has wrong shape (`projects` must be a list): {path}")
+    for entry in projects:
+        if isinstance(entry, dict) and "aliases" in entry:
+            aliases = entry["aliases"]
+            if not isinstance(aliases, list) or not all(isinstance(alias, str) for alias in aliases):
+                raise common.WorkflowError(
+                    f"registry entry `aliases` must be a list of paths: {path}")
+    common.validate_registry_path_uniqueness(projects, path)
     registry["projects"] = projects
     return registry
 
@@ -147,14 +293,32 @@ def _entry_path(entry: object) -> Path | None:
     return Path(entry["path"]).expanduser().resolve()
 
 
+def _entry_aliases(entry: object) -> list[Path]:
+    if not isinstance(entry, dict):
+        return []
+    aliases = entry.get("aliases", [])
+    if not isinstance(aliases, list) or not all(isinstance(alias, str) for alias in aliases):
+        raise common.WorkflowError("registry entry `aliases` must be a list of paths")
+    return [Path(alias).expanduser().resolve() for alias in aliases]
+
+
 def _project_main(argv: list[str]) -> int:
-    if not argv or argv[0] not in ("register", "unregister", "list"):
-        print("waystone project: expected register <path>, unregister <path>, or list", file=sys.stderr)
+    if not argv or argv[0] not in ("register", "unregister", "alias", "list"):
+        print(
+            "waystone project: expected register <path>, unregister <path>, "
+            "alias <path> --root <root>, or list",
+            file=sys.stderr,
+        )
         return 1
     command, rest = argv[0], argv[1:]
     if command == "list":
         if rest:
             print("waystone project list: takes no arguments", file=sys.stderr)
+            return 1
+    elif command == "alias":
+        if len(rest) != 3 or rest[1] != "--root":
+            print(
+                "waystone project alias: expected <path> --root <root>", file=sys.stderr)
             return 1
     elif len(rest) != 1:
         print(f"waystone project {command}: expected one path", file=sys.stderr)
@@ -177,6 +341,33 @@ def _project_main(argv: list[str]) -> int:
             return 0
 
         requested = Path(rest[0]).expanduser().resolve()
+        if command == "alias":
+            root = common.find_project_root(Path(rest[2]).expanduser())
+            if root is None:
+                raise common.WorkflowError(f"no waystone project found from {rest[2]}")
+            root = root.resolve()
+            target = next((entry for entry in projects if _entry_path(entry) == root), None)
+            if target is None:
+                raise common.WorkflowError(
+                    f"canonical project root is not registered: {root}; register it first")
+            if requested == root:
+                raise common.WorkflowError(f"alias is already the canonical project path: {root}")
+            for entry in projects:
+                if _entry_path(entry) == requested:
+                    raise common.WorkflowError(
+                        f"alias path is another project's canonical path: {requested}")
+                if requested in _entry_aliases(entry):
+                    if entry is target:
+                        print(f"already aliases: {requested}\t{root}")
+                        return 0
+                    raise common.WorkflowError(f"alias path is already registered elsewhere: {requested}")
+            target["aliases"] = sorted(
+                [*map(str, _entry_aliases(target)), str(requested)])
+            common.validate_registry_path_uniqueness(projects, path)
+            _write_registry(path, registry)
+            print(f"alias added: {requested}\t{root}")
+            return 0
+
         if command == "register":
             root = common.find_project_root(requested)
             if root is None:
@@ -192,7 +383,8 @@ def _project_main(argv: list[str]) -> int:
             if any(_entry_path(entry) == root for entry in projects):
                 print(f"already registered: {name}\t{root}")
                 return 0
-            projects.append({"name": name, "path": str(root)})
+            projects.append({"name": name, "path": str(root), "aliases": []})
+            common.validate_registry_path_uniqueness(projects, path)
             _write_registry(path, registry)
             print(f"registered: {name}\t{root}")
             return 0
@@ -282,6 +474,10 @@ def main(argv: list[str]) -> int:
     group, rest = argv[0], argv[1:]
 
     # new-style modules expose main(argv)
+    if group == "consent":
+        return _consent_main(rest)
+    if group == "install":
+        return _install_main(rest)
     if group == "task":
         import tasks
         return tasks.main(rest)

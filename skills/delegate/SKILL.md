@@ -30,6 +30,57 @@ delegable. Do not weaken or work around those checks.
 Treat SessionStart's `needs-review delegations N` line as work to resume and complete through a
 verdict, not as something to ask the user about.
 
+Resolve the profile path with `waystone paths --root <project-root>`, then inspect only the selected
+workflow role's binding in `{project_root}/.waystone/profile.yml`. This skill's implementation
+handoff uses the `implementer` role. Before choosing the execution, explicitly check all eight
+SessionStart routing questions in policy order:
+
+1. `reasoning` — required reasoning level;
+2. `context-inheritance` — whether current context must carry over;
+3. `independent-perspective` — whether isolation of perspective matters;
+4. `bounded-scope` — whether the scope is clear and bounded;
+5. `repetitive-tools` — whether repeatable tool execution dominates;
+6. `retry-cost` — cost of a failed attempt and retry;
+7. `independent-verification` — who verifies final quality;
+8. `budget-sensitivity` — the user's execution-budget sensitivity.
+
+Questions `reasoning`, `independent-perspective`, `bounded-scope`, and
+`independent-verification` are the policy questions whose preferences can admit
+`external-runner`; `context-inheritance`, `repetitive-tools`, `retry-cost`, and
+`budget-sensitivity` name host-guided executions only. A question admitting external execution does
+not override the selected profile binding. Route the task by that binding's `execution` and
+`backend`:
+
+- `implementer` + `external-runner`: continue to `waystone delegate run`; this is the only role and
+  execution pair that command can start.
+- `main-session`, `clean-subagent`, `forked-subagent`, or `deterministic-workflow`: do not call
+  `delegate run`. Dispatch the bound role/execution/backend through the host's native main-session,
+  subagent, or workflow mechanism. Preserve the role attribution and record the task as done or
+  touched in `waystone round close` plus the round's PROGRESS entry.
+
+Do not translate a host-guided binding into a headless runner. Other external-runner roles are not
+an implemented `delegate run` surface; verifier execution is handled separately in Step 4.
+
+For an external-runner route, record the budget-sensitivity judgment as one free, single-line
+main-session note in the immutable packet:
+
+```bash
+waystone delegate run <task-id> --routing-note "<budget judgment>" --root <project-root>
+```
+
+For a host-guided route, preserve the same judgment in PROGRESS and use the round route note in
+Step 2 of the round skill; no delegation packet exists on that route.
+
+When the task's path scope is exactly derivable from owner-authored task, SSOT, or review material,
+record each repo-relative prefix before either route runs:
+
+```bash
+waystone task set <task-id> --scope-add "<repo-relative-prefix>"
+```
+
+Preserve existing `scope:` entries and append only missing exact prefixes. Do not invent a broad
+prefix merely to make scope-drift evaluation available.
+
 ## Step 1.5 — Ensure recorded acceptance criteria
 
 Use existing criteria unchanged. If none exist, synthesize a criterion only when its exact bar is
@@ -50,6 +101,15 @@ agent-synthesized criterion; the durable `--accept-add` path is the audit trail.
 
 ```bash
 waystone delegate run <task-id> --root <project-root>
+```
+
+If the bound external backend is `claude:<model>`, the command is structurally unsandboxed and is
+refused by default. Do not add an override autonomously. Only after escalation 9 produces explicit
+user consent, run the same command with both recorded fields:
+
+```bash
+waystone delegate run <task-id> --allow-unsandboxed-runner \
+  --reason "<user-approved reason>" --root <project-root>
 ```
 
 Retain the command's bounded stdout as operational evidence. Treat every `waystone warn` stderr line
@@ -199,14 +259,15 @@ record path anywhere else in the report.
 | # | Escalate only when |
 |---|---|
 | 1 | Acceptance criteria cannot be derived from owner-authored task, ROADMAP, SSOT, or review material without inventing a hollow bar. |
-| 2 | The project profile is missing, a binding is invalid, or the selected backend is not supported by the Codex-backed runner. |
+| 2 | The project profile is missing, a binding is invalid, or the selected role/backend has no implemented execution surface. |
 | 3 | An unresolved blocker remains, the judgment favors apply, and no `agent_checks` evidence concretely refutes that finding. |
 | 4 | Two run attempts for the same task have been consumed in this main-session. |
 | 5 | The verifier transport still fails after one retry. |
 | 6 | Apply drift is not completely explained by this main-session's own edits. Never commit or stash the user's uncommitted work; report it and wait. |
 | 7 | The runner failure is deterministic; preserve its record and worktree evidence. |
 | 8 | A `waystone warn conflict` stderr line reports an overlay conflict that requires a policy choice. |
-| 9 | The user explicitly requested review of the task. |
+| 9 | A `claude:<model>` external-runner binding would require `--allow-unsandboxed-runner --reason`; get the user's explicit consent to that unsandboxed execution first. |
+| 10 | The user explicitly requested review of the task. |
 
 These are the only escalation cases. Otherwise, do not ask the user; continue through verdict and
 apply or discard. For an escalation, summarize the bounded evidence and use the host's native

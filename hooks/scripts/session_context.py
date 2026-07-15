@@ -16,6 +16,8 @@ import sys
 import time
 from pathlib import Path
 
+import yaml
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 from common import (  # noqa: E402
     git_branch_info, git_full_sha, hold_lock, load_config, load_tasks, migrate_project_state,
@@ -28,31 +30,58 @@ MAX_TASK_LINES = 8
 MAX_START_HERE = 2560  # ~2.5KB cap on the injected re-entry narrative (read-time, never truncates the file)
 MAX_CONTRACT = 1200
 CONTRACT_PATH = Path(__file__).resolve().parents[2] / "references" / "main-contract.md"
+ROUTING_POLICY_PATH = Path(__file__).resolve().parents[2] / "templates" / "routing-policy.yaml"
+ROUTING_QUESTION_IDS = (
+    "reasoning", "context-inheritance", "independent-perspective", "bounded-scope",
+    "repetitive-tools", "retry-cost", "independent-verification", "budget-sensitivity",
+)
 MIGRATION_LOCK_TIMEOUT = 3.0
 
 
-def _routing_line(root: Path) -> str:
+def _routing_block(root: Path) -> list[str]:
+    """Render bounded role guidance from the §9 policy artifact, never concrete model bindings."""
     import delegate
 
-    path = delegate._profile_path(root)
-    if not path.is_file():
-        return "routing: no profile — waystone delegate will guide setup"
     try:
-        profile, _fingerprint = delegate._load_profile(root)
-        bindings = profile.get("bindings")
-        if not isinstance(bindings, dict):
-            raise ValueError("bindings is not a mapping")
-        roles = sorted(bindings, key=lambda role: (role != "implementer", role))
-        rendered = []
-        for role in roles:
-            binding = bindings[role]
-            if isinstance(binding, dict) and isinstance(binding.get("backend"), str):
-                rendered.append(f"{role}→{binding['backend']}")
-        if not rendered:
-            raise ValueError("no readable bindings")
-        return "routing: " + " · ".join(rendered)
+        policy = yaml.safe_load(ROUTING_POLICY_PATH.read_text(encoding="utf-8"))
+        if not isinstance(policy, dict) or policy.get("schema") != "waystone-routing-policy-1":
+            raise ValueError("routing policy has the wrong schema")
+        roles = policy.get("roles")
+        if not isinstance(roles, dict) or set(roles) != set(delegate.PROFILE_ROLES):
+            raise ValueError("routing policy roles do not match the profile roles")
+        questions = policy.get("questions")
+        if (not isinstance(questions, list) or len(questions) != 8
+                or any(not isinstance(question, dict)
+                       or not isinstance(question.get("id"), str) for question in questions)):
+            raise ValueError("routing policy must contain the eight §9 questions")
+        question_ids = [question["id"] for question in questions]
+        if tuple(question_ids) != ROUTING_QUESTION_IDS:
+            raise ValueError("routing policy §9 questions or order do not match the contract")
+        lines = [
+            "routing Q1-3: " + ",".join(question_ids[:3]),
+            "routing Q4-6: " + ",".join(question_ids[3:6]),
+            "routing Q7-8: " + ",".join(question_ids[6:]),
+            "routing policy: role guidance",
+        ]
+        for role in delegate.PROFILE_ROLES:
+            guidance = roles[role]
+            if not isinstance(guidance, str) or not guidance.strip() or "\n" in guidance:
+                raise ValueError(f"routing guidance for {role} must be one non-empty line")
+            lines.append(f"  {role}: {guidance}")
+        profile_path = delegate._profile_path(root)
+        if not profile_path.is_file():
+            lines.append("bindings: unavailable; see `waystone paths` → profile")
+        else:
+            try:
+                delegate._load_profile(root)
+            except Exception:  # noqa: BLE001 — report damaged optional binding without model details
+                lines.append(
+                    "bindings: unavailable (profile unreadable); see `waystone paths` → profile")
+            else:
+                lines.append("bindings: see `waystone paths` → profile")
+        return lines[:12]
     except Exception:  # noqa: BLE001 — one damaged live input must not break SessionStart
-        return "routing: — unreadable"
+        return ["routing policy: — unreadable"]
 
 
 def _overlay_line(root: Path) -> str:
@@ -129,7 +158,7 @@ def _operating_contract(root: Path) -> list[str]:
         if not constitution:
             return []
         lines = ["◆ OPERATING CONTRACT (waystone)", *constitution.splitlines(),
-                 _routing_line(root), _overlay_line(root)]
+                 *_routing_block(root), _overlay_line(root)]
         live = "live: " + _delegation_summary(root)
         evidence = _evidence_summary(root)
         if evidence:

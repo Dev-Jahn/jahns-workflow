@@ -18,7 +18,8 @@ SHA the Codex bot names in its own review comment (timing is irrelevant once the
 Markers in fenced code blocks are ignored.
 
 Markers (HTML comments embedded in PR comment bodies):
-  waystone-review-cycle  : a freeze — {round_id, cycle, target_sha, base_sha, reviewers}
+  waystone-review-cycle  : a freeze — {round_id, cycle, target_sha, base_sha, reviewers,
+                                       profile_fingerprint}
   waystone-review-result : an external reviewer reply footer — {reviewer, review_cycle, reviewed_sha, verdict, decision_required}
   waystone-findings      : adjudication outcome for a cycle — {cycle, resolved}
   waystone-approval      : SHA-bound human approval — {sha, by}
@@ -36,6 +37,7 @@ import json
 import re
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -48,6 +50,10 @@ from common import (  # noqa: E402
 
 CODEX_BOT = "chatgpt-codex-connector[bot]"  # REST `user.login` form
 INBOX = Path("/tmp/review.md")  # fixed drop-file: user saves the reviewer reply here, byte-exact
+ROUND_REQUEST_BINDING_SCHEMA = "waystone-round-request-binding-1"
+PR_FREEZE_BINDING_SCHEMA = "waystone-pr-freeze-binding-1"
+PACKET_REVIEWING_RE = re.compile(
+    r"(?m)^- Reviewing:\s*([0-9a-f]{40})\s+\(diff against\s+([0-9a-f]{40}|\(root\))\)\s*$")
 
 
 def is_codex(login: str | None) -> bool:
@@ -73,6 +79,98 @@ def emit_marker(kind: str, fields: dict) -> str:
     return f"<!-- waystone-{kind}:v1\n{body}\n-->"
 
 
+def write_round_request_binding(root: Path, round_id: str, target_sha: str, base_sha: str | None,
+                                reviewers: list[str], *, mode: str) -> Path:
+    """Append an immutable round-bound sidecar for packet request projection.
+
+    A PR request row records the pre-freeze relationship but is never promoted to a reviewed-SHA
+    fact; successful PR freeze has its own cycle-bound local evidence.
+    """
+    if not _is_sha(target_sha) or (base_sha is not None and not _is_sha(base_sha)):
+        raise WorkflowError("round request binding requires full target/base commit SHAs")
+    if mode not in ("packet", "pr") or not _is_strlist(reviewers):
+        raise WorkflowError("round request binding requires packet|pr mode and literal reviewers")
+    cfg = load_config(root)
+    directory = Path(root) / cfg["reviews_dir"]
+    directory.mkdir(parents=True, exist_ok=True)
+    row = {
+        "schema": ROUND_REQUEST_BINDING_SCHEMA, "round_id": round_id,
+        "target_sha": target_sha, "base_sha": base_sha, "reviewers": reviewers,
+        "mode": mode, "canonical_store": "github-pr-comment" if mode == "pr" else "local-packet",
+        "at": datetime.now(timezone.utc).isoformat(),
+    }
+    base = directory / f"{round_id}-request.binding.json"
+    path = base
+    number = 2
+    content = json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
+    while True:
+        try:
+            with path.open("x", encoding="utf-8") as stream:
+                stream.write(content)
+            return path
+        except FileExistsError:
+            path = base.with_name(f"{base.stem}-{number}{base.suffix}")
+            number += 1
+
+
+def write_pr_freeze_binding(root: Path, round_id: str, pr: int, cycle: int,
+                            target_sha: str, base_sha: str, reviewers: list[str],
+                            profile_fingerprint: str | None, reviews_dir: str) -> Path:
+    """Record the successful PR freeze as local, immutable, round-bound improve evidence."""
+    if (not isinstance(round_id, str) or not round_id.strip() or type(pr) is not int or pr < 1
+            or not _is_cycle(cycle) or not _is_sha(target_sha) or not _is_sha(base_sha)
+            or not _is_strlist(reviewers)
+            or (profile_fingerprint is not None and not _nonempty_str(profile_fingerprint))
+            or not _nonempty_str(reviews_dir)):
+        raise WorkflowError("PR freeze binding requires round, PR, cycle, SHAs, and reviewers")
+    directory = Path(root) / reviews_dir
+    directory.mkdir(parents=True, exist_ok=True)
+    row = {
+        "schema": PR_FREEZE_BINDING_SCHEMA, "round_id": round_id, "pr": pr,
+        "cycle": cycle, "target_sha": target_sha, "base_sha": base_sha,
+        "reviewers": reviewers, "profile_fingerprint": profile_fingerprint,
+        "mode": "pr", "canonical_store": "local-freeze-evidence",
+        "at": datetime.now(timezone.utc).isoformat(),
+    }
+    contract_fields = {
+        key: value for key, value in row.items() if key != "at"
+    }
+    for existing in sorted(directory.glob(f"{round_id}-freeze-{cycle}.binding*.json")):
+        try:
+            previous = json.loads(existing.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if (isinstance(previous, dict)
+                and {key: value for key, value in previous.items() if key != "at"}
+                == contract_fields):
+            return existing
+    base = directory / f"{round_id}-freeze-{cycle}.binding.json"
+    path = base
+    number = 2
+    content = json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
+    while True:
+        try:
+            with path.open("x", encoding="utf-8") as stream:
+                stream.write(content)
+            return path
+        except FileExistsError:
+            path = base.with_name(f"{base.stem}-{number}{base.suffix}")
+            number += 1
+
+
+def parse_packet_request_binding(path: Path) -> tuple[str, str | None] | None:
+    """Read the packet template's single structured Reviewing line; ambiguity stays unknown."""
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    matches = PACKET_REVIEWING_RE.findall(text)
+    if len(matches) != 1:
+        return None
+    target_sha, raw_base = matches[0]
+    return target_sha, None if raw_base == "(root)" else raw_base
+
+
 # ---- strict marker schema (a marker is BELIEVED only if every field is the exact type) --------
 def _is_sha(v: object) -> bool:
     return isinstance(v, str) and bool(re.fullmatch(r"[0-9a-f]{40}", v))
@@ -90,6 +188,10 @@ def _nonempty_str(v: object) -> bool:
     return isinstance(v, str) and bool(v.strip())
 
 
+def _literal_reviewer(v: object) -> bool:
+    return _nonempty_str(v) and not str(v).startswith("role:")
+
+
 def marker_valid(m: dict) -> bool:
     """Type-strict schema gate. `cycle: true`, `review_cycle: 1.0`, `reviewed_sha: <not-40-hex>`,
     `decision_required: {}`, `resolved: "yes"` etc. are all rejected here (ignored), never coerced.
@@ -97,10 +199,15 @@ def marker_valid(m: dict) -> bool:
     k = m.get("_kind")
     if k == "review-cycle":
         return (_is_cycle(m.get("cycle")) and _is_sha(m.get("target_sha"))
-                and (m.get("base_sha") is None or _is_sha(m.get("base_sha"))))
+                and (m.get("base_sha") is None or _is_sha(m.get("base_sha")))
+                and (m.get("reviewers") is None or (
+                    _is_strlist(m.get("reviewers"))
+                    and all(_literal_reviewer(value) for value in m["reviewers"])))
+                and (m.get("profile_fingerprint") is None
+                     or _nonempty_str(m.get("profile_fingerprint"))))
     if k == "review-result":
         return (_is_cycle(m.get("review_cycle")) and _is_sha(m.get("reviewed_sha"))
-                and _nonempty_str(m.get("reviewer")) and _nonempty_str(m.get("verdict"))
+                and _literal_reviewer(m.get("reviewer")) and _nonempty_str(m.get("verdict"))
                 and _is_strlist(m.get("decision_required", [])))
     if k == "findings":
         return _is_cycle(m.get("cycle")) and type(m.get("resolved")) is bool
@@ -178,6 +285,11 @@ def classify(markers: list[dict], current_head: str, macro_reviewers: tuple = ()
     the latest findings resolution), so re-freezing to a new cycle/base cannot reuse a stale
     approval. Markers sharing the newest timestamp with conflicting content fail closed.
     Conflicting freeze markers for the latest cycle fail closed."""
+    if any(isinstance(reviewer, str) and reviewer.startswith("role:")
+           for reviewer in macro_reviewers):
+        raise WorkflowError(
+            "role:reviewer must be resolved from the profile before classification")
+
     def at(m: dict) -> str:
         return m.get("_at") or ""
 
@@ -188,7 +300,10 @@ def classify(markers: list[dict], current_head: str, macro_reviewers: tuple = ()
     if trusted_cycles:
         max_cycle = max(m["cycle"] for m in trusted_cycles)
         same_cycle = [m for m in trusted_cycles if m["cycle"] == max_cycle]
-        conflict = len({(str(m.get("target_sha")), str(m.get("base_sha"))) for m in same_cycle}) > 1
+        conflict = len({(
+            str(m.get("target_sha")), str(m.get("base_sha")),
+            tuple(m.get("reviewers") or ()), str(m.get("profile_fingerprint")),
+        ) for m in same_cycle}) > 1
         lc = max(same_cycle, key=at)
     else:
         conflict, lc = False, None
@@ -257,6 +372,8 @@ def classify(markers: list[dict], current_head: str, macro_reviewers: tuple = ()
     return {
         "current_head": current_head,
         "latest_cycle": cyc,
+        "round_id": (lc or {}).get("round_id"),
+        "profile_fingerprint": (lc or {}).get("profile_fingerprint"),
         "frozen_sha": frozen,
         "frozen_base": frozen_base,
         "cycle_conflict": conflict,
@@ -266,6 +383,30 @@ def classify(markers: list[dict], current_head: str, macro_reviewers: tuple = ()
         "findings_resolved": findings_resolved,
         "n_results": len(results),
         "n_approvals": len(approvals),
+    }
+
+
+def completed_pr_feedback_event(facts: dict, pr: int) -> dict | None:
+    """Project a fully completed canonical PR review cycle to the shared feedback event shape."""
+    reviewers = facts.get("reviewers")
+    if not isinstance(reviewers, list):
+        return None
+    round_id = facts.get("round_id")
+    cycle = facts.get("latest_cycle")
+    head = facts.get("current_head")
+    if (not isinstance(round_id, str) or not round_id or round_id == "(unset)"
+            or type(cycle) is not int or not _is_sha(head)
+            or facts.get("cycle_fresh") is not True or facts.get("approved_at_head") is not True):
+        return None
+    if "codex" in reviewers and (facts.get("codex_fresh") is not True
+                                 or facts.get("findings_resolved") is not True):
+        return None
+    if any(reviewer != "codex" for reviewer in reviewers) \
+            and facts.get("pro_result_at_head") is not True:
+        return None
+    return {
+        "event": "review-feedback", "source": "pr-marker", "round_id": round_id,
+        "event_id": f"pr:{pr}:cycle:{cycle}:head:{head}",
     }
 
 
@@ -430,16 +571,69 @@ def ci_state(bundle: dict) -> str:
     return "failing"
 
 
-def facts_from_bundle(bundle: dict, cfg: dict, repo: str | None) -> dict:
+def resolve_reviewer_set(root: Path, configured: list[str] | tuple[str, ...]) \
+        -> tuple[list[str], str | None]:
+    """Resolve `role:reviewer` to a namespaced backend identity and profile fingerprint."""
+    if not any(reviewer == "role:reviewer" for reviewer in configured):
+        return list(configured), None
+    import delegate
+
+    try:
+        profile, fingerprint = delegate._load_profile(root)
+    except WorkflowError as e:
+        raise WorkflowError(
+            f"{e}\nAlternatively, keep literal reviewer compatibility in .waystone.yml, e.g. "
+            "`review: {reviewers: [codex, gpt-5.5-pro]}`.") from e
+    bindings = profile.get("bindings")
+    binding = bindings.get("reviewer") if isinstance(bindings, dict) else None
+    if not isinstance(binding, dict):
+        raise WorkflowError(
+            f"review.reviewers uses 'role:reviewer' but profile has no binding for role "
+            f"'reviewer' at {delegate._profile_path(root)}; add that binding or keep a literal "
+            "compatibility list in .waystone.yml, e.g. `reviewers: [codex, gpt-5.5-pro]`")
+    delegate._validate_profile_binding("reviewer", binding)
+    backend = binding["backend"]
+    resolved = [backend if reviewer == "role:reviewer" else reviewer for reviewer in configured]
+    if any(reviewer.startswith("role:") for reviewer in resolved):
+        raise WorkflowError("review reviewer identities must be literal after profile resolution")
+    return resolved, fingerprint
+
+
+def resolve_reviewers(root: Path, configured: list[str] | tuple[str, ...]) -> list[str]:
+    """Compatibility wrapper for request renderers that only need the resolved identities."""
+    return resolve_reviewer_set(root, configured)[0]
+
+
+def facts_from_bundle(bundle: dict, cfg: dict, repo: str | None,
+                      *, root: Path | None = None) -> dict:
     owner = (repo.split("/", 1)[0] if repo else "")
     approvers = tuple({owner, *cfg["review"].get("approvers", [])} - {""})
     operators = tuple({owner, *cfg["review"].get("operators", [])} - {""})
-    macro = tuple(r for r in cfg["review"]["reviewers"] if r != "codex")
+    configured = cfg["review"]["reviewers"]
     markers = parse_bodies(bundle["bodies"])
     # Codex signals must be bound to the exact head AND post-date the latest freeze — so a re-freeze
     # (new cycle/base, same head) can't reuse a Codex review from a previous cycle. The newest
     # signal's timestamp also gates findings/approval freshness.
     lc = latest_cycle(markers, operators)
+    frozen_reviewers = lc.get("reviewers") if lc else None
+    reviewers = list(frozen_reviewers) if isinstance(frozen_reviewers, list) else []
+    frozen_contract_ok = isinstance(frozen_reviewers, list) or not configured
+    reviewer_profile_drift = False
+    if any(reviewer == "role:reviewer" for reviewer in configured):
+        if root is None:
+            reviewer_profile_drift = True
+        else:
+            try:
+                current_reviewers, current_fingerprint = resolve_reviewer_set(root, configured)
+            except WorkflowError:
+                reviewer_profile_drift = True
+            else:
+                reviewer_profile_drift = (
+                    not lc
+                    or lc.get("profile_fingerprint") != current_fingerprint
+                    or reviewers != current_reviewers
+                )
+    macro = tuple(r for r in reviewers if r != "codex")
     freeze_at = lc.get("_at") if lc else None
     signals = codex_signals_at_head(bundle.get("reviews", []), bundle.get("bodies", []),
                                     bundle["head"], since_at=freeze_at)
@@ -447,6 +641,10 @@ def facts_from_bundle(bundle: dict, cfg: dict, repo: str | None) -> dict:
     cls = classify(markers, bundle["head"], macro_reviewers=macro, approvers=approvers,
                    operators=operators, current_base=bundle.get("base_sha") or None,
                    codex_signal_at=codex_at)
+    if not frozen_contract_ok or reviewer_profile_drift:
+        cls["cycle_fresh"] = False
+    cls["reviewers"] = reviewers
+    cls["reviewer_profile_drift"] = reviewer_profile_drift
     cls["codex_fresh"] = bool(signals)
     cls["ci"] = ci_state(bundle)
     cls["pr_state"] = bundle["state"]
@@ -515,10 +713,12 @@ def freeze(root: Path, pr: int, round_id: str | None) -> int:
     base_sha = bundle.get("base_sha", "")
     markers = parse_bodies(bundle["bodies"])
     n = next_cycle_number(markers)
-    reviewers = policy["review"]["reviewers"]
+    reviewers, profile_fingerprint = resolve_reviewer_set(
+        root, policy["review"]["reviewers"])
     marker = emit_marker("review-cycle", {
         "round_id": round_id or "(unset)", "cycle": n, "target_sha": head,
         "base_sha": base_sha, "reviewers": reviewers,
+        "profile_fingerprint": profile_fingerprint,
     })
     macro = [r for r in reviewers if r != "codex"]
     body = (f"## Review cycle {n} — frozen at `{head[:12]}` (base `{base_sha[:12]}`)\n\n"
@@ -533,6 +733,17 @@ def freeze(root: Path, pr: int, round_id: str | None) -> int:
     if rc != 0:
         print(f"review freeze: gh pr comment failed: {out}", file=sys.stderr)
         return 1
+    if round_id is not None:
+        try:
+            write_pr_freeze_binding(
+                root, round_id, pr, n, head, base_sha, reviewers, profile_fingerprint,
+                policy["reviews_dir"])
+        except (OSError, WorkflowError) as e:
+            print(
+                f"review freeze: PR comment posted but local freeze binding was not recorded: {e}",
+                file=sys.stderr,
+            )
+            return 1
     print(f"review cycle {n} frozen at {head[:12]} on PR #{pr} (reviewers: {', '.join(reviewers)})")
     return 0
 
@@ -545,16 +756,42 @@ def status(root: Path, pr: int | None) -> int:
         if ctx["policy"] is None:
             print("review status: cannot read the base-branch policy at the PR base SHA.", file=sys.stderr)
             return 1
-        facts = facts_from_bundle(ctx["bundle"], ctx["policy"], ctx["repo"])
+        facts = facts_from_bundle(ctx["bundle"], ctx["policy"], ctx["repo"], root=root)
         print(f"PR #{pr} review status ({facts['pr_state']}{', DRAFT' if facts['is_draft'] else ''}):")
         print(f"  current head:   {facts['current_head'][:12]}")
         print(f"  latest cycle:   {facts['latest_cycle']} (frozen {str(facts['frozen_sha'])[:12]})")
         print(f"  cycle fresh:    {facts['cycle_fresh']}  (False = push after freeze → re-freeze)")
+        print(f"  profile drift:  {facts['reviewer_profile_drift']}")
         print(f"  codex fresh:    {facts['codex_fresh']}")
         print(f"  CI:             {facts['ci']}")
         print(f"  pro result@head:{facts['pro_result_at_head']}  ({facts['n_results']} result(s))")
         print(f"  findings resolved: {facts['findings_resolved']}")
         print(f"  approved@head:  {facts['approved_at_head']}  ({facts['n_approvals']} approval(s))")
+        round_id = facts.get("round_id")
+        if (isinstance(round_id, str) and round_id and round_id != "(unset)"
+                and _is_cycle(facts.get("latest_cycle"))
+                and _is_sha(facts.get("frozen_sha"))
+                and _is_sha(facts.get("frozen_base"))
+                and _is_strlist(facts.get("reviewers"))
+                and facts.get("cycle_conflict") is False):
+            try:
+                write_pr_freeze_binding(
+                    root, round_id, pr, facts["latest_cycle"], facts["frozen_sha"],
+                    facts["frozen_base"], facts["reviewers"],
+                    facts.get("profile_fingerprint"), ctx["policy"]["reviews_dir"])
+            except (OSError, WorkflowError) as e:
+                print(f"review status: trusted PR cycle could not be recorded locally: {e}",
+                      file=sys.stderr)
+                return 1
+        event = completed_pr_feedback_event(facts, pr)
+        if event is not None:
+            try:
+                import overlay
+                overlay.record_review_feedback(
+                    root, event["round_id"], source=event["source"], event_id=event["event_id"])
+            except Exception as e:  # noqa: BLE001 — feedback observation never changes status exit
+                print(f"review status: overlay PR feedback observation unavailable ({e}) — "
+                      "status still succeeded", file=sys.stderr)
         return 0
     cfg = load_config(root)  # packet-mode status uses the local config (no PR to read a base from)
     rdir = root / cfg["reviews_dir"]
@@ -618,10 +855,10 @@ def ingest(root: Path, round_id: str | None, src: Path = INBOX, reviewer: str | 
     # --- appended triage skeleton (beneath the verbatim body, which is never edited) ---
     lines = ["", "", "---", "", "## Findings (triage skeleton — verify each before registering)", ""]
     if findings:
-        lines.append("| finding | severity | verdict (REAL/REJECTED/NEEDS-RULING) | evidence | task id |")
-        lines.append("|---|---|---|---|---|")
+        lines.append("| finding | severity | type | verdict (REAL/REJECTED/NEEDS-RULING) | evidence | task id |")
+        lines.append("|---|---|---|---|---|---|")
         for f in findings:
-            lines.append(f"| {f['id']} — {f['title']} | {f['severity']} |  |  |  |")
+            lines.append(f"| {f['id']} — {f['title']} | {f['severity']} |  |  |  |  |")
     else:
         lines.append("_No `JW-GPT-NNN` finding blocks parsed — triage the verbatim reply directly._")
     appended = ("\n".join(lines) + "\n").encode("utf-8")
@@ -646,8 +883,28 @@ def ingest(root: Path, round_id: str | None, src: Path = INBOX, reviewer: str | 
                   "pass --force to replace it", file=sys.stderr)
             return 1
     src.unlink()
+    if (cfg.get("review") or {}).get("mode", "packet") == "packet":
+        request_binding = parse_packet_request_binding(rdir / f"{round_id}-request.md")
+        if request_binding is not None:
+            target_sha, base_sha = request_binding
+            try:
+                write_round_request_binding(
+                    root, round_id, target_sha, base_sha,
+                    resolve_reviewers(root, (cfg.get("review") or {}).get("reviewers", [])),
+                    mode="packet")
+            except (OSError, WorkflowError) as e:
+                print(f"review ingest: packet request binding unavailable ({e}); projection will "
+                      "remain unknown", file=sys.stderr)
     print(f"ingested {len(body)} bytes verbatim → {dest} (consumed {src})")
     print(f"  {len(findings)} finding(s) parsed — verify each before registering")
+    # The ingest observation is the replayable reset signal for review-skipped-closes-v1. Like the
+    # warning itself it is advisory evidence and can never change the completed ingest's exit code.
+    try:
+        import overlay
+        overlay.record_review_ingest(root, round_id, reviewer=reviewer)
+    except Exception as e:  # noqa: BLE001
+        print(f"review ingest: overlay ingest observation unavailable ({e}) — ingest still succeeded",
+              file=sys.stderr)
     # M2 §6: evaluate overlay warns at the review-ingest boundary (best-effort; never blocks).
     try:
         import overlay
@@ -673,16 +930,21 @@ def main(argv: list[str]) -> int:
     except (WorkflowError, OSError) as e:
         print(f"waystone review: migration failed: {e}", file=sys.stderr)
         return 1
-    if sub == "ingest":
-        return ingest(root, _opt(rest, "--round"), reviewer=_opt(rest, "--reviewer"),
-                      force="--force" in rest)
-    pr_s = _opt(rest, "--pr")
-    if sub == "freeze":
-        if not pr_s:
-            print("review freeze: --pr N is required", file=sys.stderr)
-            return 1
-        return freeze(root, int(pr_s), _opt(rest, "--round"))
-    return status(root, int(pr_s) if pr_s else None)
+    try:
+        if sub == "ingest":
+            with hold_lock(project_lock_path(root)):
+                return ingest(root, _opt(rest, "--round"), reviewer=_opt(rest, "--reviewer"),
+                              force="--force" in rest)
+        pr_s = _opt(rest, "--pr")
+        if sub == "freeze":
+            if not pr_s:
+                print("review freeze: --pr N is required", file=sys.stderr)
+                return 1
+            return freeze(root, int(pr_s), _opt(rest, "--round"))
+        return status(root, int(pr_s) if pr_s else None)
+    except WorkflowError as e:
+        print(f"waystone review: {e}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
