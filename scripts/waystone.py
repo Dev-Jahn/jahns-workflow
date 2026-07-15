@@ -16,7 +16,7 @@ Groups:
   approve  --pr N --sha X            SHA-bound human approval
   round    merge --pr N ...          deterministic merge guard
   improve  trace|reviews|evidence|audit|decide ...  project logs + reviews + task-id evidence / decisions
-  delegate run|status|show|verify|apply|discard ...  worktree runner + independent verifier evidence
+  delegate run|status|show|verify|verdict|apply|discard ...  worktree runner + evidence-gated verdict
   overlay  add|list|show|promote|demote|suspend|retire|replay ...  project-local adaptive warn deltas
   check    [--root DIR]               evaluate active overlay deltas at an explicit boundary (never blocks)
   paths    [--root DIR] [--json]      show resolved machine and project storage paths

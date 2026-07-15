@@ -4011,8 +4011,7 @@ class ImproveM1DefectTests(unittest.TestCase):
 
 
 class AcceptFieldTests(unittest.TestCase):
-    """0.8.0 M1: the optional task `accept` field (YAML list of acceptance criteria) — validated by
-    validate, but NOT settable via `waystone task add/set` (comma-split would distort free text)."""
+    """Acceptance stays a string list; only repeated task-set --accept-add mutates it safely."""
 
     def test_validate_accepts_string_list(self):
         data = {"version": 1, "project": "x", "tasks": [
@@ -4035,25 +4034,61 @@ class AcceptFieldTests(unittest.TestCase):
         self.assertTrue(any("accept" in e for e in errs))
 
     def test_task_add_rejects_accept_flag(self):
+        import contextlib
+        import io
+
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             (root / ".waystone.yml").write_text("version: 1\nproject: x\n")
             (root / "tasks.yaml").write_text(TASKS_FIXTURE)
             before = (root / "tasks.yaml").read_text()
-            rc = tasks.main(["add", "feat/new", str(root), "--title",
-                                "a fresh task here", "--accept", "some criterion"])
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = tasks.main(["add", "feat/new", str(root), "--title",
+                                 "a fresh task here", "--accept", "some criterion"])
             self.assertEqual(rc, 1)
+            self.assertIn("--accept-add", err.getvalue())
             self.assertEqual((root / "tasks.yaml").read_text(), before)  # nothing written
 
     def test_task_set_rejects_accept_field(self):
+        import contextlib
+        import io
+
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             (root / ".waystone.yml").write_text("version: 1\nproject: x\n")
             (root / "tasks.yaml").write_text(TASKS_FIXTURE)
             before = (root / "tasks.yaml").read_text()
-            rc = tasks.main(["set", "feat/alpha", "accept", "some criterion", str(root)])
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = tasks.main(["set", "feat/alpha", "accept", "some criterion", str(root)])
             self.assertEqual(rc, 1)
+            self.assertIn("--accept-add", err.getvalue())
             self.assertEqual((root / "tasks.yaml").read_text(), before)
+
+    def test_accept_add_repeats_round_trips_and_packet_records_provenance(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / ".waystone.yml").write_text("version: 1\nproject: x\n")
+            (root / "tasks.yaml").write_text(TASKS_FIXTURE)
+            rc = tasks.main([
+                "set", "feat/alpha", str(root),
+                "--accept-add", "criterion with, comma",
+                "--accept-add", "criterion: exact text",
+            ])
+            self.assertEqual(rc, 0)
+            data = yaml.safe_load((root / "tasks.yaml").read_text())
+            task = next(t for t in data["tasks"] if t["id"] == "feat/alpha")
+            self.assertEqual(task["accept"], ["criterion with, comma", "criterion: exact text"])
+            packet, acceptance = delegate._build_packet(
+                data, "feat/alpha", ["one-off criterion"], root)
+            self.assertEqual(acceptance, [
+                "criterion with, comma", "criterion: exact text", "one-off criterion"])
+            self.assertEqual(packet["accept_provenance"], [
+                {"criterion": "criterion with, comma", "source": "task --accept-add"},
+                {"criterion": "criterion: exact text", "source": "task --accept-add"},
+                {"criterion": "one-off criterion", "source": "delegate run --accept"},
+            ])
 
 
 class DelegateSnapshotTests(unittest.TestCase):
@@ -4666,7 +4701,8 @@ class DelegateRunTests(unittest.TestCase):
                 with self.assertRaises(delegate.WorkflowError) as cm:
                     self._run(root, home, self._fake_runner({"impl.py": "y\n"}))
                 self.assertIn("already has active delegation", str(cm.exception))
-                rc = _run_with_home(home, lambda: delegate.discard_delegation(root, rec.name))
+                rc = _run_with_home(
+                    home, lambda: delegate.discard_delegation(root, rec.name, "clear failed artifact"))
             self.assertEqual(rc, 0)
 
     def test_same_second_did_gets_suffix(self):
@@ -4770,7 +4806,7 @@ class DelegateRunTests(unittest.TestCase):
             self.assertFalse((rec / "exposure.json").exists())
             with contextlib.redirect_stdout(io.StringIO()):
                 rc = _run_with_home(home, lambda: delegate.main(
-                    ["discard", did, "--root", str(root)]))
+                    ["discard", did, "--root", str(root), "--reason", "clear incomplete claim"]))
             self.assertEqual(rc, 0)
             self.assertEqual(delegate._read_status(rec)["state"], "discarded")
             self.assertIsNone(delegate._active_delegation_for_task(root, "feat/xyz"))
@@ -4863,6 +4899,25 @@ def _latest_rec(root, home):
     return _run_with_home(home, lambda: sorted(delegate._delegations_dir(root).iterdir())[-1])
 
 
+def _write_apply_verdict(rec):
+    """Install a valid verdict fixture for tests whose subject is the apply mechanics, not judging."""
+    packet = yaml.safe_load((rec / "packet.yaml").read_text())
+    verdict = {
+        "schema": "waystone-verdict-1",
+        "decision": "apply",
+        "decided_by": "main-session",
+        "criteria": [{"criterion": criterion, "met": True, "evidence": ["fixture"]}
+                     for criterion in packet["acceptance"]],
+        "agent_checks": [{"cmd": "fixture", "exit": 0, "summary": "fixture"}],
+        "warnings_seen": [],
+        "rationale": "apply mechanics fixture",
+        "limitations": [],
+        "provenance": "main-session",
+    }
+    (rec / "artifact" / "verdict-1.json").write_text(
+        _json.dumps(verdict, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
 class DelegateEffortTests(unittest.TestCase):
     """0.8.0 M2 §20 — optional profile effort is explicit in execution and exposure."""
 
@@ -4902,6 +4957,7 @@ class DelegateApplyTests(unittest.TestCase):
                 return (0, 0.1)
             _deleg_run(root, home, fake)
             rec = _latest_rec(root, home)
+            _write_apply_verdict(rec)
             import contextlib
             import io
             with contextlib.redirect_stdout(io.StringIO()):
@@ -4914,6 +4970,7 @@ class DelegateApplyTests(unittest.TestCase):
             root, home = _deleg_project(d)
             _deleg_run(root, home, _deleg_fake({"impl.py": "print('x')\n"}))
             rec = _latest_rec(root, home)
+            _write_apply_verdict(rec)
             wt = _run_with_home(home, lambda: delegate._worktree_path(root, rec.name))
             rc = _run_with_home(home, lambda: delegate.apply_delegation(root, rec.name))
             self.assertEqual(rc, 0)
@@ -4921,8 +4978,9 @@ class DelegateApplyTests(unittest.TestCase):
             self.assertEqual(delegate._read_status(rec)["state"], "applied")
             self.assertFalse(wt.exists())                                    # worktree removed
             self.assertTrue((rec / "artifact" / "contract.yaml").exists())   # record preserved
-            self.assertNotEqual(git(root, "rev-parse", "--verify",
-                                    f"refs/waystone/delegations/{rec.name}").returncode, 0)  # ref gone
+            for suffix in ("", "-result"):
+                self.assertEqual(git(root, "rev-parse", "--verify",
+                                     f"refs/waystone/delegations/{rec.name}{suffix}").returncode, 0)
 
     def test_apply_cli_holds_project_then_record_lock_during_mutation(self):
         import contextlib
@@ -4933,6 +4991,7 @@ class DelegateApplyTests(unittest.TestCase):
             root, home = _deleg_project(d)
             _deleg_run(root, home, _deleg_fake({"impl.py": "print('x')\n"}))
             rec = _latest_rec(root, home)
+            _write_apply_verdict(rec)
             original_apply = delegate.apply_delegation
             original_hold_lock = delegate.hold_lock
             original_resolve_root = delegate._resolve_root
@@ -4954,10 +5013,10 @@ class DelegateApplyTests(unittest.TestCase):
                     fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
                     return False
 
-            def checked_apply(project, did):
+            def checked_apply(project, did, override_no_verdict_reason=None):
                 self.assertTrue(assert_held(common.project_lock_path(project)))
                 self.assertTrue(assert_held(rec / "record.lock"))
-                return original_apply(project, did)
+                return original_apply(project, did, override_no_verdict_reason)
 
             delegate.apply_delegation = checked_apply
             delegate.hold_lock = recording_lock
@@ -4984,6 +5043,7 @@ class DelegateApplyTests(unittest.TestCase):
             root, home = _deleg_project(d)
             _deleg_run(root, home, _deleg_fake({"impl.py": "print('x')\n"}))
             rec = _latest_rec(root, home)
+            _write_apply_verdict(rec)
             err = io.StringIO()
             with mock.patch.dict(os.environ, {"WAYSTONE_LOCK_TIMEOUT": "0.02"}, clear=False), \
                     common.hold_lock(common.project_lock_path(root), timeout=0.2), \
@@ -5000,6 +5060,7 @@ class DelegateApplyTests(unittest.TestCase):
             root, home = _deleg_project(d)
             _deleg_run(root, home, _deleg_fake({"a.py": "AAA\n", "b.py": "BBB\n"}))
             rec = _latest_rec(root, home)
+            _write_apply_verdict(rec)
             (root / "a.py").write_text("conflicting live content\n")  # drift on a patch target
             import contextlib
             import io
@@ -5016,6 +5077,7 @@ class DelegateApplyTests(unittest.TestCase):
             root, home = _deleg_project(d)
             _deleg_run(root, home, _deleg_fake({"impl.py": "x\n"}))
             rec = _latest_rec(root, home)
+            _write_apply_verdict(rec)
             (root / "f.txt").write_text("locally dirtied but unrelated")
             rc = _run_with_home(home, lambda: delegate.apply_delegation(root, rec.name))
             self.assertEqual(rc, 0)
@@ -5026,6 +5088,7 @@ class DelegateApplyTests(unittest.TestCase):
             root, home = _deleg_project(d)
             _deleg_run(root, home, _deleg_fake({}))  # no changes
             rec = _latest_rec(root, home)
+            _write_apply_verdict(rec)
             rc = _run_with_home(home, lambda: delegate.apply_delegation(root, rec.name))
             self.assertEqual(rc, 0)
             self.assertEqual(delegate._read_status(rec)["state"], "applied")
@@ -5035,6 +5098,7 @@ class DelegateApplyTests(unittest.TestCase):
             root, home = _deleg_project(d)
             _deleg_run(root, home, _deleg_fake({"impl.py": "x\n"}))
             rec = _latest_rec(root, home)
+            _write_apply_verdict(rec)
             _run_with_home(home, lambda: delegate.apply_delegation(root, rec.name))
             with self.assertRaises(delegate.WorkflowError):
                 _run_with_home(home, lambda: delegate.apply_delegation(root, rec.name))
@@ -5046,11 +5110,297 @@ class DelegateApplyTests(unittest.TestCase):
             rec = _latest_rec(root, home)
             wt = _run_with_home(home, lambda: delegate._worktree_path(root, rec.name))
             delegate._set_state(rec, "running")  # simulate a crash remnant (R1)
-            rc = _run_with_home(home, lambda: delegate.discard_delegation(root, rec.name))
+            rc = _run_with_home(
+                home, lambda: delegate.discard_delegation(root, rec.name, "clear crash remnant"))
             self.assertEqual(rc, 0)
             self.assertEqual(delegate._read_status(rec)["state"], "discarded")
             self.assertFalse(wt.exists())
             self.assertTrue((rec / "exposure.json").exists())  # record preserved
+
+    def test_apply_requires_verdict_and_override_no_verdict_records_reason(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _deleg_project(d)
+            _deleg_run(root, home, _deleg_fake({"impl.py": "x\n"}))
+            rec = _latest_rec(root, home)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = _run_with_home(home, lambda: delegate.main(
+                    ["apply", rec.name, "--root", str(root)]))
+            self.assertEqual(rc, 1)
+            self.assertIn("run 'waystone delegate verdict' first", err.getvalue())
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(_run_with_home(home, lambda: delegate.main([
+                    "apply", rec.name, "--root", str(root), "--override-no-verdict"])), 1)
+            self.assertEqual(_run_with_home(home, lambda: delegate.main([
+                "apply", rec.name, "--root", str(root), "--override-no-verdict",
+                "--reason", "emergency owner approval"])), 0)
+            transition = delegate._read_status(rec)["at_transitions"][-1]
+            self.assertEqual(transition["reason"], "emergency owner approval")
+            self.assertEqual(transition["overrides"], ["no-verdict"])
+
+    def test_apply_uses_latest_verdict_and_rejects_discard_decision(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _deleg_project(d)
+            _deleg_run(root, home, _deleg_fake({"impl.py": "x\n"}))
+            rec = _latest_rec(root, home)
+            _write_apply_verdict(rec)
+            discarded = _json.loads((rec / "artifact" / "verdict-1.json").read_text())
+            discarded["decision"] = "discard"
+            (rec / "artifact" / "verdict-2.json").write_text(
+                _json.dumps(discarded) + "\n", encoding="utf-8")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = _run_with_home(home, lambda: delegate.main([
+                    "apply", rec.name, "--root", str(root)]))
+            self.assertEqual(rc, 1)
+            self.assertIn("latest verdict decision is discard", err.getvalue())
+            self.assertFalse((root / "impl.py").exists())
+
+    def test_discard_cli_requires_reason_and_records_it(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _deleg_project(d)
+            _deleg_run(root, home, _deleg_fake({"impl.py": "x\n"}))
+            rec = _latest_rec(root, home)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = _run_with_home(home, lambda: delegate.main(
+                    ["discard", rec.name, "--root", str(root)]))
+            self.assertEqual(rc, 1)
+            self.assertIn("--reason", err.getvalue())
+            self.assertEqual(delegate._read_status(rec)["state"], "needs-review")
+            self.assertEqual(_run_with_home(home, lambda: delegate.main([
+                "discard", rec.name, "--root", str(root),
+                "--reason", "does not meet acceptance"])), 0)
+            transition = delegate._read_status(rec)["at_transitions"][-1]
+            self.assertEqual(transition["reason"], "does not meet acceptance")
+
+    def test_discard_orphan_cleans_refs_and_cache_without_record(self):
+        import shutil
+
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _deleg_project(d)
+            _deleg_run(root, home, _deleg_fake({"impl.py": "x\n"}))
+            rec = _latest_rec(root, home)
+            did = rec.name
+            wt = _run_with_home(home, lambda: delegate._worktree_path(root, did))
+            shutil.rmtree(rec)
+            self.assertTrue(wt.exists())
+            for suffix in ("", "-result"):
+                self.assertEqual(git(root, "rev-parse", "--verify",
+                                     f"refs/waystone/delegations/{did}{suffix}").returncode, 0)
+            self.assertEqual(_run_with_home(home, lambda: delegate.main([
+                "discard", "--orphan", did, "--root", str(root),
+                "--reason", "remove orphaned delegation storage"])), 0)
+            self.assertFalse(wt.exists())
+            for suffix in ("", "-result"):
+                self.assertNotEqual(git(root, "rev-parse", "--verify",
+                                        f"refs/waystone/delegations/{did}{suffix}").returncode, 0)
+
+
+class DelegateVerdictTests(unittest.TestCase):
+    """0.9.0-c: verdict schema, G1-G5, overrides, and append-only artifacts."""
+
+    _VERIFIER_PROFILE = (
+        'schema: waystone-profile-1\nbindings:\n'
+        '  implementer: {execution: external-runner, backend: "codex:gpt-test"}\n'
+        '  verifier: {backend: "codex:gpt-test", entry: adversarial-review}\n'
+    )
+
+    def _record(self, d, *, verifier=False):
+        root, home = _deleg_project(d)
+        if verifier:
+            _write_profile(root, self._VERIFIER_PROFILE)
+        _deleg_run(root, home, _deleg_fake({"impl.py": "x\n"}))
+        return root, home, _latest_rec(root, home)
+
+    def _payload(self, rec, *, decision="apply", decided_by="main-session", met=True,
+                 checks=True, criterion=None, overrides=None):
+        packet = yaml.safe_load((rec / "packet.yaml").read_text())
+        criteria = [{
+            "criterion": criterion if criterion is not None else item,
+            "met": met,
+            "evidence": ["agent_checks[0]"] if checks else [],
+        } for item in packet["acceptance"]]
+        payload = {
+            "schema": "waystone-verdict-1",
+            "decision": decision,
+            "decided_by": decided_by,
+            "criteria": criteria,
+            "agent_checks": ([{"cmd": "tests", "exit": 0, "summary": "passed"}]
+                             if checks else []),
+            "warnings_seen": [],
+            "rationale": "evidence supports the decision",
+            "limitations": [],
+        }
+        if overrides is not None:
+            payload["overrides"] = overrides
+        return payload
+
+    def _input(self, d, payload):
+        path = Path(d) / "verdict-input.json"
+        path.write_text(_json.dumps(payload), encoding="utf-8")
+        return path
+
+    def _record_verdict(self, root, home, rec, path, *flags):
+        return _run_with_home(home, lambda: delegate.main([
+            "verdict", rec.name, "--file", str(path), "--root", str(root), *flags]))
+
+    def _verify(self, rec, findings=None):
+        artifact = {
+            "schema": "waystone-verify-1",
+            "at": "2026-07-15T00:00:00+00:00",
+            "provenance": "independent-verifier",
+            "payload": {"summary": "reviewed", "findings": findings or [], "limitations": []},
+        }
+        (rec / "artifact" / "verify-1.json").write_text(
+            _json.dumps(artifact) + "\n", encoding="utf-8")
+
+    def test_schema_file_and_g1_wrong_state_refused(self):
+        schema = _json.loads((SCRIPTS.parent / "templates" / "verdict-schema.json").read_text())
+        self.assertEqual(schema["properties"]["schema"]["const"], "waystone-verdict-1")
+        self.assertIn("agent_checks", schema["required"])
+        with tempfile.TemporaryDirectory() as d:
+            root, home, rec = self._record(d)
+            delegate._set_state(rec, "running")
+            with self.assertRaises(delegate.WorkflowError) as cm:
+                _run_with_home(home, lambda: delegate.record_verdict(
+                    root, rec.name, self._input(d, self._payload(rec))))
+            self.assertIn("only a needs-review delegation", str(cm.exception))
+
+    def test_g2_requires_exact_criterion_set(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home, rec = self._record(d)
+            with self.assertRaises(delegate.WorkflowError) as cm:
+                _run_with_home(home, lambda: delegate.record_verdict(
+                    root, rec.name,
+                    self._input(d, self._payload(rec, criterion="criterion alpha"))))
+            self.assertIn("exactly match", str(cm.exception))
+            self.assertEqual(list((rec / "artifact").glob("verdict-*.json")), [])
+
+    def test_g3_without_verifier_requires_agent_checks(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home, rec = self._record(d)
+            with self.assertRaises(delegate.WorkflowError) as cm:
+                _run_with_home(home, lambda: delegate.record_verdict(
+                    root, rec.name, self._input(d, self._payload(rec, checks=False))))
+            self.assertIn("agent_checks", str(cm.exception))
+            self.assertEqual(self._record_verdict(
+                root, home, rec, self._input(d, self._payload(rec))), 0)
+
+    def test_g3_with_verifier_requires_verify_artifact_and_records_binding(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home, rec = self._record(d, verifier=True)
+            path = self._input(d, self._payload(rec, checks=False))
+            with self.assertRaises(delegate.WorkflowError) as cm:
+                _run_with_home(home, lambda: delegate.record_verdict(root, rec.name, path))
+            self.assertIn("verify-N.json", str(cm.exception))
+            self._verify(rec)
+            self.assertEqual(_run_with_home(
+                home, lambda: delegate.record_verdict(root, rec.name, path)), 0)
+            verdict = _json.loads((rec / "artifact" / "verdict-1.json").read_text())
+            exposure = _json.loads((rec / "exposure.json").read_text())
+            self.assertEqual(verdict["provenance"], "main-session")
+            self.assertEqual(verdict["verify_number"], 1)
+            self.assertEqual(verdict["profile_fingerprint"], exposure["profile_fingerprint"])
+            self.assertIn("at", verdict)
+            contract = yaml.safe_load((rec / "artifact" / "contract.yaml").read_text())
+            self.assertNotIn("verdict", contract)  # contract has no verdict
+
+    def test_g3_rule1_run_fire_requires_verify_even_without_binding(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home, rec = self._record(d)
+            warnings = overlay._warnings_path(root)
+            warnings.parent.mkdir(parents=True, exist_ok=True)
+            warnings.write_text(_json.dumps({
+                "boundary": "delegate-run", "rule": "delegation-verification-evidence-v1",
+                "event": "fire", "context": {"delegation_id": rec.name},
+            }) + "\n")
+            path = self._input(d, self._payload(rec))
+            with self.assertRaises(delegate.WorkflowError) as cm:
+                _run_with_home(home, lambda: delegate.record_verdict(root, rec.name, path))
+            self.assertIn("verify-N.json", str(cm.exception))
+            self._verify(rec)
+            self.assertEqual(_run_with_home(
+                home, lambda: delegate.record_verdict(root, rec.name, path)), 0)
+
+    def test_g4_blocker_and_main_session_refuted_by_gate(self):
+        blocker = {"title": "false positive", "severity": "blocker", "evidence": "x",
+                   "recommendation": "change it"}
+        with tempfile.TemporaryDirectory() as d:
+            root, home, rec = self._record(d, verifier=True)
+            self._verify(rec, [blocker])
+            with self.assertRaises(delegate.WorkflowError) as cm:
+                _run_with_home(home, lambda: delegate.record_verdict(
+                    root, rec.name, self._input(d, self._payload(rec))))
+            self.assertIn("unresolved blocker", str(cm.exception))
+            self.assertEqual(self._record_verdict(
+                root, home, rec, self._input(d, self._payload(
+                    rec, overrides=[{"refuted_by": [0]}])), "--override-blocker"), 1)
+            for overrides in (None, [{"refuted_by": []}]):
+                path = self._input(d, self._payload(rec, overrides=overrides))
+                with self.assertRaises(delegate.WorkflowError) as cm:
+                    _run_with_home(home, lambda p=path: delegate.record_verdict(
+                        root, rec.name, p, override_blocker_reason="reviewed false positive"))
+                self.assertIn("refuted_by", str(cm.exception))
+            path = self._input(d, self._payload(rec, overrides=[{"refuted_by": [0]}]))
+            self.assertEqual(self._record_verdict(
+                root, home, rec, path, "--override-blocker", "--reason",
+                "reviewed false positive"), 0)
+            verdict = _json.loads((rec / "artifact" / "verdict-1.json").read_text())
+            self.assertEqual(verdict["overrides"][0]["gate"], "blocker")
+            self.assertEqual(verdict["overrides"][0]["finding_index"], 0)
+            self.assertEqual(verdict["overrides"][0]["refuted_by"], [0])
+
+    def test_g4_user_blocker_override_needs_reason_not_refuted_by(self):
+        blocker = {"title": "known risk", "severity": "blocker", "evidence": "x",
+                   "recommendation": "change it"}
+        with tempfile.TemporaryDirectory() as d:
+            root, home, rec = self._record(d, verifier=True)
+            self._verify(rec, [blocker])
+            payload = self._payload(rec, decided_by="user", checks=False)
+            self.assertEqual(_run_with_home(home, lambda: delegate.record_verdict(
+                root, rec.name, self._input(d, payload),
+                override_blocker_reason="user accepts known risk")), 0)
+            verdict = _json.loads((rec / "artifact" / "verdict-1.json").read_text())
+            self.assertEqual(verdict["overrides"][0]["reason"], "user accepts known risk")
+            self.assertNotIn("refuted_by", verdict["overrides"][0])
+
+    def test_g5_unmet_blocks_apply_and_override_records_reason(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home, rec = self._record(d)
+            payload = self._payload(rec, met=False)
+            with self.assertRaises(delegate.WorkflowError) as cm:
+                _run_with_home(home, lambda: delegate.record_verdict(
+                    root, rec.name, self._input(d, payload)))
+            self.assertIn("unmet", str(cm.exception))
+            self.assertEqual(self._record_verdict(
+                root, home, rec, self._input(d, payload), "--override-unmet", "--reason",
+                "criterion waived by owner"), 0)
+            verdict = _json.loads((rec / "artifact" / "verdict-1.json").read_text())
+            self.assertEqual(verdict["overrides"][0]["gate"], "unmet")
+            self.assertEqual(verdict["overrides"][0]["reason"], "criterion waived by owner")
+
+    def test_verdict_numbering_never_overwrites_and_state_does_not_change(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home, rec = self._record(d)
+            payload = self._payload(rec, decision="discard")
+            self.assertEqual(_run_with_home(home, lambda: delegate.record_verdict(
+                root, rec.name, self._input(d, payload))), 0)
+            first = (rec / "artifact" / "verdict-1.json").read_bytes()
+            self.assertEqual(_run_with_home(home, lambda: delegate.record_verdict(
+                root, rec.name, self._input(d, payload))), 0)
+            self.assertEqual((rec / "artifact" / "verdict-1.json").read_bytes(), first)
+            self.assertTrue((rec / "artifact" / "verdict-2.json").is_file())
+            self.assertEqual(delegate._read_status(rec)["state"], "needs-review")
 
 
 class DelegateCorruptRecordTests(unittest.TestCase):
@@ -5117,6 +5467,7 @@ class DelegateCorruptRecordTests(unittest.TestCase):
             root, home = _deleg_project(d)
             _deleg_run(root, home, _deleg_fake({"impl.py": "x\n"}))
             rec = _latest_rec(root, home)
+            _write_apply_verdict(rec)
             (rec / "artifact" / "contract.yaml").write_text("{invalid: [unclosed", encoding="utf-8")
             import contextlib
             import io
@@ -5139,7 +5490,8 @@ class DelegateCorruptRecordTests(unittest.TestCase):
             import contextlib
             import io
             with contextlib.redirect_stdout(io.StringIO()):
-                rc = _run_with_home(home, lambda: delegate.discard_delegation(root, rec.name))
+                rc = _run_with_home(
+                    home, lambda: delegate.discard_delegation(root, rec.name, "clear corrupt record"))
             self.assertEqual(rc, 0)
             self.assertEqual(delegate._read_status(rec)["state"], "discarded")
             self.assertFalse(wt.exists())
@@ -5167,6 +5519,56 @@ class DelegateCliTests(unittest.TestCase):
                 delegate._run_codex = orig
             self.assertIn("feat/xyz", out.getvalue())
             self.assertIn("needs-review", out.getvalue())
+
+    def test_run_note_and_accept_provenance_are_recorded_in_packet(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _deleg_project(d)
+            import contextlib
+            import io
+            orig = delegate._run_codex
+            delegate._run_codex = _deleg_fake({"impl.py": "x\n"})
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc = _run_with_home(home, lambda: delegate.main([
+                        "run", "feat/xyz", "--root", str(root),
+                        "--accept", "ad-hoc exact criterion",
+                        "--note", "retry after transient registry failure",
+                    ]))
+            finally:
+                delegate._run_codex = orig
+            self.assertEqual(rc, 0)
+            rec = _latest_rec(root, home)
+            packet = yaml.safe_load((rec / "packet.yaml").read_text())
+            self.assertEqual(packet["retry_context"], {
+                "provenance": "main-session",
+                "note": "retry after transient registry failure",
+            })
+            self.assertEqual(packet["accept_provenance"][-1], {
+                "criterion": "ad-hoc exact criterion", "source": "delegate run --accept"})
+
+    def test_show_failure_limits_output_to_status_error_and_stderr_tail(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _deleg_project(d)
+            with self.assertRaises(delegate.WorkflowError):
+                _deleg_run(root, home, _deleg_fake({}, rc=7))
+            rec = _latest_rec(root, home)
+            (rec / "runner.stderr").write_text(
+                "\n".join(f"stderr line {i}" for i in range(1, 61)) + "\n", encoding="utf-8")
+            (rec / "runner.jsonl").write_text("RUNNER-JSONL-SECRET\n", encoding="utf-8")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = _run_with_home(home, lambda: delegate.main([
+                    "show", rec.name, "--failure", "--root", str(root)]))
+            self.assertEqual(rc, 0)
+            text = out.getvalue()
+            self.assertIn("runner rc 7", text)
+            self.assertIn("stderr line 11", text)
+            self.assertIn("stderr line 60", text)
+            self.assertNotIn("stderr line 10\n", text)
+            self.assertNotIn("RUNNER-JSONL-SECRET", text)
 
     def test_unknown_subcommand(self):
         import contextlib
@@ -5594,6 +5996,7 @@ class BoundaryWarnTests(unittest.TestCase):
     def test_apply_exit_unchanged_despite_warning(self):
         with tempfile.TemporaryDirectory() as d:
             root, home, did = self._deleg_needs_review(d, report=None)
+            _write_apply_verdict(delegate._record_dir(root, did))
             _run_with_home(home, lambda: overlay.add_delta(
                 root, "verification_debt/skip", rule="delegation-verification-evidence-v1", summary="s"))
             _force_status(root, home, "verification_debt/skip", "warning")
@@ -5767,6 +6170,7 @@ class BoundaryWarnTests(unittest.TestCase):
                     self.assertEqual(
                         _deleg_run(root, home, _deleg_fake({"impl.py": "x\n"})), 0)
                     rec = _latest_rec(root, home)
+                    _write_apply_verdict(rec)
                     self.assertEqual(
                         _run_with_home(
                             home, lambda: delegate.apply_delegation(root, rec.name)), 0)

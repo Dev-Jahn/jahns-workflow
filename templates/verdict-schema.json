@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "decision",
+    "decided_by",
+    "criteria",
+    "agent_checks",
+    "warnings_seen",
+    "rationale",
+    "limitations"
+  ],
+  "properties": {
+    "schema": {
+      "const": "waystone-verdict-1"
+    },
+    "decision": {
+      "enum": ["apply", "discard"]
+    },
+    "decided_by": {
+      "enum": ["main-session", "user"]
+    },
+    "criteria": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["criterion", "met", "evidence"],
+        "properties": {
+          "criterion": {"type": "string"},
+          "met": {"type": "boolean"},
+          "evidence": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    "agent_checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["cmd", "exit", "summary"],
+        "properties": {
+          "cmd": {"type": "string"},
+          "exit": {"type": "integer"},
+          "summary": {"type": "string"}
+        }
+      }
+    },
+    "warnings_seen": {"type": "array", "items": {"type": "string"}},
+    "rationale": {"type": "string"},
+    "limitations": {"type": "array", "items": {"type": "string"}},
+    "overrides": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "gate": {"enum": ["blocker", "unmet"]},
+          "reason": {"type": "string"},
+          "verify_number": {"type": "integer", "minimum": 1},
+          "finding_index": {"type": "integer", "minimum": 0},
+          "criterion_indices": {
+            "type": "array",
+            "items": {"type": "integer", "minimum": 0}
+          },
+          "refuted_by": {
+            "type": "array",
+            "items": {"type": "integer", "minimum": 0}
+          }
+        }
+      }
+    },
+    "at": {"type": "string"},
+    "provenance": {"const": "main-session"},
+    "verify_number": {"type": ["integer", "null"], "minimum": 1},
+    "profile_fingerprint": {"type": ["string", "null"]}
+  }
+}
