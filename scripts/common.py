@@ -443,6 +443,17 @@ def canonical_scope_prefixes(value: object) -> list[str]:
     return out
 
 
+def parse_iso_timestamp(value: object) -> datetime | None:
+    """Parse a timezone-qualified ISO-8601 timestamp; return None for ambiguous/invalid input."""
+    if not isinstance(value, str) or "T" not in value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None and parsed.utcoffset() is not None else None
+
+
 def _packet_declared_scope(packet: dict) -> tuple[list[str], str]:
     try:
         paths = canonical_scope_prefixes(packet.get("declared_scope"))
@@ -469,7 +480,7 @@ def delegation_scope_drift(record_dir: Path) -> dict:
     contract_path = Path(record_dir) / "artifact" / "contract.yaml"
     base = {
         "rule": "packet-declared-scope-v2", "evaluable": False, "provenance": "unknown",
-        "declared_scope": [], "changed_files": [], "outside_scope": [],
+        "fired": False, "declared_scope": [], "changed_files": [], "outside_scope": [],
     }
     for path, label in ((packet_path, "packet"), (contract_path, "contract")):
         if not path.is_file():
@@ -505,6 +516,7 @@ def delegation_scope_drift(record_dir: Path) -> dict:
     outside = [path for path in changed if not _path_in_declared_scope(path, declared)]
     return {
         "rule": "packet-declared-scope-v2", "evaluable": True, "provenance": provenance,
+        "fired": bool(outside),
         "declared_scope": declared, "changed_files": changed, "outside_scope": outside,
         "coverage_reason": None,
     }

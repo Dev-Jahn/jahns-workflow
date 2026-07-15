@@ -79,6 +79,7 @@ from common import (  # noqa: E402
     load_tasks,
     load_yaml,
     machine_dir,
+    parse_iso_timestamp,
     project_state_path,
     registry_path,
     resolve_project_paths,
@@ -1294,6 +1295,9 @@ def _load_warning_rows(root: Path) -> tuple[list[dict], int, bool]:
                 for field in ("at", "boundary", "rule", "event"))):
             skipped += 1
             continue
+        if parse_iso_timestamp(row["at"]) is None:
+            skipped += 1
+            continue
         rows.append({
             "at": row["at"], "boundary": row["boundary"], "rule": row["rule"],
             "event": row["event"], "delta_id": row.get("delta_id"),
@@ -1379,11 +1383,12 @@ def _load_decisions(root: Path) -> tuple[list[dict], int]:
             continue
         if (not isinstance(row, dict) or not isinstance(row.get("rec_id"), str)
                 or row.get("decision") not in ("accept", "reject")
-                or not isinstance(row.get("at"), str)):
+                or parse_iso_timestamp(row.get("at")) is None):
             skipped += 1
             continue
         rows.append({**row, "source_pointer": f"{path}:{line_number}"})
-    rows.sort(key=lambda row: (row["at"], row["rec_id"], row["source_pointer"]))
+    rows.sort(key=lambda row: (
+        parse_iso_timestamp(row["at"]), row["rec_id"], row["source_pointer"]))
     return rows, skipped
 
 
@@ -1397,7 +1402,7 @@ def _load_overlay_deltas(root: Path) -> tuple[list[dict], int]:
             skipped += 1
             continue
         if (not isinstance(delta.get("id"), str) or not isinstance(delta.get("rule"), str)
-                or not isinstance(delta.get("created_at"), str)):
+                or parse_iso_timestamp(delta.get("created_at")) is None):
             skipped += 1
             continue
         rows.append({**delta, "source_pointer": str(overlay._delta_path(root, delta["id"]))})
@@ -1427,7 +1432,7 @@ def _trend_fact(rows: list[dict], round_findings: dict[str, dict[str, int]],
                 recurrence_rounds: dict[str, set[str]], related_types: list[str]) -> dict:
     opportunities = sum(row.get("opportunities", 0) for row in rows)
     fires = sum(row.get("fires", 0) for row in rows)
-    round_ids = [row["round_id"] for row in rows if isinstance(row.get("round_id"), str)]
+    round_ids = sorted({row["round_id"] for row in rows if isinstance(row.get("round_id"), str)})
     finding_occurrences = {
         finding_type: sum(round_findings.get(round_id, {}).get(finding_type, 0)
                           for round_id in round_ids)
@@ -1446,11 +1451,11 @@ def _trend_fact(rows: list[dict], round_findings: dict[str, dict[str, int]],
     }
 
 
-def _recent_round_trend(before_rows: list[dict], after_rows: list[dict],
+def _recent_round_trend(phase_rows: dict[str, list[dict]],
                         round_findings: dict[str, dict[str, int]],
                         recurrence_rounds: dict[str, set[str]], related_types: list[str]) -> list[dict]:
     grouped: dict[tuple[str, str], dict[str, int]] = {}
-    for phase, rows in (("before", before_rows), ("after", after_rows)):
+    for phase, rows in phase_rows.items():
         for row in rows:
             round_id = row.get("round_id")
             if not isinstance(round_id, str):
@@ -1467,7 +1472,8 @@ def _recent_round_trend(before_rows: list[dict], after_rows: list[dict],
 
 
 def _adaptive_feedback_observation(name: str, root: Path, reviews: list[dict],
-                                   warnings: list[dict], exposures: list[dict]) -> dict:
+                                   warnings: list[dict], exposures: list[dict],
+                                   warning_context_unknown: dict[str, int]) -> dict:
     import delegate
     import overlay
 
@@ -1480,12 +1486,37 @@ def _adaptive_feedback_observation(name: str, root: Path, reviews: list[dict],
                 if row["decision"] == "accept"}
     rejected = {rec_id: row for rec_id, row in latest_decisions.items()
                 if row["decision"] == "reject"}
-    by_rec: dict[str, dict] = {}
+    deltas_by_rec: dict[str, list[dict]] = {}
     for delta in deltas:
         evidence = delta.get("evidence") if isinstance(delta.get("evidence"), dict) else {}
         rec_id = evidence.get("rec_id") if evidence.get("source") == "improve-rec" else None
         if isinstance(rec_id, str):
-            by_rec[rec_id] = delta
+            deltas_by_rec.setdefault(rec_id, []).append(delta)
+    by_rec: dict[str, dict] = {}
+    join_conflicts: Counter = Counter()
+    quarantined: set[str] = set()
+    for rec_id, rec_deltas in deltas_by_rec.items():
+        decision = latest_decisions.get(rec_id)
+        if len(rec_deltas) != 1:
+            join_conflicts["duplicate-rec-delta"] += len(rec_deltas)
+            quarantined.update(delta["id"] for delta in rec_deltas)
+            continue
+        delta = rec_deltas[0]
+        if decision is None:
+            join_conflicts["missing-rec-decision"] += 1
+            quarantined.add(delta["id"])
+            continue
+        accepted_at = parse_iso_timestamp(decision["at"])
+        created_at = parse_iso_timestamp(delta["created_at"])
+        if accepted_at is None or created_at is None or accepted_at > created_at:
+            join_conflicts["accept-after-delta"] += 1
+            quarantined.add(delta["id"])
+            continue
+        if decision["decision"] != "accept":
+            join_conflicts["delta-from-rejected-rec"] += 1
+            quarantined.add(delta["id"])
+            continue
+        by_rec[rec_id] = delta
 
     latest_exposures = sorted(_latest_round_exposures(exposures).values(), key=lambda row: (
         row["at"], row["round_id"], row.get("_file") or ""))
@@ -1497,26 +1528,54 @@ def _adaptive_feedback_observation(name: str, root: Path, reviews: list[dict],
     delta_facts: list[dict] = []
     delta_examples: list[dict] = []
     for delta in deltas:
+        if delta["id"] in quarantined:
+            continue
         rule = overlay.RULES.get(delta["rule"]) or {}
         related_types = list(rule.get("finding_types") or [])
         replay = delta.get("replay") if isinstance(delta.get("replay"), dict) else {}
-        before_rows = []
+        transitions = delta.get("transitions") if isinstance(delta.get("transitions"), list) else []
+        active_at = next((entry.get("at") for entry in transitions
+                          if isinstance(entry, dict) and entry.get("to") == "observing"
+                          and parse_iso_timestamp(entry.get("at")) is not None), delta["created_at"])
+        suspended_at = next((entry.get("at") for entry in transitions
+                             if isinstance(entry, dict) and entry.get("to") in ("suspended", "retired")
+                             and parse_iso_timestamp(entry.get("at")) is not None), None)
+
+        def phase(at: str) -> str:
+            timestamp = parse_iso_timestamp(at)
+            start = parse_iso_timestamp(active_at)
+            stop = parse_iso_timestamp(suspended_at)
+            if timestamp is None or start is None:
+                return "unknown"
+            if timestamp < start:
+                return "pre-active"
+            if stop is not None and timestamp >= stop:
+                return "post-suspend"
+            return "active"
+
+        units: dict[tuple[str, str, str], tuple[str, dict]] = {}
         unassigned_replay_rounds = 0
-        for row in replay.get("by_round") or []:
+        replay_rows = replay.get("evaluations") or replay.get("by_round") or []
+        for row in replay_rows:
             if not isinstance(row, dict) or not isinstance(row.get("round_id"), str):
                 continue
+            if type(row.get("opportunities")) is not int or row["opportunities"] < 1:
+                continue
             exposure = exposure_by_round.get(row["round_id"])
-            if exposure is None or not isinstance(exposure.get("overlays_active"), list):
+            if exposure is None:
                 unassigned_replay_rounds += 1
                 continue
-            active_ids = {item.get("id") for item in exposure["overlays_active"]}
-            if delta["id"] not in active_ids:
-                before_rows.append(row)
-        after_rows: list[dict] = []
+            current_phase = phase(exposure["at"])
+            if current_phase == "unknown":
+                unassigned_replay_rounds += 1
+                continue
+            subject = row.get("subject_id") or row["round_id"]
+            snapshot = row.get("snapshot") or row["round_id"]
+            key = (delta["id"], str(subject), str(snapshot))
+            units[key] = (current_phase, row)
         unassigned_evaluations = 0
         for warning in evaluation_rows:
-            if (warning.get("delta_id") != delta["id"]
-                    or warning.get("at", "") < delta["created_at"]):
+            if warning.get("delta_id") != delta["id"]:
                 continue
             context = warning.get("context") or {}
             round_id = context.get("round_id")
@@ -1527,19 +1586,37 @@ def _adaptive_feedback_observation(name: str, root: Path, reviews: list[dict],
             if not isinstance(round_id, str):
                 unassigned_evaluations += 1
                 continue
-            after_rows.append({"round_id": round_id, "opportunities": 1,
-                               "fires": int(context.get("fired") is True)})
-        before = _trend_fact(before_rows, round_findings, recurrence_rounds, related_types)
-        after = _trend_fact(after_rows, round_findings, recurrence_rounds, related_types)
+            current_phase = phase(warning["at"])
+            if current_phase == "unknown":
+                unassigned_evaluations += 1
+                continue
+            subject = (context.get("delegation_id") or round_id or context.get("task_id")
+                       or ",".join(context.get("task_ids") or []))
+            snapshot = context.get("snapshot") or round_id or subject
+            key = (delta["id"], str(subject), str(snapshot))
+            units[key] = (current_phase, {"round_id": round_id, "opportunities": 1,
+                                          "fires": int(context.get("fired") is True)})
+        phase_rows = {"pre-active": [], "active": [], "post-suspend": []}
+        for current_phase, row in units.values():
+            phase_rows[current_phase].append(row)
+        pre_active = _trend_fact(
+            phase_rows["pre-active"], round_findings, recurrence_rounds, related_types)
+        active_phase = _trend_fact(
+            phase_rows["active"], round_findings, recurrence_rounds, related_types)
+        post_suspend = _trend_fact(
+            phase_rows["post-suspend"], round_findings, recurrence_rounds, related_types)
         evidence = delta.get("evidence") if isinstance(delta.get("evidence"), dict) else {}
         rec_id = evidence.get("rec_id") if evidence.get("source") == "improve-rec" else None
         accepted_row = accepted.get(rec_id) if isinstance(rec_id, str) else None
         fact = {
             "delta_id": delta["id"], "rule": delta["rule"], "status": delta.get("status"),
             "provenance": "observed",
-            "related_finding_types": related_types, "before": before, "after": after,
+            "related_finding_types": related_types,
+            "pre_active": pre_active, "active": active_phase, "post_suspend": post_suspend,
+            # Compatibility aliases retain the prior public names with corrected phase semantics.
+            "before": pre_active, "after": active_phase,
             "recent_round_trend": _recent_round_trend(
-                before_rows, after_rows, round_findings, recurrence_rounds, related_types),
+                phase_rows, round_findings, recurrence_rounds, related_types),
             "accepted_rec_id": rec_id if accepted_row is not None else None,
             "decision_follow_through": accepted_row is not None,
             "unassigned_evaluations": unassigned_evaluations,
@@ -1579,7 +1656,8 @@ def _adaptive_feedback_observation(name: str, root: Path, reviews: list[dict],
             change_events.append((latest["at"], "current-profile-fingerprint-mismatch"))
         if "env_prep" in latest and latest.get("env_prep") != current_env:
             change_events.append((latest["at"], "current-delegation-env-prep-mismatch"))
-    active = [delta for delta in deltas if delta.get("status") in ("observing", "warning")]
+    active = [delta for delta in deltas if delta.get("status") in ("observing", "warning")
+              and delta["id"] not in quarantined]
     stale_rows = []
     for delta in active:
         reasons = sorted({reason for at, reason in change_events if delta["created_at"] < at})
@@ -1593,7 +1671,7 @@ def _adaptive_feedback_observation(name: str, root: Path, reviews: list[dict],
         "decision_follow_through": {
             "accepted": len(accepted), "materialized": materialized,
             "accepted_without_delta": len(accepted) - materialized,
-            "rejected_suppressed": len(rejected),
+            "rejected_decisions": len(rejected),
         },
         "same_scope_conflicts": len(conflict_rows),
         "same_scope_conflicts_by_rule": dict(sorted(Counter(
@@ -1608,6 +1686,8 @@ def _adaptive_feedback_observation(name: str, root: Path, reviews: list[dict],
             "current_profile_known": current_profile_known,
             "profile_snapshots": sum("profile_fingerprint" in row for row in latest_exposures),
             "env_prep_snapshots": sum("env_prep" in row for row in latest_exposures),
+            "accept_delta_conflicts": dict(sorted(join_conflicts.items())),
+            "warning_context_unknown": dict(sorted(warning_context_unknown.items())),
         },
     }
     examples: list[dict] = []
@@ -1635,19 +1715,23 @@ _WARNING_CONTEXT_BOUNDARIES = {
 
 _WARNING_CONTEXT_FIELDS = {
     "delegation-verification-evidence-v1": {
-        "delegation_id", "task_id", "task_ids", "round_id", "delta_ids", "resolution", "fired"},
+        "delegation_id", "task_id", "task_ids", "round_id", "delta_ids", "resolution",
+        "snapshot", "evaluable", "coverage_reason", "fired"},
     "round-close-open-findings-v1": {
         "task_id", "task_ids", "delegation_id", "round_id", "unlinked", "delta_ids",
-        "resolution", "fired"},
+        "resolution", "snapshot", "evaluable", "coverage_reason", "fired"},
     "delegation-scope-drift-v1": {
         "delegation_id", "task_id", "task_ids", "round_id", "delta_ids", "outside_scope",
-        "coverage_reason", "resolution", "fired"},
+        "coverage_reason", "resolution", "snapshot", "evaluable", "fired"},
     "env-manifest-mutation-v1": {
-        "round_id", "task_id", "task_ids", "delta_ids", "manifest_paths", "resolution", "fired"},
+        "round_id", "task_id", "task_ids", "delta_ids", "manifest_paths", "resolution",
+        "snapshot", "evaluable", "coverage_reason", "fired"},
     "review-skipped-closes-v1": {
-        "round_id", "task_id", "task_ids", "delta_ids", "consecutive", "resolution", "fired"},
+        "round_id", "task_id", "task_ids", "delta_ids", "consecutive", "resolution",
+        "snapshot", "evaluable", "coverage_reason", "fired"},
     "done-without-evidence-v1": {
-        "round_id", "task_id", "task_ids", "delta_ids", "resolution", "fired"},
+        "round_id", "task_id", "task_ids", "delta_ids", "resolution", "snapshot",
+        "evaluable", "coverage_reason", "fired"},
 }
 
 
@@ -1655,9 +1739,19 @@ def _warning_task_ids(warning: dict, did_to_task: dict[str, str]) -> tuple[set[s
     context = warning.get("context") or {}
     rule = warning.get("rule")
     boundary = warning.get("boundary")
-    if (not isinstance(context, dict) or boundary not in _WARNING_CONTEXT_BOUNDARIES.get(rule, set())):
+    if not isinstance(context, dict):
         return set(), "invalid-context-schema"
-    allowed = _WARNING_CONTEXT_FIELDS[rule]
+    if rule in _WARNING_CONTEXT_FIELDS:
+        if boundary not in _WARNING_CONTEXT_BOUNDARIES[rule]:
+            return set(), "invalid-context-schema"
+        allowed = _WARNING_CONTEXT_FIELDS[rule]
+    else:
+        # Unknown-rule evaluation errors are themselves useful friction evidence. Validate their
+        # generic attribution fields without pretending the unknown rule has a known boundary schema.
+        allowed = {
+            "delegation_id", "task_id", "task_ids", "round_id", "delta_ids", "resolution",
+            "snapshot", "evaluable", "coverage_reason", "fired",
+        }
     if set(context) - allowed:
         return set(), "invalid-context-schema"
     if "task_id" in context and not isinstance(context["task_id"], str):
@@ -1676,13 +1770,20 @@ def _warning_task_ids(warning: dict, did_to_task: dict[str, str]) -> tuple[set[s
         return set(), "invalid-context-schema"
     if "fired" in context and type(context["fired"]) is not bool:
         return set(), "invalid-context-schema"
+    if "evaluable" in context and type(context["evaluable"]) is not bool:
+        return set(), "invalid-context-schema"
     if ("outside_scope" in context and (not isinstance(context["outside_scope"], list)
             or any(not isinstance(path, str) for path in context["outside_scope"]))):
         return set(), "invalid-context-schema"
     if ("manifest_paths" in context and (not isinstance(context["manifest_paths"], list)
             or any(not isinstance(path, str) for path in context["manifest_paths"]))):
         return set(), "invalid-context-schema"
-    if "coverage_reason" in context and not isinstance(context["coverage_reason"], str):
+    if ("coverage_reason" in context and context["coverage_reason"] is not None
+            and not isinstance(context["coverage_reason"], str)):
+        return set(), "invalid-context-schema"
+    if "resolution" in context and not isinstance(context["resolution"], str):
+        return set(), "invalid-context-schema"
+    if "snapshot" in context and not isinstance(context["snapshot"], str):
         return set(), "invalid-context-schema"
     if "consecutive" in context and (type(context["consecutive"]) is not int
                                       or context["consecutive"] < 1):
@@ -1701,6 +1802,20 @@ def _warning_task_ids(warning: dict, did_to_task: dict[str, str]) -> tuple[set[s
     if isinstance(did, str) and not delegated and not direct:
         return set(), "unresolved-delegation-context"
     return task_ids, None
+
+
+def _normalize_warning_rows(warnings: list[dict], did_to_task: dict[str, str]
+                            ) -> tuple[list[dict], dict[str, int]]:
+    """Validate/attribute warning context once; every downstream consumer gets this projection."""
+    normalized: list[dict] = []
+    coverage: Counter = Counter()
+    for warning in warnings:
+        task_ids, reason = _warning_task_ids(warning, did_to_task)
+        if reason is not None:
+            coverage[reason] += 1
+            continue
+        normalized.append({**warning, "task_ids": sorted(task_ids)})
+    return normalized, dict(sorted(coverage.items()))
 
 
 def _round_exposure_projection(task: dict, exposures: list[dict] | dict[str, dict]) -> dict | None:
@@ -1780,12 +1895,18 @@ def run_evidence(registry_path: Path, out_dir: Path, projects: set[str],
         exposures, exposure_skipped = _round_exposure_rows(root)
         latest_exposures = _latest_round_exposures(exposures)
         warnings, warning_skipped, warnings_present = _load_warning_rows(root)
+        delegations, n_skipped, n_verdicts_invalid = _project_delegation_rows(root)
+        delegation_skipped += n_skipped
+        verdicts_invalid += n_verdicts_invalid
+        did_to_task = {delegation["did"]: delegation["task_id"] for delegation in delegations}
+        project_warnings, context_unknown = _normalize_warning_rows(warnings, did_to_task)
+        warning_context_coverage.update(context_unknown)
         warning_rows_skipped += warning_skipped
         round_exposures_skipped += exposure_skipped
         warning_observations.append(_warning_observation(
-            name, warnings, warning_skipped, warnings_present, exposures, exposure_skipped))
+            name, project_warnings, warning_skipped, warnings_present, exposures, exposure_skipped))
         adaptive_observations.append(_adaptive_feedback_observation(
-            name, root, reviews, warnings, exposures))
+            name, root, reviews, project_warnings, exposures, context_unknown))
 
         by_task: dict[str, dict] = {}
         for task_id, task in tasks_by_id.items():
@@ -1827,9 +1948,6 @@ def run_evidence(registry_path: Path, out_dir: Path, projects: set[str],
                         projected_finding[key] = finding[key]
                 row["findings"].append(projected_finding)
 
-        delegations, n_skipped, n_verdicts_invalid = _project_delegation_rows(root)
-        delegation_skipped += n_skipped
-        verdicts_invalid += n_verdicts_invalid
         for delegation in delegations:
             task_id = delegation["task_id"]
             row = by_task.setdefault(task_id, {
@@ -1841,15 +1959,11 @@ def run_evidence(registry_path: Path, out_dir: Path, projects: set[str],
             })
             row["delegations"].append({key: value for key, value in delegation.items()
                                        if key != "task_id"})
-        did_to_task = {delegation["did"]: delegation["task_id"] for delegation in delegations}
         warning_refs: dict[str, list[str]] = {}
-        for number, warning in enumerate(warnings, 1):
+        for number, warning in enumerate(project_warnings, 1):
             warning_id = f"{name}:warning-{number:06d}"
             normalized_warnings.append({"project": name, "warning_id": warning_id, **warning})
-            task_ids, reason = _warning_task_ids(warning, did_to_task)
-            if reason is not None:
-                warning_context_coverage[reason] += 1
-            for task_id in task_ids:
+            for task_id in warning["task_ids"]:
                 warning_refs.setdefault(task_id, []).append(warning_id)
         for row in by_task.values():
             row["findings"].sort(

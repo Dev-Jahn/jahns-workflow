@@ -180,6 +180,7 @@ def close(root: Path, round_id: str, done: list[str], touched: list[str], commit
     if full is None:
         print(f"round close: --commit {commit!r} does not resolve to a commit", file=sys.stderr)
         return 1
+    head_sha = full if commit == "HEAD" else git_full_sha(root, "HEAD")
     ctext = cfg_path.read_text(encoding="utf-8")
     prev_raw = (cfg.get("state") or {}).get("last_round_commit")
     prev_wm = git_full_sha(root, str(prev_raw)) if prev_raw else None
@@ -196,7 +197,8 @@ def close(root: Path, round_id: str, done: list[str], touched: list[str], commit
 
     orig_tasks_text = tasks_path.read_text(encoding="utf-8")
     text = orig_tasks_text
-    session_id = os.environ.get("CLAUDE_CODE_SESSION_ID") or None
+    session_id = (os.environ.get("CLAUDE_CODE_SESSION_ID")
+                  or os.environ.get("CODEX_THREAD_ID") or None)
     data0 = yaml.safe_load(text) or {}
     by_id = {t.get("id"): t for t in data0.get("tasks", []) if isinstance(t, dict)}
     done_transitions = [task_id for task_id in done
@@ -237,14 +239,20 @@ def close(root: Path, round_id: str, done: list[str], touched: list[str], commit
     final_data = yaml.safe_load(text) or {}
     final_by_id = {task.get("id"): task for task in final_data.get("tasks", [])
                    if isinstance(task, dict)}
-    try:
-        task_scopes = {
-            task_id: canonical_scope_prefixes(final_by_id.get(task_id, {}).get("scope", []))
-            for task_id in dict.fromkeys(done + touched)
-        }
-    except WorkflowError as e:
-        print(f"round close: cannot record structured task scope — {e}", file=sys.stderr)
-        return 2
+    task_scopes: dict[str, list[str]] = {}
+    task_scope_coverage: dict[str, str] = {}
+    for task_id in dict.fromkeys(done + touched):
+        raw_scope = final_by_id.get(task_id, {}).get("scope")
+        if raw_scope in (None, []):
+            task_scope_coverage[task_id] = "task-scope-unknown"
+            continue
+        try:
+            task_scopes[task_id] = canonical_scope_prefixes(raw_scope)
+        except WorkflowError:
+            task_scope_coverage[task_id] = "task-scope-invalid"
+        else:
+            task_scope_coverage[task_id] = (
+                "explicit" if task_scopes[task_id] else "task-scope-unknown")
 
     # --- commit phase (all preflight checks passed): write with rollback ---
     # ROADMAP.render reads tasks.yaml from disk, so the new registry must be written first. If any
@@ -260,6 +268,7 @@ def close(root: Path, round_id: str, done: list[str], touched: list[str], commit
         gen_backup = Path(tempfile.mkdtemp(prefix="waystone-ssot-bak-")) / "g"
         shutil.copytree(gen_dir, gen_backup)
 
+    round_exposure = None
     try:
         write_text_atomic(tasks_path, text)
         write_text_atomic(cfg_path, ctext_new)
@@ -269,9 +278,10 @@ def close(root: Path, round_id: str, done: list[str], touched: list[str], commit
             ssot.regenerate(root)  # one full regen; raises WorkflowError (caught below) not sys.exit
         try:
             import overlay
-            exposure_path, _exposure = overlay.write_round_exposure(
-                root, round_id, git_full_sha(root, "HEAD"), full, session_id=session_id,
-                base_sha=prev_wm, task_scopes=task_scopes, done_task_ids=done_transitions)
+            exposure_path, round_exposure = overlay.write_round_exposure(
+                root, round_id, head_sha, full, session_id=session_id,
+                base_sha=prev_wm, task_scopes=task_scopes,
+                task_scope_coverage=task_scope_coverage, done_task_ids=done_transitions)
             created_event_paths.append(exposure_path)
             binding_path = review.write_round_request_binding(
                 root, round_id, full, prev_wm, review_reviewers,
@@ -314,7 +324,8 @@ def close(root: Path, round_id: str, done: list[str], touched: list[str], commit
         try:
             overlay.evaluate_boundary(
                 root, "round-close", {"round_id": round_id, "closing_task_ids": done,
-                                      "task_ids": list(dict.fromkeys(done + touched))})
+                                      "task_ids": list(dict.fromkeys(done + touched)),
+                                      "round_record": round_exposure})
         finally:
             # A round override applies through its close boundary, then expires even when the
             # advisory evaluator reports an internal failure.

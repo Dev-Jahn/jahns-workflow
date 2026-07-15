@@ -16,6 +16,7 @@ import json
 import os
 import re
 import sys
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -26,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import (  # noqa: E402
     ROUND_RE, WorkflowError, _project_slug, ensure_project_state_dir, find_project_root,
     has_accepted_consent, hold_lock, load_config, machine_dir, migrate_project_state,
-    project_lock_path, project_state_path, record_consent, write_text_atomic,
+    parse_iso_timestamp, project_lock_path, project_state_path, record_consent, write_text_atomic,
 )
 
 # delta-id grammar mirrors the improve rec_id (`<lens>/<kebab-gist>`, S2) so a rec materialises to a
@@ -40,6 +41,7 @@ POLICY_STAGES = ("observing", "warning", "enforce")
 RUNTIME_POLICY_STAGES = ("observing", "warning")
 PROJECT_POLICY_SCHEMA = "waystone-project-policy-1"
 DELTA_SCHEMAS = ("waystone-delta-1", "jw-delta-1")
+REVIEW_FEEDBACK_SCHEMA = "waystone-review-feedback-1"
 
 
 class _RefusedWrite(WorkflowError):
@@ -93,12 +95,22 @@ RULES: dict[str, dict] = {
     },
 }
 
+# Dependency manifests and lockfiles across the ecosystems Waystone can identify by path alone.
+# Gradle dependency locking uses either root `gradle.lockfile` or files below
+# `gradle/dependency-locks/*.lockfile`; both are handled explicitly in `_is_dependency_manifest`.
 _MANIFEST_NAMES = frozenset({
-    "Cargo.lock", "Cargo.toml", "Gemfile", "Gemfile.lock", "Pipfile", "Pipfile.lock",
-    "bun.lock", "bun.lockb", "go.mod", "go.sum", "package-lock.json", "package.json",
-    "pnpm-lock.yaml", "poetry.lock", "pyproject.toml", "uv.lock", "yarn.lock",
+    "Cargo.lock", "Cargo.toml", "Cartfile", "Cartfile.resolved", "Directory.Packages.props",
+    "Gemfile", "Gemfile.lock", "Package.resolved", "Package.swift", "Pipfile", "Pipfile.lock",
+    "Podfile", "Podfile.lock", "build.gradle", "build.gradle.kts", "build.sbt", "bun.lock",
+    "bun.lockb", "composer.json", "composer.lock", "deno.lock", "deps.edn", "flake.lock",
+    "flake.nix", "go.mod", "go.sum", "go.work", "go.work.sum", "gradle.lockfile", "mix.exs",
+    "mix.lock", "package-lock.json", "package.json", "packages.lock.json", "pak.lock",
+    "pnpm-lock.yaml", "poetry.lock", "pom.xml", "project.clj", "pubspec.lock", "pubspec.yaml",
+    "pyproject.toml", "renv.lock", "settings.gradle", "settings.gradle.kts", "uv.lock",
+    "yarn.lock",
 })
 _REQUIREMENTS_RE = re.compile(r"^requirements[^/]*\.txt$")
+_GRADLE_LOCK_RE = re.compile(r"(?:^|/)gradle/dependency-locks/[^/]+\.lockfile$")
 
 
 def rule1_fires(contract: dict) -> bool:
@@ -167,7 +179,8 @@ def _round_payload(round_record: dict) -> dict:
 
 def _is_dependency_manifest(path: str) -> bool:
     name = path.rsplit("/", 1)[-1]
-    return name in _MANIFEST_NAMES or _REQUIREMENTS_RE.fullmatch(name) is not None
+    return (name in _MANIFEST_NAMES or _REQUIREMENTS_RE.fullmatch(name) is not None
+            or _GRADLE_LOCK_RE.search(path) is not None)
 
 
 def evaluate_env_manifest_mutation(round_record: dict) -> dict:
@@ -178,76 +191,175 @@ def evaluate_env_manifest_mutation(round_record: dict) -> dict:
     """
     from common import _path_in_declared_scope
 
+    has_snapshot = isinstance(round_record.get("round_evidence"), dict) or any(
+        key in round_record for key in ("manifest_paths", "task_scopes", "env_prep_change_kind"))
     payload = _round_payload(round_record)
     manifests = sorted({path for path in (payload.get("manifest_paths") or [])
                         if isinstance(path, str) and _is_dependency_manifest(path)})
-    if payload.get("evaluable") is not True:
-        return {"evaluable": False, "fires": [], "manifest_paths": manifests,
-                "coverage_reason": payload.get("coverage_reason") or "round-diff-unavailable"}
+    if not has_snapshot:
+        return {"evaluable": False, "fired": False, "fires": [],
+                "manifest_paths": manifests, "coverage_reason": "round-snapshot-unavailable"}
+    snapshot_reason = payload.get("coverage_reason")
+    if payload.get("evaluable") is not True and snapshot_reason != "task-scope-unknown":
+        return {"evaluable": False, "fired": False, "fires": [], "manifest_paths": manifests,
+                "coverage_reason": snapshot_reason or "round-diff-unavailable"}
     scopes = payload.get("task_scopes") if isinstance(payload.get("task_scopes"), dict) else {}
+    scope_coverage = (payload.get("task_scope_coverage")
+                      if isinstance(payload.get("task_scope_coverage"), dict) else {
+                          task_id: ("explicit" if prefixes else "scope-unknown")
+                          for task_id, prefixes in scopes.items()
+                      })
     referenced = {
         path for path in manifests
         if any(isinstance(prefixes, list) and _path_in_declared_scope(path, prefixes)
                for prefixes in scopes.values())
     }
-    fires = [] if payload.get("env_prep_changed") is True else sorted(set(manifests) - referenced)
+    remaining = sorted(set(manifests) - referenced)
+    change_kind = payload.get("env_prep_change_kind")
+    meaningful_env_update = change_kind in ("added", "updated")
+    coverage_reason = None
+    if not remaining or meaningful_env_update:
+        fires = []
+    elif any(reason in ("task-scope-invalid", "scope-invalid")
+             for reason in scope_coverage.values()):
+        fires = []
+        coverage_reason = "task-scope-invalid"
+    elif (snapshot_reason == "task-scope-unknown" or not scope_coverage
+          or any(reason in ("task-scope-unknown", "scope-unknown")
+                 for reason in scope_coverage.values())):
+        fires = []
+        coverage_reason = "task-scope-unknown"
+    else:
+        fires = remaining
+    evaluable = coverage_reason is None
     return {
-        "evaluable": True, "fires": fires, "manifest_paths": manifests,
+        "evaluable": evaluable, "fired": bool(fires) if evaluable else False,
+        "fires": fires, "manifest_paths": manifests,
         "referenced_manifest_paths": sorted(referenced),
-        "env_prep_changed": payload.get("env_prep_changed") is True,
-        "coverage_reason": None,
+        "env_prep_before": payload.get("env_prep_before"),
+        "env_prep_after": payload.get("env_prep_after"),
+        "env_prep_change_kind": change_kind,
+        "coverage_reason": coverage_reason,
     }
 
 
 def evaluate_done_without_evidence(round_record: dict) -> dict:
-    """Find tasks that transitioned to done without any of the three recorded evidence signals."""
+    """Find done transitions lacking a satisfied apply verdict or structured main verification."""
+    if not isinstance(round_record.get("round_evidence"), dict) and not any(
+            key in round_record for key in ("done_task_ids", "done_evidence")):
+        return {"evaluable": False, "fired": False, "fires": [], "done_task_ids": [],
+                "unknown_task_ids": [], "coverage_reason": "round-snapshot-unavailable"}
     payload = _round_payload(round_record)
     done_ids = sorted({task_id for task_id in (payload.get("done_task_ids") or [])
                        if isinstance(task_id, str)})
-    rows = payload.get("done_evidence") if isinstance(payload.get("done_evidence"), list) else []
-    by_task = {row.get("task_id"): row for row in rows if isinstance(row, dict)}
-    unknown = [task_id for task_id in done_ids
-               if by_task.get(task_id, {}).get("evaluation_errors", 0)]
-    fires = [task_id for task_id in done_ids
-             if task_id not in unknown
-             if not any(by_task.get(task_id, {}).get(kind) is True
-                        for kind in ("verification", "verify", "verdict"))]
-    return {"evaluable": True, "fires": fires, "done_task_ids": done_ids,
-            "evidence_rows": len(by_task), "unknown_task_ids": unknown,
-            "evaluation_errors": sum(by_task.get(task_id, {}).get("evaluation_errors", 0)
-                                     for task_id in done_ids)}
+    raw_rows = payload.get("done_evidence")
+    if not isinstance(raw_rows, list):
+        return {"evaluable": False, "fired": False, "fires": [],
+                "done_task_ids": done_ids, "unknown_task_ids": done_ids,
+                "coverage_reason": "done-evidence-unavailable"}
+    grouped: dict[str, list[dict]] = {}
+    for row in raw_rows:
+        if isinstance(row, dict) and isinstance(row.get("task_id"), str):
+            grouped.setdefault(row["task_id"], []).append(row)
+    fires: list[str] = []
+    unknown: list[str] = []
+    unknown_reasons: list[str] = []
+    errors = 0
+    for task_id in done_ids:
+        rows = grouped.get(task_id, [])
+        if len(rows) != 1:
+            unknown.append(task_id)
+            unknown_reasons.append("done-evidence-missing" if not rows else "done-evidence-conflict")
+            continue
+        row = rows[0]
+        errors += row.get("evaluation_errors", 0) if type(row.get("evaluation_errors", 0)) is int else 1
+        if row.get("evaluable") is not True:
+            unknown.append(task_id)
+            unknown_reasons.append(row.get("coverage_reason") or "done-evidence-unavailable")
+        elif row.get("positive") is not True:
+            fires.append(task_id)
+    evaluable = bool(fires) or not unknown
+    coverage_reason = None
+    if not evaluable:
+        coverage_reason = (unknown_reasons[0] if len(set(unknown_reasons)) == 1
+                           else "done-evidence-partial")
+    return {"evaluable": evaluable, "fired": bool(fires), "fires": fires,
+            "coverage_reason": coverage_reason, "done_task_ids": done_ids,
+            "evidence_rows": sum(len(rows) for rows in grouped.values()),
+            "unknown_task_ids": unknown, "evaluation_errors": errors}
+
+
+def _logical_round_rows(rounds: list[dict]) -> list[dict]:
+    """Latest immutable exposure per logical round id; a re-close remains one guard opportunity."""
+    def order(row: dict) -> tuple[str, int, str]:
+        path = Path(row.get("_file") or "")
+        base = f"round-{row.get('round_id')}"
+        suffix = path.stem.removeprefix(base + "-") if path.stem.startswith(base + "-") else ""
+        return row.get("at") or "", int(suffix) if suffix.isdigit() else 1, str(path)
+
+    latest: dict[str, dict] = {}
+    for row in rounds:
+        round_id = row.get("round_id") if isinstance(row, dict) else None
+        if not isinstance(round_id, str) or not isinstance(row.get("at"), str):
+            continue
+        if round_id not in latest or order(row) > order(latest[round_id]):
+            latest[round_id] = row
+    return sorted(latest.values(), key=lambda row: (row["at"], row["round_id"], row.get("_file") or ""))
 
 
 def evaluate_review_skipped_closes(rounds: list[dict], ingests: list[dict], *,
                                    consecutive: int = 2) -> dict:
-    """Deterministic approximation of close streaks without an intervening review ingest."""
+    """Evaluate logical close streaks over canonical packet/PR review-feedback events."""
     if type(consecutive) is not int or consecutive < 1:
         raise WorkflowError("review-skipped-closes-v1 consecutive must be a positive integer")
-    closes = sorted(
-        (row for row in rounds if isinstance(row, dict)
-         and isinstance(row.get("round_id"), str) and isinstance(row.get("at"), str)),
-        key=lambda row: (row["at"], row["round_id"], row.get("_file") or ""),
-    )
+    closes = _logical_round_rows(rounds)
     review_events = sorted(
-        (row for row in ingests if isinstance(row, dict) and isinstance(row.get("at"), str)),
+        (row for row in ingests if isinstance(row, dict) and isinstance(row.get("at"), str)
+         and row.get("event", "review-feedback") == "review-feedback"),
         key=lambda row: (row["at"], row.get("round_id") or "", row.get("source_pointer") or ""),
     )
     event_index = 0
     streak = 0
     fires: list[str] = []
     by_round: list[dict] = []
+    previous_close_at = ""
+    unknown: Counter = Counter()
     for close in closes:
-        saw_ingest = False
+        interval_events = []
         while event_index < len(review_events) and review_events[event_index]["at"] <= close["at"]:
-            saw_ingest = True
+            if review_events[event_index]["at"] > previous_close_at:
+                interval_events.append(review_events[event_index])
             event_index += 1
-        streak = 1 if saw_ingest else streak + 1
+        payload = _round_payload(close)
+        review_mode = close.get("review_mode", payload.get("review_mode"))
+        reason = None
+        if review_mode not in ("packet", "pr"):
+            reason = "review-mode-unavailable"
+        elif review_mode == "pr" and not any(event.get("source") == "pr-marker"
+                                              for event in interval_events):
+            reason = "pr-state-unavailable"
+        if reason is not None:
+            unknown[reason] += 1
+            streak = 0
+            by_round.append({"round_id": close["round_id"], "streak": None, "fired": False,
+                             "evaluable": False, "coverage_reason": reason})
+            previous_close_at = close["at"]
+            continue
+        saw_feedback = bool(interval_events)
+        streak = 1 if saw_feedback else streak + 1
         fired = streak >= consecutive
         if fired:
             fires.append(close["round_id"])
-        by_round.append({"round_id": close["round_id"], "streak": streak, "fired": fired})
-    return {"opportunities": len(closes), "fires": fires, "by_round": by_round,
-            "consecutive": consecutive}
+        by_round.append({"round_id": close["round_id"], "streak": streak, "fired": fired,
+                         "evaluable": True, "coverage_reason": None})
+        previous_close_at = close["at"]
+    opportunities = sum(row["evaluable"] for row in by_round)
+    return {"evaluable": bool(opportunities), "fired": bool(fires),
+            "coverage_reason": None if opportunities else "review-state-unavailable",
+            "opportunities": opportunities, "fires": fires, "by_round": by_round,
+            "consecutive": consecutive,
+            "unevaluable_pr_state": unknown["pr-state-unavailable"],
+            "unevaluable_review_mode": unknown["review-mode-unavailable"]}
 
 
 # ---- residence (§2 — project-local, never committed) --------------------------
@@ -314,17 +426,35 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def record_review_ingest(root: Path, round_id: str) -> dict:
-    """Append the ingest boundary needed to replay no-review close streaks."""
+def record_review_feedback(root: Path, round_id: str, *, source: str, event_id: str) -> dict:
+    """Append one canonical review-feedback event shared by packet ingest and completed PR markers."""
     if not isinstance(round_id, str) or not round_id:
-        raise WorkflowError("review ingest round_id must be non-empty")
-    row = {"at": _now_iso(), "round_id": round_id, "provenance": "observed"}
+        raise WorkflowError("review feedback round_id must be non-empty")
+    if source not in ("packet-ingest", "pr-marker"):
+        raise WorkflowError("review feedback source must be packet-ingest|pr-marker")
+    if not isinstance(event_id, str) or not event_id:
+        raise WorkflowError("review feedback event_id must be non-empty")
+    row = {
+        "schema": REVIEW_FEEDBACK_SCHEMA, "event": "review-feedback", "at": _now_iso(),
+        "round_id": round_id, "source": source, "event_id": event_id,
+        "provenance": "observed",
+    }
+    existing, _skipped = load_review_ingests(root)
+    prior = next((item for item in existing if item.get("event_id") == event_id), None)
+    if prior is not None:
+        return {key: prior[key] for key in row}
     _ensure_project_state_or_refuse(root)
     path = _review_ingests_path(root)
     _mkdir_or_refuse(path.parent)
     with path.open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
     return row
+
+
+def record_review_ingest(root: Path, round_id: str) -> dict:
+    """Compatibility wrapper: a packet ingest projects to the canonical feedback event."""
+    return record_review_feedback(
+        root, round_id, source="packet-ingest", event_id=f"packet:{round_id}")
 
 
 def load_review_ingests(root: Path) -> tuple[list[dict], int]:
@@ -345,11 +475,17 @@ def load_review_ingests(root: Path) -> tuple[list[dict], int]:
         except json.JSONDecodeError:
             skipped += 1
             continue
-        if (not isinstance(row, dict) or not isinstance(row.get("at"), str)
-                or not isinstance(row.get("round_id"), str)):
+        if (not isinstance(row, dict) or row.get("schema") != REVIEW_FEEDBACK_SCHEMA
+                or row.get("event") != "review-feedback"
+                or parse_iso_timestamp(row.get("at")) is None
+                or not isinstance(row.get("round_id"), str)
+                or row.get("source") not in ("packet-ingest", "pr-marker")
+                or not isinstance(row.get("event_id"), str)):
             skipped += 1
             continue
         rows.append({**row, "source_pointer": f"{path}:{line_number}"})
+    deduped = {row["event_id"]: row for row in rows}
+    rows = list(deduped.values())
     rows.sort(key=lambda row: (row["at"], row["round_id"], row["source_pointer"]))
     return rows, skipped
 
@@ -382,6 +518,8 @@ def _review_ingests_for_rounds(root: Path, rounds: list[dict]) -> tuple[list[dic
             continue
         rows.append({
             "round_id": feedback_round, "at": chronological[next_index]["at"],
+            "schema": REVIEW_FEEDBACK_SCHEMA, "event": "review-feedback",
+            "source": "packet-ingest", "event_id": f"legacy-packet:{feedback_round}",
             "provenance": "feedback-file-between-close-approximation",
             "source_pointer": str(review_dir / f"{feedback_round}-feedback.md"),
         })
@@ -850,6 +988,28 @@ def add_delta(root: Path, delta_id: str, *, rule: str, summary: str, pointers=No
     pslug = _project_slug(root)
     source, rec_id = ("improve-rec", from_rec) if from_rec is not None else ("manual", None)
     now = _now_iso()
+    if from_rec is not None:
+        import improve
+
+        existing = list_deltas(root)
+        if any(delta.get("corrupt") for delta in existing):
+            raise WorkflowError("cannot prove --from-rec uniqueness while an overlay delta is corrupt")
+        matches = [delta for delta in existing
+                   if isinstance(delta.get("evidence"), dict)
+                   and delta["evidence"].get("source") == "improve-rec"
+                   and delta["evidence"].get("rec_id") == from_rec]
+        if matches:
+            raise WorkflowError(
+                f"recommendation {from_rec} already materialized as delta {matches[0].get('id')}")
+        decisions, _skipped = improve._load_decisions(root)
+        matching_decisions = [row for row in decisions if row["rec_id"] == from_rec]
+        if not matching_decisions or matching_decisions[-1]["decision"] != "accept":
+            raise WorkflowError(f"--from-rec {from_rec} requires a latest accepted improve decision")
+        accepted_at = parse_iso_timestamp(matching_decisions[-1]["at"])
+        created_at = parse_iso_timestamp(now)
+        if accepted_at is None or created_at is None or accepted_at > created_at:
+            raise WorkflowError(
+                f"--from-rec {from_rec} acceptance timestamp must not follow delta creation")
     delta = {
         "schema": "waystone-delta-1",
         "id": delta_id,
@@ -917,7 +1077,7 @@ def retire(root: Path, delta_id: str, note: str | None = None) -> dict:
 def _delegation_context(record: Path, did: str) -> dict:
     import yaml
 
-    context: dict = {"delegation_id": did}
+    context: dict = {"delegation_id": did, "snapshot": did}
     try:
         packet = yaml.safe_load((record / "packet.yaml").read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, yaml.YAMLError):
@@ -963,7 +1123,9 @@ def _replay_delegations(root: Path, rule_id: str) -> dict:
     fires: list[str] = []
     errors = 0
     opportunities = 0
+    unevaluable: Counter = Counter()
     round_rows: list[tuple[str | None, bool]] = []
+    evaluations: list[dict] = []
     rounds, _round_errors = _round_records(root)
     for rec in candidates:
         context = _delegation_context(rec, rec.name)
@@ -978,14 +1140,20 @@ def _replay_delegations(root: Path, rule_id: str) -> dict:
         elif rule_id == "delegation-scope-drift-v1":
             drift = delegation_scope_drift(rec)
             if drift.get("evaluable") is not True:
-                if drift.get("coverage_reason") != "scope-unknown":
-                    errors += 1
+                reason = drift.get("coverage_reason") or "scope-unavailable"
+                unevaluable[reason] += 1
+                errors += int(reason != "scope-unknown")
                 continue
-            fired = bool(drift.get("outside_scope"))
+            fired = drift["fired"]
         else:
             raise WorkflowError(f"delegation replay does not implement {rule_id!r}")
         opportunities += 1
-        round_rows.append((_delegation_round(root, rec, context, rounds), fired))
+        round_id = _delegation_round(root, rec, context, rounds)
+        round_rows.append((round_id, fired))
+        evaluations.append({
+            "subject_id": rec.name, "snapshot": rec.name, "round_id": round_id,
+            "opportunities": 1, "fires": int(fired),
+        })
         if fired:
             fires.append(f"{rec.name}/artifact/contract.yaml")
     return {
@@ -995,6 +1163,9 @@ def _replay_delegations(root: Path, rule_id: str) -> dict:
         "fires": len(fires),
         "examples": fires[:5],
         "evaluation_errors": errors,
+        "unevaluable_delegations": sum(unevaluable.values()),
+        "unevaluable_by_reason": dict(sorted(unevaluable.items())),
+        "evaluations": evaluations,
         "by_round": _by_round_projection(round_rows),
     }
 
@@ -1045,12 +1216,12 @@ def _round_records(root: Path) -> tuple[list[dict], int]:
             errors += 1
             continue
         if (not isinstance(row, dict) or row.get("schema") != "waystone-round-exposure-1"
-                or not isinstance(row.get("round_id"), str) or not isinstance(row.get("at"), str)):
+                or not isinstance(row.get("round_id"), str)
+                or parse_iso_timestamp(row.get("at")) is None):
             errors += 1
             continue
         rows.append({**row, "_file": str(path)})
-    rows.sort(key=lambda row: (row["at"], row["round_id"], row["_file"]))
-    return rows, errors
+    return _logical_round_rows(rows), errors
 
 
 def _replay_rounds(root: Path, rule_id: str, params: dict) -> dict:
@@ -1059,6 +1230,7 @@ def _replay_rounds(root: Path, rule_id: str, params: dict) -> dict:
     by_round: list[dict] = []
     opportunities = 0
     unevaluable = 0
+    unevaluable_by_reason: Counter = Counter()
     if rule_id == "review-skipped-closes-v1":
         ingests, ingest_errors, legacy_approximations = _review_ingests_for_rounds(root, rows)
         errors += ingest_errors
@@ -1066,34 +1238,53 @@ def _replay_rounds(root: Path, rule_id: str, params: dict) -> dict:
             rows, ingests, consecutive=params.get("consecutive", 2))
         fired_rounds = result["fires"]
         opportunities = result["opportunities"]
-        by_round = [{"round_id": row["round_id"], "opportunities": 1,
-                     "fires": int(row["fired"]), "streak": row["streak"]}
+        by_round = [{"round_id": row["round_id"], "subject_id": row["round_id"],
+                     "snapshot": row["round_id"],
+                     "opportunities": int(row["evaluable"]),
+                     "fires": int(row["fired"]), "streak": row["streak"],
+                     "evaluable": row["evaluable"],
+                     "coverage_reason": row["coverage_reason"]}
                     for row in result["by_round"]]
+        unevaluable = len(by_round) - opportunities
+        unevaluable_by_reason.update(
+            row["coverage_reason"] for row in by_round if not row["evaluable"])
     else:
         for row in rows:
             if rule_id == "env-manifest-mutation-v1":
                 result = evaluate_env_manifest_mutation(row)
-                if result["evaluable"] is not True:
-                    unevaluable += 1
-                    continue
             elif rule_id == "done-without-evidence-v1":
                 result = evaluate_done_without_evidence(row)
                 errors += result.get("evaluation_errors", 0)
             else:
                 raise WorkflowError(f"round replay does not implement {rule_id!r}")
+            if result["evaluable"] is not True:
+                unevaluable += 1
+                unevaluable_by_reason[result.get("coverage_reason") or "unknown"] += 1
+                by_round.append({"round_id": row["round_id"],
+                                 "subject_id": row["round_id"], "snapshot": row["round_id"],
+                                 "opportunities": 0, "fires": 0,
+                                 "evaluable": False,
+                                 "coverage_reason": result.get("coverage_reason")})
+                continue
             opportunities += 1
-            fired = bool(result["fires"])
+            fired = result["fired"]
             if fired:
                 fired_rounds.append(row["round_id"])
-            by_round.append({"round_id": row["round_id"], "opportunities": 1,
-                             "fires": int(fired)})
+            by_round.append({"round_id": row["round_id"],
+                             "subject_id": row["round_id"], "snapshot": row["round_id"],
+                             "opportunities": 1,
+                             "fires": int(fired), "evaluable": True,
+                             "coverage_reason": None})
     report = {
         "corpus": "rounds", "corpus_size": len(rows), "opportunities": opportunities,
         "fires": len(fired_rounds), "examples": fired_rounds[:5],
         "evaluation_errors": errors, "unevaluable_rounds": unevaluable, "by_round": by_round,
+        "unevaluable_by_reason": dict(sorted(unevaluable_by_reason.items())),
     }
     if rule_id == "review-skipped-closes-v1":
         report["legacy_ingest_approximations"] = legacy_approximations
+        report["unevaluable_pr_state"] = result["unevaluable_pr_state"]
+        report["unevaluable_review_mode"] = result["unevaluable_review_mode"]
     return report
 
 
@@ -1198,8 +1389,6 @@ def _scope_drift_targets(root: Path, boundary: str, context: dict) -> tuple[list
                             if isinstance(context.get(key), str)})
         drift = delegation_scope_drift(record)
         if drift.get("evaluable") is not True:
-            if drift.get("coverage_reason") == "scope-unknown":
-                continue
             errors.append({**attribution,
                            "coverage_reason": drift.get("coverage_reason") or "scope-unavailable"})
             continue
@@ -1249,6 +1438,10 @@ def _round_rule_at_boundary(root: Path, rule_id: str, context: dict, params: dic
                         if row["round_id"] == current["round_id"]]
         result["current_fired"] = bool(current_rows and current_rows[-1]["fired"])
         result["current_streak"] = current_rows[-1]["streak"] if current_rows else None
+        result["evaluable"] = bool(current_rows and current_rows[-1]["evaluable"])
+        result["fired"] = result["current_fired"]
+        result["coverage_reason"] = (
+            current_rows[-1]["coverage_reason"] if current_rows else "round-snapshot-unavailable")
         return result
     return None
 
@@ -1263,7 +1456,8 @@ def _emit_evaluations(root: Path, boundary: str, group: list[dict], rule_id: str
     for delta in sorted(group, key=lambda item: item["id"]):
         rows.append(_emit(
             root, boundary, delta["id"], rule_id, delta["status"], "evaluation",
-            "rule evaluated at workflow boundary", {**context, "fired": fired}))
+            "rule evaluated at workflow boundary",
+            {**context, "evaluable": True, "fired": fired, "coverage_reason": None}))
     return rows
 
 
@@ -1276,7 +1470,22 @@ def evaluate_boundary(root: Path, boundary: str, context: dict) -> list[dict]:
         return _evaluate_boundary(root, boundary, context)
     except Exception as e:  # noqa: BLE001 — never propagate into the host flow
         print(f"waystone warn: overlay evaluation error at {boundary}: {e}", file=sys.stderr)
-        return []
+        unknown_context = {
+            "evaluable": False, "fired": False, "coverage_reason": "evaluation-error",
+        }
+        for key in ("delegation_id", "task_id", "round_id"):
+            if isinstance(context.get(key), str):
+                unknown_context[key] = context[key]
+        try:
+            row = _emit(
+                root, boundary, f"boundary/{boundary}", "boundary-evaluation-v1", "observing",
+                "evaluation-error", f"boundary evaluation failed: {type(e).__name__}",
+                unknown_context)
+        except Exception as record_error:  # noqa: BLE001 — the host still cannot be failed by warning IO
+            print(f"waystone warn: could not record unknown evaluation at {boundary}: {record_error}",
+                  file=sys.stderr)
+            return []
+        return [row]
 
 
 def _evaluate_boundary(root: Path, boundary: str, context: dict) -> list[dict]:
@@ -1358,6 +1567,7 @@ def _evaluate_boundary(root: Path, boundary: str, context: dict) -> list[dict]:
                         "its structured declared scope",
                         {**row, "outside_scope": outside}))
             for row in errors:
+                row.update({"evaluable": False, "fired": False})
                 events.append(_emit(
                     root, boundary, rep["id"], rule_id, eff, "evaluation-error",
                     f"delegation {row['delegation_id']} scope could not be evaluated",
@@ -1390,8 +1600,10 @@ def _evaluate_boundary(root: Path, boundary: str, context: dict) -> list[dict]:
             if out is None:
                 continue
             round_id = (_round_record_at_boundary(root, context) or {}).get("round_id")
-            fired = out.get("current_fired") if rule_id == "review-skipped-closes-v1" else bool(out["fires"])
+            fired = out["fired"]
             attribution = {"round_id": round_id}
+            if isinstance(round_id, str):
+                attribution["snapshot"] = round_id
             if rule_id == "env-manifest-mutation-v1":
                 attribution["manifest_paths"] = out.get("fires") or []
             elif rule_id == "done-without-evidence-v1":
@@ -1399,6 +1611,8 @@ def _evaluate_boundary(root: Path, boundary: str, context: dict) -> list[dict]:
             else:
                 attribution["consecutive"] = params.get("consecutive", 2)
             if out.get("evaluable", True) is not True:
+                attribution.update({"evaluable": False, "fired": False,
+                                    "coverage_reason": out.get("coverage_reason") or "unknown"})
                 events.append(_emit(
                     root, boundary, rep["id"], rule_id, eff, "evaluation-error",
                     f"round {round_id} could not be evaluated: {out.get('coverage_reason')}",
@@ -1411,7 +1625,7 @@ def _evaluate_boundary(root: Path, boundary: str, context: dict) -> list[dict]:
                                f"change or structured task scope reference: {', '.join(out['fires'])}")
                 elif rule_id == "done-without-evidence-v1":
                     message = (f"round {round_id} closes {len(out['fires'])} task(s) without joined "
-                               "verification, verify, or verdict evidence")
+                               "satisfied apply-verdict or structured main-session verification")
                 else:
                     message = (f"round {round_id} reaches {out['current_streak']} consecutive "
                                "closes without an intervening review feedback ingest")
@@ -1457,7 +1671,10 @@ def _config_env_prep_at(root: Path, sha: str) -> tuple[object, bool]:
         return None, False
     if not isinstance(cfg, dict):
         return None, False
-    delegation = cfg.get("delegation") if isinstance(cfg.get("delegation"), dict) else {}
+    raw_delegation = cfg.get("delegation")
+    if raw_delegation is not None and not isinstance(raw_delegation, dict):
+        return None, False
+    delegation = raw_delegation or {}
     value = delegation.get("env_prep")
     if value is not None and (not isinstance(value, list)
                               or any(not isinstance(item, str) for item in value)):
@@ -1465,75 +1682,181 @@ def _config_env_prep_at(root: Path, sha: str) -> tuple[object, bool]:
     return value, True
 
 
-def _task_done_evidence(root: Path, task_id: str) -> dict:
+def _main_verification_evidence(root: Path, session_id: str | None) -> dict:
+    """L2-B's structured session verification/build signal for a directly executed task."""
+    if not isinstance(session_id, str):
+        return {"evaluable": False, "positive": False,
+                "coverage_reason": "main-verification-unavailable"}
+    path = project_state_path(root) / "improve" / "sessions.jsonl"
+    if not path.is_file():
+        return {"evaluable": False, "positive": False,
+                "coverage_reason": "main-verification-unavailable"}
+    try:
+        rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+                if line.strip()]
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {"evaluable": False, "positive": False,
+                "coverage_reason": "main-verification-invalid", "evaluation_errors": 1}
+    matches = [row for row in rows if isinstance(row, dict)
+               and row.get("session_id") == session_id and row.get("kind") == "main"]
+    if len(matches) != 1:
+        return {"evaluable": False, "positive": False,
+                "coverage_reason": ("main-verification-unavailable" if not matches
+                                    else "main-verification-conflict")}
+
+    def passing(field: str) -> bool:
+        value = matches[0].get(field)
+        return (isinstance(value, dict) and type(value.get("runs")) is int
+                and value["runs"] > 0 and value.get("failed", 0) == 0)
+
+    verification = matches[0].get("verification")
+    build = matches[0].get("build")
+    if not all(isinstance(value, dict) and type(value.get("runs")) is int
+               and type(value.get("failed", 0)) is int for value in (verification, build)):
+        return {"evaluable": False, "positive": False,
+                "coverage_reason": "main-verification-invalid", "evaluation_errors": 1}
+    verification_passed = passing("verification")
+    build_passed = passing("build")
+    return {
+        "evaluable": True, "positive": verification_passed or build_passed,
+        "coverage_reason": None,
+        "evidence_kind": ("main-session-verification" if verification_passed
+                          else "main-session-build" if build_passed else "main-session-no-verification"),
+        "session_id": session_id,
+    }
+
+
+def _delegation_evidence_index(root: Path) -> tuple[dict[str, list[dict]], int]:
+    """Scan the delegation corpus once and index canonical acceptance evidence by task id."""
     import delegate
 
-    signals = {"verification": False, "verify": False, "verdict": False}
-    errors = 0
+    index: dict[str, list[dict]] = {}
+    unattributed_errors = 0
     directory = delegate._delegations_dir(root)
-    if directory.is_dir():
+    if not directory.is_dir():
+        return index, 0
+    try:
+        records = sorted(path for path in directory.iterdir() if path.is_dir())
+    except OSError:
+        return index, 1
+    for record in records:
         try:
-            records = sorted(path for path in directory.iterdir() if path.is_dir())
-        except OSError:
-            return {"task_id": task_id, **signals, "evaluation_errors": 1}
-        for record in records:
-            exposure_path = record / "exposure.json"
-            try:
-                exposure = json.loads(exposure_path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-                continue
-            if not isinstance(exposure, dict) or exposure.get("task_id") != task_id:
-                continue
-            contract_path = record / "artifact" / "contract.yaml"
-            if contract_path.is_file():
-                try:
-                    contract = delegate._load_contract(record)
-                except WorkflowError:
-                    errors += 1
+            exposure = json.loads((record / "exposure.json").read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            unattributed_errors += 1
+            continue
+        task_id = exposure.get("task_id") if isinstance(exposure, dict) else None
+        if not isinstance(task_id, str):
+            unattributed_errors += 1
+            continue
+        evidence = {"delegation_id": record.name, "evaluable": True, "positive": False,
+                    "evidence_kind": "no-apply-verdict", "coverage_reason": None}
+        try:
+            latest = delegate.latest_canonical_verdict(record)
+            if latest is not None:
+                _path, verdict = latest
+                if verdict["decision"] == "discard":
+                    evidence["evidence_kind"] = "discard-verdict"
                 else:
-                    report = contract.get("delegate_report") or {}
-                    signals["verification"] |= (
-                        report.get("present") is True and bool(report.get("verification")))
-            try:
-                signals["verify"] |= bool(delegate._verify_artifacts(record))
-            except WorkflowError:
-                errors += 1
-            try:
-                signals["verdict"] |= delegate.latest_canonical_verdict(record) is not None
-            except WorkflowError:
-                errors += 1
-    return {"task_id": task_id, **signals, "evaluation_errors": errors}
+                    packet = delegate._load_packet(record)
+                    packet_criteria = packet["acceptance"]
+                    verdict_criteria = verdict["criteria"]
+                    verdict_acceptance = [item.get("criterion") for item in verdict_criteria]
+                    exact = (len(verdict_acceptance) == len(packet_criteria)
+                             and set(verdict_acceptance) == set(packet_criteria))
+                    satisfied = (bool(verdict_criteria) and exact
+                                 and all(item.get("met") is True and bool(item.get("evidence"))
+                                         for item in verdict_criteria))
+                    evidence["positive"] = satisfied
+                    evidence["evidence_kind"] = (
+                        "satisfied-apply-verdict" if satisfied else "unmet-apply-verdict")
+        except (WorkflowError, KeyError, TypeError):
+            evidence = {"delegation_id": record.name, "evaluable": False, "positive": False,
+                        "coverage_reason": "delegation-evidence-invalid", "evaluation_errors": 1}
+        index.setdefault(task_id, []).append(evidence)
+    return index, unattributed_errors
+
+
+def _task_done_evidence(task_id: str, delegation_index: dict[str, list[dict]],
+                        delegation_errors: int, main_verification: dict) -> dict:
+    records = delegation_index.get(task_id, [])
+    if records:
+        if any(row.get("positive") is True for row in records):
+            return {"task_id": task_id, "evaluable": True, "positive": True,
+                    "evidence_kind": "satisfied-apply-verdict", "coverage_reason": None,
+                    "delegation_ids": sorted(row["delegation_id"] for row in records)}
+        if any(row.get("evaluable") is not True for row in records):
+            return {"task_id": task_id, "evaluable": False, "positive": False,
+                    "coverage_reason": "delegation-evidence-invalid",
+                    "evaluation_errors": sum(row.get("evaluation_errors", 0) for row in records)}
+        return {"task_id": task_id, "evaluable": True, "positive": False,
+                "evidence_kind": records[-1].get("evidence_kind"), "coverage_reason": None,
+                "delegation_ids": sorted(row["delegation_id"] for row in records)}
+    if delegation_errors:
+        return {"task_id": task_id, "evaluable": False, "positive": False,
+                "coverage_reason": "delegation-attribution-unknown",
+                "evaluation_errors": delegation_errors}
+    return {"task_id": task_id, **main_verification}
 
 
 def _capture_round_evidence(root: Path, base_sha: str | None, head_sha: str | None,
-                            task_scopes: dict[str, list[str]], done_task_ids: list[str]) -> dict:
+                            task_scopes: dict[str, list[str]], done_task_ids: list[str], *,
+                            task_scope_coverage: dict[str, str], session_id: str | None,
+                            review_mode: str) -> dict:
     from common import git_rc
 
     base = base_sha if isinstance(base_sha, str) and base_sha else None
     head = head_sha if isinstance(head_sha, str) and head_sha else None
+    delegation_index, delegation_errors = _delegation_evidence_index(root)
+    main_verification = _main_verification_evidence(root, session_id)
     payload = {
         "evaluable": False, "coverage_reason": "round-diff-unavailable",
         "changed_files": [], "manifest_paths": [], "env_prep_changed": None,
+        "env_prep_before": None, "env_prep_after": None, "env_prep_change_kind": None,
+        "review_mode": review_mode,
         "task_scopes": {task_id: list(scopes) for task_id, scopes in sorted(task_scopes.items())},
+        "task_scope_coverage": dict(sorted(task_scope_coverage.items())),
         "done_task_ids": sorted(set(done_task_ids)),
-        "done_evidence": [_task_done_evidence(root, task_id)
+        "done_evidence": [_task_done_evidence(
+            task_id, delegation_index, delegation_errors, main_verification)
                           for task_id in sorted(set(done_task_ids))],
     }
+    if any(reason == "task-scope-invalid" for reason in task_scope_coverage.values()):
+        return {**payload, "coverage_reason": "task-scope-invalid"}
     if base is None or head is None:
-        return payload
+        reason = ("task-scope-unknown" if any(
+            value == "task-scope-unknown" for value in task_scope_coverage.values())
+                  else payload["coverage_reason"])
+        return {**payload, "coverage_reason": reason}
     rc, out, _err = git_rc(root, "diff", "--name-only", base, head, "--")
     if rc != 0:
         return payload
     changed = sorted({line.strip() for line in out.splitlines() if line.strip()})
+    manifests = [path for path in changed if _is_dependency_manifest(path)]
     before_env, before_ok = _config_env_prep_at(root, base)
     after_env, after_ok = _config_env_prep_at(root, head)
     if not (before_ok and after_ok):
         return {**payload, "changed_files": changed,
-                "manifest_paths": [path for path in changed if _is_dependency_manifest(path)],
+                "manifest_paths": manifests,
                 "coverage_reason": "env-prep-comparison-unavailable"}
+    before_effective = before_env if isinstance(before_env, list) and before_env else None
+    after_effective = after_env if isinstance(after_env, list) and after_env else None
+    if before_effective == after_effective:
+        change_kind = "unchanged"
+    elif before_effective is None:
+        change_kind = "added"
+    elif after_effective is None:
+        change_kind = "removed"
+    else:
+        change_kind = "updated"
+    scope_unknown = any(reason == "task-scope-unknown"
+                        for reason in task_scope_coverage.values())
     return {
-        **payload, "evaluable": True, "coverage_reason": None, "changed_files": changed,
-        "manifest_paths": [path for path in changed if _is_dependency_manifest(path)],
+        **payload, "evaluable": not scope_unknown,
+        "coverage_reason": "task-scope-unknown" if scope_unknown else None,
+        "changed_files": changed,
+        "manifest_paths": manifests, "env_prep_before": before_env, "env_prep_after": after_env,
+        "env_prep_change_kind": change_kind,
         "env_prep_changed": before_env != after_env,
     }
 
@@ -1541,6 +1864,7 @@ def _capture_round_evidence(root: Path, base_sha: str | None, head_sha: str | No
 def write_round_exposure(root: Path, round_id: str, head_sha: str | None, watermark: str | None,
                          session_id: str | None = None, *, base_sha: str | None = None,
                          task_scopes: dict[str, list[str]] | None = None,
+                         task_scope_coverage: dict[str, str] | None = None,
                          done_task_ids: list[str] | None = None):
     """Immutable per-round exposure record written at close (§9/#4). A re-close of the same round-id
     gets a `-2`/`-3` suffix (H4 precedent — existing records are never overwritten)."""
@@ -1548,8 +1872,21 @@ def write_round_exposure(root: Path, round_id: str, head_sha: str | None, waterm
     fp, bindings = _profile_summary(root)
     cfg = load_config(root)
     env_prep = (cfg.get("delegation") or {}).get("env_prep")
-    round_evidence = _capture_round_evidence(
-        root, base_sha, watermark, task_scopes or {}, done_task_ids or [])
+    review_mode = (cfg.get("review") or {}).get("mode", "packet")
+    try:
+        round_evidence = _capture_round_evidence(
+            root, base_sha, watermark, task_scopes or {}, done_task_ids or [],
+            task_scope_coverage=task_scope_coverage or {}, session_id=session_id,
+            review_mode=review_mode)
+    except Exception:  # noqa: BLE001 — warning snapshots degrade to explicit unknown
+        round_evidence = {
+            "evaluable": False, "fired": False, "coverage_reason": "round-snapshot-error",
+            "evaluation_errors": 1, "changed_files": [], "manifest_paths": [],
+            "env_prep_before": None, "env_prep_after": None, "env_prep_change_kind": None,
+            "review_mode": review_mode, "task_scopes": {},
+            "task_scope_coverage": dict(sorted((task_scope_coverage or {}).items())),
+            "done_task_ids": sorted(set(done_task_ids or [])), "done_evidence": [],
+        }
     policy_composition = compose_policy(root, round_id=round_id)
     exposure = {
         "schema": "waystone-round-exposure-1", "round_id": round_id, "at": _now_iso(),
@@ -1557,7 +1894,7 @@ def write_round_exposure(root: Path, round_id: str, head_sha: str | None, waterm
         "project": {"pslug": _project_slug(root), "root": str(Path(root).resolve())},
         "head_sha": head_sha, "config_watermark": watermark, "base_sha": base_sha,
         "profile_fingerprint": fp, "bindings": bindings,
-        "env_prep": env_prep, "round_evidence": round_evidence,
+        "env_prep": env_prep, "review_mode": review_mode, "round_evidence": round_evidence,
         "overlays_active": [{"id": d["id"], "status": d["stage"]}
                             for d in policy_composition["effective"]],
         "policy_composition": policy_composition,

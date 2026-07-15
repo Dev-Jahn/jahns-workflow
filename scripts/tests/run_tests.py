@@ -6767,6 +6767,12 @@ class OverlayStoreTests(unittest.TestCase):
     def test_add_from_rec_sets_provenance(self):
         with tempfile.TemporaryDirectory() as d:
             root, home = _overlay_project(d)
+            decisions = root / ".waystone" / "improve" / "decisions.jsonl"
+            decisions.parent.mkdir(parents=True)
+            _write_jsonl(decisions, [{
+                "rec_id": "verification_debt/heavy-solo", "decision": "accept",
+                "at": "2026-07-15T00:00:00+00:00",
+            }])
             delta = _add_delta(root, home, from_rec="verification_debt/heavy-solo",
                                pointers=["a.py:1", "b.py:2"], candidate_scope="project_candidate",
                                observed_in=["proj-a", "proj-b"])
@@ -7100,16 +7106,19 @@ class BoundaryWarnTests(unittest.TestCase):
     def test_engine_exception_does_not_propagate(self):
         with tempfile.TemporaryDirectory() as d:
             root, home = _deleg_project(d)
-            orig = overlay.active_deltas
-            overlay.active_deltas = lambda r: (_ for _ in ()).throw(RuntimeError("boom"))
+            orig = overlay._evaluate_boundary
+            overlay._evaluate_boundary = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
             import contextlib
             import io
             try:
                 with contextlib.redirect_stderr(io.StringIO()):
                     events = _run_with_home(home, lambda: overlay.evaluate_boundary(root, "check", {}))
             finally:
-                overlay.active_deltas = orig
-            self.assertEqual(events, [])  # swallowed, host flow protected
+                overlay._evaluate_boundary = orig
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["event"], "evaluation-error")
+            self.assertEqual(events[0]["context"], {
+                "evaluable": False, "fired": False, "coverage_reason": "evaluation-error"})
 
     def test_unknown_active_rule_logs_evaluation_error_and_notice(self):
         import contextlib
@@ -7460,6 +7469,7 @@ class RoundExposureTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {}, clear=False), \
                     contextlib.redirect_stdout(io.StringIO()):
                 os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+                os.environ.pop("CODEX_THREAD_ID", None)
                 rc = _run_with_home(home, lambda: round.close(
                     root, "2026-01-02-close", done=["chore/close-me"],
                     touched=[], commit="HEAD"))
@@ -7640,7 +7650,8 @@ class EvidenceTests(unittest.TestCase):
                  "overlays_active": [],
                  "scope_drift": {
                      "changed_files": [], "coverage_reason": "missing-packet",
-                     "declared_scope": [], "evaluable": False, "outside_scope": [],
+                     "declared_scope": [], "evaluable": False, "fired": False,
+                     "outside_scope": [],
                      "provenance": "unknown", "rule": "packet-declared-scope-v2",
                  },
                  "state": "needs-review", "verification_present": False}])
@@ -10549,6 +10560,8 @@ class L2CGuardTests(unittest.TestCase):
     def test_round_manifest_and_done_guards_fire_without_blocking_close(self):
         import contextlib
         import io
+        import os
+        from unittest import mock
 
         with tempfile.TemporaryDirectory() as d:
             root, home = _round_review_project(d)
@@ -10556,6 +10569,9 @@ class L2CGuardTests(unittest.TestCase):
             cfg = (root / ".waystone.yml").read_text().replace(
                 "last_round_commit: null", f"last_round_commit: {base}")
             (root / ".waystone.yml").write_text(cfg)
+            tasks = (root / "tasks.yaml").read_text().replace(
+                "    deps: []\n", "    deps: []\n    scope: [src]\n", 1)
+            (root / "tasks.yaml").write_text(tasks)
             (root / "pyproject.toml").write_text("[project]\nname='demo'\n")
             git(root, "add", "-A")
             git(root, "commit", "-qm", "manifest mutation")
@@ -10563,9 +10579,17 @@ class L2CGuardTests(unittest.TestCase):
                        rule="env-manifest-mutation-v1")
             _add_delta(root, home, delta_id="verification_debt/done",
                        rule="done-without-evidence-v1")
+            sessions = root / ".waystone" / "improve" / "sessions.jsonl"
+            sessions.parent.mkdir(parents=True, exist_ok=True)
+            _write_jsonl(sessions, [{
+                "project": "demo", "kind": "main", "session_id": "s-main",
+                "verification": {"runs": 0, "failed": 0},
+                "build": {"runs": 0, "failed": 0},
+            }])
 
             err = io.StringIO()
-            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "s-main"}), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
                 rc = _run_with_home(home, lambda: round.close(
                     root, "2026-07-15-r1", done=["chore/close-me"], touched=[], commit="HEAD"))
             self.assertEqual(rc, 0)
@@ -10587,10 +10611,13 @@ class L2CGuardTests(unittest.TestCase):
         round_record = {
             "round_id": "r1", "evaluable": True,
             "changed_files": ["pyproject.toml"], "manifest_paths": ["pyproject.toml"],
-            "env_prep_changed": False,
+            "env_prep_before": None, "env_prep_after": None,
+            "env_prep_change_kind": "unchanged",
             "task_scopes": {"feat/deps": ["pyproject.toml"]},
-            "done_evidence": [{"task_id": "feat/deps", "verification": False,
-                               "verify": True, "verdict": False}],
+            "task_scope_coverage": {"feat/deps": "explicit"},
+            "done_evidence": [{"task_id": "feat/deps", "evaluable": True,
+                               "positive": True,
+                               "evidence_kind": "satisfied-apply-verdict"}],
             "done_task_ids": ["feat/deps"],
         }
         self.assertEqual(overlay.evaluate_env_manifest_mutation(round_record)["fires"], [])
@@ -10598,11 +10625,12 @@ class L2CGuardTests(unittest.TestCase):
 
     def test_review_ingest_resets_two_close_streak_and_replay_is_deterministic(self):
         rounds = [
-            {"round_id": "r1", "at": "2026-07-15T00:00:00+00:00"},
-            {"round_id": "r2", "at": "2026-07-15T02:00:00+00:00"},
-            {"round_id": "r3", "at": "2026-07-15T04:00:00+00:00"},
+            {"round_id": "r1", "at": "2026-07-15T00:00:00+00:00", "review_mode": "packet"},
+            {"round_id": "r2", "at": "2026-07-15T02:00:00+00:00", "review_mode": "packet"},
+            {"round_id": "r3", "at": "2026-07-15T04:00:00+00:00", "review_mode": "packet"},
         ]
-        ingests = [{"round_id": "r1", "at": "2026-07-15T01:00:00+00:00"}]
+        ingests = [{"event": "review-feedback", "source": "packet-ingest",
+                    "round_id": "r1", "at": "2026-07-15T01:00:00+00:00"}]
         out = overlay.evaluate_review_skipped_closes(rounds, ingests, consecutive=2)
         self.assertEqual(out["fires"], ["r3"])
         self.assertEqual(out, overlay.evaluate_review_skipped_closes(
@@ -10617,6 +10645,7 @@ class L2CGuardTests(unittest.TestCase):
                 (exposure / f"round-r{number}.json").write_text(_json.dumps({
                     "schema": "waystone-round-exposure-1", "round_id": f"r{number}",
                     "at": f"2026-07-15T0{number}:00:00+00:00",
+                    "review_mode": "packet",
                 }))
             _add_delta(root, home, delta_id="review_association/skipped",
                        rule="review-skipped-closes-v1")
@@ -10740,6 +10769,315 @@ class L2CImproveFeedbackTests(unittest.TestCase):
             self.assertEqual(delta["after"]["fire_rate"], 1.0)
             self.assertEqual(delta["after"]["finding_recurrences"]["scope"], 1)
             self.assertLessEqual(len(lens["examples"]), 5)
+
+
+class L2CAdversarialFixTests(unittest.TestCase):
+    """L2-C adversarial findings: honest coverage, canonical joins, and stable populations."""
+
+    def test_f1_invalid_task_scope_is_unknown_and_never_blocks_close(self):
+        import contextlib
+        import io
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _round_review_project(d)
+            tasks = (root / "tasks.yaml").read_text().replace(
+                "    deps: []\n", "    deps: []\n    scope: [../outside]\n", 1)
+            (root / "tasks.yaml").write_text(tasks)
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                rc = _run_with_home(home, lambda: round.close(
+                    root, "2026-07-15-invalid-scope", done=["chore/close-me"],
+                    touched=[], commit="HEAD"))
+            self.assertEqual(rc, 0)
+            exposure = _json.loads((overlay._exposure_dir(root) /
+                                    "round-2026-07-15-invalid-scope.json").read_text())
+            self.assertIs(exposure["round_evidence"]["evaluable"], False)
+            self.assertEqual(exposure["round_evidence"]["coverage_reason"],
+                             "task-scope-invalid")
+
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _round_review_project(d)
+            with mock.patch.object(
+                    overlay, "_capture_round_evidence", side_effect=RuntimeError("snapshot")), \
+                    contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                rc = _run_with_home(home, lambda: round.close(
+                    root, "2026-07-15-snapshot-error", done=["chore/close-me"],
+                    touched=[], commit="HEAD"))
+            self.assertEqual(rc, 0)
+            exposure = _json.loads((overlay._exposure_dir(root) /
+                                    "round-2026-07-15-snapshot-error.json").read_text())
+            evidence = exposure["round_evidence"]
+            self.assertEqual(
+                {key: evidence[key] for key in ("evaluable", "fired", "coverage_reason")},
+                {"evaluable": False, "fired": False,
+                 "coverage_reason": "round-snapshot-error"})
+
+    def test_f2_done_evidence_requires_satisfied_apply_or_structured_main_verification(self):
+        row = {
+            "round_evidence": {
+                "done_task_ids": ["feat/apply", "feat/discard", "feat/direct-unknown"],
+                "done_evidence": [
+                    {"task_id": "feat/apply", "evaluable": True, "positive": True,
+                     "evidence_kind": "satisfied-apply-verdict"},
+                    {"task_id": "feat/discard", "evaluable": True, "positive": False,
+                     "evidence_kind": "discard-verdict"},
+                    {"task_id": "feat/direct-unknown", "evaluable": False, "positive": False,
+                     "coverage_reason": "main-verification-unavailable"},
+                ],
+            },
+        }
+        out = overlay.evaluate_done_without_evidence(row)
+        self.assertIs(out["evaluable"], True)
+        self.assertIs(out["fired"], True)
+        self.assertEqual(out["fires"], ["feat/discard"])
+        self.assertEqual(out["unknown_task_ids"], ["feat/direct-unknown"])
+
+        unknown = overlay.evaluate_done_without_evidence({
+            "round_evidence": {
+                "done_task_ids": ["feat/direct"],
+                "done_evidence": [{"task_id": "feat/direct", "evaluable": False,
+                                   "positive": False,
+                                   "coverage_reason": "main-verification-unavailable"}],
+            },
+        })
+        self.assertIs(unknown["evaluable"], False)
+        self.assertIs(unknown["fired"], False)
+        self.assertEqual(unknown["coverage_reason"], "main-verification-unavailable")
+
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _deleg_project(d)
+            self.assertEqual(_deleg_run(root, home, _deleg_fake({"impl.py": "x\n"})), 0)
+            rec = _latest_rec(root, home)
+            _write_apply_verdict(rec)
+            index, errors = overlay._delegation_evidence_index(root)
+            self.assertEqual(errors, 0)
+            self.assertIs(index["feat/xyz"][0]["positive"], True)
+
+            verdict_path = rec / "artifact" / "verdict-1.json"
+            verdict = _json.loads(verdict_path.read_text())
+            verdict["decision"] = "discard"
+            verdict_path.write_text(_json.dumps(verdict) + "\n")
+            index, errors = overlay._delegation_evidence_index(root)
+            self.assertEqual(errors, 0)
+            self.assertIs(index["feat/xyz"][0]["positive"], False)
+            self.assertEqual(index["feat/xyz"][0]["evidence_kind"], "discard-verdict")
+
+    def test_f3_review_feedback_is_canonical_pr_unknown_and_reclose_counts_once(self):
+        rounds = [
+            {"round_id": "r1", "at": "2026-07-15T00:00:00+00:00", "review_mode": "pr",
+             "_file": "/x/round-r1.json"},
+            {"round_id": "r1", "at": "2026-07-15T00:01:00+00:00", "review_mode": "pr",
+             "_file": "/x/round-r1-2.json"},
+        ]
+        out = overlay.evaluate_review_skipped_closes(rounds, [], consecutive=2)
+        self.assertEqual(out["opportunities"], 0)
+        self.assertEqual(out["unevaluable_pr_state"], 1)
+        self.assertEqual(len(out["by_round"]), 1)
+        self.assertIs(out["by_round"][0]["evaluable"], False)
+        self.assertEqual(out["by_round"][0]["coverage_reason"], "pr-state-unavailable")
+
+        facts = {
+            "cycle_fresh": True, "approved_at_head": True, "codex_fresh": True,
+            "findings_resolved": True, "pro_result_at_head": True,
+            "reviewers": ["codex", "pro-reviewer"], "round_id": "r1",
+            "latest_cycle": 2, "current_head": "a" * 40,
+        }
+        event = review.completed_pr_feedback_event(facts, 17)
+        self.assertEqual(event["event"], "review-feedback")
+        self.assertEqual(event["source"], "pr-marker")
+        self.assertEqual(event["round_id"], "r1")
+
+    def test_f4_transition_phases_dedupe_evaluations_and_findings_by_round(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _overlay_project(d)
+            (root / ".waystone.yml").write_text("version: 1\nproject: demo\n")
+            (root / "tasks.yaml").write_text("version: 1\nproject: demo\ntasks: []\n")
+            delta = _add_delta(
+                root, home, delta_id="worker_scope_drift/phases",
+                rule="delegation-scope-drift-v1")
+            delta["created_at"] = "2026-07-15T02:00:00+00:00"
+            delta["transitions"] = [
+                {"to": "observing", "at": "2026-07-15T02:00:00+00:00"},
+                {"to": "suspended", "at": "2026-07-15T04:00:00+00:00"},
+            ]
+            delta["status"] = "suspended"
+            delta["replay"] = {"evaluations": [
+                {"round_id": "r0", "subject_id": "did-0", "snapshot": "snap-0",
+                 "opportunities": 1, "fires": 1},
+                {"round_id": "r1", "subject_id": "did-1", "snapshot": "snap-1",
+                 "opportunities": 1, "fires": 1},
+                {"round_id": "r2", "subject_id": "did-2", "snapshot": "snap-2",
+                 "opportunities": 1, "fires": 1},
+            ]}
+            overlay._write_delta(root, delta)
+            exposures = [
+                {"round_id": "r0", "at": "2026-07-15T01:00:00+00:00", "_file": "/x/r0"},
+                {"round_id": "r1", "at": "2026-07-15T03:00:00+00:00", "_file": "/x/r1"},
+                {"round_id": "r2", "at": "2026-07-15T05:00:00+00:00", "_file": "/x/r2"},
+            ]
+            warnings = [
+                {"at": "2026-07-15T03:10:00+00:00", "boundary": "check",
+                 "rule": "delegation-scope-drift-v1", "event": "evaluation",
+                 "delta_id": delta["id"],
+                 "context": {"round_id": "r1", "delegation_id": "did-1",
+                             "snapshot": "snap-1", "fired": True},
+                 "source_pointer": "/w:1"},
+                {"at": "2026-07-15T03:11:00+00:00", "boundary": "check",
+                 "rule": "delegation-scope-drift-v1", "event": "evaluation",
+                 "delta_id": delta["id"],
+                 "context": {"round_id": "r1", "delegation_id": "did-1",
+                             "snapshot": "snap-1", "fired": True},
+                 "source_pointer": "/w:2"},
+                {"at": "2026-07-15T05:10:00+00:00", "boundary": "check",
+                 "rule": "delegation-scope-drift-v1", "event": "evaluation",
+                 "delta_id": delta["id"],
+                 "context": {"round_id": "r2", "delegation_id": "did-2",
+                             "snapshot": "snap-2", "fired": True},
+                 "source_pointer": "/w:3"},
+            ]
+            reviews = [
+                {"round_id": "r0", "findings": [{"status": "REAL", "type": "scope"}]},
+                {"round_id": "r1", "findings": [{"status": "REAL", "type": "scope"}]},
+                {"round_id": "r2", "findings": [{"status": "REAL", "type": "scope"}]},
+            ]
+            observation = _run_with_home(home, lambda: improve._adaptive_feedback_observation(
+                "demo", root, reviews, warnings, exposures, {}))
+            fact = observation["facts"]["deltas"][0]
+            self.assertEqual(fact["pre_active"]["opportunities"], 1)
+            self.assertEqual(fact["active"]["opportunities"], 1)
+            self.assertEqual(fact["post_suspend"]["opportunities"], 1)
+            self.assertEqual(fact["active"]["finding_occurrences"]["scope"], 1)
+
+    def test_f5_all_new_rules_report_tri_state_and_unevaluable_reasons(self):
+        missing = {"schema": "waystone-round-exposure-1", "round_id": "old",
+                   "at": "2026-07-15T00:00:00+00:00"}
+        for evaluator in (overlay.evaluate_env_manifest_mutation,
+                          overlay.evaluate_done_without_evidence):
+            out = evaluator(missing)
+            self.assertEqual(set(("evaluable", "fired", "coverage_reason")) - set(out), set())
+            self.assertIs(out["evaluable"], False)
+            self.assertIs(out["fired"], False)
+        drift = common.delegation_scope_drift(Path("/definitely/missing"))
+        self.assertEqual(set(("evaluable", "fired", "coverage_reason")) - set(drift), set())
+
+    def test_f6_from_rec_is_one_to_one_timestamp_bound_and_rejections_are_factual(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _overlay_project(d)
+            decisions = root / ".waystone" / "improve" / "decisions.jsonl"
+            decisions.parent.mkdir(parents=True)
+            _write_jsonl(decisions, [{
+                "rec_id": "worker_scope_drift/one", "decision": "accept",
+                "at": "2026-07-15T00:00:00+00:00",
+            }])
+            _add_delta(root, home, delta_id="worker_scope_drift/first",
+                       rule="delegation-scope-drift-v1", from_rec="worker_scope_drift/one")
+            with self.assertRaises(common.WorkflowError):
+                _add_delta(root, home, delta_id="worker_scope_drift/second",
+                           rule="delegation-scope-drift-v1", from_rec="worker_scope_drift/one")
+
+            _write_jsonl(decisions, [{
+                "rec_id": "worker_scope_drift/bad-time", "decision": "accept",
+                "at": "not-an-iso-timestamp",
+            }])
+            loaded, skipped = improve._load_decisions(root)
+            self.assertEqual(loaded, [])
+            self.assertEqual(skipped, 1)
+
+    def test_f6_accept_after_delta_is_quarantined_from_adaptive_statistics(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _overlay_project(d)
+            (root / ".waystone.yml").write_text("version: 1\nproject: demo\n")
+            (root / "tasks.yaml").write_text("version: 1\nproject: demo\ntasks: []\n")
+            decisions = root / ".waystone" / "improve" / "decisions.jsonl"
+            decisions.parent.mkdir(parents=True)
+            _write_jsonl(decisions, [{
+                "rec_id": "worker_scope_drift/forged", "decision": "accept",
+                "at": "2026-07-15T02:00:00+00:00",
+            }])
+            overlay._write_delta(root, {
+                "schema": "waystone-delta-1", "id": "worker_scope_drift/forged",
+                "rule": "delegation-scope-drift-v1", "status": "observing",
+                "created_at": "2026-07-15T01:00:00+00:00", "transitions": [],
+                "evidence": {"source": "improve-rec", "rec_id": "worker_scope_drift/forged"},
+            })
+            observation = _run_with_home(home, lambda: improve._adaptive_feedback_observation(
+                "demo", root, [], [], [], {}))
+            facts = observation["facts"]
+            self.assertEqual(facts["deltas"], [])
+            self.assertEqual(facts["coverage"]["accept_delta_conflicts"],
+                             {"accept-after-delta": 1})
+
+    def test_f7_warning_context_is_normalized_once_before_any_consumer(self):
+        rows = [
+            {"at": "2026-07-15T00:00:00+00:00", "boundary": "delegate-run",
+             "rule": "delegation-scope-drift-v1", "event": "conflict", "delta_id": "d",
+             "context": {"task_id": "feat/a", "delegation_id": "did-b",
+                         "delta_ids": ["d", "other"], "resolution": "least-restrictive"},
+             "source_pointer": "/w:1"},
+            {"at": "2026-07-15T00:01:00+00:00", "boundary": "delegate-run",
+             "rule": "delegation-scope-drift-v1", "event": "evaluation", "delta_id": "d",
+             "context": {"task_id": "feat/b", "delegation_id": "did-b", "fired": False},
+             "source_pointer": "/w:2"},
+        ]
+        normalized, coverage = improve._normalize_warning_rows(rows, {"did-b": "feat/b"})
+        self.assertEqual(len(normalized), 1)
+        self.assertEqual(coverage, {"conflicting-context": 1})
+        self.assertEqual(normalized[0]["task_ids"], ["feat/b"])
+
+    def test_f8_manifest_vocabulary_and_meaningful_env_prep_semantics(self):
+        for path in ("composer.lock", "pom.xml", "gradle.lockfile", "Package.resolved",
+                     "go.sum", "Cargo.lock"):
+            self.assertTrue(overlay._is_dependency_manifest(path), path)
+        removed = overlay.evaluate_env_manifest_mutation({"round_evidence": {
+            "evaluable": True, "manifest_paths": ["pom.xml"], "task_scopes": {"feat/x": ["src"]},
+            "task_scope_coverage": {"feat/x": "explicit"},
+            "env_prep_before": ["uv sync"], "env_prep_after": None,
+            "env_prep_change_kind": "removed",
+        }})
+        self.assertIs(removed["evaluable"], True)
+        self.assertIs(removed["fired"], True)
+        self.assertEqual(removed["fires"], ["pom.xml"])
+        unknown = overlay.evaluate_env_manifest_mutation({"round_evidence": {
+            "evaluable": True, "manifest_paths": ["pom.xml"], "task_scopes": {},
+            "task_scope_coverage": {"feat/x": "scope-unknown"},
+            "env_prep_before": None, "env_prep_after": None,
+            "env_prep_change_kind": "unchanged",
+        }})
+        self.assertIs(unknown["evaluable"], False)
+        self.assertEqual(unknown["coverage_reason"], "task-scope-unknown")
+        updated = overlay.evaluate_env_manifest_mutation({"round_evidence": {
+            "evaluable": False, "coverage_reason": "task-scope-unknown",
+            "manifest_paths": ["pom.xml"], "task_scopes": {},
+            "task_scope_coverage": {"feat/x": "task-scope-unknown"},
+            "env_prep_before": None, "env_prep_after": ["mvn dependency:go-offline"],
+            "env_prep_change_kind": "added",
+        }})
+        self.assertIs(updated["evaluable"], True)
+        self.assertIs(updated["fired"], False)
+
+    def test_f9_round_snapshot_builds_delegation_index_and_capture_once(self):
+        import contextlib
+        import io
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _round_review_project(d)
+            tasks = (root / "tasks.yaml").read_text().replace(
+                "  - id: fix/finding-a", "  - id: chore/second\n    title: a second task close\n"
+                "    status: active\n    deps: []\n  - id: fix/finding-a")
+            (root / "tasks.yaml").write_text(tasks)
+            with mock.patch.object(overlay, "_delegation_evidence_index",
+                                   wraps=overlay._delegation_evidence_index) as index, \
+                    mock.patch.object(overlay, "_capture_round_evidence",
+                                      wraps=overlay._capture_round_evidence) as capture, \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                rc = _run_with_home(home, lambda: round.close(
+                    root, "2026-07-15-one-scan", done=["chore/close-me", "chore/second"],
+                    touched=[], commit="HEAD"))
+            self.assertEqual(rc, 0)
+            self.assertEqual(index.call_count, 1)
+            self.assertEqual(capture.call_count, 1)
 
 
 class L2DPolicyMachineTests(unittest.TestCase):

@@ -326,6 +326,7 @@ def classify(markers: list[dict], current_head: str, macro_reviewers: tuple = ()
     return {
         "current_head": current_head,
         "latest_cycle": cyc,
+        "round_id": (lc or {}).get("round_id"),
         "frozen_sha": frozen,
         "frozen_base": frozen_base,
         "cycle_conflict": conflict,
@@ -335,6 +336,30 @@ def classify(markers: list[dict], current_head: str, macro_reviewers: tuple = ()
         "findings_resolved": findings_resolved,
         "n_results": len(results),
         "n_approvals": len(approvals),
+    }
+
+
+def completed_pr_feedback_event(facts: dict, pr: int) -> dict | None:
+    """Project a fully completed canonical PR review cycle to the shared feedback event shape."""
+    reviewers = facts.get("reviewers")
+    if not isinstance(reviewers, list):
+        return None
+    round_id = facts.get("round_id")
+    cycle = facts.get("latest_cycle")
+    head = facts.get("current_head")
+    if (not isinstance(round_id, str) or not round_id or round_id == "(unset)"
+            or type(cycle) is not int or not _is_sha(head)
+            or facts.get("cycle_fresh") is not True or facts.get("approved_at_head") is not True):
+        return None
+    if "codex" in reviewers and (facts.get("codex_fresh") is not True
+                                 or facts.get("findings_resolved") is not True):
+        return None
+    if any(reviewer != "codex" for reviewer in reviewers) \
+            and facts.get("pro_result_at_head") is not True:
+        return None
+    return {
+        "event": "review-feedback", "source": "pr-marker", "round_id": round_id,
+        "event_id": f"pr:{pr}:cycle:{cycle}:head:{head}",
     }
 
 
@@ -678,6 +703,15 @@ def status(root: Path, pr: int | None) -> int:
         print(f"  pro result@head:{facts['pro_result_at_head']}  ({facts['n_results']} result(s))")
         print(f"  findings resolved: {facts['findings_resolved']}")
         print(f"  approved@head:  {facts['approved_at_head']}  ({facts['n_approvals']} approval(s))")
+        event = completed_pr_feedback_event(facts, pr)
+        if event is not None:
+            try:
+                import overlay
+                overlay.record_review_feedback(
+                    root, event["round_id"], source=event["source"], event_id=event["event_id"])
+            except Exception as e:  # noqa: BLE001 — feedback observation never changes status exit
+                print(f"review status: overlay PR feedback observation unavailable ({e}) — "
+                      "status still succeeded", file=sys.stderr)
         return 0
     cfg = load_config(root)  # packet-mode status uses the local config (no PR to read a base from)
     rdir = root / cfg["reviews_dir"]
