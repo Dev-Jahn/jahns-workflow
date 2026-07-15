@@ -6021,6 +6021,29 @@ class MigrationV2Phase2Tests(unittest.TestCase):
             self.assertIn(str(codex / "profile.yml"), str(cm.exception))
             self.assertFalse((root / ".waystone" / "profile.yml").exists())
 
+    def test_staged_legacy_profile_conflict_fails_even_when_live_exists(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = self._project(Path(d))
+            first = self._source(home, "claude")
+            first.mkdir(parents=True)
+            (first / "profile.yml").write_text(self.PROFILE)
+            _run_with_home(home, lambda: common.migrate_project_state(root))
+            live = root / ".waystone" / "profile.yml"
+            self.assertEqual(live.read_text(), self.PROFILE)
+
+            reentry = self._source(home, "codex", plain=True)
+            reentry.mkdir(parents=True)
+            conflicting = self.PROFILE.replace("gpt-test", "gpt-other")
+            incoming = reentry / "profile.yml"
+            incoming.write_text(conflicting)
+
+            with self.assertRaises(common.WorkflowError) as cm:
+                _run_with_home(home, lambda: common.migrate_project_state(root))
+
+            self.assertIn("profile", str(cm.exception))
+            self.assertEqual(live.read_text(), self.PROFILE)
+            self.assertEqual(incoming.read_text(), conflicting)
+
     def test_symlinked_project_state_is_rejected_without_external_write(self):
         with tempfile.TemporaryDirectory() as d:
             root, home = self._project(Path(d))
@@ -6085,6 +6108,52 @@ class MigrationV2Phase2Tests(unittest.TestCase):
             self.assertIn("same-rule", str(cm.exception))
             self.assertTrue(all(path.is_file() for path in paths))
             self.assertFalse((root / ".waystone" / "overlay").exists())
+
+    def test_staged_overlay_rule_conflict_with_live_fails_and_preserves_source(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = self._project(Path(d))
+            slug = common._project_slug(root)
+            first = self._source(home, "claude") / "overlay" / slug / "deltas" / "alpha.json"
+            first.parent.mkdir(parents=True)
+            first.write_text(_json.dumps({"id": "alpha", "rule": "same-rule", "state": "warning"}))
+            _run_with_home(home, lambda: common.migrate_project_state(root))
+            live = root / ".waystone" / "overlay" / "deltas" / "alpha.json"
+            live_body = live.read_bytes()
+
+            incoming = (self._source(home, "codex", plain=True) / "overlay" / slug /
+                        "deltas" / "beta.json")
+            incoming.parent.mkdir(parents=True)
+            incoming.write_text(
+                _json.dumps({"id": "beta", "rule": "same-rule", "state": "suspended"}))
+
+            with self.assertRaises(common.WorkflowError) as cm:
+                _run_with_home(home, lambda: common.migrate_project_state(root))
+
+            self.assertIn("same-rule", str(cm.exception))
+            self.assertEqual(live.read_bytes(), live_body)
+            self.assertTrue(incoming.is_file())
+            self.assertFalse((live.parent / "beta.json").exists())
+
+    def test_staged_byte_identical_overlay_rule_cleans_incoming_source(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = self._project(Path(d))
+            slug = common._project_slug(root)
+            first = self._source(home, "claude") / "overlay" / slug / "deltas" / "alpha.json"
+            first.parent.mkdir(parents=True)
+            first.write_text(_json.dumps({"id": "alpha", "rule": "same-rule"}))
+            _run_with_home(home, lambda: common.migrate_project_state(root))
+            live = root / ".waystone" / "overlay" / "deltas" / "alpha.json"
+            live_body = live.read_bytes()
+
+            incoming = (self._source(home, "codex", plain=True) / "overlay" / slug /
+                        "deltas" / "copy.json")
+            incoming.parent.mkdir(parents=True)
+            incoming.write_bytes(live.read_bytes())
+            _run_with_home(home, lambda: common.migrate_project_state(root))
+
+            self.assertFalse(incoming.exists())
+            self.assertFalse((live.parent / "copy.json").exists())
+            self.assertEqual(live.read_bytes(), live_body)
 
     def test_newer_general_conflict_wins_and_loser_is_quarantined(self):
         import contextlib
@@ -6194,6 +6263,69 @@ class MigrationV2Phase2Tests(unittest.TestCase):
             self.assertTrue(all(record.is_dir() for record in collisions))
             self.assertIn("did-collision", err.getvalue())
             self.assertIn("skipped", err.getvalue())
+
+    def test_staged_different_live_did_skips_and_preserves_whole_record(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            root, home = self._project(Path(d))
+            slug = common._project_slug(root)
+            first = self._source(home, "claude") / "delegations" / slug / "did-staged"
+            first.mkdir(parents=True)
+            (first / "exposure.json").write_text(_json.dumps({"task_id": "feat/demo"}))
+            (first / "status.json").write_text(_json.dumps({"state": "needs-review"}))
+            _run_with_home(home, lambda: common.migrate_project_state(root))
+            live = root / ".waystone" / "delegations" / "did-staged"
+            before = {
+                path.relative_to(live): path.read_bytes()
+                for path in live.rglob("*") if path.is_file()
+            }
+
+            incoming = (self._source(home, "codex", plain=True) / "delegations" / slug /
+                        "did-staged")
+            incoming.mkdir(parents=True)
+            (incoming / "exposure.json").write_text(_json.dumps({"task_id": "feat/demo"}))
+            (incoming / "status.json").write_text(_json.dumps({"state": "failed"}))
+            (incoming / "incoming-only.json").write_text(_json.dumps({"keep": True}))
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                _run_with_home(home, lambda: common.migrate_project_state(root))
+
+            after = {
+                path.relative_to(live): path.read_bytes()
+                for path in live.rglob("*") if path.is_file()
+            }
+            self.assertEqual(after, before)
+            self.assertTrue((incoming / "exposure.json").is_file())
+            self.assertTrue((incoming / "status.json").is_file())
+            self.assertTrue((incoming / "incoming-only.json").is_file())
+            self.assertIn("did-staged", err.getvalue())
+            self.assertIn("skipped", err.getvalue())
+
+    def test_staged_byte_identical_live_did_removes_source_as_one_record(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = self._project(Path(d))
+            slug = common._project_slug(root)
+            first = self._source(home, "claude") / "delegations" / slug / "did-identical"
+            first.mkdir(parents=True)
+            (first / "exposure.json").write_text(_json.dumps({"task_id": "feat/demo"}))
+            (first / "status.json").write_text(_json.dumps({"state": "needs-review"}))
+            _run_with_home(home, lambda: common.migrate_project_state(root))
+            live = root / ".waystone" / "delegations" / "did-identical"
+
+            incoming = (self._source(home, "codex", plain=True) / "delegations" / slug /
+                        "did-identical")
+            incoming.mkdir(parents=True)
+            for path in live.iterdir():
+                if path.is_file():
+                    (incoming / path.name).write_bytes(path.read_bytes())
+            _run_with_home(home, lambda: common.migrate_project_state(root))
+
+            self.assertFalse(incoming.exists())
+            empty_copy = (root / ".waystone" / "migration-conflicts" / "codex" /
+                          "empty-sources" / "delegations" / "did-identical")
+            self.assertFalse(empty_copy.exists())
 
     def _legacy_record_and_worktree(self, root: Path, home: Path, did: str):
         slug = common._project_slug(root)

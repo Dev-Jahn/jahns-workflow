@@ -690,8 +690,9 @@ def _profile_seed(root: Path, state: Path, sources: list[tuple[str, Path]]) -> N
     )
 
 
-def _overlay_rule_conflicts(root: Path, sources: list[tuple[str, Path]], slug: str) -> None:
-    by_rule: dict[str, dict[str, list[Path]]] = {}
+def _overlay_rule_conflicts(
+        root: Path, state: Path, sources: list[tuple[str, Path]], slug: str) -> set[Path]:
+    by_rule: dict[str, list[tuple[str, Path, bytes, bool]]] = {}
     for host, source in sources:
         deltas = source / "overlay" / slug / "deltas"
         if not _real_directory(deltas, "legacy overlay deltas directory"):
@@ -705,12 +706,58 @@ def _overlay_rule_conflicts(root: Path, sources: list[tuple[str, Path]], slug: s
             rule = delta.get("rule") if isinstance(delta, dict) else None
             if not isinstance(rule, str) or not rule:
                 raise WorkflowError(f"legacy overlay delta has no rule id: {path}")
-            by_rule.setdefault(rule, {}).setdefault(host, []).append(path)
-    for rule, hosts in sorted(by_rule.items()):
-        if "claude" in hosts and "codex" in hosts:
-            paths = ", ".join(str(path) for paths in hosts.values() for path in paths)
+            by_rule.setdefault(rule, []).append((host, path, path.read_bytes(), False))
+
+    live_deltas = state / "overlay" / "deltas"
+    if _real_directory(live_deltas, "live overlay deltas directory"):
+        for path in sorted(live_deltas.glob("*.json")):
+            _regular_file(path, "live overlay delta")
+            try:
+                delta = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as e:
+                raise WorkflowError(f"live overlay delta unreadable: {path} ({e})")
+            rule = delta.get("rule") if isinstance(delta, dict) else None
+            if not isinstance(rule, str) or not rule:
+                raise WorkflowError(f"live overlay delta has no rule id: {path}")
+            by_rule.setdefault(rule, []).append(("live", path, path.read_bytes(), True))
+
+    cleanup: set[Path] = set()
+    for rule, entries in sorted(by_rule.items()):
+        incoming = [entry for entry in entries if not entry[3]]
+        incoming_hosts = {entry[0] for entry in incoming}
+        live = [entry for entry in entries if entry[3]]
+        if not incoming or (not live and len(incoming_hosts) < 2):
+            continue
+        if len({entry[2] for entry in entries}) != 1:
+            paths = ", ".join(str(entry[1]) for entry in entries)
             raise WorkflowError(
                 f"overlay rule-id conflict {rule!r} for {root}: {paths}; human selection required")
+        if live:
+            cleanup.update(entry[1] for entry in incoming)
+        else:
+            cleanup.update(entry[1] for entry in incoming[1:])
+    return cleanup
+
+
+def _record_snapshot(record: Path, label: str) -> tuple[tuple[str, str, bytes], ...]:
+    _real_directory(record, label)
+    rows: list[tuple[str, str, bytes]] = []
+    pending = [record]
+    while pending:
+        directory = pending.pop()
+        for path in sorted(directory.iterdir()):
+            mode = path.lstat().st_mode
+            relative = str(path.relative_to(record))
+            if stat.S_ISLNK(mode):
+                raise WorkflowError(f"migration refuses symlink in {label}: {path}")
+            if stat.S_ISDIR(mode):
+                rows.append((relative, "directory", b""))
+                pending.append(path)
+            elif stat.S_ISREG(mode):
+                rows.append((relative, "file", path.read_bytes()))
+            else:
+                raise WorkflowError(f"migration refuses unsupported entry in {label}: {path}")
+    return tuple(sorted(rows))
 
 
 def _delegation_sources(
@@ -898,14 +945,13 @@ def migrate_project_state(root: Path, home: Path | None = None) -> bool:
             _regular_file(source / "profile.yml", "legacy profile")
             for _host, source in sources)
         profile_needs_seed = profiles_present and not _lexists(state / "profile.yml")
-        _overlay_rule_conflicts(root, sources, slug)
-        if profile_needs_seed:
-            profiles = [(host, source / "profile.yml") for host, source in sources
-                        if (source / "profile.yml").is_file()]
-            if len({path.read_bytes() for _host, path in profiles}) != 1:
-                paths = ", ".join(str(path) for _host, path in profiles)
-                raise WorkflowError(
-                    f"legacy profile conflict for {root}: {paths}; choose the project profile manually")
+        profiles = [(host, source / "profile.yml") for host, source in sources
+                    if _regular_file(source / "profile.yml", "legacy profile")]
+        if len({path.read_bytes() for _host, path in profiles}) > 1:
+            paths = ", ".join(str(path) for _host, path in profiles)
+            raise WorkflowError(
+                f"legacy profile conflict for {root}: {paths}; choose the project profile manually")
+        migrated_overlay_paths = _overlay_rule_conflicts(root, state, sources, slug)
 
         resume = [(host, source / "resume" / f"{slug}.md") for host, source in sources]
         start_here = [(host, source / "start_here" / f"{slug}.md") for host, source in sources]
@@ -924,6 +970,8 @@ def migrate_project_state(root: Path, home: Path | None = None) -> bool:
             return False
 
         _ensure_project_state_raw(root)
+        for path in migrated_overlay_paths:
+            path.unlink()
         for did, (old, new, marker) in pending_worktrees.items():
             if not _lexists(new):
                 if not _lexists(old):
@@ -940,6 +988,18 @@ def migrate_project_state(root: Path, home: Path | None = None) -> bool:
 
         blocked = set()
         for did, candidates in delegations.items():
+            live_record = state / "delegations" / did
+            if _lexists(live_record):
+                live_snapshot = _record_snapshot(live_record, "live delegation record")
+                if all(
+                        _record_snapshot(record, "legacy delegation record") == live_snapshot
+                        for _host, record in candidates):
+                    for _host, record in candidates:
+                        shutil.rmtree(record)
+                    continue
+                blocked.add(did)
+                _warn_did_collision(did, candidates)
+                continue
             if len(candidates) > 1:
                 blocked.add(did)
                 _warn_did_collision(did, candidates)
