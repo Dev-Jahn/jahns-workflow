@@ -17,7 +17,6 @@ See dev_docs/0.8.0-m1-implementation-notes.md for the binding spec.
 """
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import os
@@ -38,7 +37,8 @@ import yaml  # noqa: E402
 
 from common import (  # noqa: E402
     WorkflowError, _project_slug, ensure_project_state_dir, find_project_root, git_full_sha,
-    load_config, load_tasks, migrate_project_state, project_state_path, worktrees_cache_dir,
+    hold_lock, load_config, load_tasks, migrate_project_state, project_lock_path,
+    project_state_path, worktrees_cache_dir,
 )
 
 DELEG_REF_NS = "refs/waystone/delegations"
@@ -866,46 +866,6 @@ def _verify_paths(rec: Path) -> list[Path]:
                   key=number)
 
 
-def _acquire_verify_lock(rec: Path):
-    """Serialize verify with an OS lock; an unlocked marker left by a dead process is stale."""
-    lock = rec / "verify.lock"
-    try:
-        stream = lock.open("a+", encoding="utf-8")
-    except OSError as e:
-        raise _RefusedWrite(f"cannot create delegation verify lock {lock}: {e}")
-    try:
-        fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        stream.close()
-        raise WorkflowError(f"delegation {rec.name} verify already in progress")
-    except OSError as e:
-        stream.close()
-        raise _RefusedWrite(f"cannot lock delegation verify marker {lock}: {e}")
-    try:
-        stream.seek(0)
-        stream.truncate()
-        stream.write(f"pid={os.getpid()} at={_now_iso()}\n")
-        stream.flush()
-    except OSError as e:
-        stream.close()
-        raise _RefusedWrite(f"cannot write delegation verify lock {lock}: {e}")
-    return lock, stream
-
-
-def _release_verify_lock(lock: Path, stream) -> None:
-    try:
-        lock.unlink()
-    except FileNotFoundError:
-        pass
-    except OSError as e:
-        print(f"waystone delegate verify: could not remove verify lock {lock} ({e})", file=sys.stderr)
-    finally:
-        try:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
-        finally:
-            stream.close()
-
-
 def _write_verify_artifact(rec: Path, artifact: dict) -> Path:
     """Create the next verify artifact without overwriting a concurrently appearing filename."""
     n = len(_verify_paths(rec)) + 1
@@ -929,45 +889,41 @@ def verify_delegation(root: Path, did: str) -> int:
     if state != "needs-review":
         raise WorkflowError(
             f"delegation {did} is {state} — only a needs-review delegation can be verified")
-    lock, lock_stream = _acquire_verify_lock(rec)
+    profile, _fingerprint = _load_profile(root)
+    binding = _resolve_verifier_binding(profile, root)
+    script = _companion_script() if binding["execution"] == "codex-companion" else None
+    contract = _load_contract(rec)
+    exposure = _load_exposure(rec)
+    patch = _validate_verify_contract(rec, contract, exposure)
+    worktree = _worktree_path(root, did)
+    _normalize_verify_worktree(worktree, contract, patch)
+    focus = _verify_focus(rec, contract)
+    model = binding["backend"].split(":", 1)[1]
+    if binding["execution"] == "codex-companion":
+        args = ["node", str(script), "adversarial-review", "--json", "--wait", "--scope",
+                "working-tree", "-C", str(worktree), "-m", model, focus]
+        rc, stdout = _run_companion(worktree, args, rec)
+        print(_cleanup_companion_broker(worktree))
+        transport = "codex-companion:adversarial-review"
+    else:
+        rc, stdout = _run_codex_verifier(worktree, model, focus, rec)
+        transport = "codex-exec:read-only"
+    if rc != 0:
+        raise WorkflowError(
+            f"independent verifier failed (rc {rc}) — delegation remains needs-review")
     try:
-        profile, _fingerprint = _load_profile(root)
-        binding = _resolve_verifier_binding(profile, root)
-        script = _companion_script() if binding["execution"] == "codex-companion" else None
-        contract = _load_contract(rec)
-        exposure = _load_exposure(rec)
-        patch = _validate_verify_contract(rec, contract, exposure)
-        worktree = _worktree_path(root, did)
-        _normalize_verify_worktree(worktree, contract, patch)
-        focus = _verify_focus(rec, contract)
-        model = binding["backend"].split(":", 1)[1]
-        if binding["execution"] == "codex-companion":
-            args = ["node", str(script), "adversarial-review", "--json", "--wait", "--scope",
-                    "working-tree", "-C", str(worktree), "-m", model, focus]
-            rc, stdout = _run_companion(worktree, args, rec)
-            print(_cleanup_companion_broker(worktree))
-            transport = "codex-companion:adversarial-review"
-        else:
-            rc, stdout = _run_codex_verifier(worktree, model, focus, rec)
-            transport = "codex-exec:read-only"
-        if rc != 0:
-            raise WorkflowError(
-                f"independent verifier failed (rc {rc}) — delegation remains needs-review")
-        try:
-            payload = json.loads(stdout)
-        except json.JSONDecodeError as e:
-            raise WorkflowError(
-                f"independent verifier returned invalid JSON ({e}) — delegation remains needs-review")
-        artifact = {
-            "schema": "waystone-verify-1", "at": _now_iso(),
-            "transport": transport, "backend": binding["backend"],
-            "provenance": "independent-verifier", "payload": payload,
-        }
-        out = _write_verify_artifact(rec, artifact)
-        print(f"verify_artifact: {out}")
-        return 0
-    finally:
-        _release_verify_lock(lock, lock_stream)
+        payload = json.loads(stdout)
+    except json.JSONDecodeError as e:
+        raise WorkflowError(
+            f"independent verifier returned invalid JSON ({e}) — delegation remains needs-review")
+    artifact = {
+        "schema": "waystone-verify-1", "at": _now_iso(),
+        "transport": transport, "backend": binding["backend"],
+        "provenance": "independent-verifier", "payload": payload,
+    }
+    out = _write_verify_artifact(rec, artifact)
+    print(f"verify_artifact: {out}")
+    return 0
 
 
 # ---- evaluation path (§12 — apply/discard/show/status) ------------------------
@@ -1132,7 +1088,8 @@ def _resolve_root(explicit: str | None) -> Path:
     root = Path(explicit).resolve() if explicit else find_project_root(Path.cwd())
     if root is None:
         raise WorkflowError("no initialized project (run inside one, or pass --root DIR)")
-    migrate_project_state(root)
+    with hold_lock(project_lock_path(root)):
+        migrate_project_state(root)
     return root
 
 
@@ -1163,21 +1120,30 @@ def _cli_apply(rest: list[str]) -> int:
     pos, opts = _parse_opts(rest, value=("root",))
     if not pos:
         raise WorkflowError("apply requires a <delegation-id>")
-    return apply_delegation(_resolve_root(opts.get("root")), pos[0])
+    root = _resolve_root(opts.get("root"))
+    rec = _load_delegation(root, pos[0])
+    with hold_lock(rec / "record.lock"):
+        return apply_delegation(root, pos[0])
 
 
 def _cli_discard(rest: list[str]) -> int:
     pos, opts = _parse_opts(rest, value=("root",))
     if not pos:
         raise WorkflowError("discard requires a <delegation-id>")
-    return discard_delegation(_resolve_root(opts.get("root")), pos[0])
+    root = _resolve_root(opts.get("root"))
+    rec = _load_delegation(root, pos[0])
+    with hold_lock(rec / "record.lock"):
+        return discard_delegation(root, pos[0])
 
 
 def _cli_verify(rest: list[str]) -> int:
     pos, opts = _parse_opts(rest, value=("root",))
     if not pos:
         raise WorkflowError("verify requires a <delegation-id>")
-    return verify_delegation(_resolve_root(opts.get("root")), pos[0])
+    root = _resolve_root(opts.get("root"))
+    rec = _load_delegation(root, pos[0])
+    with hold_lock(rec / "record.lock"):
+        return verify_delegation(root, pos[0])
 
 
 _HANDLERS = {"run": _cli_run, "status": _cli_status, "show": _cli_show,

@@ -31,7 +31,10 @@ import yaml  # noqa: E402
 
 import round  # noqa: E402  — reuse the AST-bounded text-surgery helpers
 import validate  # noqa: E402
-from common import find_project_root, load_tasks  # noqa: E402
+from common import (  # noqa: E402
+    WorkflowError, find_project_root, hold_lock, load_tasks, migrate_project_state,
+    project_lock_path,
+)
 
 ARCHIVE_NAME = "tasks.archive.yaml"
 ARCHIVE_THRESHOLD = 100   # only archive once the registry has at least this many tasks
@@ -320,7 +323,23 @@ def main(argv: list[str]) -> int:
         root = _resolve_root(explicit)
         if root is None:
             print("waystone task: no initialized project (run inside one, or pass its path)", file=sys.stderr)
+            return None
+        try:
+            # Lazy migration has its own short lock span before the verb's body lock.
+            with hold_lock(project_lock_path(root)):
+                migrate_project_state(root)
+        except (WorkflowError, OSError) as e:
+            print(f"waystone task: migration failed: {e}", file=sys.stderr)
+            return None
         return root
+
+    def mutate(root: Path, callback) -> int:
+        try:
+            with hold_lock(project_lock_path(root)):
+                return callback()
+        except WorkflowError as e:
+            print(e, file=sys.stderr)
+            return 1
 
     if sub == "list":
         root = need_root(pos[0] if pos else None)
@@ -362,7 +381,7 @@ def main(argv: list[str]) -> int:
                 fields[k] = opts[k]
         if opts.get("deps"):
             fields["deps"] = [x.strip() for x in opts["deps"].split(",") if x.strip()]
-        return cmd_add(root, fields)
+        return mutate(root, lambda: cmd_add(root, fields))
     if sub == "set":
         if len(pos) < 3:
             print("waystone task set: <id> <field> <value> required", file=sys.stderr)
@@ -373,7 +392,7 @@ def main(argv: list[str]) -> int:
         root = need_root(pos[3] if len(pos) > 3 else None)
         if root is None:
             return 1
-        return cmd_set(root, pos[0], pos[1], pos[2])
+        return mutate(root, lambda: cmd_set(root, pos[0], pos[1], pos[2]))
     if sub == "drop":
         if not pos:
             print("waystone task drop: <id> required", file=sys.stderr)
@@ -381,7 +400,7 @@ def main(argv: list[str]) -> int:
         root = need_root(pos[1] if len(pos) > 1 else None)
         if root is None:
             return 1
-        return cmd_set(root, pos[0], "status", "dropped")
+        return mutate(root, lambda: cmd_set(root, pos[0], "status", "dropped"))
     if sub == "archive":
         root = need_root(pos[0] if pos else None)
         if root is None:
@@ -395,7 +414,7 @@ def main(argv: list[str]) -> int:
         if threshold < 0 or keep < 0:
             print("waystone task archive: --threshold/--keep must be >= 0", file=sys.stderr)
             return 1
-        return cmd_archive(root, threshold, keep)
+        return mutate(root, lambda: cmd_archive(root, threshold, keep))
 
     print(f"waystone task: unknown subcommand {sub!r}\n{__doc__}", file=sys.stderr)
     return 1

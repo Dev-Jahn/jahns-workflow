@@ -42,7 +42,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import yaml  # noqa: E402
 
 from common import (  # noqa: E402
-    CONFIG_NAME, find_project_root, git_full_sha, load_config, normalize_config,
+    CONFIG_NAME, WorkflowError, find_project_root, git_full_sha, hold_lock, load_config,
+    migrate_project_state, normalize_config, project_lock_path,
 )
 
 CODEX_BOT = "chatgpt-codex-connector[bot]"  # REST `user.login` form
@@ -657,6 +658,12 @@ def main(argv: list[str]) -> int:
     root = _root(rest)
     if root is None:
         print("review: no initialized project (missing .waystone.yml)", file=sys.stderr)
+        return 1
+    try:
+        with hold_lock(project_lock_path(root)):
+            migrate_project_state(root)
+    except (WorkflowError, OSError) as e:
+        print(f"waystone review: migration failed: {e}", file=sys.stderr)
         return 1
     if sub == "ingest":
         return ingest(root, _opt(rest, "--round"), reviewer=_opt(rest, "--reviewer"))

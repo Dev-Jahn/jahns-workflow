@@ -26,7 +26,8 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import (  # noqa: E402
-    ROUND_RE, WorkflowError, find_project_root, git_full_sha, load_config,
+    ROUND_RE, WorkflowError, find_project_root, git_full_sha, hold_lock, load_config,
+    migrate_project_state, project_lock_path,
 )
 
 
@@ -301,7 +302,17 @@ def main() -> int:
     if not round_id:
         print("round close: --round <id> is required", file=sys.stderr)
         return 1
-    return close(root, round_id, _parse_ids(opt("--done")), _parse_ids(opt("--touched")), opt("--commit") or "HEAD")
+    try:
+        # Phase-2 migration is a separate pre-verb span; close then owns one project-lock span from
+        # preflight through exposure/warn recording. Nested libraries must not acquire it again.
+        with hold_lock(project_lock_path(root)):
+            migrate_project_state(root)
+        with hold_lock(project_lock_path(root)):
+            return close(root, round_id, _parse_ids(opt("--done")),
+                         _parse_ids(opt("--touched")), opt("--commit") or "HEAD")
+    except WorkflowError as e:
+        print(e, file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

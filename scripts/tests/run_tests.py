@@ -97,6 +97,41 @@ class LockPrimitiveTests(unittest.TestCase):
                 stream.close()
 
 
+class LockWiringTests(unittest.TestCase):
+    def test_task_set_times_out_with_holder_details_and_no_write(self):
+        import os
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "repo"
+            home = Path(d) / "home"
+            root.mkdir()
+            home.mkdir()
+            (root / ".waystone.yml").write_text("version: 1\nproject: x\n")
+            (root / "tasks.yaml").write_text(TASKS_FIXTURE)
+            before = (root / "tasks.yaml").read_bytes()
+            lock = common.project_state_path(root) / "lock"
+            env = os.environ.copy()
+            env.update({
+                "HOME": str(home),
+                "WAYSTONE_HOME": str(home / ".waystone"),
+                "WAYSTONE_HOST": "codex",
+                "WAYSTONE_LOCK_TIMEOUT": "0.2",
+            })
+            with mock.patch.dict(os.environ, {"WAYSTONE_HOST": "codex"}, clear=False), \
+                    mock.patch.object(sys, "argv", ["waystone.py", "round", "close"]), \
+                    common.hold_lock(lock, timeout=0.2):
+                result = subprocess.run([
+                    sys.executable, str(SCRIPTS / "waystone.py"), "task", "set",
+                    "feat/alpha", "status", "done", str(root),
+                ], capture_output=True, text=True, env=env, timeout=5)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(str(lock), result.stderr)
+            self.assertIn("pid ", result.stderr)
+            self.assertIn("codex, round close", result.stderr)
+            self.assertEqual((root / "tasks.yaml").read_bytes(), before)
+
+
 class MarkerTests(unittest.TestCase):
     def test_emit_parse_roundtrip(self):
         s = review.emit_marker("review-cycle", {"round_id": "2026-06-15-x", "cycle": 1,
@@ -866,12 +901,12 @@ class WaystoneStorageCliTests(unittest.TestCase):
             self.assertEqual(paths["exposure"], str(state / "exposure"))
             self.assertEqual(paths["profile"], str(state / "profile.yml"))
             self.assertEqual(paths["project_improve"], str(state / "improve"))
-            self.assertFalse(state.exists())
+            self.assertEqual({p.name for p in state.iterdir()}, {".gitignore", "lock"})
             rc, human, err = self._capture(
                 home, Path(d), ["paths", "--root", str(root)])
             self.assertEqual((rc, err), (0, ""))
             self.assertIn(f"project_state: {state}", human)
-            self.assertFalse(state.exists())
+            self.assertEqual({p.name for p in state.iterdir()}, {".gitignore", "lock"})
 
     def test_dispatcher_runs_lazy_migration_for_explicit_project_root(self):
         with tempfile.TemporaryDirectory() as d:
@@ -893,7 +928,7 @@ class WaystoneStorageCliTests(unittest.TestCase):
                 (root / ".waystone" / "start-here.md").read_text(), "CLI-EXPLICIT-FRONTIER")
             self.assertFalse(source.exists())
 
-    def test_empty_state_readers_do_not_create_project_state(self):
+    def test_empty_state_readers_create_only_persistent_lock_state(self):
         import contextlib
         import io
 
@@ -910,7 +945,7 @@ class WaystoneStorageCliTests(unittest.TestCase):
                     home, lambda: delegate.main(["status", "--root", str(root)])), 0)
                 self.assertEqual(_run_with_home(
                     home, lambda: overlay.main(["list", "--root", str(root)])), 0)
-            self.assertFalse(state.exists())
+            self.assertEqual({p.name for p in state.iterdir()}, {".gitignore", "lock"})
 
     def test_project_register_list_unregister_roundtrip_is_atomic(self):
         import json as _json
@@ -979,7 +1014,10 @@ class WaystoneStorageCliTests(unittest.TestCase):
             self.assertEqual(rc, 2)
             self.assertIn("replace failed", err)
             self.assertEqual(registry.read_bytes(), original.encode())
-            self.assertEqual([p.name for p in registry.parent.iterdir()], ["projects.json"])
+            self.assertEqual(
+                sorted(p.name for p in registry.parent.iterdir()),
+                ["projects.json", "registry.lock"],
+            )
 
     def test_project_register_preserves_existing_union(self):
         import json as _json
@@ -5675,64 +5713,46 @@ class DelegateVerifyTests(unittest.TestCase):
             self.assertEqual(called["n"], 0)
 
     def test_concurrent_verify_is_refused_by_record_lock(self):
-        import threading
+        import contextlib
+        import io
+        import os
+        from unittest import mock
+
         with tempfile.TemporaryDirectory() as d:
             root, home, rec, worktree, plugin = self._setup(d, committed=False)
-            entered = threading.Event()
-            release = threading.Event()
-            calls_lock = threading.Lock()
             calls = {"n": 0}
-            first_errors = []
 
             def fake(*args):
-                with calls_lock:
-                    calls["n"] += 1
-                    number = calls["n"]
-                if number == 1:
-                    entered.set()
-                    release.wait(5)
-                return (0, _json.dumps({"run": number}))
+                calls["n"] += 1
+                return (0, _json.dumps({"run": calls["n"]}))
 
-            def exercise():
-                def first():
-                    try:
-                        delegate.verify_delegation(root, rec.name)
-                    except Exception as e:  # captured for assertion in the main test thread
-                        first_errors.append(e)
+            err = io.StringIO()
+            with mock.patch.dict(os.environ, {"WAYSTONE_LOCK_TIMEOUT": "0.02"}, clear=False), \
+                    common.hold_lock(rec / "record.lock", timeout=0.2), \
+                    contextlib.redirect_stderr(err):
+                rc = _run_with_home(home, lambda: self._with_companion(
+                    fake, lambda: delegate.main(
+                        ["verify", rec.name, "--root", str(root)])))
+            self.assertEqual(rc, 1)
+            self.assertIn("record.lock is held", err.getvalue())
+            self.assertEqual(calls["n"], 0)
 
-                orig = delegate._run_companion
-                delegate._run_companion = fake
-                thread = threading.Thread(target=first)
-                try:
-                    thread.start()
-                    self.assertTrue(entered.wait(5))
-                    with self.assertRaises(delegate.WorkflowError) as cm:
-                        delegate.verify_delegation(root, rec.name)
-                    self.assertIn("verify already in progress", str(cm.exception))
-                finally:
-                    release.set()
-                    thread.join(5)
-                    delegate._run_companion = orig
-                self.assertFalse(thread.is_alive())
-
-            _run_with_home(home, exercise)
-            self.assertEqual(first_errors, [])
-            self.assertEqual(calls["n"], 1)
-
-    def test_stale_verify_lock_is_reclaimed(self):
+    def test_unlocked_record_lock_marker_is_reused_and_preserved(self):
         import os
+
         with tempfile.TemporaryDirectory() as d:
             root, home, rec, worktree, plugin = self._setup(d, committed=False)
-            lock = rec / "verify.lock"
+            lock = rec / "record.lock"
             lock.write_text("stale fixture\n")
-            os.utime(lock, (0, 0))
 
             def fake(*args):
                 return (0, "{}")
 
-            _run_with_home(home, lambda: self._with_companion(
-                fake, lambda: delegate.verify_delegation(root, rec.name)))
-            self.assertFalse(lock.exists())
+            rc = _run_with_home(home, lambda: self._with_companion(
+                fake, lambda: delegate.main(["verify", rec.name, "--root", str(root)])))
+            self.assertEqual(rc, 0)
+            self.assertTrue(lock.exists())
+            self.assertEqual(_json.loads(lock.read_text())["pid"], os.getpid())
 
     def test_verify_artifact_name_collision_never_overwrites(self):
         with tempfile.TemporaryDirectory() as d:

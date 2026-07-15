@@ -134,6 +134,17 @@ def registry_path(home: Path | None = None) -> Path:
     return machine_dir(home) / "projects.json"
 
 
+# Any nested acquisition must follow this single order: registry -> project -> record. Never acquire
+# in reverse. Locking belongs to CLI/hook entry points; library functions below remain lock-free so
+# composed verbs such as round close cannot deadlock themselves on flock's non-reentrant semantics.
+def registry_lock_path(home: Path | None = None) -> Path:
+    return machine_dir(home) / "registry.lock"
+
+
+def project_lock_path(root: Path) -> Path:
+    return ensure_project_state_dir(root) / "lock"
+
+
 def _lock_verb() -> str:
     """Best-effort diagnostic verb; flock, not this label, is the lock authority."""
     argv = [str(arg) for arg in sys.argv]

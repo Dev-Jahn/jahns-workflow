@@ -27,8 +27,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from common import (  # noqa: E402
-    WorkflowError, _project_slug, ensure_project_state_dir, find_project_root, load_config,
-    migrate_project_state, project_state_path,
+    WorkflowError, _project_slug, ensure_project_state_dir, find_project_root, hold_lock,
+    load_config, migrate_project_state, project_lock_path, project_state_path,
 )
 
 # delta-id grammar mirrors the improve rec_id (`<lens>/<kebab-gist>`, S2) so a rec materialises to a
@@ -623,7 +623,8 @@ def _resolve_root(explicit: str | None) -> Path:
     root = Path(explicit).resolve() if explicit else find_project_root(Path.cwd())
     if root is None:
         raise WorkflowError("no initialized project (run inside one, or pass --root DIR)")
-    migrate_project_state(root)
+    with hold_lock(project_lock_path(root)):
+        migrate_project_state(root)
     return root
 
 
@@ -638,12 +639,14 @@ def _cli_add(rest: list[str]) -> int:
         raise WorkflowError("add requires --rule <rule-id>")
     if opts.get("summary") is None:
         raise WorkflowError("add requires --summary <text>")
-    delta = add_delta(
-        _resolve_root(opts.get("root")), pos[0], rule=opts["rule"], summary=opts["summary"],
-        pointers=opts.get("pointers"), expected_effect=opts.get("expected-effect", ""),
-        risk=opts.get("risk", ""), candidate_scope=opts.get("candidate-scope", "unresolved"),
-        observed_in=opts.get("observed-in") or None, from_rec=opts.get("from-rec"),
-        title=opts.get("title", ""))
+    root = _resolve_root(opts.get("root"))
+    with hold_lock(project_lock_path(root)):
+        delta = add_delta(
+            root, pos[0], rule=opts["rule"], summary=opts["summary"],
+            pointers=opts.get("pointers"), expected_effect=opts.get("expected-effect", ""),
+            risk=opts.get("risk", ""), candidate_scope=opts.get("candidate-scope", "unresolved"),
+            observed_in=opts.get("observed-in") or None, from_rec=opts.get("from-rec"),
+            title=opts.get("title", ""))
     print(f"added delta {delta['id']} ({delta['status']})")
     return 0
 
@@ -671,7 +674,9 @@ def _cli_promote(rest: list[str]) -> int:
     pos, opts = _parse_opts(rest, value=("root",))
     if not pos:
         raise WorkflowError("promote requires a <delta-id>")
-    delta = promote(_resolve_root(opts.get("root")), pos[0])
+    root = _resolve_root(opts.get("root"))
+    with hold_lock(project_lock_path(root)):
+        delta = promote(root, pos[0])
     print(f"promoted {delta['id']} -> {delta['status']}")
     return 0
 
@@ -680,7 +685,9 @@ def _cli_demote(rest: list[str]) -> int:
     pos, opts = _parse_opts(rest, value=("root",))
     if not pos:
         raise WorkflowError("demote requires a <delta-id>")
-    delta = demote(_resolve_root(opts.get("root")), pos[0])
+    root = _resolve_root(opts.get("root"))
+    with hold_lock(project_lock_path(root)):
+        delta = demote(root, pos[0])
     print(f"demoted {delta['id']} -> {delta['status']}")
     return 0
 
@@ -689,7 +696,9 @@ def _cli_suspend(rest: list[str]) -> int:
     pos, opts = _parse_opts(rest, value=("root", "note"))
     if not pos:
         raise WorkflowError("suspend requires a <delta-id>")
-    delta = suspend(_resolve_root(opts.get("root")), pos[0], note=opts.get("note"))
+    root = _resolve_root(opts.get("root"))
+    with hold_lock(project_lock_path(root)):
+        delta = suspend(root, pos[0], note=opts.get("note"))
     print(f"suspended {delta['id']}")
     return 0
 
@@ -698,7 +707,9 @@ def _cli_retire(rest: list[str]) -> int:
     pos, opts = _parse_opts(rest, value=("root", "note"))
     if not pos:
         raise WorkflowError("retire requires a <delta-id>")
-    delta = retire(_resolve_root(opts.get("root")), pos[0], note=opts.get("note"))
+    root = _resolve_root(opts.get("root"))
+    with hold_lock(project_lock_path(root)):
+        delta = retire(root, pos[0], note=opts.get("note"))
     print(f"retired {delta['id']}")
     return 0
 
@@ -707,7 +718,9 @@ def _cli_replay(rest: list[str]) -> int:
     pos, opts = _parse_opts(rest, value=("root",))
     if not pos:
         raise WorkflowError("replay requires a <delta-id>")
-    report = replay(_resolve_root(opts.get("root")), pos[0])
+    root = _resolve_root(opts.get("root"))
+    with hold_lock(project_lock_path(root)):
+        report = replay(root, pos[0])
     print(json.dumps(report, ensure_ascii=False, sort_keys=True))
     rate = "null" if report["fire_rate"] is None else f"{report['fire_rate']:.4f}"
     print(f"would have fired {report['fires']}/{report['opportunities']} times (fire rate {rate}). "

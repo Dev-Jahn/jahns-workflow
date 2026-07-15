@@ -242,13 +242,33 @@ def _migrate_command_project(argv: list[str]) -> None:
         if root is None or root in seen:
             continue
         seen.add(root)
-        common.migrate_project_state(root)
+        with common.hold_lock(common.project_lock_path(root)):
+            common.migrate_project_state(root)
+
+
+def _module_handles_phase2(argv: list[str]) -> bool:
+    """Whitelist modules whose direct CLI entry point performs its own one-time lazy migration."""
+    if not argv:
+        return False
+    if argv[0] in {"task", "review", "delegate", "overlay", "check", "roadmap"}:
+        return True
+    return argv[0] == "round" and len(argv) > 1 and argv[1] == "close"
 
 
 def main(argv: list[str]) -> int:
+    group = argv[0] if argv else None
     try:
-        common.migrate_home_data()
-        if argv:
+        # Lock acquisition order is registry -> project -> record. Project registry verbs keep the
+        # registry lock across Phase 1, their optional Phase 2 migration, and the registry RMW so a
+        # single CLI entry acquires this lock exactly once.
+        if group == "project":
+            with common.hold_lock(common.registry_lock_path()):
+                common.migrate_home_data()
+                _migrate_command_project(argv)
+                return _project_main(argv[1:])
+        with common.hold_lock(common.registry_lock_path()):
+            common.migrate_home_data()
+        if argv and not _module_handles_phase2(argv):
             _migrate_command_project(argv)
     except common.WorkflowError as e:
         print(f"waystone migration: {e}", file=sys.stderr)
@@ -282,8 +302,6 @@ def main(argv: list[str]) -> int:
         return overlay.main(["check", *rest])
     if group == "paths":
         return _paths_main(rest)
-    if group == "project":
-        return _project_main(rest)
     if group == "remote":
         import importlib
         mod = importlib.import_module("remote")
