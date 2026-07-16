@@ -214,11 +214,12 @@ tasks:
     deps: ["feat/review-pending-ledger"]
     origin: "사용자 설계 요청 (2026-07-16)"
   - id: fix/preflight-probe-isolation
+    result: "위임 2차 패치(sibling 격리·기록 내구성·stale 정리) + main 마무리(실용 최소 ruling): seatbelt/sandbox-exec 어휘·macOS 힌트, probe 내부 결함의 정직한 internal 분류(transport 위장 금지), 분류기=heuristic hint 문서화(양방향 완전성 불추구). RED 기록: 위임 7계약 + main 2계약(사전 failures=2). 653 OK, ruff 클린."
     accept: ["프로브가 본 worktree를 오염시킬 수 없다 — 동일 cache·filesystem 조건의 일회용 sibling worktree에서 실행 후 폐기하거나, 동일 worktree 유지 시 프로브 전후 tracked·untracked·ignored manifest byte 대조로 reserved 외 변경을 fail-loud하고 원상 검증 후에만 본 러너를 기동한다", "stderr 분류 패턴이 양방향 정확화된다 — 무관 permission-denied가 오분류되지 않고 어순 변형 Landlock 실패가 탐지된다", "프로브 실패의 transport(인증·네트워크) 원인이 sandbox 문제로 오진되지 않고 구분 기록된다", "프로브 비용(시간)이 record에 계상된다", "전체 테스트 스위트(신규 계약 테스트는 RED-first)와 ruff F401,F841 검사가 통과한다", "분류 재현 케이스 통과: 'Landlock setup failed: permission denied'=sandbox, 성공 서술('correctly denied … all tests passed')=hint 미발화, bwrap network namespace 실패=transport 아닌 sandbox (순서·lookahead 어휘 보정 + 케이스 고정 테스트)", "프로브 증거 수집 실패(파일 chmod 000, stderr 읽기 오류 등)가 예외로 새지 않고 probe 결과와 duration이 실패 경로에서도 기록된다 (계약 테스트)", "sibling worktree 생성 타임아웃/부분 성공이 stale 등록을 남기지 않는다 — 생성 시도를 기록 후 정리를 책임지고, 잔존 시 다음 run이 명시 진단과 함께 자동 정리 또는 안전 중단한다"]
     notes: "출처: fix/runner-env-failure-detection 적대 리뷰(blocker 0, major 4·minor 3). 수용 근거: 분류 게이트는 conjunctive(정직 무변경+report 보호 확인), 오류 방향이 fail-loud라 silent 성공보다 보수적. 잔여: 프로브 후 상태 검증(reserved 파일만 확인 중), 패턴 anchoring, 오진 구분, hint 토큰 오탐(‘all Landlock tests passed’), 프로브 duration 미계상, 실 bwrap/seatbelt 무테스트."
     scope: ["scripts"]
     title: "프리플라이트 프로브 경화: 프로브(모델 턴)가 남긴 프로브 외 편집이 main run patch에 출처 오염 가능 — 프로브 후 git 상태 대조·정리 필수; stderr 패턴 양방향 정확화(무관 permission-denied 오분류/어순 변형 Landlock 미탐); 프로브 실패의 transport(인증·네트워크) vs sandbox 구분; 프로브 비용 기록·계상"
-    status: "pending"
+    status: "done"
     severity: "major"
     origin: "review-raw-adversarial-20260716"
   - id: fix/reply-header-residuals
@@ -248,8 +249,9 @@ tasks:
     severity: "major"
     origin: "사용자 결정 (2026-07-17)"
   - id: chore/hook-matrix-normal-mode-coverage
+    accept: ["plugin hooks.json에 등록된 전 hook 스크립트(boundary_check + verifier_guard 경유 전체, nudge/session_context/resume 포함)가 정상 모드(WAYSTONE_VERIFIER_SESSION 부재)에서 실 subprocess로 기대 동작을 내는 회귀 테스트가 존재한다", "hermetic 모드(WAYSTONE_VERIFIER_SESSION=1)와 정상 모드의 hook별 동작 차이가 같은 매트릭스에서 명시적으로 고정된다", "hook 테스트가 호출 환경의 HOME을 상속하지 않는다 (테스트 자체 HOME 고정)", "전체 테스트 스위트(신규 계약은 RED-first)와 ruff F401,F841 검사가 통과한다"]
     notes: "전신 chore/verifier-guard-residuals-2(드롭됨)에서 생존한 항목 — broker 관련 항목(RPC 완료 대기, pre-cleanup fail-closed)은 fix/drop-codex-companion의 companion 전면 제거로 소멸."
-    scope: ["scripts"]
+    scope: ["scripts", "hooks"]
     title: "hook-matrix 회귀를 정상 모드(가드 부재)까지 확장: nudge, session_context, resume 포함 전 hook의 실 subprocess 동작을 양 모드에서 고정 (HOME 상속 정리 포함)"
     status: "pending"
     severity: "minor"
@@ -269,7 +271,7 @@ tasks:
     deps: ["fix/execution-surface-dep-gating"]
     origin: "review-raw-adversarial-20260716"
   - id: fix/review-feedback-triage-discipline
-    accept: ["feedback 파일 구조가 '메타데이터 헤더 + verbatim 회신 + 맨 끝 마커로 구분된 triage 섹션'이 된다 — ingest가 마커 포함 skeleton을 append하고, 신설 waystone review triage 명령이 마커 구간만 교체하며 교체 전후 앞부분이 byte-identical함을 계약 테스트로 고정", "review triage 명령은 마커 부재/손상 시 조용한 재생성 없이 시끄럽게 거부한다", "improve/overlay projection의 reviewer_configured·review_target_matches가 저장 boolean 신뢰 없이 projection 시점에 feedback 헤더 재파싱+binding 대조로 재계산된다 — 파일/헤더/binding 부재나 파싱 실패는 정직한 null(+사유), 체크섬·스냅샷·봉인 기계는 도입하지 않는다", "32KiB cap을 걸치는(시작<cap<끝) separator가 유효 메타로 읽힌다 (경계 회귀 테스트 포함)", "정규화에 실패한 invalid 값이 raw reply_metadata로 병행 노출되지 않는다", "review skill의 triage 절차가 파일 직접 편집 대신 신설 명령 사용으로 갱신된다", "전체 테스트 스위트(신규 계약 테스트는 RED-first)와 ruff F401,F841 검사가 통과한다"]
+    accept: ["feedback 파일 구조가 '메타데이터 헤더 + verbatim 회신 + 맨 끝 마커로 구분된 triage 섹션'이 된다 — ingest가 마커 포함 skeleton을 append하고, 신설 waystone review triage 명령이 마커 구간만 교체하며 교체 전후 앞부분이 byte-identical함을 계약 테스트로 고정", "review triage 명령은 마커 부재/손상 시 조용한 재생성 없이 시끄럽게 거부한다", "improve/overlay projection의 reviewer_configured·review_target_matches가 저장 boolean 신뢰 없이 projection 시점에 feedback 헤더 재파싱+binding 대조로 재계산된다 — 파일/헤더/binding 부재나 파싱 실패는 정직한 null(+사유), 체크섬·스냅샷·봉인 기계는 도입하지 않는다", "32KiB cap을 걸치는(시작<cap<끝) separator가 유효 메타로 읽힌다 (경계 회귀 테스트 포함)", "정규화에 실패한 invalid 값이 raw reply_metadata로 병행 노출되지 않는다", "review skill의 triage 절차가 파일 직접 편집 대신 신설 명령 사용으로 갱신된다", "전체 테스트 스위트(신규 계약 테스트는 RED-first)와 ruff F401,F841 검사가 통과한다", "reviewer 회신 본문이 마커 문자열을 인용해도 triage가 영구 거부에 빠지지 않고 verbatim 바이트가 교체로 파괴되지 않는다 — 마커 탐지는 내용 전역 검색이 아닌 구조 앵커(마지막 BEGIN + EOF 종단 END, 또는 ingest 기록 offset 권위)로 하며 인용 충돌 계약 테스트 포함", "같은 표준 키의 유효 선언 뒤 손상(invalid-UTF8) 중복 선언이 오면 그 키는 None이고 어떤 값도 raw reply_metadata로 부활하지 않는다", "feedback 헤더에 기록된 round가 projection의 기대 round와 다르면(파일 복사/개명) configured가 아니라 null+round-mismatch 사유로 투영된다"]
     scope: ["scripts", "skills"]
     title: "feedback 파일 쓰기 규율로 회신 검증 단순화: triage를 마커 구분 섹션으로 분리하고 script가 그 구간만 교체(앞쪽 verbatim 불가침), projection은 저장 boolean 대신 읽기 시점 재파싱+binding 대조로 재계산 — 체크섬/봉인 불채택(ruling 2026-07-17)"
     status: "pending"
@@ -301,3 +303,14 @@ tasks:
   - id: chore/remove-codex-companion-transport
     title: "codex-companion transport 완전 제거 — codex backend verifier를 호스트 불문 codex exec로 통일, ultra effort 관통, WAYSTONE_HOST 분기·legacy transport 정리"
     status: "dropped"
+  - id: chore/overengineering-prune-batch1
+    title: "오버엔지니어링 전수조사 A-2 순삭제 묶음: discard 재개 시 reason 정확 재현 강제 제거, packet 3중 검사에서 claim측 다이제스트 재도출 축약, improve._review_sha_binding dead wrapper 삭제, _finding_evidence의 '..' 경로 거부 제거 (근거: dev_docs/overengineering-audit-2026-07-17.md)"
+    status: "pending"
+    severity: "minor"
+    origin: "overengineering-audit-20260717"
+  - id: fix/reply-header-parser-simplification
+    title: "회신 헤더 파서 corner 기계 제거: byte cap 내 줄별 UnicodeDecodeError 복구·중복 키 특례·surrogate 거부를 '통 decode 실패=헤더 없음' 한 줄로 대체, read_feedback_reply_metadata의 자기 산출물 적대 재검증 제거 (근거: audit 부위 2)"
+    status: "pending"
+    severity: "minor"
+    deps: ["fix/review-feedback-triage-discipline"]
+    origin: "overengineering-audit-20260717"
