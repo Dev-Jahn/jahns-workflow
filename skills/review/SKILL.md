@@ -38,7 +38,7 @@ waystone review ingest . --round <round-id>
 ```
 
 The reply itself must begin with the request template's key/value block: `model`, `effort`, and
-`review-target` (`<target-sha>` or `<base-sha>-<target-sha>`, 6–40 hex characters each). Key
+`review-target` (`<target-sha>` or `<base-sha>-<target-sha>`, 12–40 hex characters each). Key
 case/order/colon whitespace and an optional Markdown fence are tolerated; extra keys are preserved.
 Missing, duplicate, invalid, or non-UTF-8 values stay unknown, and a leading key/value block with
 neither `model` nor `review-target` is ordinary prose. Ingest compares the declaration only with the

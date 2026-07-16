@@ -2350,10 +2350,15 @@ class IngestTests(unittest.TestCase):
 
         round_skill = (SCRIPTS.parent / "skills/round/SKILL.md").read_text()
         review_skill = (SCRIPTS.parent / "skills/review/SKILL.md").read_text()
-        for text in (round_skill, review_skill):
-            for token in ("model", "effort", "review-target", "Markdown fence", "extra keys",
-                          "ordinary prose"):
-                self.assertIn(token, text)
+        # Reviewer-facing semantics live ONCE, statically, in the template (user ruling
+        # 2026-07-17); the round skill only pins keep-the-block-verbatim, ingest semantics
+        # stay in the review skill.
+        self.assertIn("reply-header block verbatim", round_skill)
+        self.assertNotIn("Markdown fence", round_skill)
+        for token in ("model", "effort", "review-target", "Markdown fence", "extra keys",
+                      "ordinary prose"):
+            self.assertIn(token, review_skill)
+        self.assertIn("12–40 hex", review_skill)
 
     def test_stored_metadata_reader_is_header_bounded_and_revalidates_meaning(self):
         with tempfile.TemporaryDirectory() as d:

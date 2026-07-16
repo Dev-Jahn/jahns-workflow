@@ -105,12 +105,9 @@ tab, wrapping, or spacing variation:
 - Reviewing: <40-lowercase-hex-closeout-sha>   (diff against <40-lowercase-hex-base-sha-or-(root)>)
 ```
 
-Keep the template's three-line reply-header example. It asks the reviewer to begin the reply with
-`model`, `effort`, and `review-target` (`<target-sha>` or `<base-sha>-<target-sha>`, 6–40 hex
-characters each). The ingest parser accepts key case/order/colon whitespace and an optional
-Markdown fence, preserves extra keys, and treats missing, duplicate, invalid, or non-UTF-8 values
-as unknown rather than guessing. A leading key/value block with neither `model` nor
-`review-target` is ordinary prose, not a header.
+Keep the template's reply-header block verbatim — it is the machine-parsed reviewer contract.
+Its semantics are stated once, statically, in the template itself (and, for ingest behavior, in
+the review skill); do not restate or paraphrase them here or in the handoff prompt.
 
 **Packet mode** (`review.mode: packet`, default): bind the authored request while HEAD is still the
 closeout SHA, commit the request and generated binding together, push, then run the round-aware
