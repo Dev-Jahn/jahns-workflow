@@ -270,10 +270,14 @@ verification-finding trend, main direct work/context inflow, repeated warnings, 
 same-delegation verify-run judgment-set reproducibility. Only explicit `--user-wide` analysis writes its
 cross-project user-habit projection and longitudinal metrics under `~/.waystone/improve/`.
 
-Managed project files are also consent-gated: show the exact target, effect, and delete-to-rollback
-path before recording `install.agents` or `install.hooks` acceptance with `waystone consent record`,
-then run `waystone install agents` or `waystone install hooks`.
-These installs refuse overwrite and remain uncommitted for review.
+Managed project surfaces are also consent-gated: show the exact target, effect, and
+delete-to-rollback path before recording `install.agents` or `install.hooks` acceptance with
+`waystone consent record`, then run `waystone install agents` or `waystone install hooks`.
+The agent install targets `.claude/agents/waystone-operator.md` and remains uncommitted for review.
+The hook install creates the self-ignored `.waystone/boundary-hooks-enabled` marker, which enables
+the plugin-owned non-blocking Stop hook in both Claude Code and Codex; deleting the marker disables
+it. It never writes `.claude/settings.json`. When the legacy Waystone Stop hook is found in that
+settings file, the installer reports the manual removal path without modifying user settings.
 
 ## 10. Storage tiers, backup, and cleanup
 

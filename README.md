@@ -162,7 +162,7 @@ Most validation, rendering, bookkeeping, log parsing, and policy checks are plai
 | `waystone overlay promote-user` | Promotes a user-scope candidate only after evidence from at least two registered projects. |
 | `waystone overlay materialize` | Writes a consent-approved, rule-named sanitized policy to `docs/waystone-policy.yaml`, keeps delta provenance only in local state, and leaves the policy uncommitted. |
 | `waystone consent record` | Records candidate-bound user consent for materialization or managed installation. The command group is `waystone consent`. |
-| `waystone install agents` / `waystone install hooks` | Installs a consent-approved managed project agent or hook without overwriting or committing it. The command group is `waystone install`. |
+| `waystone install agents` / `waystone install hooks` | Installs a consent-approved managed project agent or enables the plugin-owned boundary hook. Hook enablement creates `.waystone/boundary-hooks-enabled` for both Claude Code and Codex and never writes `.claude/settings.json`; remove the marker to roll it back. The command group is `waystone install`. |
 | `waystone check` | Evaluates active overlay rules against the current project state; warnings are visible but never block the host command. |
 | `waystone improve evidence` | Deterministically joins review findings and delegation records by task ID into a local evidence log. |
 | `waystone improve metrics` | Appends named §15 metrics and a factual comparison with the previous same-scope snapshot. |

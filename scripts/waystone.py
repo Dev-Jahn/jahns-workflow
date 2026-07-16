@@ -19,7 +19,7 @@ Groups:
   delegate run|status|show|verify|verdict|apply|discard ...  worktree runner + evidence-gated verdict
   overlay  add|...|promote-user|override|materialize|compose ...  four-layer adaptive policy
   consent  record <surface> <choice> ...  append a standard project-local consent event
-  install  agents|hooks [--consent-recorded] ...  consent-gated managed project files
+  install  agents|hooks [--consent-recorded] ...  consent-gated agent install / hook enable marker
   check    [--root DIR]               evaluate active overlay deltas at an explicit boundary (never blocks)
   paths    [--root DIR] [--json]      show resolved machine and project storage paths
   project  register|unregister|alias|list ...  manage the cross-project registry
@@ -172,27 +172,54 @@ def _consent_main(argv: list[str]) -> int:
 
 _INSTALL_TARGETS = {
     "agents": ("waystone-operator-agent.md", Path(".claude/agents/waystone-operator.md")),
-    "hooks": ("waystone-boundary-hook.json", Path(".claude/settings.json")),
+    "hooks": (None, Path(".waystone/boundary-hooks-enabled")),
 }
 
 
-def _install_candidate(root: Path, kind: str) -> tuple[dict, Path, Path, bytes]:
+def _install_candidate(root: Path, kind: str) -> tuple[dict, Path | None, Path, bytes]:
     template_name, relative_target = _INSTALL_TARGETS[kind]
-    source = HERE.parent / "templates" / template_name
     target = root / relative_target
     if os.path.lexists(target):
         raise common.WorkflowError(f"refusing to overwrite existing managed install target {target}")
-    try:
-        payload = source.read_bytes()
-    except OSError as e:
-        raise common.WorkflowError(f"cannot read managed install template {source}: {e}") from e
-    template_hash = common.content_hash(payload)
+    source = HERE.parent / "templates" / template_name if template_name is not None else None
+    payload = b""
+    if source is not None:
+        try:
+            payload = source.read_bytes()
+        except OSError as e:
+            raise common.WorkflowError(f"cannot read managed install template {source}: {e}") from e
     candidate = {
         "kind": kind, "target_path": str(target.resolve()), "stage": "install",
-        "template_hash": template_hash,
     }
+    if source is not None:
+        candidate["template_hash"] = common.content_hash(payload)
     context = {**candidate, "candidate_hash": common.canonical_payload_hash(candidate)}
     return context, source, target, payload
+
+
+def _legacy_boundary_hook_settings(root: Path) -> Path | None:
+    settings = root / ".claude" / "settings.json"
+    if not settings.is_file():
+        return None
+    try:
+        document = json.loads(settings.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(document, dict):
+        return None
+    hooks = document.get("hooks")
+    stop_groups = hooks.get("Stop") if isinstance(hooks, dict) else None
+    if not isinstance(stop_groups, list):
+        return None
+    for group in stop_groups:
+        commands = group.get("hooks") if isinstance(group, dict) else None
+        if not isinstance(commands, list):
+            continue
+        for hook in commands:
+            if (isinstance(hook, dict) and isinstance(hook.get("command"), str)
+                    and hook["command"].strip() == "waystone check"):
+                return settings
+    return None
 
 
 def _install_main(argv: list[str]) -> int:
@@ -222,7 +249,7 @@ def _install_main(argv: list[str]) -> int:
         root = _command_root(root_value)
         surface = f"install.{kind}"
         with common.hold_lock(common.project_lock_path(root)):
-            context, source, target, payload = _install_candidate(root, kind)
+            context, _source, target, payload = _install_candidate(root, kind)
             if consent_recorded:
                 common.record_consent(root, surface, "accept", context)
             if not common.has_accepted_consent(root, surface, context):
@@ -239,9 +266,17 @@ def _install_main(argv: list[str]) -> int:
         print(f"waystone install {kind}: {e}", file=sys.stderr)
         return 1
     except OSError as e:
-        print(f"waystone install {kind}: cannot install managed file — {e}", file=sys.stderr)
+        print(f"waystone install {kind}: cannot install managed surface — {e}", file=sys.stderr)
         return 2
-    print(f"installed {kind}: {target} (left uncommitted)")
+    legacy_settings = _legacy_boundary_hook_settings(root) if kind == "hooks" else None
+    if legacy_settings is not None:
+        print("legacy waystone Stop hook detected in "
+              f"{legacy_settings}; remove that hook from .claude/settings.json after review "
+              "(Waystone did not modify the file)")
+    if kind == "hooks":
+        print(f"enabled hooks: {target} (project-local state)")
+    else:
+        print(f"installed {kind}: {target} (left uncommitted)")
     return 0
 
 

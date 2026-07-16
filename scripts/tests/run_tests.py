@@ -10658,7 +10658,8 @@ class MigrationTests(unittest.TestCase):
         for surface in (
             "waystone consent record install.agents accept",
             "waystone consent record install.hooks accept",
-            "waystone install agents", "waystone install hooks", "left\nuncommitted",
+            "waystone install agents", "waystone install hooks",
+            "agent file is left uncommitted", ".waystone/boundary-hooks-enabled",
         ):
             self.assertIn(surface, text)
 
@@ -11904,7 +11905,7 @@ class L2DPolicyMachineTests(unittest.TestCase):
                     "materialize", delta_id, "--consent-recorded", "--root", str(root)])), 0)
             self.assertTrue((root / "docs" / "waystone-policy.yaml").is_file())
 
-    def test_managed_installs_are_template_exact_uncommitted_and_never_overwrite(self):
+    def test_managed_agent_and_boundary_hook_marker_installs(self):
         import contextlib
         import io
         import waystone
@@ -11919,15 +11920,39 @@ class L2DPolicyMachineTests(unittest.TestCase):
             repo_root = SCRIPTS.parent
             self.assertEqual((root / ".claude" / "agents" / "waystone-operator.md").read_bytes(),
                              (repo_root / "templates" / "waystone-operator-agent.md").read_bytes())
-            self.assertEqual((root / ".claude" / "settings.json").read_bytes(),
-                             (repo_root / "templates" / "waystone-boundary-hook.json").read_bytes())
+            self.assertTrue((root / ".waystone" / "boundary-hooks-enabled").is_file())
+            self.assertFalse((root / ".claude" / "settings.json").exists())
+            self.assertFalse((repo_root / "templates" / "waystone-boundary-hook.json").exists())
             status = git(root, "status", "--short", "--untracked-files=all").stdout
             self.assertIn(".claude/agents/waystone-operator.md", status)
-            self.assertIn(".claude/settings.json", status)
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 rc = _run_with_home(home, lambda: waystone.main([
                     "install", "agents", "--consent-recorded", "--root", str(root)]))
             self.assertEqual(rc, 1)
+
+    def test_hook_install_reports_legacy_settings_without_modifying_them(self):
+        import contextlib
+        import io
+        import waystone
+
+        with tempfile.TemporaryDirectory() as d:
+            root, home = self._project(d)
+            settings = root / ".claude" / "settings.json"
+            settings.parent.mkdir()
+            settings.write_text(_json.dumps({"hooks": {"Stop": [{"hooks": [{
+                "type": "command", "command": "waystone check", "timeout": 30,
+            }]}]}}))
+            before = settings.read_bytes()
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+                rc = _run_with_home(home, lambda: waystone.main([
+                    "install", "hooks", "--consent-recorded", "--root", str(root)]))
+            self.assertEqual(rc, 0)
+            self.assertIn("legacy", stdout.getvalue().lower())
+            self.assertIn(".claude/settings.json", stdout.getvalue())
+            self.assertIn("remove", stdout.getvalue().lower())
+            self.assertEqual(settings.read_bytes(), before)
+            self.assertTrue((root / ".waystone" / "boundary-hooks-enabled").is_file())
 
     def test_round_and_delegate_exposures_capture_composed_policy(self):
         import contextlib
@@ -12370,8 +12395,71 @@ class CodexPluginContractTests(unittest.TestCase):
             self.assertTrue((root / codex["interface"][field]).is_file())
         claude_hooks = _json.loads((root / "hooks" / "hooks.json").read_text())["hooks"]
         self.assertEqual(set(claude_hooks),
-                         {"PreToolUse", "SessionStart", "PreCompact", "SessionEnd", "PostToolUse"})
+                         {"PreToolUse", "SessionStart", "PreCompact", "SessionEnd", "PostToolUse",
+                          "Stop"})
+        commands = [hook["command"] for groups in claude_hooks.values()
+                    for group in groups for hook in group["hooks"]]
+        for command in commands:
+            self.assertIn('"${CLAUDE_PLUGIN_ROOT}', command)
+            self.assertNotRegex(command, r"(^|[ ;])waystone(?:[ ;]|$)")
         self.assertTrue((root / "bin" / "waystone-codex").stat().st_mode & 0o111)
+
+    def test_boundary_hook_noops_without_config_or_enable_marker(self):
+        import os
+
+        script = SCRIPTS.parent / "hooks" / "scripts" / "boundary_check.sh"
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            fake_bin = base / "bin"
+            fake_bin.mkdir()
+            calls = base / "uv-calls"
+            uv = fake_bin / "uv"
+            uv.write_text("#!/usr/bin/env bash\nprintf called >> \"$UV_CALLS\"\nexit 0\n")
+            uv.chmod(0o755)
+            env = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                   "UV_CALLS": str(calls)}
+
+            missing_config = base / "missing-config"
+            (missing_config / ".waystone").mkdir(parents=True)
+            (missing_config / ".waystone" / "boundary-hooks-enabled").touch()
+            result = subprocess.run(
+                ["bash", str(script)], input=_json.dumps({"cwd": str(missing_config)}),
+                cwd=missing_config, capture_output=True, text=True, env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            missing_marker = base / "missing-marker"
+            missing_marker.mkdir()
+            (missing_marker / ".waystone.yml").write_text("version: 1\nproject: demo\n")
+            result = subprocess.run(
+                ["bash", str(script)], input=_json.dumps({"cwd": str(missing_marker)}),
+                cwd=missing_marker, capture_output=True, text=True, env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(calls.exists())
+
+    def test_boundary_hook_preserves_stderr_and_never_blocks(self):
+        import os
+
+        script = SCRIPTS.parent / "hooks" / "scripts" / "boundary_check.sh"
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "repo"
+            marker = root / ".waystone" / "boundary-hooks-enabled"
+            marker.parent.mkdir(parents=True)
+            marker.touch()
+            (root / ".waystone.yml").write_text("version: 1\nproject: demo\n")
+            fake_bin = Path(d) / "bin"
+            fake_bin.mkdir()
+            uv = fake_bin / "uv"
+            uv.write_text(
+                "#!/usr/bin/env bash\nprintf 'launcher stdout\\n'\n"
+                "printf 'launcher stderr\\n' >&2\nexit 17\n")
+            uv.chmod(0o755)
+            env = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"}
+            result = subprocess.run(
+                ["bash", str(script)], input=_json.dumps({"cwd": str(root)}), cwd=root,
+                capture_output=True, text=True, env=env)
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, "launcher stdout\n")
+            self.assertEqual(result.stderr, "launcher stderr\n")
 
     def test_machine_data_root_is_host_neutral(self):
         import os
@@ -12919,6 +13007,9 @@ class L3GapClosureAcceptanceTests(unittest.TestCase):
         for phrase in ("target path", "effect", "rollback", "delete"):
             self.assertIn(phrase, step.lower())
         self.assertLess(step.index("target path"), step.index("consent record"))
+        self.assertIn(".waystone/boundary-hooks-enabled", step)
+        self.assertIn("both Claude Code and Codex", step)
+        self.assertIn("have been shared since v0.9", skill)
 
     def test_direct_delegable_work_signal_and_high_risk_single_skip(self):
         sessions = [{
