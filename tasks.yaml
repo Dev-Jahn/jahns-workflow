@@ -155,19 +155,21 @@ tasks:
     severity: "major"
     origin: "review-raw-adversarial-20260716"
   - id: fix/execution-surface-dep-gating
+    result: "@ c4a89aa: prepare/claim 동일 경로 의존성 게이팅(미존재/미완료 전수 나열, implicit=pending), parked 제외 유지, lanes verify는 ruling대로 전체 nonterminal 검사(--round 시끄럽게 제거, SKILL 원복). claim-드리프트 계약 추가. RED 기록: 위임분 4계약 + --round 거부(사전 rc3). 620 OK, ruff 클린."
     accept: ["delegate run의 packet 구성(prepare와 claim 동일 경로)이 모든 의존 task의 존재와 status done을 강제하고, 실패 시 미충족 의존 id와 상태를 전부 출력한다", "lane 선정에서 parked가 제외된다", "round skill이 waystone lanes verify . --round <round-id>를 사용한다", "전체 테스트 스위트(신규 계약 테스트는 RED-first)와 ruff F401,F841 검사가 통과한다", "lanes verify --round는 해당 round로 stamp된 lane뿐 아니라 아직 stamp되지 않은 비종결(parked 제외) lane도 포함한다 — 스탬핑 전 검증 순서에서 현재 라운드 lane이 건너뛰어지지 않는다 (미스탬프 lane 포함 실 테스트)", "의존 상태 진단이 registry의 유효 상태를 보고한다 — status 필드가 없는 의존은 unknown이 아니라 pending으로 표기된다"]
     notes: "출처: feat/task-status-parked 적대 리뷰 major 2건(+minor: 계약 테스트가 next_actionable만 검사, delegate run/lanes CLI subprocess 미실행). 판정: parked 회귀가 아니라 기존 실행 표면 갭에 parked가 합류한 것 — next_actionable/archive/의존충족/guard/improve는 parked를 올바르게 처리(리뷰 확인). stale start-here 포인터 지적은 비권위 문서 설계로 기각."
     scope: ["scripts"]
     title: "실행 표면의 의존성 게이팅: delegate run이 대상 task 자신의 상태만 검사하고 의존 task 상태(parked/blocked/pending)를 요구하지 않아 미충족 의존의 child를 실행 가능(parked 이전부터의 갭); lanes verify가 parked lane을 in-flight로 취급해 무관한 라운드 검증을 실패시킴"
-    status: "pending"
+    status: "done"
     severity: "major"
     origin: "review-raw-adversarial-20260716"
   - id: chore/release-script-hardening
+    result: "2차 위임 기각(blocker 3) 후 사용자 재정으로 main session 직접 수정 @ e66bbab: env -i allowlist smoke(UV_ENV_FILE/UV_WORKING_DIRECTORY 차단, uv cache·python dir 의도적 통과), TMPDIR 가드 common dir+전체 worktree 확장, manifest 열거 실패 fail-loud. RED-first 기록(수정 전 failures=5), ReleaseToMainTests 18 GREEN, 전체 614 OK, ruff 클린. real-uv 스모크 e2e 계약은 사전-GREEN 가드로 정직 기록."
     accept: ["no-op 판정 경로에 CAS가 적용되어 동시 main 갱신 race에서 거짓 성공을 보고하지 않는다", "릴리스 게이트 실패 주입 테스트가 존재한다 — 테스트 실패 시 main이 전진하지 않음을 real-repo로 고정", "projected tree를 임시 worktree로 materialize해 shipped 상태의 완전성(manifest 미래 누락)을 검사하는 게이트 또는 unknown-toplevel 경고가 추가된다", "commit-tree의 hook 생략과 onbranch:main 서명 의미 변화가 스크립트 주석 또는 문서에 기록되고, TMPDIR가 저장소 내부를 가리키면 거부되며, ref 갱신 후 cleanup 실패가 성공 결과를 실패로 바꾸지 않는다(경고로 강등)", "전체 테스트 스위트(신규 계약 테스트는 RED-first)와 ruff F401,F841 검사가 통과한다", "projected smoke는 shipped front door(bin/waystone)를 실행해 launcher 부재나 비실행 상태가 게이트를 실패시킨다", "smoke 환경에서 PYTHONPATH 등 dev tree 오염 경로가 격리된다", "unknown-path 경고가 top-level 축약이 아니라 manifest 파일 수준 경로와 대조되어 scripts/ 신규 파일 누락을 탐지하고, lazy import와 중첩 데이터의 잔여 한계는 스크립트 주석에 정직 기록된다", "checked-out-main 검사가 update-ref 직전에 재수행되어 긴 게이트 동안의 TOCTOU 창이 닫힌다", "projected smoke가 UV_ENV_FILE·UV_WORKING_DIRECTORY 등 uv 환경 재주입 경로까지 차단한 격리 환경에서 실행된다 (allowlist 방식, 실 uv 실행 테스트 포함)", "TMPDIR 방어가 현재 worktree root뿐 아니라 git common dir와 모든 연결 worktree 경로를 커버한다", "unknown-path 검출기의 producer(git ls-files) 실패가 전파되어 검출 불능 시 릴리스가 fail-loud로 중단된다"]
     notes: "출처: fix/release-staging-isolation 적대 리뷰(blocker 0, major 5·minor 4) + fix-wave 외부 리뷰. checked-out-main 항목은 fix/release-checked-out-main(major)으로 승격·분리(2026-07-17). 외부 리뷰의 manifest 미래 누락 게이트 제안 채택 방향: projected tree를 별도 worktree로 materialize해 install/smoke 검증하거나 manifest-런타임 의존 완전성 검사 — dev 테스트가 전체 tree에서 돌기 때문에 zero-diff는 시점 증거일 뿐 invariant가 아님. 잔여: no-op CAS, onbranch 서명 기록, 실패 게이트 테스트, commit-tree hook 생략 기록, TMPDIR 방어, index refresh, ref 후 cleanup 실패 순서."
     scope: ["release-to-main.sh", "scripts"]
     title: "release 스크립트 경화 잔여: 체크아웃된 main worktree에서 update-ref 시 불일치, no-op 판정의 CAS 부재(동시 갱신 race), onbranch:main 서명 설정 미적용(의미 변화 기록), 미래 manifest 누락 가드(unknown-toplevel 경고+실 repo 동등성 회귀 테스트), 실패 게이트 테스트 부재, commit-tree의 hook 생략 기록, TMPDIR 저장소 내부 지정 방어, ref 갱신 후 cleanup 실패 시 결과 코드 순서"
-    status: "pending"
+    status: "done"
     severity: "minor"
     origin: "review-raw-adversarial-20260716"
   - id: feat/review-reply-structured-header
@@ -212,7 +214,7 @@ tasks:
     deps: ["feat/review-pending-ledger"]
     origin: "사용자 설계 요청 (2026-07-16)"
   - id: fix/preflight-probe-isolation
-    accept: ["프로브가 본 worktree를 오염시킬 수 없다 — 동일 cache·filesystem 조건의 일회용 sibling worktree에서 실행 후 폐기하거나, 동일 worktree 유지 시 프로브 전후 tracked·untracked·ignored manifest byte 대조로 reserved 외 변경을 fail-loud하고 원상 검증 후에만 본 러너를 기동한다", "stderr 분류 패턴이 양방향 정확화된다 — 무관 permission-denied가 오분류되지 않고 어순 변형 Landlock 실패가 탐지된다", "프로브 실패의 transport(인증·네트워크) 원인이 sandbox 문제로 오진되지 않고 구분 기록된다", "프로브 비용(시간)이 record에 계상된다", "전체 테스트 스위트(신규 계약 테스트는 RED-first)와 ruff F401,F841 검사가 통과한다"]
+    accept: ["프로브가 본 worktree를 오염시킬 수 없다 — 동일 cache·filesystem 조건의 일회용 sibling worktree에서 실행 후 폐기하거나, 동일 worktree 유지 시 프로브 전후 tracked·untracked·ignored manifest byte 대조로 reserved 외 변경을 fail-loud하고 원상 검증 후에만 본 러너를 기동한다", "stderr 분류 패턴이 양방향 정확화된다 — 무관 permission-denied가 오분류되지 않고 어순 변형 Landlock 실패가 탐지된다", "프로브 실패의 transport(인증·네트워크) 원인이 sandbox 문제로 오진되지 않고 구분 기록된다", "프로브 비용(시간)이 record에 계상된다", "전체 테스트 스위트(신규 계약 테스트는 RED-first)와 ruff F401,F841 검사가 통과한다", "분류 재현 케이스 통과: 'Landlock setup failed: permission denied'=sandbox, 성공 서술('correctly denied … all tests passed')=hint 미발화, bwrap network namespace 실패=transport 아닌 sandbox (순서·lookahead 어휘 보정 + 케이스 고정 테스트)", "프로브 증거 수집 실패(파일 chmod 000, stderr 읽기 오류 등)가 예외로 새지 않고 probe 결과와 duration이 실패 경로에서도 기록된다 (계약 테스트)", "sibling worktree 생성 타임아웃/부분 성공이 stale 등록을 남기지 않는다 — 생성 시도를 기록 후 정리를 책임지고, 잔존 시 다음 run이 명시 진단과 함께 자동 정리 또는 안전 중단한다"]
     notes: "출처: fix/runner-env-failure-detection 적대 리뷰(blocker 0, major 4·minor 3). 수용 근거: 분류 게이트는 conjunctive(정직 무변경+report 보호 확인), 오류 방향이 fail-loud라 silent 성공보다 보수적. 잔여: 프로브 후 상태 검증(reserved 파일만 확인 중), 패턴 anchoring, 오진 구분, hint 토큰 오탐(‘all Landlock tests passed’), 프로브 duration 미계상, 실 bwrap/seatbelt 무테스트."
     scope: ["scripts"]
     title: "프리플라이트 프로브 경화: 프로브(모델 턴)가 남긴 프로브 외 편집이 main run patch에 출처 오염 가능 — 프로브 후 git 상태 대조·정리 필수; stderr 패턴 양방향 정확화(무관 permission-denied 오분류/어순 변형 Landlock 미탐); 프로브 실패의 transport(인증·네트워크) vs sandbox 구분; 프로브 비용 기록·계상"
@@ -220,11 +222,11 @@ tasks:
     severity: "major"
     origin: "review-raw-adversarial-20260716"
   - id: fix/reply-header-residuals
-    accept: ["32KiB 초과 feedback에서도 구분자가 조기 등장하면 유효 메타를 읽는다 (경계 테스트 포함)", "ingest가 소비한 sidecar 경로, digest, target/base/reviewers tuple이 immutable하게 기록되고, projection의 review_target_matches와 reviewer_configured는 저장 boolean 신뢰가 아니라 그 스냅샷 재검증(또는 immutable ingest event 권위)으로 산출된다 — 검증할 binding이 없으면 null", "정규화에 실패한 invalid 값이 raw reply_metadata로 병행 노출되지 않는다", "전체 테스트 스위트(신규 계약 테스트는 RED-first)와 ruff F401,F841 검사가 통과한다"]
-    notes: "출처: feat/review-reply-structured-header 2차 적대 리뷰(major 2·minor 2 중 미해소분 — blocker였던 prefix 강도는 main-session 84ad6a7로 즉시 상향). RED-first 실행 기록 부재도 리뷰 지적(반사실 RED는 리뷰어 코드 확인) — 후속 위임 시 RED 실행 기록 의무화."
+    accept: ["32KiB 초과 feedback에서도 구분자가 조기 등장하면 유효 메타를 읽는다 (경계 테스트 포함)", "ingest가 소비한 sidecar 경로, digest, target/base/reviewers tuple이 immutable하게 기록되고, projection의 review_target_matches와 reviewer_configured는 저장 boolean 신뢰가 아니라 그 스냅샷 재검증(또는 immutable ingest event 권위)으로 산출된다 — 검증할 binding이 없으면 null", "정규화에 실패한 invalid 값이 raw reply_metadata로 병행 노출되지 않는다", "전체 테스트 스위트(신규 계약 테스트는 RED-first)와 ruff F401,F841 검사가 통과한다", "ingest event의 binding 스냅샷(target/base/reviewers/digest)이 자체 무결성 체크섬으로 봉인되고, projection이 feedback 실해시와 스냅샷 체크섬을 재계산 검증한다 — 불일치는 감지로 표면화(null+경고), 저장 digest가 장식이 아니다", "스냅샷 변조 계약 테스트: ingest-event 행의 tuple/digest 편집이 projection 사실을 바꾸지 못하고 감지로 표면화된다 (실 subprocess)", "32KiB 경계를 실제로 걸치는(시작<cap<끝) separator 회귀 테스트가 존재한다"]
+    notes: "2차 소진 후 사용자 재정(2026-07-17): 체크섬/봉인 설계 자체를 폐기(참고 기록에 과잉) — 쓰기 규율+읽기 재계산 설계의 fix/review-feedback-triage-discipline로 대체"
     scope: ["scripts"]
     title: "구조화 회신 헤더 잔여: 32KiB 초과 feedback에서 구분자 조기 등장 미확인으로 유효 메타 소실(무경고 null), improve가 저장 boolean(review_target_matches/reviewer_configured)을 사이드카 재검 없이 신뢰, 정규화 null 처리된 invalid 값이 raw reply_metadata로 병행 노출"
-    status: "pending"
+    status: "dropped"
     severity: "major"
     origin: "review-raw-adversarial-20260716"
   - id: fix/release-checked-out-main
@@ -259,3 +261,22 @@ tasks:
     status: "pending"
     severity: "major"
     origin: "review-raw-adversarial-20260717"
+  - id: decision/lanes-verify-round-scope
+    result: "Ruling(사용자 2026-07-17): lanes verify는 종결 상태(done/dropped/parked) 제외 전체 nonterminal lane을 매 마감마다 검사 — 스탬프 무관이라 재개 lane 우회 불가. 무관한 open lane의 깨진 브랜치가 마감을 막는 것은 fail-loud 의도이며 의도적 보류는 parked가 탈출구. --round 인자는 선택 필터에서 제거/보고용 강등. 수정 경로: main session 직접(2차 소진 후 재정)."
+    title: "lanes verify의 검사 범위 의미론: round 스탬프는 마감 후 부여되므로 '이번 라운드 lane'을 마감 전에 식별 불가 — 검사 대상을 무엇으로 정의하는가 (전체 nonterminal / round 연관 필드 신설)"
+    status: "done"
+    severity: "blocker"
+    deps: ["fix/execution-surface-dep-gating"]
+    origin: "review-raw-adversarial-20260716"
+  - id: fix/review-feedback-triage-discipline
+    accept: ["feedback 파일 구조가 '메타데이터 헤더 + verbatim 회신 + 맨 끝 마커로 구분된 triage 섹션'이 된다 — ingest가 마커 포함 skeleton을 append하고, 신설 waystone review triage 명령이 마커 구간만 교체하며 교체 전후 앞부분이 byte-identical함을 계약 테스트로 고정", "review triage 명령은 마커 부재/손상 시 조용한 재생성 없이 시끄럽게 거부한다", "improve/overlay projection의 reviewer_configured·review_target_matches가 저장 boolean 신뢰 없이 projection 시점에 feedback 헤더 재파싱+binding 대조로 재계산된다 — 파일/헤더/binding 부재나 파싱 실패는 정직한 null(+사유), 체크섬·스냅샷·봉인 기계는 도입하지 않는다", "32KiB cap을 걸치는(시작<cap<끝) separator가 유효 메타로 읽힌다 (경계 회귀 테스트 포함)", "정규화에 실패한 invalid 값이 raw reply_metadata로 병행 노출되지 않는다", "review skill의 triage 절차가 파일 직접 편집 대신 신설 명령 사용으로 갱신된다", "전체 테스트 스위트(신규 계약 테스트는 RED-first)와 ruff F401,F841 검사가 통과한다"]
+    scope: ["scripts", "skills"]
+    title: "feedback 파일 쓰기 규율로 회신 검증 단순화: triage를 마커 구분 섹션으로 분리하고 script가 그 구간만 교체(앞쪽 verbatim 불가침), projection은 저장 boolean 대신 읽기 시점 재파싱+binding 대조로 재계산 — 체크섬/봉인 불채택(ruling 2026-07-17)"
+    status: "pending"
+    severity: "major"
+    origin: "review-raw-adversarial-20260716"
+  - id: fix/task-cli-arg-validation
+    title: "task CLI 인자 검증 부재: task drop <id> --reason <문장>이 미지원 플래그를 조용히 root 경로로 오인 — 존재하지 않는 root에 migration이 profile을 auto-seed(디렉터리 생성 부작용)한 뒤 crash. 미지원 옵션은 즉시 거부하고, migration seeding은 초기화된 프로젝트 root에서만 동작해야 함"
+    status: "pending"
+    severity: "major"
+    origin: "dogfooding-20260717"
