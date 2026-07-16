@@ -49,7 +49,7 @@ _VERIFY_SCHEMA_PATH = Path(__file__).resolve().parent.parent / "templates" / "ve
 _VERDICT_INPUT_SCHEMA_PATH = (
     Path(__file__).resolve().parent.parent / "templates" / "verdict-input-schema.json")
 _VERDICT_SCHEMA_PATH = Path(__file__).resolve().parent.parent / "templates" / "verdict-schema.json"
-_EFFORT_VALUES = ("none", "minimal", "low", "medium", "high", "xhigh")
+_EFFORT_VALUES = ("none", "minimal", "low", "medium", "high", "xhigh", "pro", "ultra")
 PROFILE_ROLES = ("main", "orchestrator", "implementer", "clerk", "verifier", "reviewer")
 PROFILE_EXECUTIONS = (
     "main-session", "clean-subagent", "forked-subagent",
@@ -341,6 +341,22 @@ def _load_profile(root: Path) -> tuple[dict, str]:
     return data, fingerprint
 
 
+def _validate_external_runner_effort(runner: str, transport: str,
+                                     effort: str | None) -> None:
+    if effort == "pro":
+        raise WorkflowError(
+            "effort 'pro' is reserved for the web ChatGPT route and cannot be used with "
+            "an external-runner; no substitute effort will be selected")
+    if runner == "claude" and effort is not None and effort not in _CLAUDE_EFFORT_VALUES:
+        raise WorkflowError(
+            f"claude external-runner effort must be one of {', '.join(_CLAUDE_EFFORT_VALUES)}, "
+            f"got {effort!r}")
+    if effort == "ultra" and transport != "codex-cli":
+        raise WorkflowError(
+            f"effort 'ultra' requires the Codex CLI transport, got {transport!r}; "
+            "no substitute effort will be selected")
+
+
 def _resolve_binding(profile: dict, role: str, root: Path) -> dict:
     """Resolve the binding for `role`; validate execution axis and backend shape (S13/§11)."""
     bindings = profile.get("bindings")
@@ -359,10 +375,7 @@ def _resolve_binding(profile: dict, role: str, root: Path) -> dict:
             "observation attribution; delegate run starts only implementer/external-runner")
     runner, _model = _runner_parts(backend)
     effort = b.get("effort")
-    if runner == "claude" and effort is not None and effort not in _CLAUDE_EFFORT_VALUES:
-        raise WorkflowError(
-            f"claude external-runner effort must be one of {', '.join(_CLAUDE_EFFORT_VALUES)}, "
-            f"got {effort!r}")
+    _validate_external_runner_effort(runner, f"{runner}-cli", effort)
     binding = {"role": role, "execution": execution, "backend": backend, "source": "profile"}
     for field in ("effort", "use_for"):
         if field in b:
@@ -406,6 +419,7 @@ def _resolve_verifier_binding(profile: dict, root: Path) -> dict:
     execution = b.get("execution")
     backend = b.get("backend")
     runner, _model = _runner_parts(backend)
+    effort = b.get("effort")
     entry = b.get("entry")
     if entry != "adversarial-review":
         raise WorkflowError(f"entry {entry!r} not implemented in M2")
@@ -414,8 +428,12 @@ def _resolve_verifier_binding(profile: dict, root: Path) -> dict:
             raise WorkflowError(
                 f"verifier execution {execution!r} is a legacy Codex transport and conflicts "
                 f"with backend {backend!r}; use external-runner")
-        return {"role": "verifier", "execution": "claude-cli", "backend": backend,
-                "entry": entry, "source": "profile"}
+        _validate_external_runner_effort(runner, "claude-cli", effort)
+        binding = {"role": "verifier", "execution": "claude-cli", "backend": backend,
+                   "entry": entry, "source": "profile"}
+        if effort is not None:
+            binding["effort"] = effort
+        return binding
 
     derived = "codex-cli" if os.environ.get("WAYSTONE_HOST") == "codex" else "codex-companion"
     if execution is None or execution == "external-runner":
@@ -430,8 +448,12 @@ def _resolve_verifier_binding(profile: dict, root: Path) -> dict:
         raise WorkflowError(
             f"verifier execution {execution!r} conflicts with WAYSTONE_HOST-derived {derived!r} — "
             "remove the execution key to let waystone derive it")
-    return {"role": "verifier", "execution": execution, "backend": backend, "entry": entry,
-            "source": "profile"}
+    _validate_external_runner_effort(runner, execution, effort)
+    binding = {"role": "verifier", "execution": execution, "backend": backend, "entry": entry,
+               "source": "profile"}
+    if effort is not None:
+        binding["effort"] = effort
+    return binding
 
 
 def _runner_parts(backend: str) -> tuple[str, str]:
@@ -1138,14 +1160,16 @@ def _run_companion(worktree: Path, args: list[str], record_dir: Path) -> tuple[i
 
 
 def _run_codex_verifier(worktree: Path, model: str, focus: str,
-                        record_dir: Path) -> tuple[int, str]:
+                        record_dir: Path, *, effort: str | None = None) -> tuple[int, str]:
     """Run the native Codex verifier in a read-only, ephemeral session with schema output."""
     output = record_dir / "verify-last-message.json"
-    cmd = [
-        "codex", "exec", "-C", str(worktree), "-m", model, "-s", "read-only",
+    cmd = ["codex", "exec", "-C", str(worktree), "-m", model, "-s", "read-only"]
+    if effort is not None:
+        cmd.extend(["-c", f'model_reasoning_effort="{effort}"'])
+    cmd.extend([
         "--ephemeral", "--output-schema", str(_VERIFY_SCHEMA_PATH),
         "--output-last-message", str(output), "--color", "never", "--json", "-",
-    ]
+    ])
     env = _verifier_env(record_dir)
     try:
         with open(record_dir / "verify-codex.jsonl", "w", encoding="utf-8") as jout, \
@@ -1171,17 +1195,20 @@ def _run_codex_verifier(worktree: Path, model: str, focus: str,
 
 
 def _run_claude_verifier(worktree: Path, model: str, focus: str,
-                         record_dir: Path, *, runner=None) -> tuple[int, str]:
+                         record_dir: Path, *, effort: str | None = None,
+                         runner=None) -> tuple[int, str]:
     """Run Claude with schema output and no executable or write-capable tools."""
     allowed = "Read,Glob,Grep"
     denied = "Edit,Write,NotebookEdit,Bash,WebFetch,WebSearch"
-    cmd = [
-        "claude", "-p", "--model", model, *_CLAUDE_COMMON_ARGS,
+    cmd = ["claude", "-p", "--model", model, *_CLAUDE_COMMON_ARGS]
+    if effort is not None:
+        cmd.extend(["--effort", effort])
+    cmd.extend([
         "--tools", allowed, "--allowedTools", allowed,
         "--disallowedTools", denied,
         "--json-schema", _VERIFY_SCHEMA_PATH.read_text(encoding="utf-8"),
         "--output-format", "json",
-    ]
+    ])
     invoke = runner or subprocess.run
     try:
         proc = invoke(
@@ -2039,6 +2066,7 @@ def verify_delegation(root: Path, did: str) -> int:
     _normalize_verify_worktree(worktree, contract, patch)
     focus = _verify_focus(rec, contract)
     model = binding["backend"].split(":", 1)[1]
+    runner_kwargs = {"effort": binding["effort"]} if "effort" in binding else {}
     before = _verify_worktree_state(worktree)
     transport_error = None
     try:
@@ -2054,11 +2082,13 @@ def verify_delegation(root: Path, did: str) -> int:
                 print(_cleanup_companion_broker(worktree))
             transport = "codex-companion:adversarial-review"
         elif binding["execution"] == "codex-cli":
-            rc, stdout = _run_codex_verifier(worktree, model, focus, rec)
+            rc, stdout = _run_codex_verifier(
+                worktree, model, focus, rec, **runner_kwargs)
             transport = "codex-exec:read-only"
         else:
             print(CLAUDE_VERIFIER_DELTA_WARN, file=sys.stderr)
-            rc, stdout = _run_claude_verifier(worktree, model, focus, rec)
+            rc, stdout = _run_claude_verifier(
+                worktree, model, focus, rec, **runner_kwargs)
             transport = "claude-print:read-only"
     except Exception as e:  # noqa: BLE001 — postcondition still runs after any transport failure
         transport_error = e

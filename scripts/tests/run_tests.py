@@ -5379,6 +5379,57 @@ class DelegateProfileTests(unittest.TestCase):
             delegate._resolve_binding(profile, "implementer", Path("/project"))
         self.assertIn("effort", str(cm.exception))
 
+    def test_effort_vocabulary_matches_profile_schema(self):
+        schema = _json.loads(
+            (SCRIPTS.parent / "templates" / "profile-schema.json").read_text())
+        schema_values = schema["$defs"]["binding"]["properties"]["effort"]["enum"]
+        expected = ["none", "minimal", "low", "medium", "high", "xhigh", "pro", "ultra"]
+        self.assertEqual(schema_values, expected)
+        self.assertEqual(list(delegate._EFFORT_VALUES), expected)
+
+    def test_pro_effort_is_rejected_for_each_external_runner(self):
+        for backend in ("codex:gpt-test", "claude:sonnet"):
+            with self.subTest(backend=backend):
+                profile = {"bindings": {"implementer": {
+                    "execution": "external-runner", "backend": backend, "effort": "pro"}}}
+                with self.assertRaisesRegex(
+                        delegate.WorkflowError, "pro.*web ChatGPT.*external-runner"):
+                    delegate._resolve_binding(profile, "implementer", Path("/project"))
+
+    def test_ultra_effort_is_rejected_by_claude_external_runner(self):
+        profile = {"bindings": {"implementer": {
+            "execution": "external-runner", "backend": "claude:sonnet", "effort": "ultra"}}}
+        with self.assertRaisesRegex(delegate.WorkflowError, "claude external-runner effort"):
+            delegate._resolve_binding(profile, "implementer", Path("/project"))
+
+    def test_pro_effort_is_rejected_for_verifier_external_runner(self):
+        profile = {"bindings": {"verifier": {
+            "execution": "external-runner", "backend": "codex:gpt-test", "effort": "pro",
+            "entry": "adversarial-review"}}}
+        with self.assertRaisesRegex(
+                delegate.WorkflowError, "pro.*web ChatGPT.*external-runner"):
+            delegate._resolve_verifier_binding(profile, Path("/project"))
+
+    def test_ultra_verifier_effort_requires_codex_cli_transport(self):
+        import os
+
+        profile = {"bindings": {"verifier": {
+            "execution": "external-runner", "backend": "codex:gpt-test", "effort": "ultra",
+            "entry": "adversarial-review"}}}
+        old_host = os.environ.pop("WAYSTONE_HOST", None)
+        try:
+            with self.assertRaisesRegex(delegate.WorkflowError, "ultra.*Codex CLI"):
+                delegate._resolve_verifier_binding(profile, Path("/project"))
+            os.environ["WAYSTONE_HOST"] = "codex"
+            binding = delegate._resolve_verifier_binding(profile, Path("/project"))
+        finally:
+            if old_host is None:
+                os.environ.pop("WAYSTONE_HOST", None)
+            else:
+                os.environ["WAYSTONE_HOST"] = old_host
+        self.assertEqual(binding["execution"], "codex-cli")
+        self.assertEqual(binding["effort"], "ultra")
+
     def test_verifier_execution_absent_is_derived_from_host(self):
         import os
 
@@ -6259,13 +6310,13 @@ def _write_apply_verdict(rec):
 class DelegateEffortTests(unittest.TestCase):
     """0.8.0 M2 §20 — optional profile effort is explicit in execution and exposure."""
 
-    def test_set_effort_reaches_fake_runner_and_exposure(self):
+    def test_ultra_effort_reaches_codex_runner_and_exposure(self):
         with tempfile.TemporaryDirectory() as d:
             root, home = _deleg_project(d)
             _write_profile(root, (
                 "schema: waystone-profile-1\nbindings:\n"
                 "  implementer: {execution: external-runner, backend: \"codex:gpt-test\", "
-                "effort: high}\n"))
+                "effort: ultra}\n"))
             seen = {}
 
             def fake(worktree, model, prompt_path, record_dir, *, effort=None):
@@ -6277,8 +6328,21 @@ class DelegateEffortTests(unittest.TestCase):
             _deleg_run(root, home, fake)
             rec = _latest_rec(root, home)
             exposure = _json.loads((rec / "exposure.json").read_text())
-            self.assertEqual(seen["effort"], "high")
-            self.assertEqual(exposure["binding"]["effort"], "high")
+            self.assertEqual(seen["effort"], "ultra")
+            self.assertEqual(exposure["binding"]["effort"], "ultra")
+
+    def test_effort_routes_are_documented(self):
+        readme = (SCRIPTS.parent / "README.md").read_text()
+        conventions = (
+            SCRIPTS.parent / "references" / "conventions.md").read_text()
+        project_conventions = (
+            SCRIPTS.parent / "docs" / "CONVENTIONS.md").read_text()
+        for text in (readme, conventions, project_conventions):
+            self.assertIn("`pro`", text)
+            self.assertIn("web ChatGPT", text)
+            self.assertIn("`ultra`", text)
+            self.assertIn("model_reasoning_effort", text)
+            self.assertIn("external-runner", text)
 
 
 class DelegateApplyTests(unittest.TestCase):
@@ -9730,14 +9794,37 @@ class UvCacheTests(unittest.TestCase):
             delegate.subprocess.run = fake
             try:
                 delegate._run_codex(
-                    worktree, "gpt-test", prompt, record, effort="high")
+                    worktree, "gpt-test", prompt, record, effort="ultra")
                 delegate._run_codex(worktree, "gpt-test", prompt, record)
             finally:
                 delegate.subprocess.run = orig
             self.assertIn("-c", commands[0])
-            self.assertIn('model_reasoning_effort="high"', commands[0])
+            self.assertIn('model_reasoning_effort="ultra"', commands[0])
             self.assertNotIn("-c", commands[1])
             self.assertFalse(any(arg.startswith("model_reasoning_effort=") for arg in commands[1]))
+
+    def test_codex_verifier_ultra_effort_flag_is_exact(self):
+        import types
+        with tempfile.TemporaryDirectory() as d:
+            worktree = Path(d) / "wt"
+            record = Path(d) / "record"
+            worktree.mkdir()
+            record.mkdir()
+            commands = []
+            orig = delegate.subprocess.run
+
+            def fake(cmd, **kwargs):
+                commands.append(cmd)
+                return types.SimpleNamespace(returncode=1)
+
+            delegate.subprocess.run = fake
+            try:
+                delegate._run_codex_verifier(
+                    worktree, "gpt-test", "review", record, effort="ultra")
+            finally:
+                delegate.subprocess.run = orig
+            self.assertIn("-c", commands[0])
+            self.assertIn('model_reasoning_effort="ultra"', commands[0])
 
 
 class ContractInjectTests(unittest.TestCase):
