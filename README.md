@@ -234,11 +234,16 @@ Waystone; `clean-subagent`, `forked-subagent`, `deterministic-workflow`, and `ma
 through the host and attributed to the round. Bindings live in the project's uncommitted
 `{project_root}/.waystone/profile.yml`; Waystone refuses to guess one when it is missing.
 
+A Codex verifier always runs through host-independent `codex exec` with the Waystone-owned
+adversarial review prompt, `read-only` sandbox, `--output-schema`, and `--output-last-message`.
+Verifier profiles normally omit both `execution` and `entry`; 0.9 Codex transport and entrypoint
+fields are accepted with a deprecation warning and normalized to that same path.
+
 The external implementer supports Codex and Claude backends. Because the Claude backend has no
 structural filesystem/process/network sandbox, it is refused by default and can run only after
 explicit user consent with `--allow-unsandboxed-runner --reason` recorded in the exposure.
 Profile `effort` accepts `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `ultra`. `ultra` is
-Codex CLI-only and is passed unchanged as `model_reasoning_effort`; the Claude external runner
+Codex-only and is passed unchanged as `model_reasoning_effort`; the Claude external runner
 rejects it without substituting another effort. Omitting `effort` leaves the runner's configured
 default untouched.
 

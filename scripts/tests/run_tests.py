@@ -5914,8 +5914,7 @@ class DelegateProfileTests(unittest.TestCase):
 
     def test_claude_verifier_binding_selects_claude_transport(self):
         profile = {"bindings": {"verifier": {
-            "execution": "external-runner", "backend": "claude:sonnet",
-            "entry": "adversarial-review"}}}
+            "execution": "external-runner", "backend": "claude:sonnet"}}}
         binding = delegate._resolve_verifier_binding(profile, Path("/project"))
         self.assertEqual(binding["execution"], "claude-cli")
         self.assertEqual(binding["backend"], "claude:sonnet")
@@ -5943,95 +5942,65 @@ class DelegateProfileTests(unittest.TestCase):
         with self.assertRaisesRegex(delegate.WorkflowError, "claude external-runner effort"):
             delegate._resolve_binding(profile, "implementer", Path("/project"))
 
-    def test_ultra_verifier_effort_requires_codex_cli_transport(self):
-        import os
-
+    def test_ultra_verifier_effort_uses_codex_exec(self):
         profile = {"bindings": {"verifier": {
-            "execution": "external-runner", "backend": "codex:gpt-test", "effort": "ultra",
-            "entry": "adversarial-review"}}}
-        old_host = os.environ.pop("WAYSTONE_HOST", None)
-        try:
-            with self.assertRaisesRegex(delegate.WorkflowError, "ultra.*Codex CLI"):
-                delegate._resolve_verifier_binding(profile, Path("/project"))
-            os.environ["WAYSTONE_HOST"] = "codex"
-            binding = delegate._resolve_verifier_binding(profile, Path("/project"))
-        finally:
-            if old_host is None:
-                os.environ.pop("WAYSTONE_HOST", None)
-            else:
-                os.environ["WAYSTONE_HOST"] = old_host
-        self.assertEqual(binding["execution"], "codex-cli")
+            "execution": "external-runner", "backend": "codex:gpt-test", "effort": "ultra"}}}
+        binding = delegate._resolve_verifier_binding(profile, Path("/project"))
+        self.assertEqual(binding["execution"], "codex-exec")
         self.assertEqual(binding["effort"], "ultra")
 
-    def test_verifier_execution_absent_is_derived_from_host(self):
-        import os
-
-        profile = {"bindings": {"verifier": {
-            "backend": "codex:x", "entry": "adversarial-review"}}}
-        old_host = os.environ.pop("WAYSTONE_HOST", None)
-        try:
-            binding = delegate._resolve_verifier_binding(profile, Path("/project"))
-        finally:
-            if old_host is not None:
-                os.environ["WAYSTONE_HOST"] = old_host
-        self.assertEqual(binding["execution"], "codex-companion")
+    def test_verifier_execution_absent_uses_codex_exec(self):
+        profile = {"bindings": {"verifier": {"backend": "codex:x"}}}
+        binding = delegate._resolve_verifier_binding(profile, Path("/project"))
+        self.assertEqual(binding["execution"], "codex-exec")
 
     def test_verifier_external_runner_axis_preserves_codex_transport(self):
-        import os
-
         profile = {"bindings": {"verifier": {
-            "execution": "external-runner", "backend": "codex:x",
-            "entry": "adversarial-review"}}}
-        old_host = os.environ.get("WAYSTONE_HOST")
-        os.environ["WAYSTONE_HOST"] = "codex"
-        try:
-            binding = delegate._resolve_verifier_binding(profile, Path("/project"))
-        finally:
-            if old_host is None:
-                os.environ.pop("WAYSTONE_HOST", None)
-            else:
-                os.environ["WAYSTONE_HOST"] = old_host
-        self.assertEqual(binding["execution"], "codex-cli")
+            "execution": "external-runner", "backend": "codex:x"}}}
+        binding = delegate._resolve_verifier_binding(profile, Path("/project"))
+        self.assertEqual(binding["execution"], "codex-exec")
         self.assertEqual(binding["backend"], "codex:x")
 
-    def test_matching_verifier_execution_warns_and_is_accepted(self):
+    def test_legacy_codex_execution_conflicts_with_claude_backend(self):
+        profile = {"bindings": {"verifier": {
+            "execution": "codex-cli", "backend": "claude:sonnet"}}}
+        with self.assertRaisesRegex(delegate.WorkflowError, "legacy Codex transport"):
+            delegate._resolve_verifier_binding(profile, Path("/project"))
+
+    def test_codex_verifier_binding_is_host_independent_and_legacy_values_normalize(self):
         import contextlib
         import io
         import os
 
-        profile = {"bindings": {"verifier": {
-            "execution": "codex-cli", "backend": "codex:x", "entry": "adversarial-review"}}}
+        canonical = {"bindings": {"verifier": {"backend": "codex:x"}}}
         old_host = os.environ.get("WAYSTONE_HOST")
-        os.environ["WAYSTONE_HOST"] = "codex"
-        err = io.StringIO()
         try:
-            with contextlib.redirect_stderr(err):
-                binding = delegate._resolve_verifier_binding(profile, Path("/project"))
+            for host in (None, "claude", "codex"):
+                if host is None:
+                    os.environ.pop("WAYSTONE_HOST", None)
+                else:
+                    os.environ["WAYSTONE_HOST"] = host
+                with self.subTest(host=host):
+                    binding = delegate._resolve_verifier_binding(canonical, Path("/project"))
+                    self.assertEqual(binding["execution"], "codex-exec")
+
+            for execution in ("codex-cli", "codex-companion"):
+                legacy = {"bindings": {"verifier": {
+                    "execution": execution, "backend": "codex:x",
+                    "entry": "adversarial-review",
+                }}}
+                err = io.StringIO()
+                with self.subTest(execution=execution), contextlib.redirect_stderr(err):
+                    binding = delegate._resolve_verifier_binding(legacy, Path("/project"))
+                self.assertEqual(binding["execution"], "codex-exec")
+                self.assertIn("deprecated", err.getvalue())
+                self.assertIn("execution", err.getvalue())
+                self.assertIn("entry", err.getvalue())
         finally:
             if old_host is None:
                 os.environ.pop("WAYSTONE_HOST", None)
             else:
                 os.environ["WAYSTONE_HOST"] = old_host
-        self.assertEqual(binding["execution"], "codex-cli")
-        self.assertIn("deprecated", err.getvalue())
-
-    def test_conflicting_verifier_execution_is_rejected(self):
-        import os
-
-        profile = {"bindings": {"verifier": {
-            "execution": "codex-companion", "backend": "codex:x",
-            "entry": "adversarial-review"}}}
-        old_host = os.environ.get("WAYSTONE_HOST")
-        os.environ["WAYSTONE_HOST"] = "codex"
-        try:
-            with self.assertRaises(delegate.WorkflowError) as cm:
-                delegate._resolve_verifier_binding(profile, Path("/project"))
-        finally:
-            if old_host is None:
-                os.environ.pop("WAYSTONE_HOST", None)
-            else:
-                os.environ["WAYSTONE_HOST"] = old_host
-        self.assertIn("remove the execution key", str(cm.exception))
 
 
 def _packet_registry():
@@ -7232,7 +7201,7 @@ class DelegateApplyTests(unittest.TestCase):
         verifier_profile = (
             'schema: waystone-profile-1\nbindings:\n'
             '  implementer: {execution: external-runner, backend: "codex:gpt-test"}\n'
-            '  verifier: {backend: "codex:gpt-test", entry: adversarial-review}\n'
+            '  verifier: {backend: "codex:gpt-test"}\n'
         )
         with tempfile.TemporaryDirectory() as d:
             root, home = _deleg_project(d)
@@ -7389,7 +7358,7 @@ class DelegateVerdictTests(unittest.TestCase):
     _VERIFIER_PROFILE = (
         'schema: waystone-profile-1\nbindings:\n'
         '  implementer: {execution: external-runner, backend: "codex:gpt-test"}\n'
-        '  verifier: {backend: "codex:gpt-test", entry: adversarial-review}\n'
+        '  verifier: {backend: "codex:gpt-test"}\n'
     )
 
     def _record(self, d, *, verifier=False):
@@ -7444,6 +7413,7 @@ class DelegateVerdictTests(unittest.TestCase):
             "profile_fingerprint": exposure["profile_fingerprint"],
             "base_sha": contract["base_sha"], "result_sha": contract["result_sha"],
             "patch_sha256": contract["patch_sha256"],
+            "requested_effort": None, "effective_effort": None,
             "effective_tool_policy": {
                 "tools": ["codex-exec"], "sandbox": "read-only", "bash": False,
                 "filesystem_postcondition": "git-status+untracked-content-unchanged",
@@ -7615,6 +7585,7 @@ class DelegateVerdictTests(unittest.TestCase):
             "profile_fingerprint": "sha256:123456789abc",
             "base_sha": "a" * 40, "result_sha": "b" * 40,
             "patch_sha256": "sha256:" + "c" * 64,
+            "requested_effort": None, "effective_effort": None,
             "effective_tool_policy": {"tools": ["synthetic"]},
         }
         cases = (
@@ -9732,8 +9703,7 @@ class DelegateVerifyTests(unittest.TestCase):
     _PROFILE = (
         "schema: waystone-profile-1\nbindings:\n"
         "  implementer: {execution: external-runner, backend: \"codex:gpt-5.6-sol\"}\n"
-        "  verifier: {backend: \"codex:gpt-5.6-sol\", "
-        "entry: adversarial-review}\n")
+        "  verifier: {backend: \"codex:gpt-5.6-sol\"}\n")
 
     def _setup(self, d, *, committed=True):
         root, home = _deleg_project(d)
@@ -9741,13 +9711,6 @@ class DelegateVerifyTests(unittest.TestCase):
         (root / ".gitignore").write_text(".ignored-cache/\n")
         git(root, "add", ".gitignore")
         git(root, "commit", "-qm", "ignore fixture")
-        plugin = home / "codex-plugin"
-        (plugin / "scripts").mkdir(parents=True)
-        (plugin / "scripts" / "codex-companion.mjs").write_text("// synthetic fixture\n")
-        registry = home / ".claude" / "plugins" / "installed_plugins.json"
-        registry.parent.mkdir(parents=True)
-        registry.write_text(_json.dumps({"plugins": {"codex@openai-codex": [
-            {"installPath": str(plugin)}]}}))
 
         def runner(worktree, model, prompt_path, record_dir):
             (worktree / "f.txt").write_text("delegate result\n")
@@ -9765,15 +9728,7 @@ class DelegateVerifyTests(unittest.TestCase):
         ignored = worktree / ".ignored-cache" / "keep.txt"
         ignored.parent.mkdir()
         ignored.write_text("keep")
-        return root, home, rec, worktree, plugin
-
-    def _with_companion(self, fake, fn):
-        orig = delegate._run_companion
-        delegate._run_companion = fake
-        try:
-            return fn()
-        finally:
-            delegate._run_companion = orig
+        return root, home, rec, worktree, None
 
     def _with_claude_verifier(self, fake, fn):
         orig = delegate._run_claude_verifier
@@ -9782,6 +9737,48 @@ class DelegateVerifyTests(unittest.TestCase):
             return fn()
         finally:
             delegate._run_claude_verifier = orig
+
+    def _with_codex_verifier(self, fake, fn):
+        orig = delegate._run_codex_verifier
+        delegate._run_codex_verifier = fake
+        try:
+            return fn()
+        finally:
+            delegate._run_codex_verifier = orig
+
+    def test_verifier_prompt_is_rendered_from_waystone_template(self):
+        with tempfile.TemporaryDirectory() as d:
+            rec = Path(d)
+            (rec / "packet.yaml").write_text(yaml.safe_dump({
+                "acceptance": ["criterion one", "criterion two"],
+            }))
+            prompt = delegate._render_verifier_prompt(rec, {
+                "changed_files": [{"status": "M", "path": "src/example.py"}],
+            })
+            self.assertIn("criterion one", prompt)
+            self.assertIn("criterion two", prompt)
+            self.assertIn("M src/example.py", prompt)
+            self.assertIn("independent adversarial verifier", prompt)
+
+    def test_codex_verify_artifact_records_requested_and_effective_effort(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home, rec, _worktree, _plugin = self._setup(d, committed=False)
+            _write_profile(root, (
+                "schema: waystone-profile-1\nbindings:\n"
+                "  implementer: {execution: external-runner, backend: 'codex:gpt'}\n"
+                "  verifier: {backend: 'codex:gpt-test', effort: xhigh}\n"))
+
+            def fake(_worktree, _model, _prompt, _record_dir, *, effort=None):
+                self.assertEqual(effort, "xhigh")
+                return (0, _json.dumps({
+                    "summary": "checked", "findings": [], "limitations": [],
+                }))
+
+            _run_with_home(home, lambda: self._with_codex_verifier(
+                fake, lambda: delegate.verify_delegation(root, rec.name)))
+            artifact = _json.loads((rec / "artifact" / "verify-1.json").read_text())
+            self.assertEqual(artifact["requested_effort"], "xhigh")
+            self.assertEqual(artifact["effective_effort"], "xhigh")
 
     def test_claude_verifier_transport_and_schema_artifact(self):
         import contextlib
@@ -9792,8 +9789,7 @@ class DelegateVerifyTests(unittest.TestCase):
             _write_profile(root, (
                 "schema: waystone-profile-1\nbindings:\n"
                 "  implementer: {execution: external-runner, backend: 'codex:gpt'}\n"
-                "  verifier: {execution: external-runner, backend: 'claude:sonnet', "
-                "entry: adversarial-review}\n"))
+                "  verifier: {execution: external-runner, backend: 'claude:sonnet'}\n"))
             payload = {
                 "summary": "checked", "findings": [], "limitations": [],
             }
@@ -9861,7 +9857,7 @@ class DelegateVerifyTests(unittest.TestCase):
             self.assertEqual(cache, record / "runtime" / "uv-cache")
             self.assertFalse(cache.resolve().is_relative_to(worktree.resolve()))
 
-    def test_companion_transport_inherits_guard_and_record_local_cache(self):
+    def test_codex_exec_argv_schema_effort_guard_and_record_local_cache(self):
         import types
 
         with tempfile.TemporaryDirectory() as d:
@@ -9872,18 +9868,34 @@ class DelegateVerifyTests(unittest.TestCase):
             record.mkdir()
             calls = []
             original = delegate.subprocess.run
+            payload = {"summary": "checked", "findings": [], "limitations": []}
 
-            def fake(*args, **kwargs):
-                calls.append((args, kwargs))
-                return types.SimpleNamespace(returncode=0, stdout="{}", stderr="")
+            def fake(cmd, **kwargs):
+                calls.append((cmd, kwargs))
+                output = Path(cmd[cmd.index("--output-last-message") + 1])
+                output.write_text(_json.dumps(payload))
+                return types.SimpleNamespace(returncode=0)
 
             delegate.subprocess.run = fake
             try:
-                rc, output = delegate._run_companion(worktree, ["node", "companion"], record)
+                rc, output = delegate._run_codex_verifier(
+                    worktree, "gpt-test", "review prompt", record, effort="xhigh")
             finally:
                 delegate.subprocess.run = original
-            self.assertEqual((rc, output), (0, "{}"))
-            env = calls[0][1]["env"]
+            self.assertEqual(rc, 0)
+            self.assertEqual(_json.loads(output), payload)
+            cmd, kwargs = calls[0]
+            self.assertEqual(cmd[:2], ["codex", "exec"])
+            self.assertEqual(cmd[cmd.index("-C") + 1], str(worktree))
+            self.assertEqual(cmd[cmd.index("-s") + 1], "read-only")
+            self.assertEqual(
+                cmd[cmd.index("--output-schema") + 1], str(delegate._VERIFY_SCHEMA_PATH))
+            self.assertEqual(
+                cmd[cmd.index("--output-last-message") + 1],
+                str(record / "verify-last-message.json"))
+            self.assertIn('model_reasoning_effort="xhigh"', cmd)
+            self.assertEqual(kwargs["input"], "review prompt")
+            env = kwargs["env"]
             self.assertEqual(env["WAYSTONE_VERIFIER_SESSION"], "1")
             cache = Path(env["UV_CACHE_DIR"])
             self.assertEqual(cache, record / "runtime" / "uv-cache")
@@ -9911,18 +9923,18 @@ class DelegateVerifyTests(unittest.TestCase):
 
     def test_success_normalizes_committed_delegate_and_preserves_labels(self):
         with tempfile.TemporaryDirectory() as d:
-            root, home, rec, worktree, plugin = self._setup(d, committed=True)
+            root, home, rec, worktree, _unused = self._setup(d, committed=True)
             calls = []
 
-            def fake(wt, args, record_dir):
-                calls.append((wt, args, record_dir))
+            def fake(wt, model, prompt, record_dir):
+                calls.append((wt, model, prompt, record_dir))
                 return (0, _json.dumps({
                     "summary": "challenged", "findings": [], "limitations": []}))
 
             import contextlib
             import io
             with contextlib.redirect_stdout(io.StringIO()):
-                rc = _run_with_home(home, lambda: self._with_companion(
+                rc = _run_with_home(home, lambda: self._with_codex_verifier(
                     fake, lambda: delegate.verify_delegation(root, rec.name)))
             self.assertEqual(rc, 0)
             contract = yaml.safe_load((rec / "artifact" / "contract.yaml").read_text())
@@ -9932,23 +9944,21 @@ class DelegateVerifyTests(unittest.TestCase):
             self.assertTrue((worktree / ".ignored-cache" / "keep.txt").exists())
             self.assertEqual(delegate._read_status(rec)["state"], "needs-review")
             self.assertEqual(len(calls), 1)
-            args = calls[0][1]
-            self.assertEqual(args[:-1], [
-                "node", str(plugin / "scripts" / "codex-companion.mjs"),
-                "adversarial-review", "--json", "--wait", "--scope", "working-tree",
-                "-C", str(worktree), "-m", "gpt-5.6-sol"])
-            self.assertLessEqual(len(args[-1].encode("utf-8")), 1024)
+            self.assertEqual(calls[0][0], worktree)
+            self.assertEqual(calls[0][1], "gpt-5.6-sol")
+            self.assertIn("independent adversarial verifier", calls[0][2])
+            self.assertEqual(calls[0][3], rec)
             artifact = _json.loads((rec / "artifact" / "verify-1.json").read_text())
             self.assertEqual(artifact["schema"], "waystone-verify-1")
             self.assertEqual(artifact["backend"], "codex:gpt-5.6-sol")
             self.assertEqual(artifact["provenance"], "independent-verifier")
             self.assertEqual(artifact["payload"]["summary"], "challenged")
+            self.assertIsNone(artifact["requested_effort"])
+            self.assertIsNone(artifact["effective_effort"])
 
     def test_verify_session_hook_does_not_seed_state_in_review_worktree(self):
-        import os
-
         with tempfile.TemporaryDirectory() as d:
-            root, home, rec, worktree, plugin = self._setup(d, committed=False)
+            root, home, rec, worktree, _unused = self._setup(d, committed=False)
             legacy = home / ".codex" / "waystone.pre-0.9" / "profile.yml"
             legacy.parent.mkdir(parents=True)
             legacy.write_text(self._PROFILE)
@@ -9957,34 +9967,23 @@ class DelegateVerifyTests(unittest.TestCase):
                 SCRIPTS.parent / "hooks" / "scripts" / "session_context.sh",
                 SCRIPTS.parent / "hooks" / "scripts" / "resume_snapshot.sh",
             ]
-            companion = plugin / "scripts" / "codex-companion.mjs"
-            companion.write_text(
-                "import { spawnSync } from 'node:child_process';\n"
-                f"const hooks = {_json.dumps([str(hook) for hook in hooks])};\n"
-                f"const cwd = {_json.dumps(str(worktree))};\n"
-                "for (const hook of hooks) {\n"
-                "  const run = spawnSync('bash', [hook], {\n"
-                "    input: JSON.stringify({cwd}), encoding: 'utf8', env: process.env,\n"
-                "  });\n"
-                "  if (run.status !== 0) {\n"
-                "    process.stderr.write(run.stderr || 'verifier lifecycle hook failed');\n"
-                "    process.exit(run.status ?? 1);\n"
-                "  }\n"
-                "}\n"
-                "process.stdout.write(JSON.stringify({\n"
-                "  summary: 'checked', findings: [], limitations: [],\n"
-                "}));\n",
-                encoding="utf-8",
-            )
             self.assertFalse((worktree / ".waystone").exists())
 
-            old_host = os.environ.pop("WAYSTONE_HOST", None)
-            try:
-                rc = _run_with_home(
-                    home, lambda: delegate.verify_delegation(root, rec.name))
-            finally:
-                if old_host is not None:
-                    os.environ["WAYSTONE_HOST"] = old_host
+            def fake(_worktree, _model, _prompt, record_dir):
+                env = delegate._verifier_env(record_dir)
+                for hook in hooks:
+                    result = subprocess.run(
+                        ["bash", str(hook)], input=_json.dumps({"cwd": str(worktree)}),
+                        capture_output=True, text=True, env=env,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, "")
+                return (0, _json.dumps({
+                    "summary": "checked", "findings": [], "limitations": [],
+                }))
+
+            rc = _run_with_home(home, lambda: self._with_codex_verifier(
+                fake, lambda: delegate.verify_delegation(root, rec.name)))
 
             self.assertEqual(rc, 0)
             self.assertFalse((worktree / ".waystone").exists())
@@ -10053,56 +10052,27 @@ class DelegateVerifyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root, home, rec, worktree, _plugin = self._setup(d, committed=False)
 
-            def fake(wt, _args, _record_dir):
+            def fake(wt, _model, _prompt, _record_dir):
                 (wt / "verifier-write.txt").write_text("forbidden\n")
                 return (0, _json.dumps({
                     "summary": "mutated", "findings": [], "limitations": []}))
 
             with self.assertRaisesRegex(delegate.WorkflowError, "modified.*worktree"):
-                _run_with_home(home, lambda: self._with_companion(
+                _run_with_home(home, lambda: self._with_codex_verifier(
                     fake, lambda: delegate.verify_delegation(root, rec.name)))
             self.assertEqual(list((rec / "artifact").glob("verify-*.json")), [])
-
-    def test_companion_broker_lifetime_is_bounded_by_verifier_cleanup(self):
-        with tempfile.TemporaryDirectory() as d:
-            root, home, rec, worktree, _plugin = self._setup(d, committed=False)
-            events = []
-            original_run = delegate._run_companion
-            original_cleanup = delegate._cleanup_companion_broker
-
-            def cleanup(wt):
-                self.assertEqual(wt, worktree)
-                events.append("cleanup")
-                return "broker cleanup: fixture"
-
-            def run(wt, _args, record_dir):
-                self.assertEqual(wt, worktree)
-                self.assertEqual(record_dir, rec)
-                events.append("run")
-                return (0, _json.dumps({
-                    "summary": "checked", "findings": [], "limitations": [],
-                }))
-
-            delegate._run_companion = run
-            delegate._cleanup_companion_broker = cleanup
-            try:
-                _run_with_home(home, lambda: delegate.verify_delegation(root, rec.name))
-            finally:
-                delegate._run_companion = original_run
-                delegate._cleanup_companion_broker = original_cleanup
-            self.assertEqual(events, ["cleanup", "run", "cleanup"])
 
     def test_verifier_detects_content_change_to_existing_ignored_untracked_file(self):
         with tempfile.TemporaryDirectory() as d:
             root, home, rec, worktree, _plugin = self._setup(d, committed=False)
 
-            def fake(wt, _args, _record_dir):
+            def fake(wt, _model, _prompt, _record_dir):
                 (wt / ".ignored-cache" / "keep.txt").write_text("mutated\n")
                 return (0, _json.dumps({
                     "summary": "mutated", "findings": [], "limitations": []}))
 
             with self.assertRaisesRegex(delegate.WorkflowError, "modified.*worktree"):
-                _run_with_home(home, lambda: self._with_companion(
+                _run_with_home(home, lambda: self._with_codex_verifier(
                     fake, lambda: delegate.verify_delegation(root, rec.name)))
             self.assertEqual(list((rec / "artifact").glob("verify-*.json")), [])
 
@@ -10114,13 +10084,13 @@ class DelegateVerifyTests(unittest.TestCase):
                 return (0, _json.dumps({"summary": "missing fields"}))
 
             with self.assertRaisesRegex(delegate.WorkflowError, "verify artifact schema"):
-                _run_with_home(home, lambda: self._with_companion(
+                _run_with_home(home, lambda: self._with_codex_verifier(
                     fake, lambda: delegate.verify_delegation(root, rec.name)))
             self.assertEqual(list((rec / "artifact").glob("verify-*.json")), [])
 
     def test_contract_empty_must_be_bool_before_normalization(self):
         with tempfile.TemporaryDirectory() as d:
-            root, home, rec, worktree, plugin = self._setup(d, committed=False)
+            root, home, rec, _worktree, _unused = self._setup(d, committed=False)
             contract_path = rec / "artifact" / "contract.yaml"
             contract = yaml.safe_load(contract_path.read_text())
             contract["empty"] = "false"
@@ -10132,7 +10102,7 @@ class DelegateVerifyTests(unittest.TestCase):
                 return (0, "{}")
 
             with self.assertRaises(delegate.WorkflowError) as cm:
-                _run_with_home(home, lambda: self._with_companion(
+                _run_with_home(home, lambda: self._with_codex_verifier(
                     fake, lambda: delegate.verify_delegation(root, rec.name)))
             self.assertIn("empty", str(cm.exception))
             self.assertEqual(called["n"], 0)
@@ -10145,7 +10115,7 @@ class DelegateVerifyTests(unittest.TestCase):
         )
         for field, value, needle in cases:
             with self.subTest(field=field, value=value), tempfile.TemporaryDirectory() as d:
-                root, home, rec, worktree, plugin = self._setup(d, committed=False)
+                root, home, rec, _worktree, _unused = self._setup(d, committed=False)
                 contract_path = rec / "artifact" / "contract.yaml"
                 contract = yaml.safe_load(contract_path.read_text())
                 contract[field] = contract["result_sha"] if value == "result" else value
@@ -10157,14 +10127,14 @@ class DelegateVerifyTests(unittest.TestCase):
                     return (0, "{}")
 
                 with self.assertRaises(delegate.WorkflowError) as cm:
-                    _run_with_home(home, lambda: self._with_companion(
+                    _run_with_home(home, lambda: self._with_codex_verifier(
                         fake, lambda: delegate.verify_delegation(root, rec.name)))
                 self.assertIn(needle, str(cm.exception))
                 self.assertEqual(called["n"], 0)
 
     def test_contract_nonempty_requires_named_patch_file(self):
         with tempfile.TemporaryDirectory() as d:
-            root, home, rec, worktree, plugin = self._setup(d, committed=False)
+            root, home, rec, _worktree, _unused = self._setup(d, committed=False)
             (rec / "artifact" / "changes.patch").unlink()
             called = {"n": 0}
 
@@ -10173,7 +10143,7 @@ class DelegateVerifyTests(unittest.TestCase):
                 return (0, "{}")
 
             with self.assertRaises(delegate.WorkflowError) as cm:
-                _run_with_home(home, lambda: self._with_companion(
+                _run_with_home(home, lambda: self._with_codex_verifier(
                     fake, lambda: delegate.verify_delegation(root, rec.name)))
             self.assertIn("patch_file", str(cm.exception))
             self.assertEqual(called["n"], 0)
@@ -10185,7 +10155,7 @@ class DelegateVerifyTests(unittest.TestCase):
         from unittest import mock
 
         with tempfile.TemporaryDirectory() as d:
-            root, home, rec, worktree, plugin = self._setup(d, committed=False)
+            root, home, rec, _worktree, _unused = self._setup(d, committed=False)
             calls = {"n": 0}
 
             def fake(*args):
@@ -10196,7 +10166,7 @@ class DelegateVerifyTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"WAYSTONE_LOCK_TIMEOUT": "0.02"}, clear=False), \
                     common.hold_lock(rec / "record.lock", timeout=0.2), \
                     contextlib.redirect_stderr(err):
-                rc = _run_with_home(home, lambda: self._with_companion(
+                rc = _run_with_home(home, lambda: self._with_codex_verifier(
                     fake, lambda: delegate.main(
                         ["verify", rec.name, "--root", str(root)])))
             self.assertEqual(rc, 1)
@@ -10207,7 +10177,7 @@ class DelegateVerifyTests(unittest.TestCase):
         import os
 
         with tempfile.TemporaryDirectory() as d:
-            root, home, rec, worktree, plugin = self._setup(d, committed=False)
+            root, home, rec, _worktree, _unused = self._setup(d, committed=False)
             lock = rec / "record.lock"
             lock.write_text("stale fixture\n")
 
@@ -10215,7 +10185,7 @@ class DelegateVerifyTests(unittest.TestCase):
                 return (0, _json.dumps({
                     "summary": "ok", "findings": [], "limitations": []}))
 
-            rc = _run_with_home(home, lambda: self._with_companion(
+            rc = _run_with_home(home, lambda: self._with_codex_verifier(
                 fake, lambda: delegate.main(["verify", rec.name, "--root", str(root)])))
             self.assertEqual(rc, 0)
             self.assertTrue(lock.exists())
@@ -10223,7 +10193,7 @@ class DelegateVerifyTests(unittest.TestCase):
 
     def test_verify_artifact_name_collision_never_overwrites(self):
         with tempfile.TemporaryDirectory() as d:
-            root, home, rec, worktree, plugin = self._setup(d, committed=False)
+            root, home, rec, _worktree, _unused = self._setup(d, committed=False)
             sentinel = {"sentinel": True}
             injected = {"done": False}
             orig_paths = delegate._verify_paths
@@ -10242,7 +10212,7 @@ class DelegateVerifyTests(unittest.TestCase):
 
             delegate._verify_paths = raced_paths
             try:
-                _run_with_home(home, lambda: self._with_companion(
+                _run_with_home(home, lambda: self._with_codex_verifier(
                     fake, lambda: delegate.verify_delegation(root, rec.name)))
             finally:
                 delegate._verify_paths = orig_paths
@@ -10253,7 +10223,7 @@ class DelegateVerifyTests(unittest.TestCase):
 
     def test_repeated_verify_increments_and_show_surfaces_latest(self):
         with tempfile.TemporaryDirectory() as d:
-            root, home, rec, worktree, plugin = self._setup(d, committed=False)
+            root, home, rec, _worktree, _unused = self._setup(d, committed=False)
             n = {"value": 0}
 
             def fake(*args):
@@ -10265,7 +10235,7 @@ class DelegateVerifyTests(unittest.TestCase):
             import io
             with contextlib.redirect_stdout(io.StringIO()):
                 for _ in range(2):
-                    _run_with_home(home, lambda: self._with_companion(
+                    _run_with_home(home, lambda: self._with_codex_verifier(
                         fake, lambda: delegate.verify_delegation(root, rec.name)))
             self.assertTrue((rec / "artifact" / "verify-1.json").exists())
             self.assertTrue((rec / "artifact" / "verify-2.json").exists())
@@ -10278,34 +10248,28 @@ class DelegateVerifyTests(unittest.TestCase):
             self.assertIn("verify_artifacts: 2", summary.getvalue())
             self.assertEqual(_json.loads(latest.getvalue())["payload"]["summary"], "run 2")
 
-    def test_plugin_missing_and_wrong_state_fail_before_companion(self):
+    def test_wrong_state_fails_before_codex_exec(self):
         with tempfile.TemporaryDirectory() as d:
-            root, home, rec, worktree, plugin = self._setup(d)
-            (home / ".claude" / "plugins" / "installed_plugins.json").unlink()
+            root, home, rec, _worktree, _unused = self._setup(d)
             called = {"n": 0}
 
             def fake(*args):
                 called["n"] += 1
                 return (0, "{}")
 
-            with self.assertRaises(delegate.WorkflowError) as cm:
-                _run_with_home(home, lambda: self._with_companion(
-                    fake, lambda: delegate.verify_delegation(root, rec.name)))
-            self.assertIn("codex plugin not installed", str(cm.exception))
-            self.assertEqual(called["n"], 0)
             _run_with_home(home, lambda: delegate._set_state(rec, "applied"))
             with self.assertRaises(delegate.WorkflowError):
-                _run_with_home(home, lambda: self._with_companion(
+                _run_with_home(home, lambda: self._with_codex_verifier(
                     fake, lambda: delegate.verify_delegation(root, rec.name)))
             self.assertEqual(called["n"], 0)
 
     def test_unimplemented_execution_and_entry_fail_loud(self):
         with tempfile.TemporaryDirectory() as d:
-            root, home, rec, worktree, plugin = self._setup(d)
+            root, home, rec, _worktree, _unused = self._setup(d)
             for verifier, needle in (
-                ("{execution: clean-subagent, backend: \"codex:x\", entry: adversarial-review}",
+                ("{execution: clean-subagent, backend: \"codex:x\"}",
                  "schema-valid but not executable"),
-                ("{execution: codex-companion, backend: \"codex:x\", entry: review}",
+                ("{execution: external-runner, backend: \"codex:x\", entry: review}",
                  "entry 'review' not implemented in M2"),
             ):
                 body = ("schema: waystone-profile-1\nbindings:\n"
@@ -10316,9 +10280,9 @@ class DelegateVerifyTests(unittest.TestCase):
                     _run_with_home(home, lambda: delegate.verify_delegation(root, rec.name))
                 self.assertIn(needle, str(cm.exception))
 
-    def test_normalization_failure_and_companion_failure_leave_state_unchanged(self):
+    def test_normalization_and_codex_failure_leave_state_unchanged(self):
         with tempfile.TemporaryDirectory() as d:
-            root, home, rec, worktree, plugin = self._setup(d)
+            root, home, rec, _worktree, _unused = self._setup(d)
             contract_path = rec / "artifact" / "contract.yaml"
             contract = yaml.safe_load(contract_path.read_text())
             contract["base_sha"] = "0" * 40
@@ -10330,7 +10294,7 @@ class DelegateVerifyTests(unittest.TestCase):
                 return (3, "failed")
 
             with self.assertRaises(delegate.WorkflowError):
-                _run_with_home(home, lambda: self._with_companion(
+                _run_with_home(home, lambda: self._with_codex_verifier(
                     fake, lambda: delegate.verify_delegation(root, rec.name)))
             self.assertEqual(called["n"], 0)
             self.assertEqual(delegate._read_status(rec)["state"], "needs-review")
@@ -10339,55 +10303,11 @@ class DelegateVerifyTests(unittest.TestCase):
             contract["base_sha"] = _json.loads((rec / "exposure.json").read_text())["base"]["snapshot_sha"]
             contract_path.write_text(yaml.safe_dump(contract, sort_keys=False))
             with self.assertRaises(delegate.WorkflowError):
-                _run_with_home(home, lambda: self._with_companion(
+                _run_with_home(home, lambda: self._with_codex_verifier(
                     fake, lambda: delegate.verify_delegation(root, rec.name)))
             self.assertEqual(called["n"], 1)
             self.assertEqual(delegate._read_status(rec)["state"], "needs-review")
             self.assertEqual(list((rec / "artifact").glob("verify-*.json")), [])
-
-    def test_broker_shutdown_rpc_targets_only_exact_worktree_key(self):
-        with tempfile.TemporaryDirectory() as d:
-            root = Path(d) / "repo"
-            root.mkdir()
-            init_repo(root)
-            state_root = Path(d) / "state"
-            state_dir = delegate._companion_state_dir(root, state_root=state_root)
-            state_dir.mkdir(parents=True)
-            other = state_root / "other-deadbeef"
-            other.mkdir(parents=True)
-            (other / "broker.json").write_text('{"sentinel": true}')
-            sock_path = Path(d) / "broker.sock"
-            calls = {"connect": [], "sent": []}
-
-            class FakeSocket:
-                def settimeout(self, value):
-                    pass
-
-                def connect(self, value):
-                    calls["connect"].append(value)
-
-                def sendall(self, value):
-                    calls["sent"].append(value.decode())
-
-                def recv(self, size):
-                    return b'{"id":1,"result":{}}\n'
-
-                def close(self):
-                    pass
-
-            (state_dir / "broker.json").write_text(_json.dumps({
-                "endpoint": f"unix:{sock_path}", "pid": 999999, "cwd": str(root.resolve())}))
-            orig = delegate.socket.socket
-            delegate.socket.socket = lambda *args: FakeSocket()
-            try:
-                result = delegate._cleanup_companion_broker(root, state_root=state_root)
-            finally:
-                delegate.socket.socket = orig
-            self.assertEqual(calls["connect"], [str(sock_path)])
-            self.assertIn('"method":"broker/shutdown"', calls["sent"][0].replace(" ", ""))
-            self.assertIn("shutdown", result)
-            self.assertEqual((other / "broker.json").read_text(), '{"sentinel": true}')
-
 
 class UvCacheTests(unittest.TestCase):
     """0.8.0 M2 §13 — worktree-local uv cache env and result-snapshot exclusion."""
@@ -10890,7 +10810,7 @@ class MigrationV2Phase1Tests(unittest.TestCase):
             old_worktree.parent.mkdir(parents=True)
             self.assertEqual(
                 git(root, "worktree", "add", "--detach", str(old_worktree), "HEAD").returncode, 0)
-            profile = "bindings:\n  verifier: {execution: codex-companion, backend: 'codex:gpt-test'}\n"
+            profile = "bindings:\n  verifier: {execution: external-runner, backend: 'codex:gpt-test'}\n"
             (legacy / "profile.yml").write_text(profile)
             (legacy / "projects.json").write_text(_json.dumps({"projects": [
                 {"name": "demo", "path": str(root)},
@@ -10988,7 +10908,7 @@ class MigrationV2Phase2Tests(unittest.TestCase):
     PROFILE = (
         "schema: waystone-profile-1\nbindings:\n"
         "  implementer: {execution: external-runner, backend: 'codex:gpt-test'}\n"
-        "  verifier: {execution: codex-companion, backend: 'codex:gpt-test'}\n"
+        "  verifier: {execution: external-runner, backend: 'codex:gpt-test'}\n"
     )
 
     def _project(self, d: Path) -> tuple[Path, Path]:
@@ -11019,7 +10939,7 @@ class MigrationV2Phase2Tests(unittest.TestCase):
             with contextlib.redirect_stderr(err):
                 _run_with_home(home, lambda: common.migrate_project_state(root))
             self.assertEqual((root / ".waystone" / "profile.yml").read_text(), self.PROFILE)
-            self.assertIn("execution: codex-companion", (root / ".waystone" / "profile.yml").read_text())
+            self.assertIn("execution: external-runner", (root / ".waystone" / "profile.yml").read_text())
             for host in ("claude", "codex"):
                 self.assertEqual((self._source(home, host) / "profile.yml").read_text(), self.PROFILE)
             self.assertIn("seeded", err.getvalue())
@@ -12081,56 +12001,40 @@ class CodexTraceTests(unittest.TestCase):
 
 
 class CodexVerifierTests(unittest.TestCase):
-    def test_native_verifier_never_resolves_claude_companion(self):
+    def test_codex_verifier_uses_exec_without_host_or_plugin_state(self):
         import contextlib
         import io
-        import os
 
         with tempfile.TemporaryDirectory() as d:
-            old_host = os.environ.get("WAYSTONE_HOST")
-            os.environ["WAYSTONE_HOST"] = "codex"
+            root, home = _deleg_project(d)
+            profile = common.ensure_project_state_dir(root) / "profile.yml"
+            profile.write_text(
+                "schema: waystone-profile-1\nbindings:\n"
+                "  implementer: {execution: external-runner, backend: \"codex:gpt-test\"}\n"
+                "  verifier: {backend: \"codex:gpt-test\"}\n"
+            )
+            _deleg_run(root, home, _deleg_fake({"f.txt": "changed\n"}))
+            rec = _latest_rec(root, home)
+            calls = []
+            original_native = delegate._run_codex_verifier
+
+            def fake_native(worktree, model, focus, record_dir):
+                calls.append((worktree, model, focus, record_dir))
+                return 0, _json.dumps({
+                    "summary": "reviewed", "findings": [], "limitations": [],
+                })
+
+            delegate._run_codex_verifier = fake_native
             try:
-                root, home = _deleg_project(d)
-                profile = common.ensure_project_state_dir(root) / "profile.yml"
-                profile.write_text(
-                    "schema: waystone-profile-1\nbindings:\n"
-                    "  implementer: {execution: external-runner, backend: \"codex:gpt-test\"}\n"
-                    "  verifier: {backend: \"codex:gpt-test\", "
-                    "entry: adversarial-review}\n"
-                )
-                _deleg_run(root, home, _deleg_fake({"f.txt": "changed\n"}))
-                rec = _latest_rec(root, home)
-                calls = []
-                original_native = delegate._run_codex_verifier
-                original_companion = delegate._companion_script
-
-                def fake_native(worktree, model, focus, record_dir):
-                    calls.append((worktree, model, focus, record_dir))
-                    return 0, _json.dumps({
-                        "summary": "reviewed", "findings": [], "limitations": [],
-                    })
-
-                def companion_must_not_run():
-                    raise AssertionError("Codex native verification touched the Claude registry")
-
-                delegate._run_codex_verifier = fake_native
-                delegate._companion_script = companion_must_not_run
-                try:
-                    with contextlib.redirect_stdout(io.StringIO()):
-                        rc = _run_with_home(home, lambda: delegate.verify_delegation(root, rec.name))
-                finally:
-                    delegate._run_codex_verifier = original_native
-                    delegate._companion_script = original_companion
-                self.assertEqual(rc, 0)
-                self.assertEqual(len(calls), 1)
-                artifact = _json.loads((rec / "artifact" / "verify-1.json").read_text())
-                self.assertEqual(artifact["transport"], "codex-exec:read-only")
-                self.assertEqual(artifact["provenance"], "independent-verifier")
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc = _run_with_home(home, lambda: delegate.verify_delegation(root, rec.name))
             finally:
-                if old_host is None:
-                    os.environ.pop("WAYSTONE_HOST", None)
-                else:
-                    os.environ["WAYSTONE_HOST"] = old_host
+                delegate._run_codex_verifier = original_native
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(calls), 1)
+            artifact = _json.loads((rec / "artifact" / "verify-1.json").read_text())
+            self.assertEqual(artifact["transport"], "codex-exec:read-only")
+            self.assertEqual(artifact["provenance"], "independent-verifier")
 
 
 class L2CGuardTests(unittest.TestCase):
@@ -13773,15 +13677,8 @@ class L3GapClosureAcceptanceTests(unittest.TestCase):
             _write_profile(root, (
                 'schema: waystone-profile-1\nbindings:\n'
                 '  implementer: {execution: external-runner, backend: "codex:gpt-test"}\n'
-                '  verifier: {backend: "codex:gpt-test", entry: adversarial-review}\n'
+                '  verifier: {backend: "codex:gpt-test"}\n'
             ))
-            plugin = home / "codex-plugin"
-            (plugin / "scripts").mkdir(parents=True)
-            (plugin / "scripts" / "codex-companion.mjs").write_text("// fixture\n")
-            registry = home / ".claude" / "plugins" / "installed_plugins.json"
-            registry.parent.mkdir(parents=True)
-            registry.write_text(_json.dumps({"plugins": {"codex@openai-codex": [
-                {"installPath": str(plugin)}]}}))
             _deleg_run(root, home, _deleg_fake({"impl.py": "x\n"}))
             rec = _latest_rec(root, home)
             contract_path = rec / "artifact" / "contract.yaml"
@@ -13810,7 +13707,7 @@ class L3GapClosureAcceptanceTests(unittest.TestCase):
             _write_profile(root, (
                 'schema: waystone-profile-1\nbindings:\n'
                 '  implementer: {execution: external-runner, backend: "codex:gpt-test"}\n'
-                '  verifier: {backend: "codex:gpt-test", entry: adversarial-review}\n'
+                '  verifier: {backend: "codex:gpt-test"}\n'
             ))
             _deleg_run(root, home, _deleg_fake({"impl.py": "x\n"}))
             rec = _latest_rec(root, home)
@@ -13827,6 +13724,7 @@ class L3GapClosureAcceptanceTests(unittest.TestCase):
                 "profile_fingerprint": exposure["profile_fingerprint"],
                 "base_sha": contract["base_sha"], "result_sha": contract["result_sha"],
                 "patch_sha256": contract["patch_sha256"],
+                "requested_effort": None, "effective_effort": None,
                 "effective_tool_policy": {"tools": ["synthetic"]},
             }
             verify_path.write_text(_json.dumps(verify) + "\n")

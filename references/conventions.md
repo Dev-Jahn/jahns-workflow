@@ -178,7 +178,8 @@ brought back through an explicit artifact contract. The invariants:
   *main-session* decision in `verdict-N.json`. Delegate-claimed content is never promoted to fact,
   and an absent runner report is a reporting absence rather than proof that no verification happened.
 - **Role sandboxes are fixed, not user knobs.** The implementer runs `workspace-write`; the verifier
-  runs `read-only` through the host-derived transport. Verification leaves the delegation
+  runs `read-only`. A Codex verifier uses host-independent `codex exec`, the Waystone-owned
+  adversarial review prompt, `--output-schema`, and `--output-last-message`. Verification leaves the delegation
   `needs-review`. The per-record `record.lock` serializes verify, verdict, apply, and discard; the OS
   releases the lock if its process dies.
 - **The main session judges; the user audits.** `waystone delegate verdict` compares the packet's
@@ -201,9 +202,10 @@ brought back through an explicit artifact contract. The invariants:
 Delegation records live project-local (`{project_root}/.waystone/delegations/…`) and worktrees live
 under `~/.waystone/cache/worktrees/…`; neither is committed. The runner backend (model) is bound
 per role in `{project_root}/.waystone/profile.yml`; a missing binding fails loud rather than
-guessing a default. A verifier binding should normally omit `execution` so Waystone derives the
-transport from the current host. A binding may set `effort` to `none`, `minimal`, `low`, `medium`,
-`high`, `xhigh`, or `ultra`. `ultra` is Codex CLI-only and is passed unchanged as
+guessing a default. A verifier binding should normally omit `execution` and `entry`; Waystone owns
+the verifier transport and prompt. Legacy 0.9 Codex transport and entrypoint fields are normalized
+with a deprecation warning. A binding may set `effort` to `none`, `minimal`, `low`, `medium`,
+`high`, `xhigh`, or `ultra`. `ultra` is Codex-only and is passed unchanged as
 `model_reasoning_effort`; the Claude external runner rejects it without substituting another effort.
 When `effort` is omitted, the runner's configured default is left untouched. Use `waystone paths`
 to inspect every resolved residence.

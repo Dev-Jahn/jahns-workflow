@@ -23,8 +23,6 @@ import os
 import re
 import shlex
 import shutil
-import signal
-import socket
 import stat
 import subprocess
 import sys
@@ -45,6 +43,8 @@ from common import (  # noqa: E402
 DELEG_REF_NS = "refs/waystone/delegations"
 TERMINAL_STATES = ("applied", "discarded")
 _TEMPLATE_PATH = Path(__file__).resolve().parent.parent / "templates" / "delegate-prompt.md"
+_VERIFY_PROMPT_PATH = (
+    Path(__file__).resolve().parent.parent / "templates" / "adversarial-review-prompt.md")
 _VERIFY_SCHEMA_PATH = Path(__file__).resolve().parent.parent / "templates" / "verifier-output-schema.json"
 _VERDICT_INPUT_SCHEMA_PATH = (
     Path(__file__).resolve().parent.parent / "templates" / "verdict-input-schema.json")
@@ -129,8 +129,7 @@ _PROFILE_EXAMPLE = (
     "schema: waystone-profile-1\n"
     "bindings:\n"
     "  implementer: {execution: external-runner, backend: \"codex:gpt-5.6-sol\", effort: xhigh}\n"
-    "  verifier: {execution: external-runner, backend: \"codex:gpt-5.6-sol\", "
-    "entry: adversarial-review}\n"
+    "  verifier: {execution: external-runner, backend: \"codex:gpt-5.6-sol\"}\n"
     "  reviewer: {execution: external-runner, backend: \"codex:gpt-5.6-sol\"}\n"
 )
 
@@ -361,15 +360,14 @@ def _load_profile(root: Path) -> tuple[dict, str]:
     return data, fingerprint
 
 
-def _validate_external_runner_effort(runner: str, transport: str,
-                                     effort: str | None) -> None:
+def _validate_external_runner_effort(runner: str, effort: str | None) -> None:
     if runner == "claude" and effort is not None and effort not in _CLAUDE_EFFORT_VALUES:
         raise WorkflowError(
             f"claude external-runner effort must be one of {', '.join(_CLAUDE_EFFORT_VALUES)}, "
             f"got {effort!r}")
-    if effort == "ultra" and transport != "codex-cli":
+    if effort == "ultra" and runner != "codex":
         raise WorkflowError(
-            f"effort 'ultra' requires the Codex CLI transport, got {transport!r}; "
+            f"effort 'ultra' requires the Codex runner, got {runner!r}; "
             "no substitute effort will be selected")
 
 
@@ -391,7 +389,7 @@ def _resolve_binding(profile: dict, role: str, root: Path) -> dict:
             "observation attribution; delegate run starts only implementer/external-runner")
     runner, _model = _runner_parts(backend)
     effort = b.get("effort")
-    _validate_external_runner_effort(runner, f"{runner}-cli", effort)
+    _validate_external_runner_effort(runner, effort)
     binding = {"role": role, "execution": execution, "backend": backend, "source": "profile"}
     for field in ("effort", "use_for"):
         if field in b:
@@ -420,7 +418,7 @@ def _unsandboxed_runner_override(binding: dict, allow: bool,
 
 
 def _resolve_verifier_binding(profile: dict, root: Path) -> dict:
-    """Resolve a Codex companion/native transport or a headless Claude verifier transport."""
+    """Resolve a host-independent Codex exec or headless Claude verifier transport."""
     bindings = profile.get("bindings")
     b = bindings.get("verifier") if isinstance(bindings, dict) else None
     if not isinstance(b, dict):
@@ -437,35 +435,30 @@ def _resolve_verifier_binding(profile: dict, root: Path) -> dict:
     runner, _model = _runner_parts(backend)
     effort = b.get("effort")
     entry = b.get("entry")
-    if entry != "adversarial-review":
+    if entry not in (None, "adversarial-review"):
         raise WorkflowError(f"entry {entry!r} not implemented in M2")
+    legacy_fields = []
+    if execution in _LEGACY_VERIFIER_EXECUTIONS:
+        legacy_fields.append(f"execution {execution!r}")
+    if entry == "adversarial-review":
+        legacy_fields.append("entry 'adversarial-review'")
     if runner == "claude":
         if execution in _LEGACY_VERIFIER_EXECUTIONS:
             raise WorkflowError(
                 f"verifier execution {execution!r} is a legacy Codex transport and conflicts "
                 f"with backend {backend!r}; use external-runner")
-        _validate_external_runner_effort(runner, "claude-cli", effort)
-        binding = {"role": "verifier", "execution": "claude-cli", "backend": backend,
-                   "entry": entry, "source": "profile"}
-        if effort is not None:
-            binding["effort"] = effort
-        return binding
-
-    derived = "codex-cli" if os.environ.get("WAYSTONE_HOST") == "codex" else "codex-companion"
-    if execution is None or execution == "external-runner":
-        execution = derived
-    elif execution == derived:
+        resolved_execution = "claude-cli"
+    else:
+        resolved_execution = "codex-exec"
+    if legacy_fields:
         print(
-            f"waystone delegate: verifier execution {execution!r} is deprecated in profile — "
-            "remove the execution key to let waystone derive it",
+            "waystone delegate: verifier profile field(s) "
+            f"{', '.join(legacy_fields)} are deprecated — remove them; Waystone owns the "
+            "verification entrypoint and transport",
             file=sys.stderr,
         )
-    else:
-        raise WorkflowError(
-            f"verifier execution {execution!r} conflicts with WAYSTONE_HOST-derived {derived!r} — "
-            "remove the execution key to let waystone derive it")
-    _validate_external_runner_effort(runner, execution, effort)
-    binding = {"role": "verifier", "execution": execution, "backend": backend, "entry": entry,
+    _validate_external_runner_effort(runner, effort)
+    binding = {"role": "verifier", "execution": resolved_execution, "backend": backend,
                "source": "profile"}
     if effort is not None:
         binding["effort"] = effort
@@ -1226,24 +1219,9 @@ def _warn_boundary(root: Path, boundary: str, context: dict) -> list[dict]:
         return []
 
 
-# ---- independent verifier (§11 — same-base codex-companion transport) --------
-def _companion_script() -> Path:
-    registry = Path.home() / ".claude" / "plugins" / "installed_plugins.json"
-    try:
-        data = json.loads(registry.read_text(encoding="utf-8"))
-        entries = (data.get("plugins") or {}).get("codex@openai-codex")
-        install_path = entries[0].get("installPath") if isinstance(entries, list) and entries else None
-        script = Path(install_path) / "scripts" / "codex-companion.mjs" if install_path else None
-    except (OSError, json.JSONDecodeError, AttributeError, TypeError):
-        script = None
-    if script is None or not script.is_file():
-        raise WorkflowError(
-            "codex plugin not installed — install it or bind verifier to another transport")
-    return script
-
-
+# ---- independent verifier (§11 — same-base read-only transport) --------------
 def _verifier_env(record_dir: Path) -> dict[str, str]:
-    """Hermetic verifier env inherited by the transport and any broker it starts.
+    """Hermetic verifier env passed directly to the verifier subprocess.
 
     Runtime cache belongs to the durable record, never to the review worktree.
     """
@@ -1252,25 +1230,6 @@ def _verifier_env(record_dir: Path) -> dict[str, str]:
         "UV_CACHE_DIR": str(record_dir / "runtime" / "uv-cache"),
         _VERIFIER_SESSION_ENV: "1",
     }
-
-
-def _run_companion(worktree: Path, args: list[str], record_dir: Path) -> tuple[int, str]:
-    """Single codex-companion invocation, isolated for tests. The command already contains the
-    dynamically resolved plugin script. stderr is retained as local diagnostic evidence."""
-    try:
-        p = subprocess.run(
-            args, cwd=str(worktree), capture_output=True, text=True, timeout=1800,
-            env=_verifier_env(record_dir),
-        )
-    except subprocess.TimeoutExpired:
-        return 124, ""
-    except OSError as e:
-        return 127, str(e)
-    try:
-        (record_dir / "verify.stderr").write_text(p.stderr, encoding="utf-8")
-    except OSError:
-        pass
-    return p.returncode, p.stdout
 
 
 def _run_codex_verifier(worktree: Path, model: str, focus: str,
@@ -1286,6 +1245,7 @@ def _run_codex_verifier(worktree: Path, model: str, focus: str,
     ])
     env = _verifier_env(record_dir)
     try:
+        output.unlink(missing_ok=True)
         with open(record_dir / "verify-codex.jsonl", "w", encoding="utf-8") as jout, \
              open(record_dir / "verify.stderr", "w", encoding="utf-8") as jerr:
             proc = subprocess.run(
@@ -1421,12 +1381,10 @@ def _effective_verifier_tool_policy(binding: dict) -> dict:
     if execution == "claude-cli":
         return {"tools": ["Read", "Glob", "Grep"], "bash": False,
                 "filesystem_postcondition": "git-status+untracked-content-unchanged"}
-    if execution == "codex-cli":
+    if execution == "codex-exec":
         return {"tools": ["codex-exec"], "sandbox": "read-only", "bash": False,
                 "filesystem_postcondition": "git-status+untracked-content-unchanged"}
-    return {"tools": ["codex-companion:adversarial-review"], "sandbox": "read-only",
-            "bash": False,
-            "filesystem_postcondition": "git-status+untracked-content-unchanged"}
+    raise WorkflowError(f"unknown verifier execution {execution!r}")
 
 
 def _validate_verify_contract(rec: Path, contract: dict, exposure: dict) -> Path | None:
@@ -1495,7 +1453,7 @@ def _normalize_verify_worktree(worktree: Path, contract: dict, patch: Path | Non
             "verify worktree normalization result does not match contract result_sha")
 
 
-def _verify_focus(rec: Path, contract: dict) -> str:
+def _render_verifier_prompt(rec: Path, contract: dict) -> str:
     try:
         packet = yaml.safe_load((rec / "packet.yaml").read_text(encoding="utf-8"))
     except (OSError, yaml.YAMLError) as e:
@@ -1503,73 +1461,25 @@ def _verify_focus(rec: Path, contract: dict) -> str:
     if not isinstance(packet, dict):
         raise WorkflowError("cannot read delegation packet for verify: packet is not a mapping")
     acceptance = packet.get("acceptance") or []
+    if not isinstance(acceptance, list) or not all(isinstance(item, str) for item in acceptance):
+        raise WorkflowError("cannot read delegation packet for verify: acceptance must be strings")
     changed = contract.get("changed_files") or []
-    text = (
-        "Adversarially challenge whether this worktree's working-tree changes (HEAD is the "
-        "delegation base) actually satisfy the acceptance criteria.\nAcceptance criteria:\n"
-        + "\n".join(f"- {item}" for item in acceptance)
-        + "\nChanged files:\n"
-        + "\n".join(f"- {item.get('status', '?')} {item.get('path', '?')}"
-                    for item in changed if isinstance(item, dict)))
-    raw = text.encode("utf-8")
-    return raw[:1024].decode("utf-8", errors="ignore") if len(raw) > 1024 else text
-
-
-def _companion_state_root() -> Path:
-    plugin_data = os.environ.get("CLAUDE_PLUGIN_DATA")
-    return Path(plugin_data) / "state" if plugin_data else Path(tempfile.gettempdir()) / "codex-companion"
-
-
-def _companion_state_dir(worktree: Path, *, state_root: Path | None = None) -> Path:
-    workspace = Path(_git_out(worktree, "rev-parse", "--show-toplevel"))
-    canonical = Path(os.path.realpath(workspace))
-    slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", workspace.name).strip("-") or "workspace"
-    key = f"{slug}-{hashlib.sha256(str(canonical).encode()).hexdigest()[:16]}"
-    return (state_root or _companion_state_root()) / key
-
-
-def _cleanup_companion_broker(worktree: Path, *, state_root: Path | None = None) -> str:
-    """Shutdown only this worktree's exactly keyed broker. RPC is self-identifying; SIGTERM is used
-    only after RPC failure and only when broker.json explicitly binds cwd to this worktree (S16)."""
     try:
-        broker_path = _companion_state_dir(worktree, state_root=state_root) / "broker.json"
-        if not broker_path.is_file():
-            return "broker cleanup: no broker state"
-        broker = json.loads(broker_path.read_text(encoding="utf-8"))
-        if not isinstance(broker, dict):
-            raise ValueError("broker.json is not an object")
-    except Exception as e:  # noqa: BLE001 — cleanup is explicitly best-effort
-        print(f"waystone delegate verify: broker cleanup unreadable; daemon may remain ({e})", file=sys.stderr)
-        return "broker cleanup: daemon may remain"
-
-    endpoint = broker.get("endpoint")
-    rpc_ok = False
-    if isinstance(endpoint, str) and endpoint.startswith("unix:") and endpoint[5:]:
-        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        client.settimeout(2)
-        try:
-            client.connect(endpoint[5:])
-            request = {"id": 1, "method": "broker/shutdown", "params": {}}
-            client.sendall((json.dumps(request, separators=(",", ":")) + "\n").encode())
-            client.recv(4096)
-            rpc_ok = True
-        except OSError:
-            rpc_ok = False
-        finally:
-            client.close()
-    if rpc_ok:
-        return "broker cleanup: shutdown RPC requested"
-
-    canonical = str(Path(os.path.realpath(worktree)))
-    pid = broker.get("pid")
-    if broker.get("cwd") == canonical and type(pid) is int and pid > 0:
-        try:
-            os.kill(pid, signal.SIGTERM)
-            return "broker cleanup: SIGTERM sent after shutdown RPC failure"
-        except OSError:
-            pass
-    print("waystone delegate verify: broker shutdown failed; daemon may remain", file=sys.stderr)
-    return "broker cleanup: daemon may remain"
+        template = _VERIFY_PROMPT_PATH.read_text(encoding="utf-8")
+    except OSError as e:
+        raise WorkflowError(f"cannot read verifier prompt template {_VERIFY_PROMPT_PATH}: {e}") from e
+    replacements = {
+        "{{ACCEPTANCE}}": "\n".join(f"- {item}" for item in acceptance) or "- (none)",
+        "{{CHANGED_FILES}}": "\n".join(
+            f"- {item.get('status', '?')} {item.get('path', '?')}"
+            for item in changed if isinstance(item, dict)
+        ) or "- (none)",
+    }
+    for marker, value in replacements.items():
+        if marker not in template:
+            raise WorkflowError(f"verifier prompt template is missing marker {marker}")
+        template = template.replace(marker, value)
+    return template
 
 
 def _artifact_paths(rec: Path, prefix: str) -> list[Path]:
@@ -1789,7 +1699,7 @@ def _validate_verify_artifact(path: Path, artifact: dict) -> None:
     required = {
         "schema", "at", "transport", "backend", "provenance", "payload",
         "profile_fingerprint", "base_sha", "result_sha", "patch_sha256",
-        "effective_tool_policy",
+        "requested_effort", "effective_effort", "effective_tool_policy",
     }
     if set(artifact) != required:
         invalid("envelope fields do not match waystone-verify-1")
@@ -1811,6 +1721,14 @@ def _validate_verify_artifact(path: Path, artifact: dict) -> None:
     if patch_digest is not None and (not isinstance(patch_digest, str)
                                      or re.fullmatch(r"sha256:[0-9a-f]{64}", patch_digest) is None):
         invalid("patch_sha256 must be a sha256 digest or null")
+    requested_effort = artifact.get("requested_effort")
+    effective_effort = artifact.get("effective_effort")
+    for field, value in (
+            ("requested_effort", requested_effort), ("effective_effort", effective_effort)):
+        if value is not None and value not in _EFFORT_VALUES:
+            invalid(f"{field} must be a supported effort or null")
+    if effective_effort != requested_effort:
+        invalid("effective_effort must equal the exactly forwarded requested_effort")
     policy = artifact.get("effective_tool_policy")
     if not isinstance(policy, dict) or not policy:
         invalid("effective_tool_policy must be a non-empty object")
@@ -2172,30 +2090,18 @@ def verify_delegation(root: Path, did: str) -> int:
             f"delegation {did} is {state} — only a needs-review delegation can be verified")
     profile, fingerprint = _load_profile(root)
     binding = _resolve_verifier_binding(profile, root)
-    script = _companion_script() if binding["execution"] == "codex-companion" else None
     contract = _load_contract(rec)
     exposure = _load_exposure(rec)
     patch = _validate_verify_contract(rec, contract, exposure)
     worktree = _worktree_path(root, did)
     _normalize_verify_worktree(worktree, contract, patch)
-    focus = _verify_focus(rec, contract)
+    focus = _render_verifier_prompt(rec, contract)
     model = binding["backend"].split(":", 1)[1]
     runner_kwargs = {"effort": binding["effort"]} if "effort" in binding else {}
     before = _verify_worktree_state(worktree)
     transport_error = None
     try:
-        if binding["execution"] == "codex-companion":
-            args = ["node", str(script), "adversarial-review", "--json", "--wait", "--scope",
-                    "working-tree", "-C", str(worktree), "-m", model, focus]
-            # A broker inherits its environment only when it starts. End any exact-worktree broker
-            # left by RUN before verification so the verifier guard covers the broker's full life.
-            print(_cleanup_companion_broker(worktree))
-            try:
-                rc, stdout = _run_companion(worktree, args, rec)
-            finally:
-                print(_cleanup_companion_broker(worktree))
-            transport = "codex-companion:adversarial-review"
-        elif binding["execution"] == "codex-cli":
+        if binding["execution"] == "codex-exec":
             rc, stdout = _run_codex_verifier(
                 worktree, model, focus, rec, **runner_kwargs)
             transport = "codex-exec:read-only"
@@ -2229,6 +2135,8 @@ def verify_delegation(root: Path, did: str) -> int:
         "schema": "waystone-verify-1", "at": _now_iso(),
         "transport": transport, "backend": binding["backend"],
         "provenance": "independent-verifier", "payload": payload,
+        "requested_effort": binding.get("effort"),
+        "effective_effort": binding.get("effort"),
         "profile_fingerprint": fingerprint,
         "base_sha": contract["base_sha"], "result_sha": contract["result_sha"],
         "patch_sha256": contract["patch_sha256"],

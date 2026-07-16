@@ -157,8 +157,9 @@ HARD rules:
 ## Step 4 — Produce verification evidence
 
 Use `waystone paths --root <project-root>` to resolve the single project profile at
-`{project_root}/.waystone/profile.yml`. A verifier binding should normally omit `execution` so
-Waystone derives its transport from the current host.
+`{project_root}/.waystone/profile.yml`. A verifier binding should normally omit `execution` and
+`entry`; Waystone owns the verification transport and prompt. Codex verification always uses
+host-independent `codex exec` in a read-only sandbox.
 
 When a verifier binding exists, always run it:
 
