@@ -217,6 +217,23 @@ Every route first checks the eight policy questions in `templates/routing-policy
 run records the budget-sensitivity judgment in packet `routing_note` with main-session provenance;
 an actually used host-guided route is recorded by repeatable `round close --route-note
 <role>,<execution>,<backend>`. Without that note, improve keeps host-guided role attribution unknown.
+
+`deterministic-workflow` names an execution, not a tool: a fixed plan-manifest procedure whose
+Claude Code carrier is the native Workflow tool (a skill or user instruction is the opt-in).
+A host without a carrier cannot run this binding — the route fails loud and the role must be
+rebound explicitly for that host; prose-driven sequential dispatch is never recorded as
+deterministic-workflow. A session-level workflow default (such as ultracode mode) never rebinds
+a role: the profile binding decides each role's execution, workflow agent model/effort derive
+from the resolved carrier manifest rather than being hardcoded, and a workflow result is a
+non-authoritative carrier report that still passes the ordinary verdict gate before acceptance.
+A deterministic-workflow binding must declare an explicit `effort`, and its `backend` names the
+model owning the procedure; mechanical in-workflow agents borrow the clerk binding's
+backend/effort and attribute to the orchestrator route (ADR-0001). Delegations dispatched from
+a carrier record `carrier` and `carrier_instance_id` in the immutable packet. Documented
+binding options: flip `clerk → deterministic-workflow / claude:haiku-4.5` for sweep-heavy
+rounds; `orchestrator → deterministic-workflow` is scale-up only — parallel task groups with
+pairwise-disjoint scopes, main retaining decomposition and acceptance.
+
 The `claude:<model>` external implementer has no structural filesystem/process/network sandbox and
 is refused unless the user explicitly consents to
 `--allow-unsandboxed-runner --reason <why>`.

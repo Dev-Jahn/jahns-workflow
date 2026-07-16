@@ -28,7 +28,7 @@ from common import (  # noqa: E402
 MAX_CHARS = 8000
 MAX_TASK_LINES = 8
 MAX_START_HERE = 2560  # ~2.5KB cap on the injected re-entry narrative (read-time, never truncates the file)
-MAX_CONTRACT = 1200
+MAX_CONTRACT = 1300
 CONTRACT_PATH = Path(__file__).resolve().parents[2] / "references" / "main-contract.md"
 ROUTING_POLICY_PATH = Path(__file__).resolve().parents[2] / "templates" / "routing-policy.yaml"
 ROUTING_QUESTION_IDS = (

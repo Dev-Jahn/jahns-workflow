@@ -280,3 +280,24 @@ tasks:
     status: "pending"
     severity: "major"
     origin: "dogfooding-20260717"
+  - id: decision/deterministic-workflow-carrier-semantics
+    title: "ADR: deterministic-workflow의 carrier·귀속 의미론 확정 (execution=절차 정의, carrier 축, Codex fail-loud, backend·effort 규칙)"
+    status: "pending"
+  - id: feat/delegate-fanout-cli-contract
+    scope: ["scripts/delegate.py"]
+    title: "delegate CLI orchestration-safe 경화: plan --json(manifest·dep gate·corrupt fail-closed), run --expect-packet-sha/--expect-profile/--carrier/--json-events, status --json"
+    status: "pending"
+    deps: ["decision/deterministic-workflow-carrier-semantics"]
+  - id: feat/deterministic-workflow-carrier-contract
+    scope: ["skills/delegate", "docs/CONVENTIONS.md", "references"]
+    title: "delegate 스킬·CONVENTIONS·main-contract에 deterministic-workflow 캐리어 계약(binding 우선·carrier report 비권위·Codex fail-loud) 명문화"
+    status: "pending"
+    deps: ["decision/deterministic-workflow-carrier-semantics"]
+  - id: feat/delegate-fanout-workflow-template
+    scope: ["templates/hosts"]
+    title: "CC 캐리어 템플릿 templates/hosts/claude-code/delegate-fanout.workflow.js + validateOnly compile gate + 시나리오 matrix bake"
+    status: "pending"
+    deps: ["feat/delegate-fanout-cli-contract"]
+  - id: chore/remove-codex-companion-transport
+    title: "codex-companion transport 완전 제거 — codex backend verifier를 호스트 불문 codex exec로 통일, ultra effort 관통, WAYSTONE_HOST 분기·legacy transport 정리"
+    status: "dropped"

@@ -86,6 +86,11 @@ _LEGACY_VERIFIER_EXECUTIONS = ("codex-cli", "codex-companion")
 _EXTERNAL_RUNNERS = ("codex", "claude")
 _CLAUDE_EFFORT_VALUES = ("low", "medium", "high", "xhigh")
 _VERIFIER_SESSION_ENV = "WAYSTONE_VERIFIER_SESSION"
+# Fan-out carrier attribution (§4.2 / ADR-0001): recorded in the immutable packet as an
+# improve/cclog join key. v1 has a single carrier; the instance id is a pre-generated correlation id.
+_CARRIER_NAMES = ("claude-workflow",)
+_CARRIER_INSTANCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.:_-]*$")
+FANOUT_PLAN_SCHEMA = "waystone-fanout-plan-1"
 # Claude implementer execution is intentionally refused unless the user records an explicit
 # unsandboxed-runner override. These flags reduce surfaces after that override, but are not described
 # as confinement: bare Bash can cross filesystem, process, repository, and network boundaries.
@@ -545,6 +550,48 @@ def _build_packet(data: dict, task_id: str, accept_flags: list[str], root: Path,
             "provenance": "main-session", "note": routing_note.strip(),
         }
     return packet, acceptance
+
+
+def _packet_core_digest(packet: dict) -> str:
+    """Machine- and worktree-stable digest of the decision-bearing packet core (§4.1 / Major 4).
+
+    Only the fixed field list below enters the hash. Volatile fields (routing_note, retry_context,
+    carrier, runner_override) are deliberately excluded so a carrier-instance never perturbs the
+    digest, and `project` is the config project NAME (never an absolute root) so the same task hashes
+    identically across machines and worktrees. `delegate plan` pins this value; `delegate run
+    --expect-packet-sha` recomputes it on the freshly rebuilt packet and refuses a mismatch before
+    any record is written."""
+    task = packet.get("task") or {}
+    task_id = task.get("id")
+    core = {
+        "task_id": task_id,
+        "title": task.get("title"),
+        "type": task_id.partition("/")[0] if isinstance(task_id, str) else None,
+        "status": task.get("status"),
+        "deps": [{"id": d.get("id"), "status": d.get("status")} for d in (task.get("deps") or [])],
+        "acceptance": list(packet.get("acceptance") or []),
+        "accept_provenance": list(packet.get("accept_provenance") or []),
+        "declared_scope": list(packet.get("declared_scope") or []),
+        "project": (packet.get("project") or {}).get("name"),
+    }
+    blob = json.dumps(core, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return "sha256:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _validate_carrier(carrier: str | None, instance: str | None) -> dict | None:
+    """Validate the both-or-neither --carrier/--carrier-instance pair (§4.2). Returns the packet
+    carrier record, or None when neither is given."""
+    if carrier is None and instance is None:
+        return None
+    if carrier is None or instance is None:
+        raise WorkflowError("--carrier and --carrier-instance must be given together")
+    if carrier not in _CARRIER_NAMES:
+        raise WorkflowError(
+            f"--carrier must be one of {', '.join(_CARRIER_NAMES)}, got {carrier!r}")
+    if not _CARRIER_INSTANCE_RE.fullmatch(instance):
+        raise WorkflowError(
+            "--carrier-instance must match ^[A-Za-z0-9][A-Za-z0-9.:_-]*$")
+    return {"name": carrier, "instance_id": instance}
 
 
 def _render_prompt(packet: dict, base_sha: str) -> str:
@@ -1009,15 +1056,23 @@ def _add_worktree(root: Path, worktree_path: Path, base_sha: str) -> None:
 def _prepare_run(root: Path, task_id: str, role: str, accept_flags: list[str],
                  retry_note: str | None = None, routing_note: str | None = None, *,
                  allow_unsandboxed_runner: bool = False,
-                 unsandboxed_reason: str | None = None) -> dict:
+                 unsandboxed_reason: str | None = None,
+                 expect_packet_sha: str | None = None, expect_profile: str | None = None,
+                 carrier: str | None = None, carrier_instance: str | None = None,
+                 json_events: bool = False) -> dict:
     _ensure_project_state_or_refuse(root)
     _check_snapshot_preconditions(root)
     profile, fingerprint = _load_profile(root)
+    if expect_profile is not None and expect_profile != fingerprint:
+        raise WorkflowError(
+            f"profile fingerprint mismatch: expected {expect_profile}, live profile is "
+            f"{fingerprint} — re-plan from the current profile before dispatch")
     if role != "implementer":
         raise WorkflowError(f"role {role} not consumed in M1")
     binding = _resolve_binding(profile, role, root)
     runner_override = _unsandboxed_runner_override(
         binding, allow_unsandboxed_runner, unsandboxed_reason)
+    carrier_record = _validate_carrier(carrier, carrier_instance)
     model = _runner_model(binding["backend"])
     cfg = load_config(root)
     if (cfg.get("delegation") or {}).get("enabled") is not True:
@@ -1029,13 +1084,22 @@ def _prepare_run(root: Path, task_id: str, role: str, accept_flags: list[str],
         routing_note=routing_note)
     if runner_override is not None:
         packet["runner_override"] = runner_override
+    if carrier_record is not None:
+        packet["carrier"] = carrier_record
+    if expect_packet_sha is not None:
+        actual = _packet_core_digest(packet)
+        if actual != expect_packet_sha:
+            raise WorkflowError(
+                f"packet digest mismatch: expected {expect_packet_sha}, rebuilt {actual} — the task "
+                f"changed since planning; re-plan from current state before dispatch")
     bindings = profile.get("bindings")
     verifier_bound = isinstance(bindings, dict) and "verifier" in bindings
     return {"task_id": task_id, "binding": binding, "model": model, "cfg": cfg,
             "packet": packet, "fingerprint": fingerprint, "accept_flags": list(accept_flags),
             "retry_note": retry_note, "routing_note": routing_note,
             "verifier_bound": verifier_bound,
-            "runner_override": runner_override}
+            "runner_override": runner_override, "carrier": carrier_record,
+            "expect_packet_sha": expect_packet_sha, "json_events": json_events}
 
 
 def _claim_run(root: Path, plan: dict) -> tuple[str, Path]:
@@ -1046,12 +1110,22 @@ def _claim_run(root: Path, plan: dict) -> tuple[str, Path]:
             retry_note=plan["retry_note"], routing_note=plan["routing_note"])
         if plan["runner_override"] is not None:
             current_packet["runner_override"] = plan["runner_override"]
+        if plan.get("carrier") is not None:
+            current_packet["carrier"] = plan["carrier"]
     except WorkflowError as e:
         raise WorkflowError(
             f"task {task_id} changed while preparing delegation — retry from current state: {e}") from e
     if current_packet != plan["packet"]:
         raise WorkflowError(
             f"task {task_id} changed while preparing delegation — retry from current state")
+    if plan.get("expect_packet_sha") is not None:
+        # Re-derive on the freshly rebuilt packet BEFORE any record write — a stale fan-out dispatch
+        # is refused pre-claim (§4.2), never after a worktree/record has been created.
+        actual = _packet_core_digest(current_packet)
+        if actual != plan["expect_packet_sha"]:
+            raise WorkflowError(
+                f"packet digest mismatch at claim: expected {plan['expect_packet_sha']}, rebuilt "
+                f"{actual} — refusing before claim; re-plan from current state")
     active = _active_delegation_for_task(root, task_id)
     if active:
         raise WorkflowError(
@@ -1087,7 +1161,36 @@ def _claim_run(root: Path, plan: dict) -> tuple[str, Path]:
     return did, record_dir
 
 
+def _emit_event(event: dict) -> None:
+    """Emit one NDJSON run event on stdout (pure machine stream under --json-events, §4.2)."""
+    sys.stdout.write(json.dumps(event, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
 def _run_claimed(root: Path, plan: dict, did: str, record_dir: Path) -> int:
+    task_id = plan["task_id"]
+    packet = plan["packet"]
+    json_events = plan.get("json_events", False)
+    # Under --json-events every human line moves to stderr so stdout stays pure NDJSON (§4.2).
+    human = sys.stderr if json_events else sys.stdout
+    # `claimed` is emitted immediately (the claim record is already on disk) and BEFORE any
+    # snapshot/ref/worktree creation, so the did is recoverable even if a later step fails.
+    if json_events:
+        _emit_event({"event": "claimed", "delegation_id": did, "task_id": task_id,
+                     "packet_sha256": _packet_core_digest(packet)})
+    try:
+        return _run_claimed_body(root, plan, did, record_dir, human)
+    except WorkflowError as e:
+        if json_events:
+            state = (_read_status_raw(record_dir) or {}).get("state") or "failed-runner"
+            _emit_event({"event": "finished", "delegation_id": did, "state": state,
+                         "artifact": None, "base_sha": None, "changed_file_count": None,
+                         "patch_sha256": None, "patch_empty": None,
+                         "delegate_report_present": None, "error": str(e)})
+        raise
+
+
+def _run_claimed_body(root: Path, plan: dict, did: str, record_dir: Path, human) -> int:
     task_id = plan["task_id"]
     binding = plan["binding"]
     model = plan["model"]
@@ -1095,6 +1198,7 @@ def _run_claimed(root: Path, plan: dict, did: str, record_dir: Path) -> int:
     packet = plan["packet"]
     fingerprint = plan["fingerprint"]
     overlays = plan["overlays"]
+    json_events = plan.get("json_events", False)
     artifact_dir = record_dir / "artifact"
     worktree_path = _worktree_path(root, did)
     _mkdir_or_refuse(artifact_dir)
@@ -1104,9 +1208,9 @@ def _run_claimed(root: Path, plan: dict, did: str, record_dir: Path) -> int:
     base_sha, dirty = _snapshot(root, f"waystone delegation snapshot: {task_id} {did}")
     _git_out(root, "update-ref", f"{DELEG_REF_NS}/{did}", base_sha, "")
     _add_worktree(root, worktree_path, base_sha)
-    print(f"base_sha: {base_sha}")
-    print(f"dirty: {str(dirty).lower()}")
-    print(f"worktree: {worktree_path}")
+    print(f"base_sha: {base_sha}", file=human)
+    print(f"dirty: {str(dirty).lower()}", file=human)
+    print(f"worktree: {worktree_path}", file=human)
 
     (record_dir / "packet.yaml").write_text(
         yaml.safe_dump(packet, sort_keys=False, allow_unicode=True), encoding="utf-8")
@@ -1117,7 +1221,7 @@ def _run_claimed(root: Path, plan: dict, did: str, record_dir: Path) -> int:
     env_kind, env_commands = _resolve_env_prep(worktree_path, cfg)
     env_rc, env_tail = _run_env_prep(worktree_path, env_commands)
     env_rec = {"prep": env_kind, "commands": env_commands, "rc": env_rc}
-    print(f"env_prep: {env_kind} rc={env_rc}")
+    print(f"env_prep: {env_kind} rc={env_rc}", file=human)
     if env_rc != 0:
         _set_state(record_dir, "failed-env", env=env_rec, error=env_tail)
         raise WorkflowError(
@@ -1143,7 +1247,7 @@ def _run_claimed(root: Path, plan: dict, did: str, record_dir: Path) -> int:
                    error=f"runner transport exception: {e}")
         raise WorkflowError(
             f"runner transport failed: {e} — worktree preserved at {worktree_path}") from e
-    print(f"runner: backend={binding['backend']} rc={runner_rc}")
+    print(f"runner: backend={binding['backend']} rc={runner_rc}", file=human)
     if runner_rc != 0:
         _set_state(record_dir, "failed-runner", env=env_rec, error=f"runner rc {runner_rc}")
         raise WorkflowError(
@@ -1202,19 +1306,32 @@ def _run_claimed(root: Path, plan: dict, did: str, record_dir: Path) -> int:
     )
     _set_state(record_dir, "needs-review", env=env_rec,
                verification_required=plan["verifier_bound"] or rule1_fired)
-    print(f"artifact: {artifact_dir / 'contract.yaml'}")
+    if json_events:
+        _emit_event({
+            "event": "finished", "delegation_id": did, "state": "needs-review",
+            "artifact": str(artifact_dir / "contract.yaml"), "base_sha": base_sha,
+            "changed_file_count": len(changed),
+            "patch_sha256": contract["patch_sha256"], "patch_empty": empty,
+            "delegate_report_present": report.get("present") is True,
+        })
+    print(f"artifact: {artifact_dir / 'contract.yaml'}", file=human)
     return 0
 
 
 def run_delegation(root: Path, task_id: str, role: str, accept_flags: list[str],
                    retry_note: str | None = None, routing_note: str | None = None, *,
                    allow_unsandboxed_runner: bool = False,
-                   unsandboxed_reason: str | None = None) -> int:
+                   unsandboxed_reason: str | None = None,
+                   expect_packet_sha: str | None = None, expect_profile: str | None = None,
+                   carrier: str | None = None, carrier_instance: str | None = None,
+                   json_events: bool = False) -> int:
     """Library entry: prepare, claim, then run without acquiring flock; CLI owns lock placement."""
     plan = _prepare_run(
         root, task_id, role, accept_flags, retry_note=retry_note, routing_note=routing_note,
         allow_unsandboxed_runner=allow_unsandboxed_runner,
-        unsandboxed_reason=unsandboxed_reason)
+        unsandboxed_reason=unsandboxed_reason,
+        expect_packet_sha=expect_packet_sha, expect_profile=expect_profile,
+        carrier=carrier, carrier_instance=carrier_instance, json_events=json_events)
     did, record_dir = _claim_run(root, plan)
     return _run_claimed(root, plan, did, record_dir)
 
@@ -2302,22 +2419,62 @@ def discard_orphan(root: Path, did: str, reason: str) -> int:
     return 0
 
 
+def _status_fields(did: str, rec: Path) -> dict:
+    """Structured status of one record (§4.3). Corruption is aligned with the owner-lock scan
+    (_active_delegation_for_task / _corrupt_delegation_records): corrupt iff status.json is
+    unparseable, or the task binding is unreadable — read from exposure.json when it exists, else
+    claim.json. A readable claim.json with no exposure/status yet — the claim→exposure window or a
+    crash remnant — is a healthy active hold in state "claimed", never corrupt. task_id is recovered
+    from claim.json when the exposure is absent/corrupt (display only) — no slug heuristics."""
+    st = _read_status_raw(rec)
+    claim_only = not (rec / "exposure.json").exists()
+    exposure = None
+    if not claim_only:
+        try:
+            exposure = _load_exposure(rec)
+        except WorkflowError:
+            exposure = None
+    if exposure is not None:
+        task_id = exposure.get("task_id")
+        base_sha = exposure.get("base", {}).get("snapshot_sha")
+        binding_ok = task_id is not None
+    else:
+        try:
+            task_id = _load_claim(rec).get("task_id")
+        except WorkflowError:
+            task_id = None
+        base_sha = None
+        # Owner-lock reads the binding from claim only when exposure is absent; a present-but-corrupt
+        # exposure is an unreadable binding regardless of what claim.json still holds for display.
+        binding_ok = claim_only and task_id is not None
+    corrupt = st is None or not binding_ok
+    state = st.get("state") if st is not None else None
+    if state is None and claim_only and not corrupt:
+        state = "claimed"  # owner-lock synthesizes this hold state in the claim→exposure window
+    at = (st.get("at_transitions") or [{}])[0].get("at") if st is not None else None
+    return {"delegation_id": did, "task_id": task_id, "state": state,
+            "base_sha": base_sha, "at": at, "corrupt": corrupt}
+
+
 def _status_row(did: str, rec: Path) -> str:
     """One list line. Lenient: a corrupt record renders as [corrupt] instead of killing the whole
     listing (H3) — single-record verbs (show/apply) are the strict, file-naming paths."""
-    st = _read_status_raw(rec)
-    try:
-        exposure = _load_exposure(rec)
-    except WorkflowError:
-        exposure = None
-    if st is None or exposure is None:
+    f = _status_fields(did, rec)
+    if f["corrupt"]:
         return f"{did}  ?  [corrupt]  ?  ?"
-    base7 = (exposure.get("base", {}).get("snapshot_sha") or "")[:7]
-    at = (st.get("at_transitions") or [{}])[0].get("at", "?")
-    return f"{did}  {exposure.get('task_id', '?')}  [{st.get('state', '?')}]  {base7}  {at}"
+    base7 = (f["base_sha"] or "")[:7]
+    at = f["at"] or "?"
+    return f"{did}  {f['task_id'] or '?'}  [{f['state'] or '?'}]  {base7}  {at}"
 
 
-def status(root: Path, did: str | None) -> int:
+def status(root: Path, did: str | None, *, as_json: bool = False) -> int:
+    if as_json:
+        if did:
+            rows = [_status_fields(did, _load_delegation(root, did))]
+        else:
+            rows = [_status_fields(name, rec) for name, rec in _iter_delegations(root)]
+        print(json.dumps(rows, ensure_ascii=False))
+        return 0
     if did:
         rec = _load_delegation(root, did)
         print(_status_row(did, rec))
@@ -2392,6 +2549,156 @@ def show(root: Path, did: str, opt: str | None) -> int:
     return 0
 
 
+# ---- fan-out plan (§4.1 — orchestration-safe manifest, all gates fail-loud) ---
+def _corrupt_delegation_records(root: Path) -> list[tuple[str, str]]:
+    """Project-wide fail-closed scan mirroring the owner-lock corruption test (H3): a non-terminal
+    record whose status or task binding cannot be read is corrupt (the owner lock would treat it as
+    an active hold). Returns [(did, broken_file), ...]."""
+    corrupt: list[tuple[str, str]] = []
+    for did, sub in _iter_delegations(root):
+        st = _read_status_raw(sub)
+        state = st.get("state") if st is not None else None
+        if state in TERMINAL_STATES:
+            continue
+        claim_only = not (sub / "exposure.json").exists()
+        try:
+            tid = (_load_claim(sub) if claim_only else _load_exposure(sub)).get("task_id")
+        except WorkflowError:
+            tid = None
+        if st is None or tid is None:
+            broken = "status.json" if st is None else ("claim.json" if claim_only else "exposure.json")
+            corrupt.append((did, broken))
+    return corrupt
+
+
+def _plan_carrier_block(profile: dict, root: Path) -> dict:
+    """Resolve and validate the orchestrator/clerk/implementer bindings a fan-out consumes, then copy
+    them into the manifest carrier block (§4.1 / ADR-0001): orchestrator must bind
+    deterministic-workflow, implementer must be external-runner, and all three must declare an
+    explicit effort (no model/effort guessing)."""
+    bindings = profile.get("bindings")
+    if not isinstance(bindings, dict):
+        raise WorkflowError(f"profile {_profile_path(root)} bindings must be a mapping")
+
+    def required(role: str) -> dict:
+        b = bindings.get(role)
+        if not isinstance(b, dict):
+            raise WorkflowError(
+                f"fan-out plan requires a '{role}' binding in {_profile_path(root)}")
+        _validate_profile_binding(role, b)  # shape/backend/execution-for-role
+        effort = b.get("effort")
+        if not effort:
+            raise WorkflowError(
+                f"binding '{role}' must declare an explicit effort for a fan-out plan (ADR-0001 §5)")
+        return b
+
+    orchestrator = required("orchestrator")
+    if _canonical_execution("orchestrator", orchestrator) != "deterministic-workflow":
+        raise WorkflowError(
+            "fan-out plan requires orchestrator execution 'deterministic-workflow', got "
+            f"{orchestrator.get('execution')!r}")
+    clerk = required("clerk")
+    implementer = required("implementer")
+    if _canonical_execution("implementer", implementer) != "external-runner":
+        raise WorkflowError(
+            "fan-out plan requires implementer execution 'external-runner', got "
+            f"{implementer.get('execution')!r}")
+    return {
+        "orchestrator": {"execution": "deterministic-workflow",
+                         "backend": orchestrator["backend"], "effort": orchestrator["effort"]},
+        "clerk": {"backend": clerk["backend"], "effort": clerk["effort"]},
+        "implementer": {"execution": "external-runner",
+                        "backend": implementer["backend"], "effort": implementer["effort"]},
+    }
+
+
+def _scope_overlap_pairs(tasks_out: list[dict]) -> list[list[str]]:
+    """Pairwise declared-scope prefix overlap (same semantics as canonical_scope_prefixes + the
+    carrier template): two tasks overlap when any prefix of one is a path-prefix of any prefix of the
+    other. Undeclared-scope tasks are handled separately (unknown_scope_tasks), never here."""
+    def norm(p: str) -> str:
+        return p.rstrip("/") + "/"
+
+    def overlap(a: str, b: str) -> bool:
+        x, y = norm(a), norm(b)
+        return x.startswith(y) or y.startswith(x)
+
+    pairs: list[list[str]] = []
+    for i in range(len(tasks_out)):
+        for j in range(i + 1, len(tasks_out)):
+            a, b = tasks_out[i], tasks_out[j]
+            if a["scope"] and b["scope"] and any(
+                    overlap(x, y) for x in a["scope"] for y in b["scope"]):
+                pairs.append([a["task_id"], b["task_id"]])
+    return pairs
+
+
+def _make_fanout_correlation_id() -> str:
+    """Pre-generated correlation id in the _make_did timestamp style (§4.1). The real host workflow
+    run id is joined later in the improve/cclog loop — never a pre-unknown value in the manifest.
+    The trailing `-fanout-<6 hex>` mirrors the plan schema's `-fanout-<seq>` shape: the hex is a
+    uniqueness discriminator so two plans in the same UTC second cannot collide, since this value
+    becomes each delegation's immutable carrier.instance_id (the improve/cclog join key)."""
+    return (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            + "-fanout-" + os.urandom(3).hex())
+
+
+def plan(root: Path, task_ids: list[str], routing_note: str | None) -> int:
+    cfg = load_config(root)
+    if (cfg.get("delegation") or {}).get("enabled") is not True:
+        raise WorkflowError(
+            "delegation is disabled by .waystone.yml delegation.enabled; re-run init consent "
+            "before planning a fan-out")
+    if not task_ids:
+        raise WorkflowError("plan requires at least one <task-id>")
+    seen: set[str] = set()
+    targets: list[str] = []
+    for tid in task_ids:
+        if tid not in seen:
+            seen.add(tid)
+            targets.append(tid)
+    profile, fingerprint = _load_profile(root)
+    carrier = _plan_carrier_block(profile, root)
+    corrupt = _corrupt_delegation_records(root)
+    if corrupt:
+        raise WorkflowError(
+            "refusing fan-out plan — corrupt delegation record(s): "
+            + "; ".join(f"{did} ({broken})" for did, broken in corrupt)
+            + " — the owner lock treats these as active; discard them before planning")
+    data = load_tasks(root)
+    tasks_out: list[dict] = []
+    for tid in targets:
+        # _build_packet enforces status ∈ {pending, active}, the dependency gate, and acceptance.
+        packet, _acceptance = _build_packet(data, tid, [], root)
+        active = _active_delegation_for_task(root, tid)
+        if active:
+            raise WorkflowError(
+                f"task {tid} already has a non-terminal delegation {active[0]} (state {active[1]}) — "
+                f"apply or discard it before planning a fan-out")
+        tasks_out.append({
+            "task_id": tid,
+            "packet_sha256": _packet_core_digest(packet),
+            "scope": packet["declared_scope"],
+            "deps": packet["task"]["deps"],
+            "deps_ok": True,
+        })
+    registry_bytes = (root / "tasks.yaml").read_bytes()
+    manifest = {
+        "schema": FANOUT_PLAN_SCHEMA,
+        "root": str(root.resolve()),
+        "correlation_id": _make_fanout_correlation_id(),
+        "profile_fingerprint": fingerprint,
+        "registry_fingerprint": "sha256:" + hashlib.sha256(registry_bytes).hexdigest(),
+        "carrier": carrier,
+        "tasks": tasks_out,
+        "overlap_pairs": _scope_overlap_pairs(tasks_out),
+        "unknown_scope_tasks": [t["task_id"] for t in tasks_out if not t["scope"]],
+        "routing_note": routing_note if routing_note is not None else "",
+    }
+    print(json.dumps(manifest, ensure_ascii=False, indent=2))
+    return 0
+
+
 # ---- CLI (hand-rolled parsing; {0,1,2} exit contract, never a raw git rc) -----
 def _parse_opts(rest: list[str], *, value=(), boolean=(), repeat=()) -> tuple[list[str], dict]:
     pos: list[str] = []
@@ -2431,10 +2738,21 @@ def _resolve_root(explicit: str | None) -> Path:
     return root
 
 
+def _cli_plan(rest: list[str]) -> int:
+    pos, opts = _parse_opts(rest, value=("root", "routing-note"), boolean=("json",))
+    if not opts.get("json"):
+        raise WorkflowError("plan requires --json (the fan-out manifest is machine output)")
+    if not pos:
+        raise WorkflowError("plan requires at least one <task-id>")
+    return plan(_resolve_root(opts.get("root")), pos, opts.get("routing-note"))
+
+
 def _cli_run(rest: list[str]) -> int:
     pos, opts = _parse_opts(
-        rest, value=("role", "root", "note", "routing-note", "reason"), repeat=("accept",),
-        boolean=("allow-unsandboxed-runner",))
+        rest, value=("role", "root", "note", "routing-note", "reason",
+                     "expect-packet-sha", "expect-profile", "carrier", "carrier-instance"),
+        repeat=("accept",),
+        boolean=("allow-unsandboxed-runner", "json-events"))
     if not pos:
         raise WorkflowError("run requires a <task-id>")
     allow_unsandboxed = bool(opts.get("allow-unsandboxed-runner"))
@@ -2443,22 +2761,27 @@ def _cli_run(rest: list[str]) -> int:
     if opts.get("reason") and not allow_unsandboxed:
         raise WorkflowError("run --reason is only valid with --allow-unsandboxed-runner")
     root = _resolve_root(opts.get("root"))
-    plan = _prepare_run(
+    plan_ = _prepare_run(
         root, pos[0], opts.get("role", "implementer"), opts.get("accept", []),
         retry_note=opts.get("note"), routing_note=opts.get("routing-note"),
         allow_unsandboxed_runner=allow_unsandboxed,
-        unsandboxed_reason=opts.get("reason"))
+        unsandboxed_reason=opts.get("reason"),
+        expect_packet_sha=opts.get("expect-packet-sha"),
+        expect_profile=opts.get("expect-profile"),
+        carrier=opts.get("carrier"), carrier_instance=opts.get("carrier-instance"),
+        json_events=bool(opts.get("json-events")))
     # Constant-level lock span: only local task/overlay revalidation, owner scan, and one claim write.
     # Git preflight, profile/packet preparation, snapshot/worktree setup, and the runner stay outside.
     with hold_lock(project_lock_path(root)):
-        did, record_dir = _claim_run(root, plan)
+        did, record_dir = _claim_run(root, plan_)
     with hold_lock(record_dir / "record.lock"):
-        return _run_claimed(root, plan, did, record_dir)
+        return _run_claimed(root, plan_, did, record_dir)
 
 
 def _cli_status(rest: list[str]) -> int:
-    pos, opts = _parse_opts(rest, value=("root",))
-    return status(_resolve_root(opts.get("root")), pos[0] if pos else None)
+    pos, opts = _parse_opts(rest, value=("root",), boolean=("json",))
+    return status(_resolve_root(opts.get("root")), pos[0] if pos else None,
+                  as_json=bool(opts.get("json")))
 
 
 def _cli_show(rest: list[str]) -> int:
@@ -2533,7 +2856,7 @@ def _cli_verdict(rest: list[str]) -> int:
         )
 
 
-_HANDLERS = {"run": _cli_run, "status": _cli_status, "show": _cli_show,
+_HANDLERS = {"plan": _cli_plan, "run": _cli_run, "status": _cli_status, "show": _cli_show,
              "apply": _cli_apply, "discard": _cli_discard, "verify": _cli_verify,
              "verdict": _cli_verdict}
 
@@ -2541,7 +2864,7 @@ _HANDLERS = {"run": _cli_run, "status": _cli_status, "show": _cli_show,
 def main(argv: list[str]) -> int:
     if not argv or argv[0] not in _HANDLERS:
         print("waystone delegate: expected subcommand "
-              "(run|status|show|apply|discard|verify|verdict)", file=sys.stderr)
+              "(plan|run|status|show|apply|discard|verify|verdict)", file=sys.stderr)
         return 1
     try:
         return _HANDLERS[argv[0]](argv[1:])
