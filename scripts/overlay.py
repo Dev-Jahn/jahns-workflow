@@ -480,23 +480,9 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _configured_reviewer_membership(root: Path, reviewer_id: str | None) -> tuple[bool | None, str | None]:
-    if not isinstance(reviewer_id, str) or not reviewer_id.strip():
-        return None, "reviewer-identity-unavailable"
-    try:
-        import review
-
-        configured = review.resolve_reviewers(
-            root, (load_config(root).get("review") or {}).get("reviewers", []))
-    except (OSError, ValueError, WorkflowError):
-        return None, "configured-reviewer-resolution-unavailable"
-    if reviewer_id not in configured:
-        return None, "reviewer-not-configured"
-    return True, None
-
-
 def record_review_feedback(root: Path, round_id: str, *, source: str, event_id: str,
-                           reviewer: str | None = None) -> dict:
+                           reviewer: str | None = None, reply_header: dict | None = None,
+                           binding: dict | None = None, force: bool = False) -> dict:
     """Append one canonical review-feedback event shared by packet ingest and completed PR markers."""
     if not isinstance(round_id, str) or not round_id:
         raise WorkflowError("review feedback round_id must be non-empty")
@@ -506,33 +492,94 @@ def record_review_feedback(root: Path, round_id: str, *, source: str, event_id: 
         raise WorkflowError("review feedback event_id must be non-empty")
     if reviewer is not None and (not isinstance(reviewer, str) or not reviewer.strip()):
         raise WorkflowError("review feedback reviewer must be a non-empty string when provided")
+    reviewer_effort = None
+    review_target = None
+    review_target_matches = None
+    reply_metadata = None
+    binding_target_sha = None
+    binding_base_sha = None
+    binding_source = None
     if source == "pr-marker":
         reviewer_configured, reviewer_reason = True, None
     else:
-        reviewer_configured, reviewer_reason = _configured_reviewer_membership(root, reviewer)
+        import review
+
+        reply_header = reply_header if isinstance(reply_header, dict) else {
+            "metadata": {}, "model": reviewer, "effort": None, "review_target": None,
+        }
+        reviewer = reply_header.get("model")
+        reviewer_effort = reply_header.get("effort")
+        review_target = reply_header.get("review_target")
+        reply_metadata = reply_header.get("metadata") or {}
+        assessment = review.assess_review_reply(reply_header, binding)
+        review_target_matches = assessment["review_target_matches"]
+        reviewer_configured = assessment["reviewer_configured"]
+        reviewer_reason = assessment["reviewer_coverage_reason"]
+        if isinstance(binding, dict):
+            binding_target_sha = binding.get("target_sha")
+            binding_base_sha = binding.get("base_sha")
+            binding_source = binding.get("source")
     row = {
         "schema": REVIEW_FEEDBACK_SCHEMA, "event": "review-feedback", "at": _now_iso(),
         "round_id": round_id, "source": source, "event_id": event_id,
         "reviewer": reviewer, "reviewer_configured": reviewer_configured,
         "reviewer_coverage_reason": reviewer_reason, "provenance": "observed",
     }
+    if source == "packet-ingest":
+        row.update({
+            "reviewer_effort": reviewer_effort, "review_target": review_target,
+            "review_target_matches": review_target_matches,
+            "reply_metadata": reply_metadata,
+            "binding_target_sha": binding_target_sha, "binding_base_sha": binding_base_sha,
+            "review_binding_source": binding_source,
+        })
+    _ensure_project_state_or_refuse(root)
+    path = _review_ingests_path(root)
+    _mkdir_or_refuse(path.parent)
+    if force and source == "packet-ingest" and path.is_file():
+        lines = path.read_text(encoding="utf-8").splitlines()
+        output: list[str] = []
+        replaced = False
+        for line in lines:
+            try:
+                prior = json.loads(line)
+            except json.JSONDecodeError:
+                output.append(line)
+                continue
+            prior_event_id = prior.get("event_id") if isinstance(prior, dict) else None
+            same_round = (isinstance(prior, dict)
+                          and prior.get("source") == "packet-ingest"
+                          and (prior.get("round_id") == round_id
+                               or (isinstance(prior_event_id, str)
+                                   and prior_event_id.startswith(
+                                       f"packet:{round_id}:reviewer:"))))
+            if same_round:
+                if not replaced:
+                    output.append(json.dumps(row, ensure_ascii=False, sort_keys=True))
+                    replaced = True
+                continue
+            output.append(line)
+        if not replaced:
+            output.append(json.dumps(row, ensure_ascii=False, sort_keys=True))
+        write_text_atomic(path, "\n".join(output) + "\n")
+        return row
     existing, _skipped = load_review_ingests(root)
     prior = next((item for item in existing if item.get("event_id") == event_id), None)
     if prior is not None:
         return {key: prior.get(key) for key in row}
-    _ensure_project_state_or_refuse(root)
-    path = _review_ingests_path(root)
-    _mkdir_or_refuse(path.parent)
     with path.open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
     return row
 
 
-def record_review_ingest(root: Path, round_id: str, reviewer: str | None = None) -> dict:
+def record_review_ingest(root: Path, round_id: str, reviewer: str | None = None,
+                         *, reply_header: dict | None = None, binding: dict | None = None,
+                         force: bool = False) -> dict:
     """Compatibility wrapper: a packet ingest projects to the canonical feedback event."""
     return record_review_feedback(
         root, round_id, source="packet-ingest",
-        event_id=f"packet:{round_id}:reviewer:{reviewer or 'unknown'}", reviewer=reviewer)
+        event_id=f"packet:{round_id}", reviewer=reviewer, reply_header=reply_header,
+        binding=binding, force=force)
 
 
 def load_review_ingests(root: Path) -> tuple[list[dict], int]:

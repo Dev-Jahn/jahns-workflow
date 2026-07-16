@@ -1069,11 +1069,19 @@ def _project_review_rows(name: str, root: Path, cfg: dict) -> list[dict]:
     rows: list[dict] = []
     for rid in round_ids:
         findings: list[dict] = []
+        reply_metadata = {
+            "metadata": {}, "model": None, "effort": None, "review_target": None,
+            "review_target_matches": None, "reviewer_configured": None,
+            "reviewer_coverage_reason": "reply-metadata-unavailable",
+        }
         round_tasks = tasks_by_round.get(rid, [])
         tasks_by_id = {t["id"]: t for t in round_tasks if t.get("id")}
         referenced_task_ids: set[str] = set()
         fb = feedback_files.get(rid)
         if fb is not None:
+            import review
+
+            reply_metadata = review.read_feedback_reply_metadata(fb)
             try:
                 text = fb.read_text(encoding="utf-8", errors="replace")
             except OSError:
@@ -1122,6 +1130,13 @@ def _project_review_rows(name: str, root: Path, cfg: dict) -> list[dict]:
             "round_at": (latest_round_exposures.get(rid) or {}).get("at"),
             "request_file": str(req) if req else None,
             "feedback_file": str(fb) if fb else None,
+            "reviewer": reply_metadata["model"],
+            "reviewer_effort": reply_metadata["effort"],
+            "review_target": reply_metadata["review_target"],
+            "review_target_matches": reply_metadata["review_target_matches"],
+            "reviewer_configured": reply_metadata["reviewer_configured"],
+            "reviewer_coverage_reason": reply_metadata["reviewer_coverage_reason"],
+            "reply_metadata": reply_metadata["metadata"],
             **review_binding,
             "session_id": session_id,
             "round_session_provenance": session_provenance,

@@ -34,14 +34,20 @@ deterministic ingest, which copies `/tmp/review.md` byte-exact into the feedback
 metadata header and consumes the drop-file:
 
 ```bash
-waystone review ingest . --round <round-id> --reviewer "<resolved reviewer backend>"
+waystone review ingest . --round <round-id>
 ```
 
-Resolve `review.reviewers` first. When it contains `role:reviewer` (the new-project default), read
-the `reviewer` binding from `{project_root}/.waystone/profile.yml` and pass its literal backend as
-`<resolved reviewer backend>`. If the project intentionally keeps a legacy literal reviewer list,
-pass that configured literal. Never invent a backend when the role binding is missing; follow the
-CLI's fail-loud guidance to add the binding or explicitly retain literal reviewers.
+The reply itself must begin with the request template's key/value block: `model`, `effort`, and
+`review-target` (`<target-sha>` or `<base-sha>-<target-sha>`, 6–40 hex characters each). Key
+case/order/colon whitespace and an optional Markdown fence are tolerated; extra keys are preserved.
+Missing, duplicate, invalid, or non-UTF-8 values stay unknown, and a leading key/value block with
+neither `model` nor `review-target` is ordinary prose. Ingest compares the declaration only with the
+round's publication-time sidecar; it never rebuilds a missing legacy binding from current config or
+profile. For new projects that sidecar already freezes the backend resolved from `role:reviewer` at
+publication time. A model matches an exact configured identity, or a provider-qualified identity
+matches the same bare model slug; two provider-qualified identities must match completely.
+Missing/mismatched identity or target does not count as configured feedback for
+`review-skipped-closes-v1`.
 
 Besides the byte-exact copy, ingest **appends** (never edits the verbatim body) a *finding triage
 skeleton*: if the reply has `JW-GPT-NNN` finding blocks it builds a table, else it notes "triage the

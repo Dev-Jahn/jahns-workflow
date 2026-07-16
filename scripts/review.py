@@ -28,8 +28,8 @@ Subcommands (also `waystone review <sub>`):
   freeze --pr N [--round ID] [root]   stamp the current PR head as a new review cycle + post request
   status [--pr N] [root]              show per-cycle review status (PR mode) or packet pairs (packet mode)
   prepare --round ID [root]           bind an authored packet request to the closeout HEAD
-  ingest [--round ID] [--reviewer M] [--force]  byte-exact copy /tmp/review.md →
-                                                <id>-feedback.md, then append triage
+  ingest [--round ID] [--force]  parse the reply header, byte-exact copy /tmp/review.md →
+                                 <id>-feedback.md, then append triage
 """
 from __future__ import annotations
 
@@ -60,6 +60,16 @@ PACKET_REVIEWING_FORMAT = (
     "- Reviewing: <40-lowercase-hex-sha>   "
     "(diff against <40-lowercase-hex-sha-or-(root)>)"
 )
+REVIEW_REPLY_HEADER_MAX_LINES = 32
+REVIEW_REPLY_HEADER_MAX_BYTES = 16 * 1024
+FEEDBACK_HEADER_MAX_BYTES = 32 * 1024
+REVIEW_EFFORT_VALUES = ("none", "minimal", "low", "medium", "high", "xhigh", "ultra")
+_REPLY_KEY_RE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9_-]*)\s*:\s*(.*?)\s*$")
+_REPLY_MODEL_RE = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._/-]*(?::[A-Za-z0-9][A-Za-z0-9._/-]*)?")
+_REVIEW_TARGET_RE = re.compile(
+    r"(?P<first>[0-9a-fA-F]{6,40})(?:-(?P<second>[0-9a-fA-F]{6,40}))?")
+_FEEDBACK_METADATA_PREFIX = "reply-metadata-json: "
 
 
 def is_codex(login: str | None) -> bool:
@@ -83,6 +93,186 @@ def emit_marker(kind: str, fields: dict) -> str:
     body = yaml.safe_dump(dict(fields), sort_keys=False, default_flow_style=False,
                           allow_unicode=True).strip()
     return f"<!-- waystone-{kind}:v1\n{body}\n-->"
+
+
+def _reply_key(value: str) -> str:
+    return value.strip().lower().replace("_", "-")
+
+
+def normalize_reviewer_model(value: object) -> str | None:
+    """Canonical reply identity: one ASCII model slug, optionally provider-qualified.
+
+    Case is insignificant. A provider-qualified configured route may match a bare declared model
+    slug, but two provider-qualified values must match in full; no other aliasing is performed.
+    """
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if "\ufffd" in candidate or _REPLY_MODEL_RE.fullmatch(candidate) is None:
+        return None
+    return candidate.lower()
+
+
+def normalize_review_effort(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip().lower()
+    return candidate if candidate in REVIEW_EFFORT_VALUES else None
+
+
+def normalize_review_target(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip().lower()
+    return candidate if _REVIEW_TARGET_RE.fullmatch(candidate) is not None else None
+
+
+def reviewer_model_matches(declared: str, configured: str) -> bool:
+    """Documented identity normalization used by ingest and the configured-feedback guard."""
+    left = normalize_reviewer_model(declared)
+    right = normalize_reviewer_model(configured)
+    if left is None or right is None:
+        return False
+    if left == right:
+        return True
+    left_provider, left_sep, left_model = left.partition(":")
+    right_provider, right_sep, right_model = right.partition(":")
+    if bool(left_sep) == bool(right_sep):
+        return False
+    return (left_model if left_sep else left_provider) == (
+        right_model if right_sep else right_provider)
+
+
+def parse_review_reply_header(body: bytes) -> dict:
+    """Parse only the reply's leading key/value block.
+
+    Leading blank lines and one optional Markdown fence are ignored; key case, order, and colon
+    whitespace are insignificant. The block ends at its first blank/non-key line (or closing
+    fence), is bounded to 32 lines/16 KiB, and is classified only if it contains ``model`` or
+    ``review-target``. Unknown keys are retained. Damaged UTF-8 and duplicate fields are never
+    replacement-decoded or guessed.
+    """
+    metadata: dict[str, str] = {}
+    damaged: set[str] = set()
+    warnings: list[str] = []
+    seen: set[str] = set()
+    started = False
+    fenced = False
+    consumed = 0
+
+    for line_number, raw in enumerate(body.splitlines(), 1):
+        if line_number > REVIEW_REPLY_HEADER_MAX_LINES:
+            warnings.append("header-limit-exceeded")
+            break
+        consumed += len(raw) + 1
+        if consumed > REVIEW_REPLY_HEADER_MAX_BYTES:
+            warnings.append("header-limit-exceeded")
+            break
+        stripped = raw.strip()
+        if not started and not stripped:
+            continue
+        if not started and re.fullmatch(rb"```[^`]*", stripped):
+            started = True
+            fenced = True
+            continue
+        if fenced and stripped == b"```":
+            break
+        if started and not stripped:
+            break
+        try:
+            line = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            raw_key, separator, _raw_value = raw.partition(b":")
+            try:
+                key = _reply_key(raw_key.decode("ascii")) if separator else ""
+            except UnicodeDecodeError:
+                key = ""
+            if key and re.fullmatch(r"[a-z][a-z0-9-]*", key):
+                started = True
+                damaged.add(key)
+                seen.add(key)
+            warnings.append("invalid-utf8")
+            if not started:
+                break
+            continue
+        match = _REPLY_KEY_RE.fullmatch(line)
+        if match is None:
+            break
+        started = True
+        key = _reply_key(match.group(1))
+        value = match.group(2).strip()
+        if key in seen:
+            metadata.pop(key, None)
+            damaged.add(key)
+            warnings.append(f"duplicate-{key}")
+            continue
+        seen.add(key)
+        metadata[key] = value
+
+    detected = "model" in seen or "review-target" in seen
+    if not detected:
+        return {
+            "detected": False, "metadata": {}, "model": None, "effort": None,
+            "review_target": None, "warnings": [],
+        }
+
+    model = None if "model" in damaged else normalize_reviewer_model(metadata.get("model"))
+    effort = None if "effort" in damaged else normalize_review_effort(metadata.get("effort"))
+    target = (None if "review-target" in damaged
+              else normalize_review_target(metadata.get("review-target")))
+    for key, value, invalid in (
+            ("model", model, "invalid-model"),
+            ("effort", effort, "invalid-effort"),
+            ("review-target", target, "invalid-review-target")):
+        if key not in seen:
+            warnings.append(f"missing-{key}")
+        elif value is None and key not in damaged:
+            warnings.append(invalid)
+    return {
+        "detected": True, "metadata": metadata, "model": model, "effort": effort,
+        "review_target": target, "warnings": list(dict.fromkeys(warnings)),
+    }
+
+
+def review_target_matches_binding(declared: str | None, binding: dict | None) -> bool | None:
+    target = normalize_review_target(declared)
+    if target is None or binding is None:
+        return None
+    match = _REVIEW_TARGET_RE.fullmatch(target)
+    if match is None:  # normalize_review_target is the single semantic gate
+        return None
+    first, second = match.group("first"), match.group("second")
+    bound_target = str(binding.get("target_sha") or "").lower()
+    bound_base = str(binding.get("base_sha") or "").lower()
+    if second is None:
+        return bool(bound_target) and bound_target.startswith(first)
+    return (bool(bound_base) and bool(bound_target)
+            and bound_base.startswith(first) and bound_target.startswith(second))
+
+
+def assess_review_reply(parsed: dict, binding: dict | None) -> dict:
+    target_matches = review_target_matches_binding(parsed.get("review_target"), binding)
+    reviewers = binding.get("reviewers") if isinstance(binding, dict) else None
+    model = parsed.get("model")
+    model_configured = (isinstance(model, str) and isinstance(reviewers, list)
+                        and any(reviewer_model_matches(model, item) for item in reviewers))
+    if binding is None:
+        reason = "round-binding-unavailable"
+    elif model is None:
+        reason = "reviewer-identity-unavailable"
+    elif parsed.get("review_target") is None:
+        reason = "review-target-unavailable"
+    elif target_matches is not True:
+        reason = "review-target-mismatch"
+    elif not model_configured:
+        reason = "reviewer-not-configured"
+    else:
+        reason = None
+    return {
+        "review_target_matches": target_matches,
+        "reviewer_configured": True if reason is None else None,
+        "reviewer_coverage_reason": reason,
+    }
 
 
 def write_round_request_binding(root: Path, round_id: str, target_sha: str, base_sha: str | None,
@@ -157,6 +347,100 @@ def round_request_binding_order(path: Path, row: dict) -> tuple[str, int, str]:
     match = re.search(r"-request\.binding(?:-(\d+))?\.json$", Path(path).name)
     sequence = int(match.group(1)) if match and match.group(1) else 1
     return str(row.get("at") or ""), sequence, str(path)
+
+
+def ingest_round_binding(root: Path, round_id: str, cfg: dict) -> tuple[dict | None, str | None]:
+    """Return only publication-time sidecar evidence; never rebuild it from current config."""
+    directory = Path(root) / cfg["reviews_dir"]
+    mode = (cfg.get("review") or {}).get("mode", "packet")
+    try:
+        if mode == "packet":
+            paths = sorted(directory.glob(f"{round_id}-request.binding*.json"))
+            if not paths:
+                return None, "missing-round-request-sidecar"
+            rows = [(path, read_round_request_binding(path, expected_round_id=round_id))
+                    for path in paths]
+            path, row = max(rows, key=lambda item: round_request_binding_order(*item))
+            return {**row, "source": str(path)}, None
+
+        paths = sorted(directory.glob(f"{round_id}-freeze-*.binding*.json"))
+        if not paths:
+            return None, "missing-pr-freeze-sidecar"
+        rows = [(path, read_pr_freeze_binding(path, expected_round_id=round_id))
+                for path in paths]
+        latest_cycle = max(row["cycle"] for _path, row in rows)
+        latest = [(path, row) for path, row in rows if row["cycle"] == latest_cycle]
+        contracts = {(row["target_sha"], row["base_sha"], tuple(row["reviewers"]))
+                     for _path, row in latest}
+        if len(contracts) != 1:
+            return None, "conflicting-pr-freeze-sidecars"
+        path, row = max(latest, key=lambda item: (item[1]["at"], str(item[0])))
+        return {**row, "source": str(path)}, None
+    except (OSError, WorkflowError) as e:
+        return None, f"corrupt-round-binding:{type(e).__name__}"
+
+
+def feedback_metadata_payload(parsed: dict, assessment: dict) -> dict:
+    return {
+        "metadata": parsed.get("metadata") if isinstance(parsed.get("metadata"), dict) else {},
+        "review_target_matches": assessment.get("review_target_matches"),
+        "reviewer_configured": assessment.get("reviewer_configured"),
+        "reviewer_coverage_reason": assessment.get("reviewer_coverage_reason"),
+    }
+
+
+def read_feedback_reply_metadata(path: Path) -> dict:
+    """Read and revalidate ingest metadata from the bounded feedback-file header only."""
+    unknown = {
+        "metadata": {}, "model": None, "effort": None, "review_target": None,
+        "review_target_matches": None, "reviewer_configured": None,
+        "reviewer_coverage_reason": "reply-metadata-unavailable",
+    }
+    try:
+        with Path(path).open("rb") as stream:
+            prefix = stream.read(FEEDBACK_HEADER_MAX_BYTES + 1)
+    except OSError:
+        return unknown
+    if len(prefix) > FEEDBACK_HEADER_MAX_BYTES:
+        return unknown
+    separator = prefix.find(b"\n\n---\n\n")
+    if separator < 0:
+        return unknown
+    try:
+        header = prefix[:separator].decode("utf-8")
+    except UnicodeDecodeError:
+        return unknown
+    candidates = [line[len(_FEEDBACK_METADATA_PREFIX):]
+                  for line in header.splitlines() if line.startswith(_FEEDBACK_METADATA_PREFIX)]
+    if len(candidates) != 1:
+        return unknown
+    try:
+        payload = json.loads(candidates[0])
+    except json.JSONDecodeError:
+        return unknown
+    metadata = payload.get("metadata") if isinstance(payload, dict) else None
+    if (not isinstance(metadata, dict)
+            or any(not isinstance(key, str) or not isinstance(value, str)
+                   for key, value in metadata.items())):
+        return unknown
+    model = normalize_reviewer_model(metadata.get("model"))
+    effort = normalize_review_effort(metadata.get("effort"))
+    target = normalize_review_target(metadata.get("review-target"))
+    raw_target_matches = payload.get("review_target_matches")
+    target_matches = (raw_target_matches
+                      if target is not None and type(raw_target_matches) is bool else None)
+    configured = payload.get("reviewer_configured")
+    reason = payload.get("reviewer_coverage_reason")
+    return {
+        "metadata": metadata,
+        "model": model,
+        "effort": effort,
+        "review_target": target,
+        "review_target_matches": target_matches,
+        "reviewer_configured": (
+            True if configured is True and model is not None and target_matches is True else None),
+        "reviewer_coverage_reason": reason if isinstance(reason, str) else None,
+    }
 
 
 def read_pr_freeze_binding(path: Path, *, expected_round_id: str | None = None,
@@ -996,8 +1280,9 @@ def ingest(root: Path, round_id: str | None, src: Path = INBOX, reviewer: str | 
 
     The user saves the reviewer's reply to `src` (default /tmp/review.md) in a separate shell
     (`cat > /tmp/review.md`, paste, Ctrl-D); this copies the body VERBATIM into
-    <reviews_dir>/<round-id>-feedback.md (NO model re-typing — the whole point) under a metadata
-    header, then APPENDS a finding triage skeleton beneath it. The verbatim body is never edited.
+    <reviews_dir>/<round-id>-feedback.md under a metadata header, then APPENDS a finding triage
+    skeleton beneath it. Identity comes only from the reply's leading structured header; the
+    deprecated ``reviewer`` argument is never identity evidence. The verbatim body is never edited.
     Round id from --round, else the newest <reviews_dir>/*-request.md."""
     import datetime
     cfg = load_config(root)
@@ -1021,6 +1306,29 @@ def ingest(root: Path, round_id: str | None, src: Path = INBOX, reviewer: str | 
     rdir.mkdir(parents=True, exist_ok=True)
     dest = rdir / f"{round_id}-feedback.md"
 
+    parsed_header = parse_review_reply_header(body)
+    binding, binding_reason = ingest_round_binding(root, round_id, cfg)
+    assessment = assess_review_reply(parsed_header, binding)
+    if reviewer is not None:
+        print("review ingest: warning: --reviewer is ignored; the reply header is authoritative",
+              file=sys.stderr)
+    if not parsed_header["detected"]:
+        print("review ingest: warning: structured reply header not found; model, effort, and "
+              "review-target are unknown", file=sys.stderr)
+    for warning in parsed_header["warnings"]:
+        print(f"review ingest: warning: reply header {warning}; affected field is unknown",
+              file=sys.stderr)
+    if binding is None:
+        print(f"review ingest: warning: round binding unavailable ({binding_reason}); reply cannot "
+              "count as configured feedback", file=sys.stderr)
+    elif assessment["review_target_matches"] is False:
+        print("review ingest: warning: declared review-target does not match the round binding; "
+              "reply cannot count as configured feedback", file=sys.stderr)
+    if (parsed_header["model"] is not None and binding is not None
+            and assessment["reviewer_coverage_reason"] == "reviewer-not-configured"):
+        print("review ingest: warning: declared model does not match a reviewer frozen in the "
+              "round binding; reply cannot count as configured feedback", file=sys.stderr)
+
     findings = _parse_findings(body.decode("utf-8", "replace"))
 
     # --- appended triage skeleton (beneath the verbatim body, which is never edited) ---
@@ -1034,15 +1342,22 @@ def ingest(root: Path, round_id: str | None, src: Path = INBOX, reviewer: str | 
         lines.append("_No `JW-GPT-NNN` finding blocks parsed — triage the verbatim reply directly._")
     appended = ("\n".join(lines) + "\n").encode("utf-8")
 
+    metadata_json = json.dumps(
+        feedback_metadata_payload(parsed_header, assessment), ensure_ascii=False,
+        sort_keys=True, separators=(",", ":"))
     header = (
         "<!-- waystone feedback: the body below is the reviewer reply VERBATIM (byte-exact "
         "copy via `waystone review ingest`) — do not edit it; a triage skeleton is appended beneath it. -->\n"
         f"round: {round_id}\n"
-        f"reviewer: {reviewer or '(unknown)'}\n"
+        f"reviewer: {parsed_header['model'] or '(unknown)'}\n"
+        f"reviewer-effort: {parsed_header['effort'] or '(unknown)'}\n"
+        f"review-target: {parsed_header['review_target'] or '(unknown)'}\n"
+        f"{_FEEDBACK_METADATA_PREFIX}{metadata_json}\n"
         f"ingested: {datetime.date.today().isoformat()}\n"
         f"source: {src}\n\n---\n\n"
     )
     content = header.encode("utf-8") + body + appended
+    prior_content = dest.read_bytes() if force and dest.is_file() else None
     if force:
         write_bytes_atomic(dest, content)
     else:
@@ -1053,29 +1368,37 @@ def ingest(root: Path, round_id: str | None, src: Path = INBOX, reviewer: str | 
             print(f"review ingest: feedback already exists for round {round_id}: {dest}; "
                   "pass --force to replace it", file=sys.stderr)
             return 1
-    src.unlink()
-    if (cfg.get("review") or {}).get("mode", "packet") == "packet":
-        request_binding = parse_packet_request_binding(rdir / f"{round_id}-request.md")
-        if request_binding is not None:
-            target_sha, base_sha = request_binding
+    if force:
+        try:
+            import overlay
+            overlay.record_review_ingest(
+                root, round_id, reply_header=parsed_header, binding=binding, force=True)
+        except Exception as e:  # noqa: BLE001 — rollback keeps the correction surfaces coherent
             try:
-                write_round_request_binding(
-                    root, round_id, target_sha, base_sha,
-                    resolve_reviewers(root, (cfg.get("review") or {}).get("reviewers", [])),
-                    mode="packet")
-            except (OSError, WorkflowError) as e:
-                print(f"review ingest: packet request binding unavailable ({e}); projection will "
-                      "remain unknown", file=sys.stderr)
+                if prior_content is None:
+                    dest.unlink(missing_ok=True)
+                else:
+                    write_bytes_atomic(dest, prior_content)
+            except OSError as rollback_error:
+                print(f"review ingest: forced overlay correction failed ({e}) and feedback "
+                      f"rollback failed ({rollback_error})", file=sys.stderr)
+                return 1
+            print(f"review ingest: forced overlay correction failed ({e}); feedback replacement "
+                  "was rolled back and the source was preserved", file=sys.stderr)
+            return 1
+    src.unlink()
     print(f"ingested {len(body)} bytes verbatim → {dest} (consumed {src})")
     print(f"  {len(findings)} finding(s) parsed — verify each before registering")
-    # The ingest observation is the replayable reset signal for review-skipped-closes-v1. Like the
-    # warning itself it is advisory evidence and can never change the completed ingest's exit code.
-    try:
-        import overlay
-        overlay.record_review_ingest(root, round_id, reviewer=reviewer)
-    except Exception as e:  # noqa: BLE001
-        print(f"review ingest: overlay ingest observation unavailable ({e}) — ingest still succeeded",
-              file=sys.stderr)
+    # A normal ingest remains useful even if the advisory event store is unavailable. A forced
+    # correction is handled above and rolls the feedback file back unless both surfaces update.
+    if not force:
+        try:
+            import overlay
+            overlay.record_review_ingest(
+                root, round_id, reply_header=parsed_header, binding=binding)
+        except Exception as e:  # noqa: BLE001
+            print(f"review ingest: overlay ingest observation unavailable ({e}) — "
+                  "ingest still succeeded", file=sys.stderr)
     # M2 §6: evaluate overlay warns at the review-ingest boundary (best-effort; never blocks).
     try:
         import overlay
