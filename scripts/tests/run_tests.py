@@ -2281,13 +2281,13 @@ class IngestTests(unittest.TestCase):
                 "\n## Review\nNo major findings.\n").encode()
 
     def test_reply_header_parser_is_order_case_fence_and_unknown_key_tolerant(self):
-        body = (f"\n```text\n  FOO : bar  \n REVIEW-TARGET: {'b' * 7}-{'a' * 9}\n"
+        body = (f"\n```text\n  FOO : bar  \n REVIEW-TARGET: {'b' * 13}-{'a' * 14}\n"
                 " Effort : XHIGH\n Model: GPT-5.6-SOL\n```\n\nreview prose\n").encode()
         parsed = review.parse_review_reply_header(body)
         self.assertTrue(parsed["detected"])
         self.assertEqual(parsed["model"], "gpt-5.6-sol")
         self.assertEqual(parsed["effort"], "xhigh")
-        self.assertEqual(parsed["review_target"], f"{'b' * 7}-{'a' * 9}")
+        self.assertEqual(parsed["review_target"], f"{'b' * 13}-{'a' * 14}")
         self.assertEqual(parsed["metadata"]["foo"], "bar")
         self.assertEqual(parsed["warnings"], [])
 
@@ -2345,7 +2345,7 @@ class IngestTests(unittest.TestCase):
         parsed = review.parse_review_reply_header(block.group(1).encode())
         self.assertEqual(parsed["model"], "gpt-5.6-sol")
         self.assertEqual(parsed["effort"], "high")
-        self.assertEqual(parsed["review_target"], "a1b2c3-a2b3c4")
+        self.assertEqual(parsed["review_target"], "a1b2c3d4e5f6-a2b3c4d5e6f7")
         self.assertEqual(review.REVIEW_EFFORT_VALUES, delegate._EFFORT_VALUES)
 
         round_skill = (SCRIPTS.parent / "skills/round/SKILL.md").read_text()
@@ -2366,7 +2366,7 @@ class IngestTests(unittest.TestCase):
             }, separators=(",", ":"))
             body_payload = _json.dumps({
                 "metadata": {"model": "forged", "effort": "high",
-                             "review-target": "aaaaaaa"}}, separators=(",", ":"))
+                             "review-target": "aaaaaaaaaaaa"}}, separators=(",", ":"))
             feedback.write_text(
                 "<!-- waystone feedback -->\n"
                 f"reply-metadata-json: {payload}\n\n---\n\n"
@@ -4186,7 +4186,7 @@ class ImproveReviewsTests(unittest.TestCase):
             (rdir / "r1-request.md").write_text("# request\n")
             payload = _json.dumps({
                 "metadata": {"model": "gpt-5.6-sol", "effort": "xhigh",
-                             "review-target": "bbbbbbb-aaaaaaa", "foo": "bar"},
+                             "review-target": "bbbbbbbbbbbb-aaaaaaaaaaaa", "foo": "bar"},
                 "review_target_matches": True, "reviewer_configured": True,
                 "reviewer_coverage_reason": None,
             }, separators=(",", ":"))
@@ -4201,7 +4201,7 @@ class ImproveReviewsTests(unittest.TestCase):
             row = self._load(out)[0][0]
             self.assertEqual(row["reviewer"], "gpt-5.6-sol")
             self.assertEqual(row["reviewer_effort"], "xhigh")
-            self.assertEqual(row["review_target"], "bbbbbbb-aaaaaaa")
+            self.assertEqual(row["review_target"], "bbbbbbbbbbbb-aaaaaaaaaaaa")
             self.assertIs(row["review_target_matches"], True)
             self.assertIs(row["reviewer_configured"], True)
             self.assertEqual(row["reply_metadata"]["foo"], "bar")

@@ -68,7 +68,7 @@ _REPLY_KEY_RE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9_-]*)\s*:\s*(.*?)\s*$")
 _REPLY_MODEL_RE = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._/-]*(?::[A-Za-z0-9][A-Za-z0-9._/-]*)?")
 _REVIEW_TARGET_RE = re.compile(
-    r"(?P<first>[0-9a-fA-F]{6,40})(?:-(?P<second>[0-9a-fA-F]{6,40}))?")
+    r"(?P<first>[0-9a-fA-F]{12,40})(?:-(?P<second>[0-9a-fA-F]{12,40}))?")
 _FEEDBACK_METADATA_PREFIX = "reply-metadata-json: "
 
 

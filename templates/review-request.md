@@ -46,12 +46,12 @@ review priorities, if present.}
 ## Response wanted
 
 Start the reply with this block (replace values; key case/order/spacing and a Markdown fence are
-optional; extra keys are preserved). Echo the `Reviewing` target, alone or as a 6–40 hex
+optional; extra keys are preserved). Echo the `Reviewing` target, alone or as a 12–40 hex
 `base-target` range; missing/damaged values stay unknown, and no model/target means ordinary prose:
 ```text
 model: gpt-5.6-sol
 effort: high
-review-target: a1b2c3-a2b3c4
+review-target: a1b2c3d4e5f6-a2b3c4d5e6f7
 ```
 
 Major / critical issues only. For each: a concrete failure mechanism and where you confirmed it.
