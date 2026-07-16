@@ -47,3 +47,9 @@ tasks:
     result: "SSOT.md + .waystone.yml + ADR-0000 + docs 구조 + release EXCLUDES 확장 + profile 6-role binding. main 누출 0을 tree-hash 시뮬레이션으로 증명 (커밋 4f8ddbc·2d318c7)"
     title: "waystone 자기채택 bootstrap: SSOT.md 합성(ideate), init(패킷 리뷰·warn-allowed·delegation on), ADR-0000, 부산물 dev-only 릴리스 제외(EXCLUDES), 3축 profile 구성"
     status: done
+  - id: fix/round-packet-remote-visibility
+    scope: ["skills"]
+    notes: "세 번째 dogfooding finding (2026-07-16, 첫 round 마감에서 사용자 적발). 부수 지점: round close가 찍는 binding target_sha(close 시점 HEAD)와 packet의 Reviewing(closeout 커밋)이 한 커밋 어긋남 — ingest가 packet 기준으로 binding을 재작성해 동작은 하나, close→closeout→request의 sha 의미론을 일원화할 것. skill Step 4의 순서를 'request 작성(Reviewing=closeout sha) → docs(round) 커밋에 포함 또는 후속 커밋 → push → remote verify → 보고'로 재규정 + 보고문의 전달 안내를 remote 경로 기준으로. 대상: skills/round/SKILL.md (+ 필요시 review.py의 binding 시점)."
+    title: "round skill packet 모드: 리뷰 요청 순서가 '작성→커밋/푸시→보고'가 아니라 'closeout 푸시→작성→로컬 전달'이라 remote에서 repo를 읽는 리뷰어에게 packet이 안 보임 — 요청 파일을 커밋·푸시 후 보고하도록 skill 순서 수정"
+    status: "pending"
+    severity: "major"
