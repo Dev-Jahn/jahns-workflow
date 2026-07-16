@@ -436,7 +436,9 @@ def _resolve_verifier_binding(profile: dict, root: Path) -> dict:
     effort = b.get("effort")
     entry = b.get("entry")
     if entry not in (None, "adversarial-review"):
-        raise WorkflowError(f"entry {entry!r} not implemented in M2")
+        raise WorkflowError(
+            f"entry {entry!r} is not a known verifier entry — the only (deprecated) value is "
+            "'adversarial-review'; new profiles omit the entry field")
     legacy_fields = []
     if execution in _LEGACY_VERIFIER_EXECUTIONS:
         legacy_fields.append(f"execution {execution!r}")

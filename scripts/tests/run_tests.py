@@ -10270,7 +10270,7 @@ class DelegateVerifyTests(unittest.TestCase):
                 ("{execution: clean-subagent, backend: \"codex:x\"}",
                  "schema-valid but not executable"),
                 ("{execution: external-runner, backend: \"codex:x\", entry: review}",
-                 "entry 'review' not implemented in M2"),
+                 "entry 'review' is not a known verifier entry"),
             ):
                 body = ("schema: waystone-profile-1\nbindings:\n"
                         "  implementer: {execution: external-runner, backend: \"codex:x\"}\n"

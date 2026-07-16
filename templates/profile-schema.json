@@ -57,7 +57,7 @@
         "use_for": {"type": "string", "minLength": 1, "pattern": "^[^\\r\\n]+$"},
         "effort": {"enum": ["none", "minimal", "low", "medium", "high", "xhigh", "ultra"]},
         "entry": {
-          "type": "string",
+          "enum": ["adversarial-review"],
           "deprecated": true,
           "description": "Legacy verifier entrypoint field. adversarial-review is normalized to Waystone's owned verifier prompt; new profiles omit this field."
         }
