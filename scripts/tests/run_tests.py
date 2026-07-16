@@ -53,6 +53,123 @@ def init_repo(root: Path):
     git(root, "commit", "-qm", "c0")
 
 
+class ReleaseToMainTests(unittest.TestCase):
+    def _repo(self, d: str, *, shipped_change: bool) -> tuple[Path, dict[str, str]]:
+        import os
+
+        root = Path(d) / "repo"
+        root.mkdir()
+        git(root, "init", "-q", "-b", "main")
+        git(root, "config", "user.email", "t@t")
+        git(root, "config", "user.name", "t")
+        (root / ".gitignore").write_text(".claude/settings.local.json\n")
+        (root / "README.md").write_text("main\n")
+        (root / "bin").mkdir()
+        (root / "bin" / "waystone").write_text("runtime\n")
+        git(root, "add", "-A")
+        git(root, "commit", "-qm", "main base")
+        git(root, "branch", "dev")
+        git(root, "checkout", "-q", "dev")
+
+        release = root / "release-to-main.sh"
+        release.write_bytes((SCRIPTS.parent / "release-to-main.sh").read_bytes())
+        release.chmod(0o755)
+        (root / ".claude" / "agents").mkdir(parents=True)
+        (root / ".claude" / "agents" / "waystone.md").write_text("agent\n")
+        (root / "future-dogfood.md").write_text("must not ship\n")
+        if shipped_change:
+            (root / "README.md").write_text("release\n")
+        git(root, "add", "-A")
+        git(root, "commit", "-qm", "dev changes")
+        settings = root / ".claude" / "settings.local.json"
+        settings.write_bytes(b'{"permission":"local"}\n')
+
+        fake_bin = Path(d) / "fake-bin"
+        fake_bin.mkdir()
+        uv = fake_bin / "uv"
+        uv.write_text("#!/bin/sh\nexit 0\n")
+        uv.chmod(0o755)
+        env = os.environ.copy()
+        env["PATH"] = str(fake_bin) + os.pathsep + env["PATH"]
+        return root, env
+
+    def _run(self, root: Path, env: dict[str, str]) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["bash", str(root / "release-to-main.sh")], cwd=root,
+            env=env, capture_output=True, text=True, timeout=20)
+
+    def _worktree_files(self, root: Path) -> dict[str, bytes]:
+        return {
+            str(path.relative_to(root)): path.read_bytes()
+            for path in root.rglob("*")
+            if path.is_file() and ".git" not in path.relative_to(root).parts
+        }
+
+    def test_release_preserves_ignored_local_file_and_current_worktree(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, env = self._repo(d, shipped_change=True)
+            branch_before = git(root, "symbolic-ref", "--short", "HEAD").stdout
+            head_before = git(root, "rev-parse", "HEAD").stdout
+            status_before = git(root, "status", "--porcelain").stdout
+            files_before = self._worktree_files(root)
+
+            result = self._run(root, env)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(git(root, "symbolic-ref", "--short", "HEAD").stdout, branch_before)
+            self.assertEqual(git(root, "rev-parse", "HEAD").stdout, head_before)
+            self.assertEqual(git(root, "status", "--porcelain").stdout, status_before)
+            self.assertEqual(self._worktree_files(root), files_before)
+            self.assertEqual(git(root, "show", "main:README.md").stdout, "release\n")
+            released = git(root, "ls-tree", "-r", "--name-only", "main").stdout.splitlines()
+            self.assertIn("bin/waystone", released)
+            self.assertNotIn("future-dogfood.md", released)
+            self.assertFalse(any(path.startswith(".claude/") for path in released))
+
+    def test_commit_failure_preserves_ref_branch_and_worktree(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, env = self._repo(d, shipped_change=True)
+            signer = Path(d) / "fake-bin" / "gpg-fail"
+            signer.write_text("#!/bin/sh\nexit 1\n")
+            signer.chmod(0o755)
+            git(root, "config", "commit.gpgsign", "true")
+            git(root, "config", "gpg.program", str(signer))
+            main_before = git(root, "rev-parse", "main").stdout
+            branch_before = git(root, "symbolic-ref", "--short", "HEAD").stdout
+            head_before = git(root, "rev-parse", "HEAD").stdout
+            status_before = git(root, "status", "--porcelain").stdout
+            files_before = self._worktree_files(root)
+
+            result = self._run(root, env)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(git(root, "rev-parse", "main").stdout, main_before)
+            self.assertEqual(git(root, "symbolic-ref", "--short", "HEAD").stdout, branch_before)
+            self.assertEqual(git(root, "rev-parse", "HEAD").stdout, head_before)
+            self.assertEqual(git(root, "status", "--porcelain").stdout, status_before)
+            self.assertEqual(self._worktree_files(root), files_before)
+            worktrees = git(root, "worktree", "list", "--porcelain").stdout
+            self.assertEqual(worktrees.count("worktree "), 1)
+
+    def test_unlisted_dev_paths_are_noop_when_shipped_tree_matches_main(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, env = self._repo(d, shipped_change=False)
+            main_before = git(root, "rev-parse", "main").stdout
+
+            result = self._run(root, env)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("nothing to release", result.stdout)
+            self.assertEqual(git(root, "rev-parse", "main").stdout, main_before)
+
+    def test_release_script_has_isolated_staging_contract(self):
+        script = (SCRIPTS.parent / "release-to-main.sh").read_text()
+        self.assertIn("SHIP_PATHS=(", script)
+        self.assertNotIn("git checkout", script)
+        self.assertNotIn("git read-tree -u", script)
+        self.assertNotIn('rm -rf -- "$p"', script)
+
+
 class LockPrimitiveTests(unittest.TestCase):
     def test_hold_lock_records_diagnostics_and_never_unlinks_marker(self):
         import json as _json

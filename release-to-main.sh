@@ -1,23 +1,46 @@
 #!/usr/bin/env bash
-# release-to-main.sh — sync dev's shipping subset onto main, excluding dev-only tooling.
+# release-to-main.sh — sync dev's shipping subset onto main without touching the caller's tree.
 #
 # Branch model (see README): dev = integration branch (the test suite and this tooling live
 # here); main = release branch carrying the plugin runtime only. The marketplace pins main.
-# This rebuilds main's tree as `dev's tree − EXCLUDES` in one release commit. It is itself
-# dev-only (listed in EXCLUDES) and never lands on main.
+# The positive manifest below is the complete shipping surface; unlisted paths stay dev-only.
 #
 # Usage:  ./release-to-main.sh
-#   Runs the dev test gate, then commits the synced tree onto main. Does NOT push — review the
+#   Runs the dev test gate, then commits the projected tree onto main. Does NOT push — review the
 #   commit, then `git push origin main` and bump the marketplace sha to it.
 set -euo pipefail
 
-# paths that exist only on dev and must never appear in a main release:
-EXCLUDES=(scripts/tests release-to-main.sh)
-# waystone's own project artifacts (this repo dogfoods waystone): tracked on dev, never shipped.
-EXCLUDES+=(
-  SSOT.md .waystone.yml tasks.yaml tasks.archive.yaml ROADMAP.md PROGRESS.md AGENTS.md
-  docs/CONVENTIONS.md docs/ssot docs/adr docs/reviews docs/progress docs/waystone-policy.yaml
-  .claude
+SHIP_PATHS=(
+  .claude-plugin
+  .codex-plugin
+  .github
+  .gitignore
+  LICENSE
+  README.md
+  assets
+  bin
+  hooks
+  references
+  scripts/cclog.py
+  scripts/codexlog.py
+  scripts/common.py
+  scripts/dashboard.py
+  scripts/delegate.py
+  scripts/improve.py
+  scripts/lanes.py
+  scripts/merge.py
+  scripts/overlay.py
+  scripts/remote.py
+  scripts/resume.py
+  scripts/review.py
+  scripts/roadmap.py
+  scripts/round.py
+  scripts/ssot.py
+  scripts/tasks.py
+  scripts/validate.py
+  scripts/waystone.py
+  skills
+  templates
 )
 
 cd "$(git rev-parse --show-toplevel)"
@@ -27,34 +50,68 @@ if [ -n "$(git status --porcelain)" ]; then
   exit 1
 fi
 
-start=$(git symbolic-ref --short HEAD)
-restore() { git checkout -q "$start"; }
+dev_oid=$(git rev-parse --verify 'dev^{commit}')
+dev_sha=$(git rev-parse --short "$dev_oid")
+main_oid=$(git rev-parse --verify 'refs/heads/main^{commit}')
+tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/waystone-release.XXXXXX")
+test_worktree="$tmpdir/dev"
+release_index="$tmpdir/index"
 
-# 1. release gate — the suite must pass on dev before anything reaches main
-git checkout -q dev
+cleanup() {
+  local status=$?
+  local cleanup_status=0
+  trap - EXIT HUP INT TERM
+  set +e
+  if [ -e "$test_worktree/.git" ]; then
+    if ! git worktree remove --force "$test_worktree"; then
+      echo "release: failed to remove temporary worktree; state kept at $tmpdir." >&2
+      cleanup_status=1
+    fi
+  fi
+  if [ "$cleanup_status" -eq 0 ] && ! rm -rf -- "$tmpdir"; then
+    echo "release: failed to remove temporary state at $tmpdir." >&2
+    cleanup_status=1
+  fi
+  if [ "$status" -eq 0 ]; then
+    status=$cleanup_status
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Run the gate against the exact dev commit being projected, in an isolated worktree.
+git worktree add --detach -q "$test_worktree" "$dev_oid"
 echo "release: running the test suite on dev…"
-if ! uv run scripts/tests/run_tests.py; then
+if ! (cd "$test_worktree" && uv run scripts/tests/run_tests.py); then
   echo "release: tests failed on dev — aborting." >&2
-  restore
   exit 1
 fi
-dev_sha=$(git rev-parse --short dev)
 
-# 2. main's next tree = dev's tree − EXCLUDES, committed on top of main
-git checkout -q main
-git read-tree -u --reset dev
-for p in "${EXCLUDES[@]}"; do
-  git rm -r -q --cached --ignore-unmatch -- "$p"
-  rm -rf -- "$p"
-done
+# Build the release tree in a temporary index from positive-manifest paths only.
+GIT_INDEX_FILE="$release_index" git read-tree --empty
+git ls-tree -r -z "$dev_oid" -- "${SHIP_PATHS[@]}" |
+  GIT_INDEX_FILE="$release_index" git update-index -z --index-info
+release_tree=$(GIT_INDEX_FILE="$release_index" git write-tree)
+main_tree=$(git rev-parse "$main_oid^{tree}")
 
-if git diff --cached --quiet; then
+if [ "$release_tree" = "$main_tree" ]; then
   echo "release: main already in sync with dev@${dev_sha} — nothing to release."
-  restore
   exit 0
 fi
 
-git commit -q -m "release: sync from dev@${dev_sha}"
-echo "release: main @ $(git rev-parse --short main) built from dev@${dev_sha} (minus ${EXCLUDES[*]})."
+commit_args=(commit-tree "$release_tree" -p "$main_oid" -m "release: sync from dev@${dev_sha}")
+if git config --get-regexp '^commit\.gpgsign$' >/dev/null; then
+  commit_gpgsign=$(git config --bool --get commit.gpgsign)
+  if [ "$commit_gpgsign" = "true" ]; then
+    commit_args+=(-S)
+  fi
+fi
+release_commit=$(git "${commit_args[@]}")
+git update-ref -m "release: sync from dev@${dev_sha}" \
+  refs/heads/main "$release_commit" "$main_oid"
+
+echo "release: main @ $(git rev-parse --short "$release_commit") built from dev@${dev_sha}."
 echo "next:    git push origin main   then bump the marketplace sha to this commit."
-restore
