@@ -53,3 +53,13 @@ tasks:
     title: "round skill packet 모드: 리뷰 요청 순서가 '작성→커밋/푸시→보고'가 아니라 'closeout 푸시→작성→로컬 전달'이라 remote에서 repo를 읽는 리뷰어에게 packet이 안 보임 — 요청 파일을 커밋·푸시 후 보고하도록 skill 순서 수정"
     status: "pending"
     severity: "major"
+  - id: feat/reviewer-self-declared-identity
+    scope: ["templates", "scripts", "skills"]
+    notes: "사용자 지시 (2026-07-16): 외부 리뷰 모델은 언제든 바뀌므로 하드코딩은 부적합. 설계 시 결정할 것: (a) 선언 부재 시 정직한 unknown 처리(추측 금지), (b) reviewer_configured 판정(review-skipped-closes-v1의 configured-reviewer check) 및 request binding의 reviewers 필드와의 관계 재정의, (c) profile reviewer binding의 잔여 역할(기본값? 폐기?). 대상: templates/review-request.md, scripts/review.py(ingest 파싱), skills/round·review, 관련 계약 테스트."
+    title: "외부 리뷰어 identity를 config/profile 하드코딩(예: chatgpt:gpt-5.5-pro) 대신 리뷰 회신의 자기선언으로 수집 — 리뷰 패킷 템플릿에 '리뷰 첫머리에 본인의 모델 slug(effort 포함)를 명시해 달라' 한 줄 추가하고 ingest가 이를 파싱해 기록"
+    status: "pending"
+  - id: feat/effort-pro-ultra
+    scope: ["templates", "scripts"]
+    notes: "사용자 지시 (2026-07-16): 'pro'는 gpt-5.5까지 model variant였으나 5.6부터 effort로 취급되는 것으로 보임. 현 enum none|minimal|low|medium|high|xhigh (profile-schema.json + delegate.py _EFFORT_VALUES). 설계 시 결정할 것: effort 값별 실행 가능 경로 매핑 — pro는 web ChatGPT 경로 전용(CLI 전달 불가), ultra는 codex CLI 경로(model_reasoning_effort) — 실행 불가 조합은 fail-loud로 거부(무기록 대체 금지). 대상: templates/profile-schema.json, scripts/delegate.py(검증+runner 전달), 계약 테스트, README/conventions의 effort 서술."
+    title: "effort 어휘 확장: xhigh 위에 pro(web ChatGPT 경로)와 ultra(codex CLI 경로) 추가 — GPT-5.6부터 'pro'가 model variant가 아니라 effort의 일종으로 취급됨"
+    status: "pending"
