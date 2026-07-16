@@ -16,11 +16,12 @@ milestones: []
 #   lane       — {branch, base_sha, depends_on} for parallel worktree lanes (`waystone lanes verify`)
 tasks:
   - id: fix/boundary-hook-cli-resolution
+    result: "2차 위임 apply — plugin hooks.json Stop hook(비차단·마커 게이트), install hooks 마커 재설계+레거시 감지, 561 tests OK. 기록: .waystone/delegations/20260716T014050Z-fix-boundary-hook-cli-resolution"
     accept: ["plugin hooks.json에 Stop hook이 추가되어 ${CLAUDE_PLUGIN_ROOT} 경로로 boundary check를 실행하며, hook 경로 어디에도 bare waystone 호출이 남지 않는다", ".waystone.yml이 없거나 enable 마커가 없는 프로젝트에서는 Stop hook이 즉시 성공 종료로 no-op한다 (기존 waystone hook들의 no-op-fast 패턴)", "waystone install hooks는 .claude/settings.json을 쓰지 않고 consent 기록 + 프로젝트 상태 enable 마커로 동작하며, 마커 제거가 문서화된 롤백 경로다", "templates/waystone-boundary-hook.json이 제거되고 README, init 스킬, conventions, tests의 참조가 일관되게 갱신된다", "Codex host 반영 여부가 명시적으로 구현되거나 사유와 함께 기록된다 (무기록 드롭 금지)", "전체 테스트 스위트(신규 계약 테스트는 RED-first)와 ruff F401,F841 검사가 통과한다", "Stop hook 스크립트는 launcher가 어떤 종료 코드를 반환해도 자신은 0으로 종료하고 stderr는 그대로 통과시킨다 (경고 비차단 계약 — blocking exit 전파 금지)", "waystone install hooks는 레거시 .claude/settings.json의 waystone Stop hook 설치를 감지하면 제거 안내를 출력한다 (사용자 설정 파일 자동 수정 금지)", "hooks.json의 모든 hook command에서 ${CLAUDE_PLUGIN_ROOT}를 따옴표로 감싼다", "init 스킬에서 Codex 저장 분리를 주장하는 서술을 0.9 통합 저장 사실에 맞게 바로잡는다"]
     scope: ["templates", "hooks", "scripts", "skills", "README.md"]
     notes: "owner 결정 (2026-07-16): boundary hook을 plugin 소유 hooks.json으로 이동 — CLAUDE_PLUGIN_ROOT 해석(공식 메커니즘, 버전 독립), 프로젝트별 enable 마커(.waystone/ 내)로 게이트, 기존 hook들의 no-op-fast 패턴 준수. install hooks는 consent+마커 기록으로 재설계(settings.json 미작성). 이 repo의 설치본 settings.json은 롤백 절차대로 삭제(활성 규칙 0개라 손실 없음). 근거: CC 문서상 bin PATH는 Bash tool 한정, settings.json hook의 버전 독립 참조 공식 경로 부재. 템플릿 waystone-boundary-hook.json은 제거 대상, README/init 스킬/tests 갱신 필요. Codex host 반영 여부는 구현 시 명시적으로 결정·기록(무기록 드롭 금지)."
     title: "install hooks가 설치한 boundary hook이 bare 'waystone'을 호출해 hook 실행 환경(PATH에 plugin bin 미주입)에서 command not found — 템플릿/설치 시점에 버전 독립적 CLI 경로 해석 필요"
-    status: "pending"
+    status: "done"
     severity: "major"
   - id: fix/verify-worktree-self-contamination
     scope: ["scripts"]
