@@ -93,9 +93,11 @@ class ReleaseToMainTests(unittest.TestCase):
         env["PATH"] = str(fake_bin) + os.pathsep + env["PATH"]
         return root, env
 
-    def _run(self, root: Path, env: dict[str, str]) -> subprocess.CompletedProcess:
+    def _run(
+            self, root: Path, env: dict[str, str], *, script: Path | None = None,
+    ) -> subprocess.CompletedProcess:
         return subprocess.run(
-            ["bash", str(root / "release-to-main.sh")], cwd=root,
+            ["bash", str(script or root / "release-to-main.sh")], cwd=root,
             env=env, capture_output=True, text=True, timeout=20)
 
     def _worktree_files(self, root: Path) -> dict[str, bytes]:
@@ -125,6 +127,35 @@ class ReleaseToMainTests(unittest.TestCase):
             self.assertIn("bin/waystone", released)
             self.assertNotIn("future-dogfood.md", released)
             self.assertFalse(any(path.startswith(".claude/") for path in released))
+
+    def test_release_refuses_when_current_worktree_checks_out_main(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, env = self._repo(d, shipped_change=True)
+            git(root, "checkout", "-q", "main")
+            main_before = git(root, "rev-parse", "main").stdout
+
+            result = self._run(root, env, script=SCRIPTS.parent / "release-to-main.sh")
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                f"refs/heads/main is checked out at {root.resolve()}", result.stderr)
+            self.assertNotIn("running the test suite", result.stdout)
+            self.assertEqual(git(root, "rev-parse", "main").stdout, main_before)
+
+    def test_release_refuses_when_linked_worktree_checks_out_main(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, env = self._repo(d, shipped_change=True)
+            main_worktree = Path(d) / "main-worktree"
+            git(root, "worktree", "add", "-q", str(main_worktree), "main")
+            main_before = git(root, "rev-parse", "main").stdout
+
+            result = self._run(root, env)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                f"refs/heads/main is checked out at {main_worktree.resolve()}", result.stderr)
+            self.assertNotIn("running the test suite", result.stdout)
+            self.assertEqual(git(root, "rev-parse", "main").stdout, main_before)
 
     def test_commit_failure_preserves_ref_branch_and_worktree(self):
         with tempfile.TemporaryDirectory() as d:

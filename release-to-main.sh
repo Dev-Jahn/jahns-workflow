@@ -45,6 +45,20 @@ SHIP_PATHS=(
 
 cd "$(git rev-parse --show-toplevel)"
 
+worktree_list=$(git worktree list --porcelain)
+main_worktree=""
+worktree_path=""
+while IFS= read -r line; do
+  case "$line" in
+    "worktree "*) worktree_path=${line#worktree } ;;
+    "branch refs/heads/main") main_worktree=$worktree_path; break ;;
+  esac
+done <<< "$worktree_list"
+if [ -n "$main_worktree" ]; then
+  echo "release: refs/heads/main is checked out at $main_worktree — aborting." >&2
+  exit 1
+fi
+
 if [ -n "$(git status --porcelain)" ]; then
   echo "release: working tree not clean — commit or stash first." >&2
   exit 1
