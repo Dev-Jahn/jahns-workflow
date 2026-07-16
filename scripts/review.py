@@ -3,7 +3,7 @@
 # requires-python = ">=3.10"
 # dependencies = ["pyyaml"]
 # ///
-"""SHA-bound review cycles for the PR-mode review profile.
+"""SHA-bound PR review cycles and packet-request publication.
 
 A review means "reviewer R examined tree SHA X". That fact is stored as machine-readable
 markers in PR comments (GitHub is the canonical event store), never inferred from filenames.
@@ -27,6 +27,7 @@ Markers (HTML comments embedded in PR comment bodies):
 Subcommands (also `waystone review <sub>`):
   freeze --pr N [--round ID] [root]   stamp the current PR head as a new review cycle + post request
   status [--pr N] [root]              show per-cycle review status (PR mode) or packet pairs (packet mode)
+  prepare --round ID [root]           bind an authored packet request to the closeout HEAD
   ingest [--round ID] [--reviewer M] [--force]  byte-exact copy /tmp/review.md →
                                                 <id>-feedback.md, then append triage
 """
@@ -44,8 +45,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import yaml  # noqa: E402
 
 from common import (  # noqa: E402
-    CONFIG_NAME, WorkflowError, find_project_root, git_full_sha, hold_lock, load_config,
-    migrate_project_state, normalize_config, project_lock_path, write_bytes_atomic,
+    CONFIG_NAME, WorkflowError, find_project_root, git_full_sha, git_rc, hold_lock, is_ancestor,
+    load_config, migrate_project_state, normalize_config, parse_iso_timestamp, project_lock_path,
+    write_bytes_atomic,
 )
 
 CODEX_BOT = "chatgpt-codex-connector[bot]"  # REST `user.login` form
@@ -53,7 +55,11 @@ INBOX = Path("/tmp/review.md")  # fixed drop-file: user saves the reviewer reply
 ROUND_REQUEST_BINDING_SCHEMA = "waystone-round-request-binding-1"
 PR_FREEZE_BINDING_SCHEMA = "waystone-pr-freeze-binding-1"
 PACKET_REVIEWING_RE = re.compile(
-    r"(?m)^- Reviewing:\s*([0-9a-f]{40})\s+\(diff against\s+([0-9a-f]{40}|\(root\))\)\s*$")
+    r"- Reviewing: ([0-9a-f]{40})   \(diff against ([0-9a-f]{40}|\(root\))\)")
+PACKET_REVIEWING_FORMAT = (
+    "- Reviewing: <40-lowercase-hex-sha>   "
+    "(diff against <40-lowercase-hex-sha-or-(root)>)"
+)
 
 
 def is_codex(login: str | None) -> bool:
@@ -99,7 +105,17 @@ def write_round_request_binding(root: Path, round_id: str, target_sha: str, base
         "mode": mode, "canonical_store": "github-pr-comment" if mode == "pr" else "local-packet",
         "at": datetime.now(timezone.utc).isoformat(),
     }
+    contract = {key: value for key, value in row.items() if key != "at"}
     base = directory / f"{round_id}-request.binding.json"
+    prior: list[tuple[Path, dict]] = []
+    for existing in sorted(directory.glob(f"{round_id}-request.binding*.json")):
+        previous = read_round_request_binding(existing, expected_round_id=round_id)
+        prior.append((existing, previous))
+    if prior:
+        existing, previous = max(
+            prior, key=lambda item: round_request_binding_order(item[0], item[1]))
+        if {key: value for key, value in previous.items() if key != "at"} == contract:
+            return existing
     path = base
     number = 2
     content = json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
@@ -111,6 +127,66 @@ def write_round_request_binding(root: Path, round_id: str, target_sha: str, base
         except FileExistsError:
             path = base.with_name(f"{base.stem}-{number}{base.suffix}")
             number += 1
+
+
+def read_round_request_binding(path: Path, *, expected_round_id: str | None = None) -> dict:
+    """Load one request sidecar without silently accepting damaged projection evidence."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise WorkflowError(f"corrupt review binding {path}: {type(e).__name__}") from e
+    if (not isinstance(data, dict) or data.get("schema") != ROUND_REQUEST_BINDING_SCHEMA
+            or not isinstance(data.get("round_id"), str) or not data["round_id"]
+            or not _is_sha(data.get("target_sha"))
+            or (data.get("base_sha") is not None and not _is_sha(data.get("base_sha")))
+            or not _is_strlist(data.get("reviewers"))
+            or data.get("mode") not in ("packet", "pr")
+            or data.get("canonical_store") != (
+                "local-packet" if data.get("mode") == "packet" else "github-pr-comment")
+            or parse_iso_timestamp(data.get("at")) is None):
+        raise WorkflowError(f"corrupt review binding {path}: invalid schema or fields")
+    if expected_round_id is not None and data["round_id"] != expected_round_id:
+        raise WorkflowError(
+            f"corrupt review binding {path}: round_id {data['round_id']!r} does not match "
+            f"{expected_round_id!r}")
+    return data
+
+
+def round_request_binding_order(path: Path, row: dict) -> tuple[str, int, str]:
+    """Canonical newest-sidecar order shared by publication and improve projection."""
+    match = re.search(r"-request\.binding(?:-(\d+))?\.json$", Path(path).name)
+    sequence = int(match.group(1)) if match and match.group(1) else 1
+    return str(row.get("at") or ""), sequence, str(path)
+
+
+def read_pr_freeze_binding(path: Path, *, expected_round_id: str | None = None,
+                           expected_cycle: int | None = None) -> dict:
+    """Load a PR freeze sidecar strictly so a damaged predecessor cannot be hidden by a suffix."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise WorkflowError(f"corrupt review binding {path}: {type(e).__name__}") from e
+    if (not isinstance(data, dict) or data.get("schema") != PR_FREEZE_BINDING_SCHEMA
+            or not isinstance(data.get("round_id"), str) or not data["round_id"]
+            or type(data.get("pr")) is not int or data["pr"] < 1
+            or not _is_cycle(data.get("cycle"))
+            or not _is_sha(data.get("target_sha")) or not _is_sha(data.get("base_sha"))
+            or not _is_strlist(data.get("reviewers"))
+            or (data.get("profile_fingerprint") is not None
+                and not _nonempty_str(data.get("profile_fingerprint")))
+            or data.get("mode") != "pr"
+            or data.get("canonical_store") != "local-freeze-evidence"
+            or parse_iso_timestamp(data.get("at")) is None):
+        raise WorkflowError(f"corrupt review binding {path}: invalid schema or fields")
+    if expected_round_id is not None and data["round_id"] != expected_round_id:
+        raise WorkflowError(
+            f"corrupt review binding {path}: round_id {data['round_id']!r} does not match "
+            f"{expected_round_id!r}")
+    if expected_cycle is not None and data["cycle"] != expected_cycle:
+        raise WorkflowError(
+            f"corrupt review binding {path}: cycle {data['cycle']!r} does not match "
+            f"{expected_cycle!r}")
+    return data
 
 
 def write_pr_freeze_binding(root: Path, round_id: str, pr: int, cycle: int,
@@ -136,12 +212,9 @@ def write_pr_freeze_binding(root: Path, round_id: str, pr: int, cycle: int,
         key: value for key, value in row.items() if key != "at"
     }
     for existing in sorted(directory.glob(f"{round_id}-freeze-{cycle}.binding*.json")):
-        try:
-            previous = json.loads(existing.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            continue
-        if (isinstance(previous, dict)
-                and {key: value for key, value in previous.items() if key != "at"}
+        previous = read_pr_freeze_binding(
+            existing, expected_round_id=round_id, expected_cycle=cycle)
+        if ({key: value for key, value in previous.items() if key != "at"}
                 == contract_fields):
             return existing
     base = directory / f"{round_id}-freeze-{cycle}.binding.json"
@@ -159,16 +232,114 @@ def write_pr_freeze_binding(root: Path, round_id: str, pr: int, cycle: int,
 
 
 def parse_packet_request_binding(path: Path) -> tuple[str, str | None] | None:
-    """Read the packet template's single structured Reviewing line; ambiguity stays unknown."""
+    """Read the packet template's one byte-shape-exact structured Reviewing line."""
     try:
-        text = Path(path).read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
+        text = Path(path).read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        print(f"review: warning: cannot read packet request {path}: {e}", file=sys.stderr)
         return None
-    matches = PACKET_REVIEWING_RE.findall(text)
-    if len(matches) != 1:
+    candidates = re.findall(r"(?m)^- Reviewing:.*$", text)
+    match = PACKET_REVIEWING_RE.fullmatch(candidates[0]) if len(candidates) == 1 else None
+    if match is None:
+        print(
+            f"review: warning: packet request {path} must contain exactly one line in this "
+            f"exact format: {PACKET_REVIEWING_FORMAT}", file=sys.stderr)
         return None
-    target_sha, raw_base = matches[0]
+    target_sha, raw_base = match.groups()
     return target_sha, None if raw_base == "(root)" else raw_base
+
+
+def prepare_packet_request(root: Path, round_id: str) -> int:
+    """Create the request sidecar while HEAD is still the closeout commit being reviewed."""
+    cfg = load_config(root)
+    if (cfg.get("review") or {}).get("mode", "packet") != "packet":
+        print("review prepare: review.mode is not packet", file=sys.stderr)
+        return 1
+    request = root / cfg["reviews_dir"] / f"{round_id}-request.md"
+    request_binding = parse_packet_request_binding(request)
+    if request_binding is None:
+        return 1
+    target_sha, base_sha = request_binding
+    head = git_full_sha(root, "HEAD")
+    if target_sha != head:
+        print(
+            f"review prepare: Reviewing target {target_sha} is not the closeout HEAD {head or '?'}; "
+            "author the request after the closeout commit and before the publication commit",
+            file=sys.stderr)
+        return 1
+    try:
+        path = write_round_request_binding(
+            root, round_id, target_sha, base_sha,
+            resolve_reviewers(root, (cfg.get("review") or {}).get("reviewers", [])),
+            mode="packet")
+    except (OSError, WorkflowError) as e:
+        print(f"review prepare: packet request binding unavailable ({e})", file=sys.stderr)
+        return 1
+    print(f"prepared packet request binding: {path}")
+    return 0
+
+
+def _committed_unchanged(root: Path, path: Path) -> tuple[bool, str | None]:
+    try:
+        relative = path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False, f"{path} is outside the project"
+    relative_text = relative.as_posix()
+    rc, status, error = git_rc(
+        root, "status", "--porcelain=v1", "--untracked-files=all", "--", relative_text)
+    if rc != 0:
+        return False, f"cannot inspect {relative_text}: {error or 'git status failed'}"
+    if status:
+        return False, f"{relative_text} is not committed unchanged at HEAD"
+    rc, _out, error = git_rc(root, "cat-file", "-e", f"HEAD:{relative_text}")
+    if rc != 0:
+        return False, f"{relative_text} is not committed in the HEAD tree: {error or 'missing'}"
+    return True, None
+
+
+def verify_packet_publication(root: Path, round_id: str) -> int:
+    """Verify the pushed-HEAD packet payload after generic remote containment has passed."""
+    cfg = load_config(root)
+    if (cfg.get("review") or {}).get("mode", "packet") != "packet":
+        print("remote: --round publication verification requires review.mode packet", file=sys.stderr)
+        return 1
+    rdir = root / cfg["reviews_dir"]
+    request = rdir / f"{round_id}-request.md"
+    request_binding = parse_packet_request_binding(request)
+    if request_binding is None:
+        return 1
+    sidecar_paths = sorted(rdir.glob(f"{round_id}-request.binding*.json"))
+    if not sidecar_paths:
+        print(f"remote: packet request binding is missing for round {round_id}", file=sys.stderr)
+        return 1
+    rows: list[tuple[Path, dict]] = []
+    try:
+        for path in sidecar_paths:
+            row = read_round_request_binding(path, expected_round_id=round_id)
+            if row["mode"] != "packet":
+                raise WorkflowError(f"corrupt review binding {path}: expected packet mode")
+            rows.append((path, row))
+    except WorkflowError as e:
+        print(f"remote: {e}", file=sys.stderr)
+        return 1
+    binding_path, binding = max(
+        rows, key=lambda item: round_request_binding_order(item[0], item[1]))
+    if (binding["target_sha"], binding.get("base_sha")) != request_binding:
+        print(
+            f"remote: packet request and latest binding disagree for round {round_id}",
+            file=sys.stderr)
+        return 1
+    for artifact in (request, binding_path):
+        committed, reason = _committed_unchanged(root, artifact)
+        if not committed:
+            print(f"remote: packet publication failed — {reason}", file=sys.stderr)
+            return 1
+    if not is_ancestor(root, binding["target_sha"], "HEAD"):
+        print(
+            f"remote: packet Reviewing target {binding['target_sha']} is not contained in HEAD",
+            file=sys.stderr)
+        return 1
+    return 0
 
 
 # ---- strict marker schema (a marker is BELIEVED only if every field is the exact type) --------
@@ -916,7 +1087,7 @@ def ingest(root: Path, round_id: str | None, src: Path = INBOX, reviewer: str | 
 
 
 def main(argv: list[str]) -> int:
-    if not argv or argv[0] not in ("freeze", "status", "ingest"):
+    if not argv or argv[0] not in ("freeze", "status", "prepare", "ingest"):
         print(__doc__, file=sys.stderr)
         return 1
     sub, rest = argv[0], argv[1:]
@@ -931,6 +1102,13 @@ def main(argv: list[str]) -> int:
         print(f"waystone review: migration failed: {e}", file=sys.stderr)
         return 1
     try:
+        if sub == "prepare":
+            round_id = _opt(rest, "--round")
+            if not round_id:
+                print("review prepare: --round ID is required", file=sys.stderr)
+                return 1
+            with hold_lock(project_lock_path(root)):
+                return prepare_packet_request(root, round_id)
         if sub == "ingest":
             with hold_lock(project_lock_path(root)):
                 return ingest(root, _opt(rest, "--round"), reviewer=_opt(rest, "--reviewer"),

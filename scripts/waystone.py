@@ -11,8 +11,8 @@ Groups:
   roadmap  [root]                    regenerate ROADMAP.md
   ssot     split|digest|check [root] SSOT generated views
   status   [--project N]             cross-project dashboard
-  remote   verify|drift [root]       is HEAD pushed / how far behind
-  review   freeze|status|ingest ...  SHA-bound review cycles (PR mode); ingest = byte-exact reply copy
+  remote   verify|drift [root]       is HEAD pushed / how far behind; verify --round gates packets
+  review   freeze|status|prepare|ingest ...  SHA-bound review publication and reply ingest
   approve  --pr N --sha X            SHA-bound human approval
   round    merge --pr N ...          deterministic merge guard
   improve  trace|reviews|evidence|audit|metrics|decide ...  project evidence, metrics, and decisions

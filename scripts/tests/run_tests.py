@@ -908,6 +908,139 @@ class RemoteTests(unittest.TestCase):
             self.assertIn("fetch failed", info.get("reason", ""))
 
 
+class PacketPublicationTests(unittest.TestCase):
+    ROUND_ID = "2026-07-16-packet"
+
+    def _request(self, root: Path, target: str, base: str = "(root)") -> Path:
+        request = root / "docs" / "reviews" / f"{self.ROUND_ID}-request.md"
+        request.parent.mkdir(parents=True, exist_ok=True)
+        request.write_text(
+            f"# Review Request — {self.ROUND_ID}\n\n"
+            f"- Reviewing: {target}   (diff against {base})\n")
+        return request
+
+    def test_reviewing_line_is_exact_and_malformed_input_warns(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            request = Path(d) / "request.md"
+            target, base = "a" * 40, "b" * 40
+            request.write_text(
+                f"- Reviewing: {target}   (diff against {base})\n")
+            self.assertEqual(review.parse_packet_request_binding(request), (target, base))
+
+            malformed = (
+                f"- Reviewing:  {target}   (diff against {base})\n",
+                f"- Reviewing: {target}  (diff against {base})\n",
+                f"- Reviewing: {target}\t(diff against {base})\n",
+                f"- Reviewing: {target}   (diff against {base}) extra\n",
+                f"- Reviewing: {target}   (diff against\n{base})\n",
+                f"- Reviewing: {target}   (diff against {base})\r\n",
+                (f"- Reviewing: {target}   (diff against {base})\n" * 2),
+            )
+            for text in malformed:
+                request.write_text(text)
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    self.assertIsNone(review.parse_packet_request_binding(request), text)
+                self.assertIn("exactly one line", err.getvalue())
+                self.assertIn(str(request), err.getvalue())
+
+    def test_prepare_binds_request_to_closeout_head_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            init_repo(root)
+            (root / ".waystone.yml").write_text(
+                "version: 1\nproject: demo\nreviews_dir: docs/reviews\n")
+            head = git(root, "rev-parse", "HEAD").stdout.strip()
+            self._request(root, head)
+
+            self.assertEqual(review.prepare_packet_request(root, self.ROUND_ID), 0)
+            bindings = list((root / "docs" / "reviews").glob(
+                f"{self.ROUND_ID}-request.binding*.json"))
+            self.assertEqual(len(bindings), 1)
+            self.assertEqual(review.prepare_packet_request(root, self.ROUND_ID), 0)
+            self.assertEqual(list((root / "docs" / "reviews").glob(
+                f"{self.ROUND_ID}-request.binding*.json")), bindings)
+
+            other = "a" * 40 if head != "a" * 40 else "b" * 40
+            self._request(root, other)
+            self.assertEqual(review.prepare_packet_request(root, self.ROUND_ID), 1)
+
+    def test_packet_publication_gate_uses_real_remote_and_rejects_partial_commit(self):
+        import os
+
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            bare, root, home = base / "remote.git", base / "work", base / "home"
+            subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+            root.mkdir()
+            home.mkdir()
+            init_repo(root)
+            (root / ".waystone.yml").write_text(
+                "version: 1\nproject: demo\nreviews_dir: docs/reviews\n")
+            (root / "tasks.yaml").write_text("version: 1\nproject: demo\ntasks: []\n")
+            git(root, "add", "-A")
+            git(root, "commit", "-qm", "closeout")
+            git(root, "remote", "add", "origin", str(bare))
+            git(root, "push", "-q", "-u", "origin", "main")
+            closeout = git(root, "rev-parse", "HEAD").stdout.strip()
+            request = self._request(root, closeout)
+            env = os.environ.copy()
+            env.update({"HOME": str(home), "WAYSTONE_HOME": str(home / ".waystone")})
+
+            def cli(*args: str):
+                return subprocess.run(
+                    [sys.executable, str(SCRIPTS / "waystone.py"), *args],
+                    cwd=root, env=env, capture_output=True, text=True, timeout=15)
+
+            prepared = cli("review", "prepare", "--round", self.ROUND_ID, str(root))
+            self.assertEqual(prepared.returncode, 0, prepared.stderr)
+            binding = next((root / "docs" / "reviews").glob(
+                f"{self.ROUND_ID}-request.binding*.json"))
+
+            untracked = cli("remote", "verify", str(root), "--round", self.ROUND_ID)
+            self.assertNotEqual(untracked.returncode, 0)
+            self.assertIn("not committed", untracked.stderr)
+
+            git(root, "add", str(request.relative_to(root)))
+            git(root, "commit", "-qm", "publish request without binding")
+            git(root, "push", "-q")
+            partial = cli("remote", "verify", str(root), "--round", self.ROUND_ID)
+            self.assertNotEqual(partial.returncode, 0)
+            self.assertIn("binding", partial.stderr)
+
+            git(root, "add", str(binding.relative_to(root)))
+            git(root, "commit", "--amend", "-qm", "publish review request")
+            git(root, "push", "-q", "--force-with-lease")
+            published = cli("remote", "verify", str(root), "--round", self.ROUND_ID)
+            self.assertEqual(published.returncode, 0, published.stderr)
+            self.assertIn("request and binding", published.stdout)
+
+    def test_improve_warns_when_corrupt_request_binding_is_skipped(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            rdir = Path(d) / "reviews"
+            rdir.mkdir()
+            corrupt = rdir / f"{self.ROUND_ID}-request.binding.json"
+            corrupt.write_text("{not-json")
+            corrupt_freeze = rdir / f"{self.ROUND_ID}-freeze-1.binding.json"
+            corrupt_freeze.write_text("{also-not-json")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(improve._round_review_sidecars(rdir), {})
+            self.assertIn("corrupt review binding", err.getvalue())
+            self.assertIn(str(corrupt), err.getvalue())
+            self.assertIn(str(corrupt_freeze), err.getvalue())
+            with self.assertRaisesRegex(common.WorkflowError, "corrupt review binding"):
+                review.write_pr_freeze_binding(
+                    Path(d), self.ROUND_ID, 1, 1, "a" * 40, "b" * 40,
+                    ["codex:test"], None, "reviews")
+
+
 class ResumeStartHereTests(unittest.TestCase):
     """Persistent model-authored re-entry pointer (START_HERE) + its SessionStart injection."""
 
@@ -7839,10 +7972,20 @@ class RoundExposureTests(unittest.TestCase):
             self.assertEqual(exp["waivers"], [])
             bindings = list((root / "docs" / "reviews").glob(
                 "2026-01-02-close-request.binding*.json"))
-            self.assertEqual(len(bindings), 1)
-            binding = _json.loads(bindings[0].read_text())
+            self.assertEqual(bindings, [])
+
+            git(root, "add", "-A")
+            git(root, "commit", "-qm", "closeout")
+            closeout = git(root, "rev-parse", "HEAD").stdout.strip()
+            (root / "docs" / "reviews" / "2026-01-02-close-request.md").write_text(
+                "# Review Request\n\n"
+                f"- Reviewing: {closeout}   (diff against (root))\n")
+            self.assertEqual(review.prepare_packet_request(root, "2026-01-02-close"), 0)
+            binding_path = next((root / "docs" / "reviews").glob(
+                "2026-01-02-close-request.binding*.json"))
+            binding = _json.loads(binding_path.read_text())
             self.assertEqual(binding["round_id"], "2026-01-02-close")
-            self.assertEqual(binding["target_sha"], git(root, "rev-parse", "HEAD").stdout.strip())
+            self.assertEqual(binding["target_sha"], closeout)
             self.assertEqual(binding["canonical_store"], "local-packet")
 
     def test_profile_absent_null_bindings(self):

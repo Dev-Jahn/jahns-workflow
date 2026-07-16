@@ -982,13 +982,8 @@ def _review_binding(request_file: Path | None, round_id: str, mode: str,
 
     packet_binding = review.parse_packet_request_binding(request_file)
     if sidecars:
-        def sidecar_order(row: dict) -> tuple[str, int, str]:
-            path = Path(row["_file"])
-            match = re.search(r"-request\.binding(?:-(\d+))?\.json$", path.name)
-            sequence = int(match.group(1)) if match and match.group(1) else 1
-            return row["at"], sequence, str(path)
-
-        latest = max(sidecars, key=sidecar_order)
+        latest = max(sidecars, key=lambda row: review.round_request_binding_order(
+            Path(row["_file"]), row))
         if packet_binding is None:
             return result(reason="missing-structured-reviewing-line")
         if packet_binding != (latest["target_sha"], latest.get("base_sha")):
@@ -1037,29 +1032,19 @@ def _round_review_sidecars(rdir: Path) -> dict[str, list[dict]]:
     if not rdir.is_dir():
         return rows
     for path in sorted(rdir.glob("*-request.binding*.json")):
-        data = _load_record_mapping(path, "json")
-        if (data is None or data.get("schema") != review.ROUND_REQUEST_BINDING_SCHEMA
-                or not isinstance(data.get("round_id"), str)
-                or not review._is_sha(data.get("target_sha"))
-                or (data.get("base_sha") is not None and not review._is_sha(data.get("base_sha")))
-                or data.get("mode") != "packet" or data.get("canonical_store") != "local-packet"
-                or not isinstance(data.get("at"), str)):
+        try:
+            data = review.read_round_request_binding(path)
+        except WorkflowError as e:
+            print(f"improve: warning: {e}; excluded from projection", file=sys.stderr)
+            continue
+        if data.get("mode") != "packet":
             continue
         rows.setdefault(data["round_id"], []).append({**data, "_file": str(path)})
     for path in sorted(rdir.glob("*-freeze-*.binding*.json")):
-        data = _load_record_mapping(path, "json")
-        if (data is None or data.get("schema") != review.PR_FREEZE_BINDING_SCHEMA
-                or not isinstance(data.get("round_id"), str)
-                or type(data.get("pr")) is not int or data["pr"] < 1
-                or not review._is_cycle(data.get("cycle"))
-                or not review._is_sha(data.get("target_sha"))
-                or not review._is_sha(data.get("base_sha"))
-                or not review._is_strlist(data.get("reviewers"))
-                or (data.get("profile_fingerprint") is not None
-                    and not review._nonempty_str(data.get("profile_fingerprint")))
-                or data.get("mode") != "pr"
-                or data.get("canonical_store") != "local-freeze-evidence"
-                or parse_iso_timestamp(data.get("at")) is None):
+        try:
+            data = review.read_pr_freeze_binding(path)
+        except WorkflowError as e:
+            print(f"improve: warning: {e}; excluded from projection", file=sys.stderr)
             continue
         rows.setdefault(data["round_id"], []).append({**data, "_file": str(path)})
     return rows

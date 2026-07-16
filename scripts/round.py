@@ -337,12 +337,8 @@ def close(root: Path, round_id: str, done: list[str], touched: list[str], commit
                 task_scope_coverage=task_scope_coverage, done_task_ids=done_transitions,
                 routes=routes)
             created_event_paths.append(exposure_path)
-            binding_path = review.write_round_request_binding(
-                root, round_id, full, prev_wm, review_reviewers,
-                mode=(cfg.get("review") or {}).get("mode", "packet"))
-            created_event_paths.append(binding_path)
         except Exception as e:  # noqa: BLE001 — exposure is part of the close transaction
-            raise WorkflowError(f"round exposure/request binding not recorded: {e}") from e
+            raise WorkflowError(f"round exposure not recorded: {e}") from e
     except Exception as e:  # noqa: BLE001 — any failure must roll every written artifact back
         write_text_atomic(tasks_path, orig_tasks_text)
         write_text_atomic(cfg_path, ctext)

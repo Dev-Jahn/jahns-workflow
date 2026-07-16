@@ -4,7 +4,9 @@ The reviewer has the repository via git. This is a domain/code review, not a wor
 keep the waystone harness out of scope unless asked.
 
 - Project / Branch: {project} / {branch}
-- Reviewing: {head full sha}   (diff against {base full sha, or "(root)" for the first round})
+- Reviewing: {40-lowercase-hex-closeout-sha}   (diff against {40-lowercase-hex-base-sha-or-(root)})
+
+<!-- Keep the Reviewing field on exactly one line with the literal spacing shown above. -->
 
 ## What changed and why
 
