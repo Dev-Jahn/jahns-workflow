@@ -131,6 +131,7 @@ tasks:
     severity: "major"
     origin: "spark1/susradar dogfooding 보고 (2026-07-16)"
   - id: chore/verifier-guard-residuals-2
+    accept: ["broker pre-cleanup 실패 시 verify가 중단된다 — hermetic 절대 계약(기존 ruling)의 일관 적용; daemon 잔존 상태로 verification을 계속하지 않는다", "companion broker shutdown이 RPC 응답이 아니라 실제 종료·endpoint 소멸을 확인한다", "hook-matrix가 정상 모드(가드 부재)의 실 subprocess 동작도 회귀로 고정한다 (nudge, session_context, resume 포함)", "전체 테스트 스위트와 ruff F401,F841 검사가 통과한다"]
     notes: "출처: fix/verifier-hook-hermeticity 패치의 raw codex 적대 리뷰(blocker 0). 구현 보고 risks에 broker RPC 한계가 이미 기록되어 기준 5('처리 또는 한계 기록')는 충족 — 이 task는 실제 종료 대기(완료 보장) + 정상 모드 회귀 커버리지 확장의 경화분."
     scope: ["scripts"]
     title: "hermeticity 적대 리뷰 잔여 2건: ①companion broker shutdown이 RPC 응답만 확인하고 실제 종료·endpoint 소멸을 대기하지 않음(stale/guarded broker 누출 race — 테스트는 호출 순서만 mock) ②hook-matrix가 가드 모드만 검증, 정상 모드 실 subprocess 커버리지는 nudge/session_context/resume 미포함 + HOME 상속"
@@ -138,6 +139,7 @@ tasks:
     severity: "minor"
     origin: "review-raw-adversarial-20260716"
   - id: fix/publication-gate-bypasses
+    accept: ["publication 게이트는 working tree가 아니라 HEAD tree를 증거 소스로 사용한다 — request와 binding을 git ls-tree의 정확한 lexical path로 찾아 HEAD blob에서 직접 읽어 파싱하고, symlink mode는 거부하며, 사이드카 후보 열거도 filesystem glob이 아니라 HEAD tree에서 한다", "skip-worktree나 assume-unchanged로 위장한 tracked 변경이 게이트를 통과하지 못한다", "round id 재사용 시 binding이 현재 closeout에 결속됨이 검증된다 (조상 검사만으로 불충분)", "improve의 파일명과 내장 round_id 불일치 사이드카가 무경고 오귀속되지 않는다 (PR freeze 동일)", "들여쓴 중복 Reviewing 줄이 모호성으로 탐지된다", "삭제된 upstream의 stale tracking ref로 게이트가 통과하지 않는다", "전체 테스트 스위트(신규 계약 테스트는 RED-first)와 ruff F401,F841 검사가 통과한다"]
     notes: "출처: fix/round-packet-remote-visibility 2차 패치의 raw codex 적대 리뷰(blocker 2·major 3). 사용자 결정(2026-07-16): 2차 패치는 일반 경로 계약(미추적·부분커밋 거부, 실 bare-remote RED-first 증명)을 달성했으므로 apply하고 edge 우회는 본 task로 이관. 수정 방향: 심링크 비추적 검사(과거 bundle 심링크 교훈 재적용), binding을 현재 closeout에 결속(조상 검사 불충분), improve 사이드카 로드에 expected_round_id 강제, 모호성 탐지 확장, head_pushed의 prune/존재 확인."
     scope: ["scripts"]
     title: "publication 게이트 edge 우회 5건: reviews 디렉터리 심링크 추적으로 존재검사 오통과, round id 재사용 시 낡은 request/binding이 조상 검사만으로 통과(현재 closeout과 미결속), improve의 파일명↔내장 round_id 불일치 사이드카 무경고 오귀속(PR freeze 동일), 들여쓴 중복 Reviewing 줄 모호성 미탐지, 삭제된 upstream의 stale tracking ref 통과"
@@ -145,6 +147,7 @@ tasks:
     severity: "major"
     origin: "review-raw-adversarial-20260716"
   - id: fix/companion-verifier-effort-forwarding
+    accept: ["companion verifier 경로에서 effort가 명시적으로 전달되거나(raw argv 계약 테스트), 전달 불가면 effort is not None을 fail-loud로 거부한다 — 침묵 폐기 금지", "verify artifact에 requested_effort와 effective_effort가 기록된다", "전체 테스트 스위트(신규 계약 테스트는 RED-first)와 ruff F401,F841 검사가 통과한다"]
     notes: "출처: feat/effort-pro-ultra 패치의 raw codex 적대 리뷰 blocker. 패치 이전에는 verifier effort가 전 transport에서 폐기됐고, 패치가 codex-cli 전달 + pro/ultra 거부를 추가했으나 companion 분기 argv(delegate.py:2074-2075)는 여전히 legacy effort를 침묵 폐기(무기록 대체 금지 위반). 현재 verifier unbind 상태라 즉시 노출 없음 — verify binding 복원 전 처리 권장. wave 3."
     scope: ["scripts"]
     title: "codex-companion verifier transport이 유효 effort 값(xhigh 등)을 argv에 전달하지 않고 무기록 폐기 — effort를 companion에 전달하거나 미지원이면 fail-loud 거부, companion effort 전달 계약 테스트 추가"
@@ -152,6 +155,7 @@ tasks:
     severity: "major"
     origin: "review-raw-adversarial-20260716"
   - id: fix/execution-surface-dep-gating
+    accept: ["delegate run의 packet 구성(prepare와 claim 동일 경로)이 모든 의존 task의 존재와 status done을 강제하고, 실패 시 미충족 의존 id와 상태를 전부 출력한다", "lane 선정에서 parked가 제외된다", "round skill이 waystone lanes verify . --round <round-id>를 사용한다", "전체 테스트 스위트(신규 계약 테스트는 RED-first)와 ruff F401,F841 검사가 통과한다"]
     notes: "출처: feat/task-status-parked 적대 리뷰 major 2건(+minor: 계약 테스트가 next_actionable만 검사, delegate run/lanes CLI subprocess 미실행). 판정: parked 회귀가 아니라 기존 실행 표면 갭에 parked가 합류한 것 — next_actionable/archive/의존충족/guard/improve는 parked를 올바르게 처리(리뷰 확인). stale start-here 포인터 지적은 비권위 문서 설계로 기각."
     scope: ["scripts"]
     title: "실행 표면의 의존성 게이팅: delegate run이 대상 task 자신의 상태만 검사하고 의존 task 상태(parked/blocked/pending)를 요구하지 않아 미충족 의존의 child를 실행 가능(parked 이전부터의 갭); lanes verify가 parked lane을 in-flight로 취급해 무관한 라운드 검증을 실패시킴"
@@ -159,7 +163,7 @@ tasks:
     severity: "major"
     origin: "review-raw-adversarial-20260716"
   - id: chore/release-script-hardening
-    notes: "출처: fix/release-staging-isolation 적대 리뷰(blocker 0, major 5·minor 4). 핵심 계약은 생존: 워킹트리 무접촉(temp index), ignored 보존·실패 원상 테스트는 실 repo·실 스크립트, 리뷰어의 독립 zero-diff 대조로 현 시점 동등성 확인. 본 task는 solo-dev 운용에서 즉시 위험 없는 edge들의 경화 모음."
+    notes: "출처: fix/release-staging-isolation 적대 리뷰(blocker 0, major 5·minor 4) + fix-wave 외부 리뷰. checked-out-main 항목은 fix/release-checked-out-main(major)으로 승격·분리(2026-07-17). 외부 리뷰의 manifest 미래 누락 게이트 제안 채택 방향: projected tree를 별도 worktree로 materialize해 install/smoke 검증하거나 manifest-런타임 의존 완전성 검사 — dev 테스트가 전체 tree에서 돌기 때문에 zero-diff는 시점 증거일 뿐 invariant가 아님. 잔여: no-op CAS, onbranch 서명 기록, 실패 게이트 테스트, commit-tree hook 생략 기록, TMPDIR 방어, index refresh, ref 후 cleanup 실패 순서."
     scope: ["release-to-main.sh", "scripts"]
     title: "release 스크립트 경화 잔여: 체크아웃된 main worktree에서 update-ref 시 불일치, no-op 판정의 CAS 부재(동시 갱신 race), onbranch:main 서명 설정 미적용(의미 변화 기록), 미래 manifest 누락 가드(unknown-toplevel 경고+실 repo 동등성 회귀 테스트), 실패 게이트 테스트 부재, commit-tree의 hook 생략 기록, TMPDIR 저장소 내부 지정 방어, ref 갱신 후 cleanup 실패 시 결과 코드 순서"
     status: "pending"
@@ -187,7 +191,7 @@ tasks:
     origin: "사용자 실측 (2026-07-16)"
   - id: feat/deterministic-review-packet
     accept: ["round의 리뷰 요청 문서는 script가 template 기반으로 렌더링한다 — 정확 참조 필드(Reviewing과 diff base sha, 프로젝트, 브랜치, 리뷰어, 회신 header 템플릿 블록)는 script가 git과 binding에서 도출해 채우며 모델 손을 거치지 않는다", "모델이 작성하는 부분은 서사 섹션(변경 의도, 우선 읽을 파일, 공격할 claim, 증거 표, 약점, 도메인 렌즈)에 한정되고 별도 입력 파일로 전달되어 script가 병합한다", "렌더링 시 Reviewing 값이 해당 round binding 대상과 일치함을 script가 검증하고 불일치는 fail-loud로 거부된다", "round skill이 리뷰 요청 생성을 라운드 마감의 무조건 단계로 서술하며 생성 여부를 사용자에게 묻는 선택지가 없다", "전체 테스트 스위트(신규 계약 테스트는 RED-first)와 ruff F401,F841 검사가 통과한다"]
-    notes: "실제 사고: steno round 2026-07-16-review-execution-wave의 packet에서 Reviewing sha가 eaf6c3d5cc0e…로 기재됐으나 실제 closeout은 eaf6c3d8c57e… — 짧은 prefix(eaf6c3d)만 일치, 모델이 나머지 자릿수를 hallucinate. 리뷰어가 fail-closed 거부(검토 중단). 근본 원인: round skill이 모델에게 'git rev-parse HEAD로 Reviewing을 채우라'고 지시 → 모델이 손으로 옮겨 적는 구조. 해결: script 렌더링 + Reviewing≡binding 검증(fail-loud, C2 착지분의 bind 기구 활용) + 서사만 모델 입력. 또한 기존 사례(라운드 마감 선언 후 packet 미생성·'생성할까요?' 질문)도 skill 문구에서 제거."
+    notes: "실제 사고: steno round 2026-07-16-review-execution-wave의 packet에서 Reviewing sha가 eaf6c3d5cc0e…로 기재됐으나 실제 closeout은 eaf6c3d8c57e… — 짧은 prefix(eaf6c3d)만 일치, 모델이 나머지 자릿수를 hallucinate. 리뷰어가 fail-closed 거부(검토 중단). 근본 원인: round skill이 모델에게 'git rev-parse HEAD로 Reviewing을 채우라'고 지시 → 모델이 손으로 옮겨 적는 구조. 해결: script 렌더링 + Reviewing≡binding 검증(fail-loud, C2 착지분의 bind 기구 활용) + 서사만 모델 입력. 또한 기존 사례(라운드 마감 선언 후 packet 미생성·'생성할까요?' 질문)도 skill 문구에서 제거. 추가 ruling (2026-07-17): 리뷰어 대상 지침(회신 헤더 블록 등)은 템플릿에서만 정적 렌더링 — skill 산문·전달 프롬프트에 재서술 금지(중복 산문 드리프트 실증: skill의 6–40이 84ad6a7의 12+ 상향을 놓침). script 렌더링이 착지하면 round skill의 keep-verbatim 한 줄도 제거 대상."
     scope: ["scripts", "templates", "skills"]
     title: "리뷰 packet의 결정론 렌더링 분리: 정확 참조 필드(Reviewing/diff base sha, 프로젝트·브랜치, 리뷰어, 회신 header 블록)는 script가 git/binding에서 채우고, 모델은 서사 섹션만 별도 입력으로 작성 — round skill은 packet 생성을 마감의 무조건 단계로 수행(생성 여부 질문 금지)"
     status: "pending"
@@ -207,6 +211,7 @@ tasks:
     deps: ["feat/review-pending-ledger"]
     origin: "사용자 설계 요청 (2026-07-16)"
   - id: fix/preflight-probe-isolation
+    accept: ["프로브가 본 worktree를 오염시킬 수 없다 — 동일 cache·filesystem 조건의 일회용 sibling worktree에서 실행 후 폐기하거나, 동일 worktree 유지 시 프로브 전후 tracked·untracked·ignored manifest byte 대조로 reserved 외 변경을 fail-loud하고 원상 검증 후에만 본 러너를 기동한다", "stderr 분류 패턴이 양방향 정확화된다 — 무관 permission-denied가 오분류되지 않고 어순 변형 Landlock 실패가 탐지된다", "프로브 실패의 transport(인증·네트워크) 원인이 sandbox 문제로 오진되지 않고 구분 기록된다", "프로브 비용(시간)이 record에 계상된다", "전체 테스트 스위트(신규 계약 테스트는 RED-first)와 ruff F401,F841 검사가 통과한다"]
     notes: "출처: fix/runner-env-failure-detection 적대 리뷰(blocker 0, major 4·minor 3). 수용 근거: 분류 게이트는 conjunctive(정직 무변경+report 보호 확인), 오류 방향이 fail-loud라 silent 성공보다 보수적. 잔여: 프로브 후 상태 검증(reserved 파일만 확인 중), 패턴 anchoring, 오진 구분, hint 토큰 오탐(‘all Landlock tests passed’), 프로브 duration 미계상, 실 bwrap/seatbelt 무테스트."
     scope: ["scripts"]
     title: "프리플라이트 프로브 경화: 프로브(모델 턴)가 남긴 프로브 외 편집이 main run patch에 출처 오염 가능 — 프로브 후 git 상태 대조·정리 필수; stderr 패턴 양방향 정확화(무관 permission-denied 오분류/어순 변형 Landlock 미탐); 프로브 실패의 transport(인증·네트워크) vs sandbox 구분; 프로브 비용 기록·계상"
@@ -214,9 +219,18 @@ tasks:
     severity: "major"
     origin: "review-raw-adversarial-20260716"
   - id: fix/reply-header-residuals
+    accept: ["32KiB 초과 feedback에서도 구분자가 조기 등장하면 유효 메타를 읽는다 (경계 테스트 포함)", "ingest가 소비한 sidecar 경로, digest, target/base/reviewers tuple이 immutable하게 기록되고, projection의 review_target_matches와 reviewer_configured는 저장 boolean 신뢰가 아니라 그 스냅샷 재검증(또는 immutable ingest event 권위)으로 산출된다 — 검증할 binding이 없으면 null", "정규화에 실패한 invalid 값이 raw reply_metadata로 병행 노출되지 않는다", "전체 테스트 스위트(신규 계약 테스트는 RED-first)와 ruff F401,F841 검사가 통과한다"]
     notes: "출처: feat/review-reply-structured-header 2차 적대 리뷰(major 2·minor 2 중 미해소분 — blocker였던 prefix 강도는 main-session 84ad6a7로 즉시 상향). RED-first 실행 기록 부재도 리뷰 지적(반사실 RED는 리뷰어 코드 확인) — 후속 위임 시 RED 실행 기록 의무화."
     scope: ["scripts"]
     title: "구조화 회신 헤더 잔여: 32KiB 초과 feedback에서 구분자 조기 등장 미확인으로 유효 메타 소실(무경고 null), improve가 저장 boolean(review_target_matches/reviewer_configured)을 사이드카 재검 없이 신뢰, 정규화 null 처리된 invalid 값이 raw reply_metadata로 병행 노출"
     status: "pending"
     severity: "major"
     origin: "review-raw-adversarial-20260716"
+  - id: fix/release-checked-out-main
+    accept: ["refs/heads/main이 현재 또는 다른 linked worktree에 checkout되어 있으면 release가 시작 전에 해당 worktree 경로를 출력하며 fail-loud로 중단한다 (git worktree list --porcelain 검사)", "현재 worktree가 main인 경우와 다른 linked worktree가 main인 경우가 각각 real-repo 테스트로 재현·고정된다 (RED-first)", "전체 테스트 스위트와 ruff F401,F841 검사가 통과한다"]
+    notes: "리뷰어(gpt-5.6-pro, high)가 재현: main checkout 상태에서 update-ref 후 'M README.md' + release 역방향 cached diff — 이후 평범한 commit이 release를 역전 가능. 비파괴 계약·release provenance 직접 위협이라 chore/release-script-hardening의 minor 항목에서 major 단독 task로 승격(리뷰어 권고 수용). 기존 회귀 테스트 factory가 항상 dev checkout이라 미커버."
+    scope: ["release-to-main.sh", "scripts"]
+    title: "main이 어느 worktree에든 checkout된 상태에서 release가 성공하면 그 worktree의 HEAD만 이동하고 index/파일은 구 tree로 남아 release 역방향 staged diff가 생김 — 시작 전 git worktree list 검사로 fail-loud"
+    status: "pending"
+    severity: "major"
+    origin: "review-2026-07-16-fix-wave"
