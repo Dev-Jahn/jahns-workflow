@@ -154,6 +154,9 @@ Most validation, rendering, bookkeeping, log parsing, and policy checks are plai
 | `waystone task set <id> --scope-add <prefix>` | Appends a validated repo-relative task boundary for scope-drift evaluation. |
 | `waystone paths` | Shows the resolved project-state, machine-state, and worktree-cache locations. |
 | `waystone project` | Registers, unregisters, and lists projects through the machine-wide registry. |
+| `waystone delegate plan` | Emits an immutable fan-out manifest (with `--json`) for a set of decided tasks — dependency-gated, corrupt-fail-closed — that a deterministic-workflow carrier carries. |
+| `waystone delegate run --json-events --expect-packet-sha` | Runs one delegation; `--json-events` streams pure NDJSON on stdout and `--expect-packet-sha` (with `--expect-profile`) refuses a stale dispatch before any work starts. |
+| `waystone delegate status --json` | Reports delegation state (including `corrupt`) with an exact `task_id` field for machine consumption. |
 | `waystone delegate verify` | Re-runs independent read-only verification of a delegation result in its preserved worktree. |
 | `waystone delegate verdict` | Records the main session's evidence-backed apply or discard decision before resolution. |
 | `waystone round close --route-note <role>,<execution>,<backend>` | Records an actually used host-guided route in the immutable round exposure; repeat once per route. |
