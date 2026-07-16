@@ -2,18 +2,30 @@
      Source of truth: tasks.yaml. Regenerated automatically on tasks.yaml edits. -->
 # Roadmap — waystone
 
-**Progress:** 0/0 done · 0 active · 0 blocked · generated 2026-07-15 17:10 UTC @ `4f8ddbc`
+**Progress:** 3/4 done · 0 active · 0 blocked · generated 2026-07-16 08:12 UTC @ `c8ec816`
 
 ```mermaid
 flowchart TD
+    subgraph backlog["(no milestone)"]
+        fix_boundary_hook_cli_resolution["<b>fix/boundary-hook-cli-resolution</b><br/>install hooks가 설치한<br/>boundary hook이 bare<br/>'waystone'을 호출해 hook 실행<br/>환경(PATH에 plugin bin 미주입)에서<br/>command not found — 템플릿/설치<br/>시점에 버전 독립적 CLI 경로 해석 필요"]
+        fix_verify_worktree_self_contamination["<b>fix/verify-worktree-self-contamination</b><br/>delegate verify가 리뷰<br/>worktree 안에 .waystone 프로젝트<br/>상태(profile 시딩·lock)를 생성해<br/>자신의 tree-mutation<br/>postcondition에 걸림 —<br/>.waystone.yml이 커밋된 프로젝트 +<br/>레거시 시드 존재 머신 조합에서 verify가<br/>결정론적으로 실패"]
+        chore_verifier_session_guard_hardening["<b>chore/verifier-session-guard-hardening</b><br/>verifier session guard 경화:<br/>boundary_check/tasks_read_<br/>nudge 등 미가드 hook 표면,<br/>companion broker의 guard<br/>env 수명 범위, RUN 단계 구현자 세션의<br/>.waystone 시딩(무해하나 무기록) —<br/>적대 리뷰 major 4건의 후속 처리"]
+        docs_adopt_waystone_harness["<b>docs/adopt-waystone-harness</b><br/>waystone 자기채택 bootstrap:<br/>SSOT.md 합성(ideate),<br/>init(패킷 리뷰·warn-<br/>allowed·delegation on),<br/>ADR-0000, 부산물 dev-only 릴리스<br/>제외(EXCLUDES), 3축 profile<br/>구성"]
+    end
     classDef pending fill:#f5f5f5,stroke:#9e9e9e,color:#424242
     classDef active fill:#bbdefb,stroke:#1565c0,color:#0d2b56,stroke-width:2px
     classDef blocked fill:#ffcdd2,stroke:#c62828,color:#7f1d1d
     classDef done fill:#c8e6c9,stroke:#2e7d32,color:#1b4332
     classDef dropped fill:#eeeeee,stroke:#bdbdbd,color:#9e9e9e,stroke-dasharray: 4 4
+    class fix_boundary_hook_cli_resolution,fix_verify_worktree_self_contamination,docs_adopt_waystone_harness done
+    class chore_verifier_session_guard_hardening pending
 ```
 
 ## Tasks
 
 | ID | Title | Status | Round | Deps | Anchor |
 |---|---|---|---|---|---|
+| `chore/verifier-session-guard-hardening` | verifier session guard 경화: boundary_check/tasks_read_nudge 등 미가드 hook 표면, companion broker의 guard env 수명 범위, RUN 단계 구현자 세션의 .waystone 시딩(무해하나 무기록) — 적대 리뷰 major 4건의 후속 처리 | ⬜ pending | — | — | — |
+| `docs/adopt-waystone-harness` | waystone 자기채택 bootstrap: SSOT.md 합성(ideate), init(패킷 리뷰·warn-allowed·delegation on), ADR-0000, 부산물 dev-only 릴리스 제외(EXCLUDES), 3축 profile 구성 | ✅ done | 2026-07-16-adopt-dogfooding | — | — |
+| `fix/boundary-hook-cli-resolution` | install hooks가 설치한 boundary hook이 bare 'waystone'을 호출해 hook 실행 환경(PATH에 plugin bin 미주입)에서 command not found — 템플릿/설치 시점에 버전 독립적 CLI 경로 해석 필요 | ✅ done | 2026-07-16-adopt-dogfooding | — | — |
+| `fix/verify-worktree-self-contamination` | delegate verify가 리뷰 worktree 안에 .waystone 프로젝트 상태(profile 시딩·lock)를 생성해 자신의 tree-mutation postcondition에 걸림 — .waystone.yml이 커밋된 프로젝트 + 레거시 시드 존재 머신 조합에서 verify가 결정론적으로 실패 | ✅ done | 2026-07-16-adopt-dogfooding | — | — |
