@@ -108,6 +108,10 @@ assert_main_not_checked_out() {
 
 assert_main_not_checked_out
 
+# Concurrency model: single user, single process (SSOT §3). The assert→update-ref window is not
+# atomic against a concurrent checkout of main from another process; that scenario is out of the
+# supported threat model. The CAS old-OID on update-ref protects against main *moving*, only.
+
 if [ -n "$(git status --porcelain)" ]; then
   echo "release: working tree not clean — commit or stash first." >&2
   exit 1
