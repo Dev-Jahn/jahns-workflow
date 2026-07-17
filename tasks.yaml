@@ -413,6 +413,7 @@ tasks:
     title: "dev 이력 대비 살아있는 문서 staleness 감사·정정 (README 표면·배지, ADR-0001 SSOT 포인터, CLAUDE.md 릴리스 메커니즘, docs gate 확장)"
     status: done
   - id: fix/remote-verify-live-ref
+    accept: ["publication 증명이 라이브 원격 기반이다 — 정확한 upstream branch를 명시 refspec으로 fetch한 결과(FETCH_HEAD 또는 전용 임시 ref)를 증거 SHA로 사용하고, persisted refs/remotes/* 신뢰 경로가 remote.py verify와 common.py head_pushed 양쪽에서 제거된다", "RED-first 2건: (a) 원격 branch가 삭제된 상태, (b) branch가 fetch refspec에서 제외된 상태 — 양쪽 모두 gate가 거부한다 (실 bare-remote 테스트, 검증 clone과 삭제 주체 clone 분리)", "fetch 실패·branch 부재·빈 FETCH_HEAD는 전부 fail-closed이며 오류 메시지가 원인(부재 vs 네트워크)을 구분한다", "전체 테스트 스위트 green + ruff F401,F841 clean, 기존 publication gate 계약 테스트 무회귀"]
     notes: "JW-GPT-001 (REAL major, 동적 재현으로 실제 false PASS 확인). 원칙: publication 증명은 라이브 원격에서 — 정확한 branch를 명시 refspec으로 fetch해 FETCH_HEAD(또는 전용 임시 ref)의 SHA를 증거로 사용, branch 부재·fetch 실패는 fail-closed. remote.py:46 verify와 common.py:1596 head_pushed 공통 경로 모두 수정 (persisted refs/remotes/* 신뢰 제거가 근본 해소, --prune 단독은 땜질). RED 2건: 원격 branch 삭제 상태 / fetch refspec 제외 상태에서 gate 거부."
     deps: ["fix/binding-narrative-digest"]
     scope: ["scripts/remote.py", "scripts/common.py", "scripts/review.py", "scripts/tests/run_tests.py"]
@@ -421,20 +422,25 @@ tasks:
     severity: "major"
     origin: "review-2026-07-18-carrier-lanes"
   - id: fix/packet-digest-prompt-coverage
-    notes: "JW-GPT-002 (REAL major, 동일 digest 재현 확인). 원칙: implementer prompt에 렌더되는 모든 registry 필드가 곧 digest 커버리지 — _packet_core_digest(delegate.py:611-621)에 milestone/round/anchor/notes 포함(_render_prompt 645-647과 정합). 미소비 registry_fingerprint는 검증 경로 연결 또는 제거로 정직화. 필드별 RED 4건: plan 후 각 필드 변조 → 기존 --expect-packet-sha로 run 시 claim record 생성 전 거부."
+    result: "attempt-2 apply + main claim-게이트 하드닝(동일 커밋): digest≡prompt projection 결속, registry_fingerprint 제거. codex REJECT(prepare→claim 재정렬 창)는 main 검증으로 dispatch 영향 nil 판정 + 하드닝으로 잔여 창 폐쇄. 통합 730 green + ruff clean. 기록: .waystone/delegations/20260717T183011Z-fix-packet-digest-prompt-coverage"
+    accept: ["plan 생성 후 tasks.yaml에서 notes·anchor·round·milestone 각각을 변조하면, 기존 manifest의 --expect-packet-sha로 호출된 delegate run이 claim record 생성 전에 거부된다 — 필드별 RED-first 4건", "digest 커버리지 원칙이 코드에 명시된다: implementer prompt에 렌더되는 registry 유래 필드 집합 = packet-core digest 필드 집합 (의도적 제외는 docstring에 열거된 carrier/retry 메타데이터만)", "registry_fingerprint가 정직해진다 — run 경로에서 실제 검증되거나 manifest에서 제거된다 (기록만 되고 소비 안 되는 상태 금지)", "전체 테스트 스위트 green + ruff F401,F841 clean, 기존 §4.1-4.3 delegate 계약 테스트 무회귀", "digest가 prompt 렌더와 결속된다 — canonicalization(json.dumps sort_keys)과 prompt 렌더(str())가 갈리는 클래스가 닫힌다: prompt-렌더 registry 필드는 scalar(str/None)로 강제되거나(비scalar면 plan/packet-build가 fail-loud) digest가 prompt가 보는 표현 그대로를 해싱한다. load_tasks 미검증 경로로도 mapping-typed notes/anchor가 우회하지 못한다", "canonicalization RED: notes(또는 anchor)를 YAML mapping으로 넣고 nested key 순서만 바꾼 tasks.yaml이 기존 --expect-packet-sha로 run 시 claim record 생성 전에 거부된다 (문자열→문자열 변조뿐 아니라 컨테이너 재정렬도)"]
+    notes: "ATTEMPT-2 (2026-07-18): attempt-1 REJECT — load_tasks 미검증(common.py:1606)이라 notes/anchor mapping이 _render_prompt(str(dict), 삽입순서)와 _packet_core_digest(json.dumps sort_keys)를 갈라 우회 잔존. 근본 해소: prompt-렌더 필드를 scalar로 강제(비scalar fail-loud) 또는 digest를 prompt 렌더 표현에 결속. attempt-1의 필드 추가 + registry_fingerprint 제거는 유지. milestone/round/anchor/notes 필드별 RED 4건 + canonicalization RED 1건."
     scope: ["scripts/delegate.py", "scripts/tests/run_tests.py"]
     title: "packet-core digest가 prompt 렌더 필드(milestone/round/anchor/notes)를 누락 — 디스패치 내용에 영향 주는 모든 필드를 digest에 포함, 미소비 registry_fingerprint 정직화"
-    status: "pending"
+    status: "done"
     severity: "major"
     origin: "review-2026-07-18-carrier-lanes"
   - id: fix/pending-corrupt-binding-honesty
-    notes: "JW-GPT-003 (REAL major). 원칙: 최신 후보를 파일명 시퀀스로 먼저 결정하고 그것이 corrupt면 round는 pending/unknown 유지 — 구 binding으로 완료 처리 금지 (review.py:502-509의 corrupt-continue-후-max 제거). sidecar 발행(review.py:344-351)은 tmp 완전 기록 후 exclusive publish로 crash-atomic화. RED 계약: valid binding-1 + corrupt/빈 binding-2 + binding-1 target과 일치하는 feedback → 여전히 pending."
+    result: "attempt-2 apply(b858ec3): latest_round_request_binding 공유 헬퍼로 전 소비자(pending·ingest·improve) 통일, mkstemp+os.link crash-atomic 발행. codex 적대 리뷰 ACCEPT(no majors), 724→통합 730 green. 기록: .waystone/delegations/20260717T183010Z-fix-pending-corrupt-binding-honesty"
+    accept: ["valid binding-1 + corrupt(빈 파일·부분 JSON) binding-2 + binding-1 target과 일치하는 feedback 상태에서 review pending이 해당 round를 pending(target unknown)으로 유지한다 — RED-first 계약 테스트", "최신 binding 후보는 파싱 이전에 파일명 시퀀스로 결정된다 — corrupt 후보를 건너뛰고 구 binding을 최신으로 승격하는 경로가 코드에서 제거된다", "sidecar 발행이 crash-atomic이다 — create-후-write 대신 tmp 완전 기록 후 exclusive publish, 기존 -N 시퀀스 명명과 동시 발행 배타성 보존", "전체 테스트 스위트 green + ruff F401,F841 clean, 기존 pending·binding 계약 테스트 무회귀", "latest-binding 해소(파일명 시퀀스로 최신 선택 → corrupt면 unknown)가 review.py의 단일 공유 헬퍼로 추출되고, pending_reviews와 improve.py의 review-target provenance 경로(_round_review_sidecars/_review_target_provenance, 984-985 max 포함)가 모두 그 헬퍼를 경유한다 — corrupt 최신 binding을 구 binding으로 승격하는 경로가 전 소비자에서 사라진다", "improve projection RED: valid binding-1 + corrupt binding-2 + 일치 feedback 상태에서 improve의 review-target provenance가 explicit로 구 target을 승격하지 않는다(unknown/미승격)"]
+    notes: "JW-GPT-003 (REAL major). 원칙: 최신 binding 후보를 파일명 시퀀스로 먼저 결정, corrupt면 pending/unknown 유지. sidecar는 tmp 완전 기록 후 os.link 배타 발행으로 crash-atomic. ATTEMPT-2 (2026-07-18): attempt-1 REJECT — improve.py:984-985(_round_review_sidecars 1025)가 pending_reviews와 동일 결함(파싱 성공 집합에서 max로 구 binding 승격). 근본 해소: latest-binding 해소를 review.py 단일 공유 헬퍼로 추출해 pending_reviews·improve 양쪽이 경유(중복 수정 금지). os.link 발행 방식은 유지."
     scope: ["scripts/review.py", "scripts/tests/run_tests.py"]
     title: "pending 파생이 corrupt 최신 binding을 건너뛰고 구 binding+구 feedback으로 완료 처리 — 시퀀스 우선 최신 판정(corrupt면 pending 유지) + sidecar crash-atomic 발행"
-    status: "pending"
+    status: "done"
     severity: "major"
     origin: "review-2026-07-18-carrier-lanes"
   - id: fix/binding-narrative-digest
+    accept: ["binding contract에 검증된 narrative의 canonical digest가 포함된다 — narrative만 바뀐 재-prepare는 새 sidecar를 발행하고 해당 round가 pending으로 재개된다 (RED-first: prepare A → feedback ingest → prepare B 같은 target → pending 재개)", "freeze는 stored narrative digest를 최신 binding과 대조한 뒤에만 게시한다 — 불일치는 fail-loud", "digest 없는 기존(legacy) sidecar는 조용히 통과되지 않는다 — 정직한 unknown/재발행 유도 경로로 처리", "전체 테스트 스위트 green + ruff F401,F841 clean"]
     notes: "JW-GPT-004 (REAL major). binding contract(review.py:324-330)에 canonical narrative digest(필요시 rendered request digest) 포함 — narrative만 바뀐 재-prepare(810-816 통과 경로)가 새 sidecar를 만들어 pending이 재개되게. freeze는 stored narrative digest를 binding과 대조 후 게시. RED: prepare(narrative A) → feedback ingest → prepare(narrative B, 같은 target) 후 pending 재개 또는 prepare 거부."
     deps: ["fix/pending-corrupt-binding-honesty"]
     scope: ["scripts/review.py", "scripts/tests/run_tests.py"]
@@ -443,6 +449,7 @@ tasks:
     severity: "major"
     origin: "review-2026-07-18-carrier-lanes"
   - id: fix/probe-proof-machine-scope
+    accept: ["codex 프로브 증명이 커밋 추적 파일(.waystone.yml)에 더 이상 기록되지 않는다 — 저장 위치가 미커밋 티어({root}/.waystone, self-ignored)로 이동하고 읽기·쓰기·진단 안내가 전부 새 위치를 가리킨다", "RED-first: .waystone.yml에 legacy codex_runner_verified: true가 커밋돼 있어도 로컬 마커가 없으면 프로브가 실행된다 — legacy 키는 조용히 수용되지 않고 무시+제거 안내를 출력한다", "전체 테스트 스위트 green + ruff F401,F841 clean, 프로브 1회 실행(probe-once) 계약 무회귀"]
     notes: "리뷰어 open question 1 승격 (REAL major, 상태 격리 위반). proof 저장을 커밋 추적 .waystone.yml(delegate.py:1137-1158, 973-1104)에서 미커밋 티어 {root}/.waystone(self-ignored, per-checkout)으로 이동. .waystone.yml 스키마에서 codex_runner_verified 제거 — legacy 키 발견 시 무시+제거 안내(조용한 수용 금지). 진단 메시지(1239-1258, 3090-3093)의 키 제거 안내 경로 갱신. RED: 커밋된 true 값이 있어도 로컬 마커 없으면 프로브 실행."
     deps: ["fix/packet-digest-prompt-coverage"]
     scope: ["scripts/delegate.py", "scripts/common.py", "scripts/tests/run_tests.py"]
