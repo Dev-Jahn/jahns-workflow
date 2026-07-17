@@ -249,7 +249,7 @@ tasks:
     severity: "major"
     origin: "사용자 결정 (2026-07-17)"
   - id: chore/hook-matrix-normal-mode-coverage
-    accept: ["plugin hooks.json에 등록된 전 hook 스크립트(boundary_check + verifier_guard 경유 전체, nudge/session_context/resume 포함)가 정상 모드(WAYSTONE_VERIFIER_SESSION 부재)에서 실 subprocess로 기대 동작을 내는 회귀 테스트가 존재한다", "hermetic 모드(WAYSTONE_VERIFIER_SESSION=1)와 정상 모드의 hook별 동작 차이가 같은 매트릭스에서 명시적으로 고정된다", "hook 테스트가 호출 환경의 HOME을 상속하지 않는다 (테스트 자체 HOME 고정)", "전체 테스트 스위트(신규 계약은 RED-first)와 ruff F401,F841 검사가 통과한다"]
+    accept: ["plugin hooks.json에 등록된 전 hook 스크립트(boundary_check + verifier_guard 경유 전체, nudge/session_context/resume 포함)가 정상 모드(WAYSTONE_VERIFIER_SESSION 부재)에서 실 subprocess로 기대 동작을 내는 회귀 테스트가 존재한다", "hermetic 모드(WAYSTONE_VERIFIER_SESSION=1)와 정상 모드의 hook별 동작 차이가 같은 매트릭스에서 명시적으로 고정된다", "hook 테스트가 호출 환경의 HOME을 상속하지 않는다 (테스트 자체 HOME 고정)", "전체 테스트 스위트(신규 계약은 RED-first)와 ruff F401,F841 검사가 통과한다", "매 hooks.json entry가 선행 hook 실행 상태에 오염되지 않는 인과 독립 단언을 가진다 — 해당 entry 명령을 no-op으로 치환하면 그 단언이 실패함을 mutation 실행으로 실증하고 보고서에 기록 (SessionEnd 포함)", "정상/hermetic 쓰기 차이가 hook별로 고정된다 — 각 hook 실행 후 worktree와 synthetic HOME 양쪽을 대조하고, session_context 정상 모드의 WAYSTONE_HOME 쓰기는 존재(정상)/부재(hermetic)로 명시 단언", "HOME 격리의 의미를 명확화: hook subprocess 환경은 명시 구성되어 호출자 HOME이 hook 프로세스에 도달하지 않으면 충족 — fixture 준비 명령(git, uv cache dir)의 caller-env 사용은 스위트 관례상 허용"]
     notes: "전신 chore/verifier-guard-residuals-2(드롭됨)에서 생존한 항목 — broker 관련 항목(RPC 완료 대기, pre-cleanup fail-closed)은 fix/drop-codex-companion의 companion 전면 제거로 소멸."
     scope: ["scripts", "hooks"]
     title: "hook-matrix 회귀를 정상 모드(가드 부재)까지 확장: nudge, session_context, resume 포함 전 hook의 실 subprocess 동작을 양 모드에서 고정 (HOME 상속 정리 포함)"
@@ -271,10 +271,11 @@ tasks:
     deps: ["fix/execution-surface-dep-gating"]
     origin: "review-raw-adversarial-20260716"
   - id: fix/review-feedback-triage-discipline
+    result: "@ f898eb3: 위임 2차 패치(마커 섹션+review triage 명령+읽기 재계산+round 불일치 null+중복키 non-부활+32KiB 경계, RED-first 6) + main 마무리(2차 소진 후 재정): anchor를 검색→산술로 교체(ingest가 verbatim-bytes를 헤더에 기록, triage는 위치 도출+바이트 대조) — 인용 마커 masking 클래스 소멸, 리뷰어 반례 계약 고정(RED: 구 anchor rc0 파괴). 661 OK, ruff 클린. 무결성 기계 0."
     accept: ["feedback 파일 구조가 '메타데이터 헤더 + verbatim 회신 + 맨 끝 마커로 구분된 triage 섹션'이 된다 — ingest가 마커 포함 skeleton을 append하고, 신설 waystone review triage 명령이 마커 구간만 교체하며 교체 전후 앞부분이 byte-identical함을 계약 테스트로 고정", "review triage 명령은 마커 부재/손상 시 조용한 재생성 없이 시끄럽게 거부한다", "improve/overlay projection의 reviewer_configured·review_target_matches가 저장 boolean 신뢰 없이 projection 시점에 feedback 헤더 재파싱+binding 대조로 재계산된다 — 파일/헤더/binding 부재나 파싱 실패는 정직한 null(+사유), 체크섬·스냅샷·봉인 기계는 도입하지 않는다", "32KiB cap을 걸치는(시작<cap<끝) separator가 유효 메타로 읽힌다 (경계 회귀 테스트 포함)", "정규화에 실패한 invalid 값이 raw reply_metadata로 병행 노출되지 않는다", "review skill의 triage 절차가 파일 직접 편집 대신 신설 명령 사용으로 갱신된다", "전체 테스트 스위트(신규 계약 테스트는 RED-first)와 ruff F401,F841 검사가 통과한다", "reviewer 회신 본문이 마커 문자열을 인용해도 triage가 영구 거부에 빠지지 않고 verbatim 바이트가 교체로 파괴되지 않는다 — 마커 탐지는 내용 전역 검색이 아닌 구조 앵커(마지막 BEGIN + EOF 종단 END, 또는 ingest 기록 offset 권위)로 하며 인용 충돌 계약 테스트 포함", "같은 표준 키의 유효 선언 뒤 손상(invalid-UTF8) 중복 선언이 오면 그 키는 None이고 어떤 값도 raw reply_metadata로 부활하지 않는다", "feedback 헤더에 기록된 round가 projection의 기대 round와 다르면(파일 복사/개명) configured가 아니라 null+round-mismatch 사유로 투영된다"]
     scope: ["scripts", "skills"]
     title: "feedback 파일 쓰기 규율로 회신 검증 단순화: triage를 마커 구분 섹션으로 분리하고 script가 그 구간만 교체(앞쪽 verbatim 불가침), projection은 저장 boolean 대신 읽기 시점 재파싱+binding 대조로 재계산 — 체크섬/봉인 불채택(ruling 2026-07-17)"
-    status: "pending"
+    status: "done"
     severity: "major"
     origin: "review-raw-adversarial-20260716"
   - id: fix/task-cli-arg-validation
