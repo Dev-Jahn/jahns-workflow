@@ -2,6 +2,22 @@
 
 round 단위 작업 이력이 이 파일에 축적된다. 활성 task와 의존성은 `tasks.yaml`(CLI: `waystone task`)과 생성 파일 `ROADMAP.md` 참조.
 
+## 2026-07-18-carrier-lanes-fixes
+
+- **Goal**: carrier-lanes 리뷰(gpt-5.6-pro/xhigh, CHANGES REQUESTED)의 잔여 major 3건을 병렬 lane으로 해소하고 재검토 요청 — 신뢰 표면(프로브 증명·narrative 결속·publication 증명) 경화.
+- **Shipped** (lane 3건은 implementer=external-runner/codex:gpt-5.6-sol xhigh, 각 attempt마다 host 스위트+ruff 실측 + raw codex 적대 리뷰(xhigh) + main verdict — 전 회전 근거는 delegation record의 verdict artifact):
+  - fix/probe-proof-machine-scope — codex 프로브 증명을 커밋 추적 `.waystone.yml`에서 미커밋 per-checkout 마커(`.waystone/codex-runner-verified`)로 이동 (attempt-3 인수 @ 874c4c3, 위임 20260717T200543Z). 3회전 경화: 복원적·원자적 self-ignore(migration 경로 통일, symlink 불수용) · 마커는 untracked+계약값일 때만 증명(추적된 마커는 무시+untrack 안내+재프로브) · legacy 키 무시+제거 안내(source-aware) · barrier 게이팅 동시성 계약(lock 하 재확인 자체를 고정)
+  - fix/binding-narrative-digest — binding contract에 canonical narrative digest 결속 (attempt-3 인수 @ 874c4c3, 위임 20260717T200543Z). narrative만 바뀐 재-prepare가 새 sidecar 발행+pending 재개(RED) · freeze/packet 게이트 모두 exposure+stored narrative 재렌더 대조(request.md 변조 거부 RED) · legacy digestless는 양측-digestless일 때만 legacy-pre-digest 라벨 폴백(digest-strip 위장 차단 RED), publication 게이트는 digest 하드 요구 · improve 투영에 digest·전용 narrative_coverage_reason 보존
+  - fix/remote-verify-live-ref — publication 증명을 stale remote-tracking ref 신뢰에서 라이브 원격 증명으로 재작성 (attempt-2 인수 @ 4673b58, 위임 20260717T205101Z). 정확한 upstream branch를 명시 refspec으로 pid+uuid 전용 임시 ref에 fetch해 원자 고정(공유 FETCH_HEAD 미사용, cleanup 실패도 fail-closed) · persisted refs/remotes/* 신뢰를 remote verify·head_pushed 양쪽에서 제거(RED: 삭제된 upstream·refspec 제외 — 실 bare-remote, clone 분리) · 부재 vs 네트워크 구분(ls-remote --exit-code) · remote '.' 거부 · freeze binding↔exposure 교차검증을 packet 게이트와 동등화. criterion 9 잔여(shallow 경계 rc=1 오진단, fail-closed 방향)는 override-unmet 기록 + fix/shallow-ancestry-honesty 등록
+  - docs/readme-delegate-fold — README delegate 섹션을 리드+`<details>` fold(전체 lifecycle·명령 지도·run 7단계·verify/verdict/apply/discard 계약)로 재작성 @ 07bab60 (main-session; dev_docs/delegate_readme.md 스타일 참조, 최신 표면 재검증)
+- **신규 등록(이번 라운드 발견, 미착수)**: fix/reply-narrative-echo (major — ingest가 현재 binding digest를 도장하는 재-prepare race, reply 헤더 계약 변경 필요·사용자 ruling 대기) · fix/marker-diagnostics-polish · fix/shallow-ancestry-honesty · fix/hook-matrix-color-env (FORCE_COLOR env에서 스위트 1건 오염 — main tree 재현으로 lane 회귀 아님 판별) · chore/legacy-name-residue (JW/jahns-workflow 구명 잔재, 사용자 지시) · chore/pre-header-feedback-settlement (0.10 헤더 이전 역사 feedback 3라운드 영구 pending — 기존 부채)
+- **Gates**: 병합 전체 스위트 730→748 green (2회: 874c4c3에서 740, 4673b58에서 748; FORCE_COLOR 중화 실측) + ruff F401/F841 clean. 각 lane worktree 개별 실측 green.
+- **SSOT**: unchanged.
+- **Decisions pending**: fix/reply-narrative-echo (reply 계약 변경 ruling) · chore/pre-header-feedback-settlement (역사 라운드 정착 방식).
+- **Review**: requested (docs/reviews/2026-07-18-carrier-lanes-fixes-request.md) — carrier-lanes 재검토.
+- **Adaptive rules**: unevaluable (활성 overlay 규칙 0개).
+- **Next**: 재리뷰 통과 시 릴리스 0.11 → /plugin update → hooks 마커 → verifier binding 복원(TEMP UNBOUND 해제) → carrier 라이브 fan-out 검증. 이후 chore/migration-sunset(전 머신 이관 확인 후)·minor 큐(diagnostics polish·color env·name residue).
+
 ## 2026-07-18-carrier-lanes
 
 - **Goal**: fix-wave 리뷰 큐를 3-lane 병렬 체인(R: review.py / D: delegate.py / A: release)으로 전량 해소하고, deterministic-workflow carrier(CC Workflow 통합)를 편입.

@@ -2,7 +2,7 @@
      Source of truth: tasks.yaml. Regenerated automatically on tasks.yaml edits. -->
 # Roadmap — waystone
 
-**Progress:** 38/51 done · 0 active · 0 blocked · generated 2026-07-17 19:20 UTC @ `5800c3b`
+**Progress:** 42/58 done · 0 active · 0 blocked · generated 2026-07-17 21:11 UTC @ `4c04203`
 
 ```mermaid
 flowchart TD
@@ -58,6 +58,13 @@ flowchart TD
         fix_binding_narrative_digest["<b>fix/binding-narrative-digest</b><br/>binding contract에<br/>narrative/request digest<br/>부재 — 동일 target 재-prepare가<br/>구 sidecar·구 feedback 재사용.<br/>narrative digest를<br/>contract에 포함해 재발행 시<br/>pending 재개"]
         fix_probe_proof_machine_scope["<b>fix/probe-proof-machine-scope</b><br/>codex 프로브 증명이 커밋 추적<br/>.waystone.yml에 저장돼 머신 간<br/>전파(상태 격리 위반) — 미커밋<br/>티어({root}/.waystone)로 이동"]
         docs_release_single_writer_assumption["<b>docs/release-single-writer-assumption</b><br/>release 스크립트의 단일 사용자·단일<br/>프로세스 동시성 전제를 명시 (lease 기계<br/>도입 대신 제한 문서화 — SSOT §3)"]
+        fix_reply_narrative_echo["<b>fix/reply-narrative-echo</b><br/>리뷰 회신이 검토한 narrative를<br/>자기증언하지 않아 ingest가 현재<br/>binding digest를 도장 —<br/>prepare(A)→리뷰 중<br/>prepare(B)→A회신 ingest 시 B<br/>완료 오판. request 렌더에 digest<br/>노출 + reply 구조화 헤더에<br/>request-digest 에코 + ingest<br/>대조 (reply 계약 변경 — 사용자<br/>ruling 필요)"]
+        chore_legacy_name_residue["<b>chore/legacy-name-residue</b><br/>구명 잔재 전면 제거:<br/>JW_REPORT.yaml 등 JW·jahns-<br/>workflow 이름이 남은 표면을 rg 전수로<br/>청소 (마이그레이션 호환 불요 — 사용자 지시<br/>2026-07-18). delegate.py<br/>계약·in-flight lane과 겹치므로<br/>lane 머지 후 실행"]
+        docs_readme_delegate_fold["<b>docs/readme-delegate-fold</b><br/>README delegate 섹션 재작성 — d<br/>ev_docs/delegate_readme.md<br/>(codex 해설, 구버전 기준)를 참조<br/>스타일로 최신 dev 동작에 맞게 재작성, 상세<br/>메커니즘은 details fold로 접어 배치<br/>(사용자 지시 2026-07-18, main<br/>직접 — docs 작업)"]
+        fix_hook_matrix_color_env["<b>fix/hook-matrix-color-env</b><br/>hook matrix 테스트의 uv cache<br/>dir 파싱이 FORCE_COLOR 환경에서<br/>ANSI 오염으로 실패 — subprocess<br/>env에서 색상 강제 변수 중화(또는<br/>NO_COLOR 부여)로 환경 무관하게<br/>(2026-07-18 실측:<br/>FORCE_COLOR=3 세션에서 main<br/>tree도 동일 실패, lane 회귀 아님)"]
+        fix_marker_diagnostics_polish["<b>fix/marker-diagnostics-polish</b><br/>probe 마커 진단 폴리시: 추적<br/>마커+워킹트리 삭제 상태의 1회차 안내 공백,<br/>staged 무효 마커 시 git rm<br/>--cached -f 안내 보강, lock 하<br/>재확인 경합 창의 안내 억제 — 전부 fail-<br/>open 아님(프로브는 항상 실행), 안내<br/>품질만 (adversarial round-3,<br/>main 판정 minor)"]
+        chore_pre_header_feedback_settlement["<b>chore/pre-header-feedback-settlement</b><br/>구조화 헤더(0.10) 이전 형식의 역사<br/>feedback 3라운드가 완료 판정 불가로<br/>영구 pending — 패치 전부터 동일(기존<br/>부채). 역사 라운드 정착(settle) 방식<br/>결정 필요: 아카이브 마커 vs 재-ingest<br/>vs pending 제외 규칙"]
+        fix_shallow_ancestry_honesty["<b>fix/shallow-ancestry-honesty</b><br/>shallow 위상에서 merge-base<br/>rc=1이 판정 불가일 수 있음에도 확정<br/>'미포함'으로 보고(fail-closed<br/>오진단) — is-shallow-<br/>repository 감지 시 rc=1을<br/>unverifiable로 정직 강등; 임시<br/>verify-fetch ref의 인터럽트 잔류<br/>sweep 포함 (adversarial<br/>V-round-2, main 판정 minor)"]
     end
     decision_verifier_hook_isolation_contract --> fix_verifier_hook_hermeticity
     feat_review_pending_ledger --> feat_waystone_statusline
@@ -69,24 +76,34 @@ flowchart TD
     fix_binding_narrative_digest --> fix_remote_verify_live_ref
     fix_pending_corrupt_binding_honesty --> fix_binding_narrative_digest
     fix_packet_digest_prompt_coverage --> fix_probe_proof_machine_scope
+    fix_binding_narrative_digest --> fix_reply_narrative_echo
+    fix_probe_proof_machine_scope --> chore_legacy_name_residue
+    fix_binding_narrative_digest --> chore_legacy_name_residue
+    fix_probe_proof_machine_scope --> fix_hook_matrix_color_env
+    fix_binding_narrative_digest --> fix_hook_matrix_color_env
+    fix_probe_proof_machine_scope --> fix_marker_diagnostics_polish
+    fix_remote_verify_live_ref --> fix_shallow_ancestry_honesty
     classDef pending fill:#f5f5f5,stroke:#9e9e9e,color:#424242
     classDef active fill:#bbdefb,stroke:#1565c0,color:#0d2b56,stroke-width:2px
     classDef blocked fill:#ffcdd2,stroke:#c62828,color:#7f1d1d
     classDef done fill:#c8e6c9,stroke:#2e7d32,color:#1b4332
     classDef dropped fill:#eeeeee,stroke:#bdbdbd,color:#9e9e9e,stroke-dasharray: 4 4
-    class fix_boundary_hook_cli_resolution,fix_verify_worktree_self_contamination,docs_adopt_waystone_harness,fix_round_packet_remote_visibility,feat_effort_pro_ultra,fix_release_staging_isolation,decision_verifier_hook_isolation_contract,decision_release_ship_manifest,fix_verifier_hook_hermeticity,feat_task_status_parked,fix_runner_env_failure_detection,fix_execution_surface_dep_gating,chore_release_script_hardening,feat_review_reply_structured_header,fix_effort_drop_pro,feat_deterministic_review_packet,feat_review_pending_ledger,feat_waystone_statusline,fix_preflight_probe_isolation,fix_release_checked_out_main,fix_drop_codex_companion,chore_hook_matrix_normal_mode_coverage,decision_lanes_verify_round_scope,fix_review_feedback_triage_discipline,decision_deterministic_workflow_carrier_semantics,feat_delegate_fanout_cli_contract,feat_deterministic_workflow_carrier_contract,feat_delegate_fanout_workflow_template,chore_overengineering_prune_batch1,fix_reply_header_parser_simplification,fix_cli_uninitialized_root_gate,fix_probe_once_config_gate,fix_verifier_transport_hardening,fix_publication_gate_direct_binding,docs_readme_staleness_sweep,fix_packet_digest_prompt_coverage,fix_pending_corrupt_binding_honesty,docs_release_single_writer_assumption done
+    class fix_boundary_hook_cli_resolution,fix_verify_worktree_self_contamination,docs_adopt_waystone_harness,fix_round_packet_remote_visibility,feat_effort_pro_ultra,fix_release_staging_isolation,decision_verifier_hook_isolation_contract,decision_release_ship_manifest,fix_verifier_hook_hermeticity,feat_task_status_parked,fix_runner_env_failure_detection,fix_execution_surface_dep_gating,chore_release_script_hardening,feat_review_reply_structured_header,fix_effort_drop_pro,feat_deterministic_review_packet,feat_review_pending_ledger,feat_waystone_statusline,fix_preflight_probe_isolation,fix_release_checked_out_main,fix_drop_codex_companion,chore_hook_matrix_normal_mode_coverage,decision_lanes_verify_round_scope,fix_review_feedback_triage_discipline,decision_deterministic_workflow_carrier_semantics,feat_delegate_fanout_cli_contract,feat_deterministic_workflow_carrier_contract,feat_delegate_fanout_workflow_template,chore_overengineering_prune_batch1,fix_reply_header_parser_simplification,fix_cli_uninitialized_root_gate,fix_probe_once_config_gate,fix_verifier_transport_hardening,fix_publication_gate_direct_binding,docs_readme_staleness_sweep,fix_remote_verify_live_ref,fix_packet_digest_prompt_coverage,fix_pending_corrupt_binding_honesty,fix_binding_narrative_digest,fix_probe_proof_machine_scope,docs_release_single_writer_assumption,docs_readme_delegate_fold done
     class chore_verifier_session_guard_hardening,feat_reviewer_self_declared_identity,chore_verifier_guard_residuals_2,fix_publication_gate_bypasses,fix_companion_verifier_effort_forwarding,fix_reply_header_residuals,fix_codex_exec_verifier_hardening,fix_task_cli_arg_validation,chore_remove_codex_companion_transport dropped
-    class chore_migration_sunset,fix_remote_verify_live_ref,fix_binding_narrative_digest,fix_probe_proof_machine_scope pending
+    class chore_migration_sunset,fix_reply_narrative_echo,chore_legacy_name_residue,fix_hook_matrix_color_env,fix_marker_diagnostics_polish,chore_pre_header_feedback_settlement,fix_shallow_ancestry_honesty pending
 ```
 
 ## Tasks
 
 | ID | Title | Status | Round | Deps | Anchor |
 |---|---|---|---|---|---|
+| `chore/legacy-name-residue` | 구명 잔재 전면 제거: JW_REPORT.yaml 등 JW·jahns-workflow 이름이 남은 표면을 rg 전수로 청소 (마이그레이션 호환 불요 — 사용자 지시 2026-07-18). delegate.py 계약·in-flight lane과 겹치므로 lane 머지 후 실행 | ⬜ pending | — | fix/probe-proof-machine-scope, fix/binding-narrative-digest | — |
 | `chore/migration-sunset` | legacy migration 서브시스템 sunset: 모든 머신이 0.11+ 이관 완료 확인 후 pre-0.9 마커·재개·자동 repair 상태기계 통째 삭제 (audit 부위 5, 사용자 승인 — 실행은 이관 확인 후) | ⬜ pending | — | — | — |
-| `fix/binding-narrative-digest` | binding contract에 narrative/request digest 부재 — 동일 target 재-prepare가 구 sidecar·구 feedback 재사용. narrative digest를 contract에 포함해 재발행 시 pending 재개 | ⬜ pending | — | fix/pending-corrupt-binding-honesty | — |
-| `fix/probe-proof-machine-scope` | codex 프로브 증명이 커밋 추적 .waystone.yml에 저장돼 머신 간 전파(상태 격리 위반) — 미커밋 티어({root}/.waystone)로 이동 | ⬜ pending | — | fix/packet-digest-prompt-coverage | — |
-| `fix/remote-verify-live-ref` | remote verify가 stale remote-tracking ref로 삭제된 upstream을 published로 오판 — 명시적 refspec fetch(FETCH_HEAD) 기반 라이브 원격 증명으로 재작성 | ⬜ pending | — | fix/binding-narrative-digest | — |
+| `chore/pre-header-feedback-settlement` | 구조화 헤더(0.10) 이전 형식의 역사 feedback 3라운드가 완료 판정 불가로 영구 pending — 패치 전부터 동일(기존 부채). 역사 라운드 정착(settle) 방식 결정 필요: 아카이브 마커 vs 재-ingest vs pending 제외 규칙 | ⬜ pending | — | — | — |
+| `fix/hook-matrix-color-env` | hook matrix 테스트의 uv cache dir 파싱이 FORCE_COLOR 환경에서 ANSI 오염으로 실패 — subprocess env에서 색상 강제 변수 중화(또는 NO_COLOR 부여)로 환경 무관하게 (2026-07-18 실측: FORCE_COLOR=3 세션에서 main tree도 동일 실패, lane 회귀 아님) | ⬜ pending | — | fix/probe-proof-machine-scope, fix/binding-narrative-digest | — |
+| `fix/marker-diagnostics-polish` | probe 마커 진단 폴리시: 추적 마커+워킹트리 삭제 상태의 1회차 안내 공백, staged 무효 마커 시 git rm --cached -f 안내 보강, lock 하 재확인 경합 창의 안내 억제 — 전부 fail-open 아님(프로브는 항상 실행), 안내 품질만 (adversarial round-3, main 판정 minor) | ⬜ pending | — | fix/probe-proof-machine-scope | — |
+| `fix/reply-narrative-echo` | 리뷰 회신이 검토한 narrative를 자기증언하지 않아 ingest가 현재 binding digest를 도장 — prepare(A)→리뷰 중 prepare(B)→A회신 ingest 시 B 완료 오판. request 렌더에 digest 노출 + reply 구조화 헤더에 request-digest 에코 + ingest 대조 (reply 계약 변경 — 사용자 ruling 필요) | ⬜ pending | — | fix/binding-narrative-digest | — |
+| `fix/shallow-ancestry-honesty` | shallow 위상에서 merge-base rc=1이 판정 불가일 수 있음에도 확정 '미포함'으로 보고(fail-closed 오진단) — is-shallow-repository 감지 시 rc=1을 unverifiable로 정직 강등; 임시 verify-fetch ref의 인터럽트 잔류 sweep 포함 (adversarial V-round-2, main 판정 minor) | ⬜ pending | — | fix/remote-verify-live-ref | — |
 | `chore/hook-matrix-normal-mode-coverage` | hook-matrix 회귀를 정상 모드(가드 부재)까지 확장: nudge, session_context, resume 포함 전 hook의 실 subprocess 동작을 양 모드에서 고정 (HOME 상속 정리 포함) | ✅ done | 2026-07-18-carrier-lanes | — | — |
 | `chore/overengineering-prune-batch1` | 오버엔지니어링 전수조사 A-2 순삭제 묶음: discard 재개 시 reason 정확 재현 강제 제거, packet 3중 검사에서 claim측 다이제스트 재도출 축약, improve._review_sha_binding dead wrapper 삭제, _finding_evidence의 '..' 경로 거부 제거 (근거: dev_docs/overengineering-audit-2026-07-17.md) | ✅ done | 2026-07-18-carrier-lanes | — | — |
 | `chore/release-script-hardening` | release 스크립트 경화 잔여: 체크아웃된 main worktree에서 update-ref 시 불일치, no-op 판정의 CAS 부재(동시 갱신 race), onbranch:main 서명 설정 미적용(의미 변화 기록), 미래 manifest 누락 가드(unknown-toplevel 경고+실 repo 동등성 회귀 테스트), 실패 게이트 테스트 부재, commit-tree의 hook 생략 기록, TMPDIR 저장소 내부 지정 방어, ref 갱신 후 cleanup 실패 시 결과 코드 순서 | ✅ done | 2026-07-18-carrier-lanes | — | — |
@@ -95,6 +112,7 @@ flowchart TD
 | `decision/release-ship-manifest` | release 배포 대상 모델 ruling 필요: 현행 denylist(dev tree − EXCLUDES)는 미래 dogfooding artifact 경로를 증명 못함 — positive ship manifest / artifact manifest / contract test 중 택일 또는 현행 유지 | ✅ done | 2026-07-16-fix-wave | — | — |
 | `decision/verifier-hook-isolation-contract` | WAYSTONE_VERIFIER_SESSION 계약 범위 ruling 필요: 기록 hook 2종만 차단(현행) vs 모든 waystone host hook no-op(hermetic verifier) — 리뷰어는 hermetic이 일관된 경계라고 권고 | ✅ done | 2026-07-16-fix-wave | — | — |
 | `docs/adopt-waystone-harness` | waystone 자기채택 bootstrap: SSOT.md 합성(ideate), init(패킷 리뷰·warn-allowed·delegation on), ADR-0000, 부산물 dev-only 릴리스 제외(EXCLUDES), 3축 profile 구성 | ✅ done | 2026-07-16-adopt-dogfooding | — | — |
+| `docs/readme-delegate-fold` | README delegate 섹션 재작성 — dev_docs/delegate_readme.md(codex 해설, 구버전 기준)를 참조 스타일로 최신 dev 동작에 맞게 재작성, 상세 메커니즘은 details fold로 접어 배치 (사용자 지시 2026-07-18, main 직접 — docs 작업) | ✅ done | 2026-07-18-carrier-lanes-fixes | — | — |
 | `docs/readme-staleness-sweep` | dev 이력 대비 살아있는 문서 staleness 감사·정정 (README 표면·배지, ADR-0001 SSOT 포인터, CLAUDE.md 릴리스 메커니즘, docs gate 확장) | ✅ done | 2026-07-18-carrier-lanes | — | — |
 | `docs/release-single-writer-assumption` | release 스크립트의 단일 사용자·단일 프로세스 동시성 전제를 명시 (lease 기계 도입 대신 제한 문서화 — SSOT §3) | ✅ done | — | — | — |
 | `feat/delegate-fanout-cli-contract` | delegate CLI orchestration-safe 경화: plan --json(manifest·dep gate·corrupt fail-closed), run --expect-packet-sha/--expect-profile/--carrier/--json-events, status --json | ✅ done | 2026-07-18-carrier-lanes | decision/deterministic-workflow-carrier-semantics | — |
@@ -106,6 +124,7 @@ flowchart TD
 | `feat/review-reply-structured-header` | 리뷰 회신 머리에 기계 파싱용 구조화 key:value 블록(model, effort, review-target 등)을 요구하는 템플릿을 리뷰 패킷에 포함하고, ingest가 이를 robust하게 파싱해 identity·결속 증거로 기록 — 웹 복사 텍스트 전제, guard 약화 금지 | ✅ done | 2026-07-16-fix-wave | — | — |
 | `feat/task-status-parked` | task 상태 어휘에 parked(의도적 보류) 추가 — 종결도 착수 후보도 아닌 상태: next-actionable·세션 주입 제외, ROADMAP/status에서 blocked와 구별 표기, 자동 archive 비대상. 보류 사유는 notes 관행(전용 필드 없음) | ✅ done | 2026-07-16-fix-wave | — | — |
 | `feat/waystone-statusline` | waystone statusline 명령 + optional 설치: 파생 상태만으로 fancy 한 줄(tasks done/total, 현재 round, pending 리뷰 수, blocker 수) 출력, init/install에서 consent 기반 설치하되 기존 statusLine 설정은 덮어쓰지 않고 embed 안내 | ✅ done | 2026-07-18-carrier-lanes | feat/review-pending-ledger | — |
+| `fix/binding-narrative-digest` | binding contract에 narrative/request digest 부재 — 동일 target 재-prepare가 구 sidecar·구 feedback 재사용. narrative digest를 contract에 포함해 재발행 시 pending 재개 | ✅ done | 2026-07-18-carrier-lanes-fixes | fix/pending-corrupt-binding-honesty | — |
 | `fix/boundary-hook-cli-resolution` | install hooks가 설치한 boundary hook이 bare 'waystone'을 호출해 hook 실행 환경(PATH에 plugin bin 미주입)에서 command not found — 템플릿/설치 시점에 버전 독립적 CLI 경로 해석 필요 | ✅ done | 2026-07-16-adopt-dogfooding | — | — |
 | `fix/cli-uninitialized-root-gate` | CLI 미초기화 root 쓰기 차단을 단일 chokepoint로: 문법은 각 모듈 소유 유지(중앙 preflight 금지), mkdir가 일어나는 프로젝트 lock 획득 지점에서만 초기화(.waystone.yml) 요구 — task drop --reason 사고의 구조적 재설계 (Fable subagent 구현, 사용자 재정 2026-07-17) | ✅ done | 2026-07-18-carrier-lanes | — | — |
 | `fix/drop-codex-companion` | codex-companion 경로 전면 제거 — verifier의 codex 실행을 host 무관 codex exec 단일 경로로 통일 (waystone 소유 adversarial-review 프롬프트 + verifier-output-schema 검증), broker 탐지·정리 로직 삭제, codex-cc plugin 의존 0 | ✅ done | 2026-07-18-carrier-lanes | — | — |
@@ -115,9 +134,11 @@ flowchart TD
 | `fix/pending-corrupt-binding-honesty` | pending 파생이 corrupt 최신 binding을 건너뛰고 구 binding+구 feedback으로 완료 처리 — 시퀀스 우선 최신 판정(corrupt면 pending 유지) + sidecar crash-atomic 발행 | ✅ done | — | — | — |
 | `fix/preflight-probe-isolation` | 프리플라이트 프로브 경화: 프로브(모델 턴)가 남긴 프로브 외 편집이 main run patch에 출처 오염 가능 — 프로브 후 git 상태 대조·정리 필수; stderr 패턴 양방향 정확화(무관 permission-denied 오분류/어순 변형 Landlock 미탐); 프로브 실패의 transport(인증·네트워크) vs sandbox 구분; 프로브 비용 기록·계상 | ✅ done | 2026-07-18-carrier-lanes | — | — |
 | `fix/probe-once-config-gate` | 프리플라이트 프로브를 1회성 검증으로: .waystone.yml delegation.codex_runner_verified key가 미설정일 때만 프로브 실행, 성공 시 true를 주석 보존 편집으로 기록, 이후 참조만 하고 프로브 생략 (사용자 설계 2026-07-17) | ✅ done | 2026-07-18-carrier-lanes | — | — |
+| `fix/probe-proof-machine-scope` | codex 프로브 증명이 커밋 추적 .waystone.yml에 저장돼 머신 간 전파(상태 격리 위반) — 미커밋 티어({root}/.waystone)로 이동 | ✅ done | 2026-07-18-carrier-lanes-fixes | fix/packet-digest-prompt-coverage | — |
 | `fix/publication-gate-direct-binding` | 발행 게이트 직접-결속 재설계: 게이트는 binding 사이드카가 가리키는 closeout SHA의 원격 containment와 그 커밋 트리 안 packet 파일(request/binding) 바이트 대조만 검증 — 조상 추론(merge topology·first-parent·HEAD 재해석) 클래스 제거 (audit 새 항아리, 사용자 승인 2026-07-17, Fable fork 구현) | ✅ done | 2026-07-18-carrier-lanes | — | — |
 | `fix/release-checked-out-main` | main이 어느 worktree에든 checkout된 상태에서 release가 성공하면 그 worktree의 HEAD만 이동하고 index/파일은 구 tree로 남아 release 역방향 staged diff가 생김 — 시작 전 git worktree list 검사로 fail-loud | ✅ done | 2026-07-18-carrier-lanes | — | — |
 | `fix/release-staging-isolation` | release-to-main.sh가 현 워킹트리를 release staging으로 사용해 EXCLUDES 경로의 ignored 로컬 파일(.claude/settings.local.json 등)을 rm -rf로 영구 삭제하고, restore가 trap 미등록이라 중간 실패 시 main checkout·부분 변경이 잔류 — 임시 index/worktree 투영으로 재작성 | ✅ done | 2026-07-16-fix-wave | — | — |
+| `fix/remote-verify-live-ref` | remote verify가 stale remote-tracking ref로 삭제된 upstream을 published로 오판 — 명시적 refspec fetch(FETCH_HEAD) 기반 라이브 원격 증명으로 재작성 | ✅ done | 2026-07-18-carrier-lanes-fixes | fix/binding-narrative-digest | — |
 | `fix/reply-header-parser-simplification` | 회신 헤더 파서 corner 기계 제거: byte cap 내 줄별 UnicodeDecodeError 복구·중복 키 특례·surrogate 거부를 '통 decode 실패=헤더 없음' 한 줄로 대체, read_feedback_reply_metadata의 자기 산출물 적대 재검증 제거 (근거: audit 부위 2) | ✅ done | 2026-07-18-carrier-lanes | fix/review-feedback-triage-discipline | — |
 | `fix/review-feedback-triage-discipline` | feedback 파일 쓰기 규율로 회신 검증 단순화: triage를 마커 구분 섹션으로 분리하고 script가 그 구간만 교체(앞쪽 verbatim 불가침), projection은 저장 boolean 대신 읽기 시점 재파싱+binding 대조로 재계산 — 체크섬/봉인 불채택(ruling 2026-07-17) | ✅ done | 2026-07-18-carrier-lanes | — | — |
 | `fix/round-packet-remote-visibility` | round skill packet 모드: 리뷰 요청 순서가 '작성→커밋/푸시→보고'가 아니라 'closeout 푸시→작성→로컬 전달'이라 remote에서 repo를 읽는 리뷰어에게 packet이 안 보임 — 요청 파일을 커밋·푸시 후 보고하도록 skill 순서 수정 | ✅ done | 2026-07-16-fix-wave | — | — |
