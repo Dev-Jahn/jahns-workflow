@@ -1883,21 +1883,22 @@ Fail-loud protocol boundaries.
 
     def test_gate_source_has_no_ancestry_topology_checks(self):
         import inspect
+        import re
 
         source = inspect.getsource(review.verify_packet_publication)
+        # Whitespace-normalized so `is_ancestor (` spellings cannot slip past the count.
+        flat = re.sub(r"\s+", "", source)
         for banned in ("HEAD", "first_parent", "parents", "head_pushed"):
-            self.assertNotIn(banned, source.replace(
-                "merge parents, first-parent chains, HEAD", ""))
+            self.assertNotIn(banned, flat.replace("mergeparents,first-parentchains,HEAD", ""))
         # Exactly ONE containment primitive, and it binds the two pinned literals — any second
         # is_ancestor (or one anchored to a symbolic ref) is ancestry-inference creeping back.
-        calls = [line.strip() for line in source.splitlines() if "is_ancestor(" in line]
-        self.assertEqual(
-            calls, ['if not is_ancestor(root, binding["target_sha"], remote_sha):'])
+        self.assertEqual(flat.count("is_ancestor("), 1)
+        self.assertIn('ifnotis_ancestor(root,binding["target_sha"],remote_sha):', flat)
         # The CLI boundary must not re-introduce a HEAD-topology precheck on the --round path:
         # head_pushed belongs to the no-round question only (asserted as exactly one call site).
-        remote_source = inspect.getsource(remote.verify)
-        self.assertEqual(remote_source.count("head_pushed("), 1)
-        round_branch = remote_source.split("pushed, info = head_pushed(")[0]
+        remote_flat = re.sub(r"\s+", "", inspect.getsource(remote.verify))
+        self.assertEqual(remote_flat.count("head_pushed("), 1)
+        round_branch = remote_flat.split("pushed,info=head_pushed(")[0]
         self.assertIn("verify_packet_publication", round_branch)
 
     def test_round_verify_judges_remote_not_local_head(self):
