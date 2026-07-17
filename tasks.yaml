@@ -350,10 +350,11 @@ tasks:
     severity: "minor"
     origin: "overengineering-audit-20260717"
   - id: fix/verifier-transport-hardening
-    accept: ["verifier codex exec 호출의 타임아웃과 비정상 종료에서 stderr가 record에 보존되고 원인이 진단에 나타난다", "빈 출력(0바이트 last-message)은 성공으로 위장되지 않고 명시 실패로 분류된다", "verify 재시도 시 이전 시도의 stale output 파일이 새 결과로 오인되지 않는다 (정리 또는 시도별 격리)", "전체 테스트 스위트(신규 계약 RED-first)와 ruff F401,F841 검사가 통과한다"]
+    result: "위임 2차 apply(리뷰 실계약 전부 생존): timeout 예산·signal 명명·빈/공백/미생성 출력 명시 실패·절단실패 loud. blocker(verify-N 무효화)는 범위 밖 과잉으로 기각, 보고 계상 오류(+3/718→실제 +4/719) 기록. 719 OK, ruff 클린"
+    accept: ["verifier codex exec 호출의 타임아웃과 비정상 종료에서 stderr가 record에 보존되고 원인이 진단에 나타난다", "빈 출력(0바이트 last-message)은 성공으로 위장되지 않고 명시 실패로 분류된다", "verify 재시도 시 이전 시도의 stale output 파일이 새 결과로 오인되지 않는다 (정리 또는 시도별 격리)", "전체 테스트 스위트(신규 계약 RED-first)와 ruff F401,F841 검사가 통과한다", "재시도 시 이전 stderr/jsonl 절단·정리 실패는 조용히 삼켜지지 않고 시끄럽게 실패한다 — stale 내용이 새 시도의 진단으로 표시될 수 없다 (절단 실패 주입 계약 테스트)", "음수 rc는 시그널로 해석되어 진단에 시그널 번호와 이름(예: signal 9 SIGKILL)이 표기된다", "whitespace-only 출력과 출력 파일 미생성도 0바이트와 같은 명시 실패 클래스로 계약 테스트에 고정된다"]
     scope: ["scripts"]
     title: "codex exec verifier의 transport 실패경로 경화: 타임아웃·비정상 종료 시 stderr 보존, 빈 출력 정직 처리, 재시도 시 stale output 정리 (verifier-hardening에서 legacy 하위호환 폐기 후 승계)"
-    status: "pending"
+    status: "done"
     severity: "major"
     origin: "review-raw-adversarial-20260716"
   - id: fix/publication-gate-direct-binding
