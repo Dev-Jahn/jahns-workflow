@@ -209,10 +209,11 @@ tasks:
     status: "done"
     origin: "사용자 설계 요청 (2026-07-16)"
   - id: feat/waystone-statusline
-    accept: ["waystone statusline이 현재 프로젝트의 한 줄 상태(tasks done/total, 현재 round, pending 리뷰 수, blocker 수)를 수백 ms 내 출력하고 waystone 프로젝트 밖에서는 빈 출력으로 조용히 끝난다", "설치는 optional이며 consent 기록을 남기고, 기존 statusLine 설정이 있으면 덮어쓰지 않고 waystone statusline을 기존 스크립트에 embed하는 안내를 출력한다", "한 줄 렌더링은 ANSI 색과 글리프를 활용하되 정보는 파생 상태만 사용하며 모델 토큰을 쓰지 않는다", "pending 리뷰 수는 feat/review-pending-ledger의 단일 파생 함수를 재사용한다 (중복 구현 금지)", "전체 테스트 스위트(신규 계약 테스트는 RED-first)와 ruff F401,F841 검사가 통과한다"]
+    result: "위임 2차 패치(inline 렌더+consent 설치+embed 안내, 실측 50ms·무lock) + main 마감(금지된 렌더별 validate 제거, 읽기불가 reviews 정직 토큰 — RED가 'reviews 0' 부정직 줄 실증, 설치 명령의 launcher 경계 가드). 위임 RED 부재는 착지 시 직접 생성(구현 부재 5 failures). 700 OK, ruff 클린."
+    accept: ["waystone statusline이 현재 프로젝트의 한 줄 상태(tasks done/total, 현재 round, pending 리뷰 수, blocker 수)를 수백 ms 내 출력하고 waystone 프로젝트 밖에서는 빈 출력으로 조용히 끝난다", "설치는 optional이며 consent 기록을 남기고, 기존 statusLine 설정이 있으면 덮어쓰지 않고 waystone statusline을 기존 스크립트에 embed하는 안내를 출력한다", "한 줄 렌더링은 ANSI 색과 글리프를 활용하되 정보는 파생 상태만 사용하며 모델 토큰을 쓰지 않는다", "pending 리뷰 수는 feat/review-pending-ledger의 단일 파생 함수를 재사용한다 (중복 구현 금지)", "전체 테스트 스위트(신규 계약 테스트는 RED-first)와 ruff F401,F841 검사가 통과한다", "statusline 렌더 경로는 어떤 파일도 변조하지 않는다 — legacy 전용 프로젝트(waystone.yml만 존재)에서 config 개명 migration을 지나지 않고 조용히 빈 출력으로 종료 (실파일 확인 계약 테스트)", "프로젝트 내부의 손상 registry/config에서 rc 1이나 stderr 대신 정직한 한 줄 표시(예: registry unreadable)를 stdout rc 0으로 렌더한다 — 프롬프트 라인은 절대 깨지지 않는다"]
     scope: ["scripts", "skills"]
     title: "waystone statusline 명령 + optional 설치: 파생 상태만으로 fancy 한 줄(tasks done/total, 현재 round, pending 리뷰 수, blocker 수) 출력, init/install에서 consent 기반 설치하되 기존 statusLine 설정은 덮어쓰지 않고 embed 안내"
-    status: "pending"
+    status: "done"
     deps: ["feat/review-pending-ledger"]
     origin: "사용자 설계 요청 (2026-07-16)"
   - id: fix/preflight-probe-isolation
