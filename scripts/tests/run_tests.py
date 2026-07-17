@@ -2621,6 +2621,7 @@ class ConfigTests(unittest.TestCase):
     def test_delegation_default_env_prep_none_no_sandbox_knob(self):
         cfg = self._cfg("version: 1\nproject: x\n")
         self.assertIsNone(cfg["delegation"]["env_prep"])
+        self.assertIsNone(cfg["delegation"]["codex_runner_verified"])
         self.assertNotIn("sandbox", cfg["delegation"])  # R7: no sandbox config knob in M1
 
     def test_delegation_env_prep_list_ok(self):
@@ -2632,6 +2633,17 @@ class ConfigTests(unittest.TestCase):
             self._cfg("version: 1\nproject: x\ndelegation:\n  env_prep: notalist\n")
         with self.assertRaises(ValueError):
             self._cfg("version: 1\nproject: x\ndelegation:\n  env_prep:\n    - 42\n")
+
+    def test_codex_runner_verified_is_optional_true_only(self):
+        cfg = self._cfg(
+            "version: 1\nproject: x\ndelegation:\n  codex_runner_verified: true\n")
+        self.assertIs(cfg["delegation"]["codex_runner_verified"], True)
+        for value in ("false", "'yes'", "1"):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                    ValueError, "codex_runner_verified"):
+                self._cfg(
+                    "version: 1\nproject: x\ndelegation:\n"
+                    f"  codex_runner_verified: {value}\n")
 
     def test_reviewers_accept_literal_models_and_reviewer_role_reference(self):
         cfg = self._cfg(
@@ -8120,6 +8132,10 @@ class DelegateRunTests(unittest.TestCase):
             self.assertEqual(status["state"], "failed-env")
             self.assertIn(stderr.strip(), status["error"])
             self.assertFalse((rec / "artifact" / "contract.yaml").exists())
+            failure = io.StringIO()
+            with contextlib.redirect_stdout(failure):
+                self.assertEqual(delegate.show(root, rec.name, "failure"), 0)
+            self.assertIn("delegation.codex_runner_verified", failure.getvalue())
 
     def test_empty_diff_with_report_is_not_misclassified_by_sandbox_stderr(self):
         import contextlib
@@ -8872,6 +8888,190 @@ def _deleg_run(root, home, fake, task="feat/xyz", accept=None):
 
 def _latest_rec(root, home):
     return _run_with_home(home, lambda: sorted(delegate._delegations_dir(root).iterdir())[-1])
+
+
+class CodexRunnerVerificationGateTests(unittest.TestCase):
+    @staticmethod
+    def _fixture(base: Path, config: bytes) -> tuple[Path, Path, Path, Path]:
+        import json
+
+        root = base / "repo"
+        worktree = base / "worktree"
+        record = base / "record"
+        root.mkdir()
+        worktree.mkdir()
+        record.mkdir()
+        (root / ".waystone.yml").write_bytes(config)
+        (record / "exposure.json").write_text(
+            json.dumps({"project": {"root": str(root)}}) + "\n", encoding="utf-8")
+        prompt = base / "prompt.txt"
+        prompt.write_text("implement", encoding="utf-8")
+        return root, worktree, record, prompt
+
+    def test_merge_key_delegation_refuses_surgical_append(self):
+        original = (
+            b"version: 1\nproject: demo\n"
+            b"defaults: &d\n  delegation:\n    enabled: true\n"
+            b"<<: *d\n"
+        )
+        with tempfile.TemporaryDirectory() as d:
+            root, _worktree, _record, _prompt = self._fixture(Path(d), original)
+            with self.assertRaisesRegex(delegate.WorkflowError, "merge/anchor indirection"):
+                delegate._record_codex_runner_verified(root / ".waystone.yml")
+            self.assertEqual((root / ".waystone.yml").read_bytes(), original)
+
+    def test_existing_null_or_false_value_is_rewritten_to_true(self):
+        for variant in (b"  codex_runner_verified: null\n", b"  codex_runner_verified:\n",
+                        b"  codex_runner_verified: false\n"):
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as d:
+                original = (
+                    b"version: 1\nproject: demo\ndelegation:\n"
+                    b"  enabled: true # keep\n" + variant)
+                root, _worktree, _record, _prompt = self._fixture(Path(d), original)
+                config = root / ".waystone.yml"
+                delegate._record_codex_runner_verified(config)
+                text = config.read_text()
+                self.assertIn("codex_runner_verified: true", text)
+                self.assertEqual(text.count("codex_runner_verified"), 1)
+                self.assertIn("enabled: true # keep", text)
+
+    def test_surgical_write_preserves_file_mode(self):
+        original = b"version: 1\nproject: demo\ndelegation:\n  enabled: true\n"
+        with tempfile.TemporaryDirectory() as d:
+            root, _worktree, _record, _prompt = self._fixture(Path(d), original)
+            config = root / ".waystone.yml"
+            config.chmod(0o664)
+            delegate._record_codex_runner_verified(config)
+            self.assertEqual(oct(config.stat().st_mode & 0o777), oct(0o664))
+            self.assertIn("codex_runner_verified: true", config.read_text())
+
+    def test_success_records_true_preserving_comments_and_crlf_then_skips_probe(self):
+        import types
+
+        original = (
+            b"# keep top\r\nversion: 1\r\nproject: demo\r\ndelegation:\r\n"
+            b"  # keep enabled comment\r\n  enabled: true # keep inline\r\n"
+            b"state:\r\n  last_round_commit: null\r\n"
+        )
+        with tempfile.TemporaryDirectory() as d:
+            root, worktree, record, prompt = self._fixture(Path(d), original)
+            calls = {"probe": 0, "runner": 0}
+            original_probe = delegate._run_codex_sandbox_probe
+            original_run = delegate.subprocess.run
+
+            def probe(*args, **kwargs):
+                calls["probe"] += 1
+                return {"schema": "waystone-sandbox-probe-1", "outcome": "passed"}
+
+            def run(*args, **kwargs):
+                calls["runner"] += 1
+                return types.SimpleNamespace(returncode=0)
+
+            delegate._run_codex_sandbox_probe = probe
+            delegate.subprocess.run = run
+            try:
+                self.assertEqual(delegate._run_codex(
+                    worktree, "gpt-test", prompt, record)[0], 0)
+                self.assertEqual(delegate._run_codex(
+                    worktree, "gpt-test", prompt, record)[0], 0)
+            finally:
+                delegate.subprocess.run = original_run
+                delegate._run_codex_sandbox_probe = original_probe
+
+            self.assertEqual(calls, {"probe": 1, "runner": 2})
+            self.assertEqual((root / ".waystone.yml").read_bytes(), original.replace(
+                b"  # keep enabled comment\r\n",
+                b"  # keep enabled comment\r\n  codex_runner_verified: true\r\n",
+            ))
+            self.assertFalse(any(record.glob("sandbox-probe*")))
+
+    def test_probe_failure_does_not_record_key_and_next_call_reprobes(self):
+        original = b"version: 1\nproject: demo\ndelegation:\n  enabled: true\n"
+        with tempfile.TemporaryDirectory() as d:
+            root, worktree, record, prompt = self._fixture(Path(d), original)
+            calls = {"probe": 0}
+            original_probe = delegate._run_codex_sandbox_probe
+
+            def probe(*args, **kwargs):
+                calls["probe"] += 1
+                result = {"schema": "waystone-sandbox-probe-1", "classification": "sandbox"}
+                raise delegate._RunnerSandboxUnusable("runner sandbox unusable", result)
+
+            delegate._run_codex_sandbox_probe = probe
+            try:
+                for _ in range(2):
+                    with self.assertRaises(delegate._RunnerSandboxUnusable):
+                        delegate._run_codex(worktree, "gpt-test", prompt, record)
+            finally:
+                delegate._run_codex_sandbox_probe = original_probe
+
+            self.assertEqual(calls["probe"], 2)
+            self.assertEqual((root / ".waystone.yml").read_bytes(), original)
+            self.assertNotIn(
+                "codex_runner_verified", (root / ".waystone.yml").read_text(encoding="utf-8"))
+
+    def test_real_file_surgery_refuses_delegation_anchors_and_aliases(self):
+        cases = (
+            b"version: 1\nproject: demo\ndelegation: &shared\n  enabled: true\n",
+            b"version: 1\nproject: demo\nshared: &shared\n  enabled: true\ndelegation: *shared\n",
+        )
+        with tempfile.TemporaryDirectory() as d:
+            for index, original in enumerate(cases):
+                with self.subTest(index=index):
+                    path = Path(d) / f"config-{index}.yml"
+                    path.write_bytes(original)
+                    with self.assertRaisesRegex(
+                            delegate.WorkflowError, "anchor|alias|manually"):
+                        delegate._record_codex_runner_verified(path)
+                    self.assertEqual(path.read_bytes(), original)
+
+    def test_real_file_surgery_supports_legacy_missing_and_flow_delegation(self):
+        cases = (
+            (
+                b"# keep\nversion: 1\nproject: demo\n",
+                b"# keep\nversion: 1\nproject: demo\ndelegation:\n"
+                b"  codex_runner_verified: true\n",
+            ),
+            (
+                b"version: 1\nproject: demo\ndelegation: {enabled: true} # keep\n",
+                b"version: 1\nproject: demo\n"
+                b"delegation: {enabled: true, codex_runner_verified: true} # keep\n",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as d:
+            for index, (original, expected) in enumerate(cases):
+                with self.subTest(index=index):
+                    path = Path(d) / f"config-{index}.yml"
+                    path.write_bytes(original)
+                    delegate._record_codex_runner_verified(path)
+                    self.assertEqual(path.read_bytes(), expected)
+
+    def test_read_only_config_fails_loud_after_probe_without_starting_runner(self):
+        original = b"version: 1\nproject: demo\ndelegation:\n  enabled: true\n"
+        with tempfile.TemporaryDirectory() as d:
+            root, worktree, record, prompt = self._fixture(Path(d), original)
+            config = root / ".waystone.yml"
+            config.chmod(0o444)
+            calls = {"runner": 0}
+            original_probe = delegate._run_codex_sandbox_probe
+            original_run = delegate.subprocess.run
+            delegate._run_codex_sandbox_probe = lambda *args, **kwargs: {
+                "schema": "waystone-sandbox-probe-1", "outcome": "passed"}
+
+            def run(*args, **kwargs):
+                calls["runner"] += 1
+                raise AssertionError("main runner must not start")
+
+            delegate.subprocess.run = run
+            try:
+                with self.assertRaisesRegex(delegate._RunnerProbeFailure, "read-only|writable"):
+                    delegate._run_codex(worktree, "gpt-test", prompt, record)
+            finally:
+                config.chmod(0o644)
+                delegate.subprocess.run = original_run
+                delegate._run_codex_sandbox_probe = original_probe
+            self.assertEqual(calls["runner"], 0)
+            self.assertEqual(config.read_bytes(), original)
 
 
 def _write_apply_verdict(rec):
@@ -10410,6 +10610,18 @@ class DelegateCliTests(unittest.TestCase):
                     self.assertEqual(rc, 0)
                     self.assertIn("diagnostic hint:", out.getvalue())
                     self.assertIn(hint, out.getvalue())
+
+            # A failed-env WITHOUT a recognized sandbox-mechanism line must still point at the
+            # one-time verification key (a broken second machine skipped the probe).
+            delegate._set_state(rec, "failed-env", error="runner wrote nothing")
+            (rec / "runner.stderr").write_text(
+                "some opaque environment error\n", encoding="utf-8")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = _run_with_home(home, lambda: delegate.main([
+                    "show", rec.name, "--failure", "--root", str(root)]))
+            self.assertEqual(rc, 0)
+            self.assertIn("codex_runner_verified", out.getvalue())
 
     def test_unknown_subcommand(self):
         import contextlib

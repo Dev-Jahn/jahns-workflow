@@ -1529,7 +1529,8 @@ def normalize_config(cfg: dict | None) -> dict:
         raise ValueError("review.operators must be a list of strings")
     dl = cfg.setdefault("delegation", {})
     if not isinstance(dl, dict):
-        raise ValueError("delegation: must be a mapping (enabled/env_prep)")
+        raise ValueError(
+            "delegation: must be a mapping (enabled/env_prep/codex_runner_verified)")
     dl.setdefault("enabled", True)
     if not isinstance(dl["enabled"], bool):
         raise ValueError("delegation.enabled must be a boolean")
@@ -1537,6 +1538,9 @@ def normalize_config(cfg: dict | None) -> dict:
     ep = dl["env_prep"]
     if ep is not None and not (isinstance(ep, list) and all(isinstance(x, str) for x in ep)):
         raise ValueError("delegation.env_prep must be a list of shell command strings")
+    dl.setdefault("codex_runner_verified", None)
+    if dl["codex_runner_verified"] is not None and dl["codex_runner_verified"] is not True:
+        raise ValueError("delegation.codex_runner_verified must be true when set")
     policy = cfg.setdefault("policy", {})
     if not isinstance(policy, dict):
         raise ValueError("policy: must be a mapping (start_level)")
