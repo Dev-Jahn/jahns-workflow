@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import shlex
 import shutil
 import stat
@@ -1860,10 +1861,43 @@ def _verifier_env(record_dir: Path) -> dict[str, str]:
     }
 
 
+def _prepare_codex_verifier_transport(record_dir: Path) -> tuple[Path, Path, Path]:
+    """Reset every mutable Codex verifier transport file before a retry.
+
+    The record lock serializes verify attempts. A reset failure therefore stops the attempt before
+    Codex starts; continuing could make a prior attempt's output look current.
+    """
+    output = record_dir / "verify-last-message.json"
+    jsonl = record_dir / "verify-codex.jsonl"
+    stderr = record_dir / "verify.stderr"
+    try:
+        output.unlink(missing_ok=True)
+    except OSError as e:
+        raise WorkflowError(
+            f"cannot prepare Codex verifier transport file {output}: {e}") from e
+    for path in (jsonl, stderr):
+        try:
+            with open(path, "w", encoding="utf-8"):
+                pass
+        except OSError as e:
+            raise WorkflowError(
+                f"cannot prepare Codex verifier transport file {path}: {e}") from e
+    return output, jsonl, stderr
+
+
+def _append_codex_verifier_stderr(path: Path, message: str) -> None:
+    """Record a harness-side Codex transport cause without discarding process stderr."""
+    try:
+        with open(path, "a", encoding="utf-8") as stream:
+            stream.write(f"\n{message}\n")
+    except OSError as e:
+        raise WorkflowError(f"cannot record Codex verifier transport failure in {path}: {e}") from e
+
+
 def _run_codex_verifier(worktree: Path, model: str, focus: str,
                         record_dir: Path, *, effort: str | None = None) -> tuple[int, str]:
     """Run the native Codex verifier in a read-only, ephemeral session with schema output."""
-    output = record_dir / "verify-last-message.json"
+    output, jsonl, stderr = _prepare_codex_verifier_transport(record_dir)
     cmd = ["codex", "exec", "-C", str(worktree), "-m", model, "-s", "read-only"]
     if effort is not None:
         cmd.extend(["-c", f'model_reasoning_effort="{effort}"'])
@@ -1873,27 +1907,34 @@ def _run_codex_verifier(worktree: Path, model: str, focus: str,
     ])
     env = _verifier_env(record_dir)
     try:
-        output.unlink(missing_ok=True)
-        with open(record_dir / "verify-codex.jsonl", "w", encoding="utf-8") as jout, \
-             open(record_dir / "verify.stderr", "w", encoding="utf-8") as jerr:
+        with open(jsonl, "a", encoding="utf-8") as jout, \
+             open(stderr, "a", encoding="utf-8") as jerr:
             proc = subprocess.run(
                 cmd, input=focus, stdout=jout, stderr=jerr, text=True,
                 timeout=1800, env=env,
             )
     except subprocess.TimeoutExpired:
+        _append_codex_verifier_stderr(stderr, "codex verifier timed out after 1800 seconds")
         return 124, ""
     except OSError as e:
-        try:
-            (record_dir / "verify.stderr").write_text(str(e), encoding="utf-8")
-        except OSError:
-            pass
+        _append_codex_verifier_stderr(stderr, f"codex verifier transport error: {e}")
         return 127, ""
     if proc.returncode != 0:
         return proc.returncode, ""
     try:
-        return 0, output.read_text(encoding="utf-8")
-    except OSError:
-        return 0, ""
+        content = output.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        _append_codex_verifier_stderr(
+            stderr, "empty verifier output: last-message file was not created")
+        return 65, ""
+    except OSError as e:
+        _append_codex_verifier_stderr(stderr, f"cannot read Codex verifier output {output}: {e}")
+        return 74, ""
+    if not content.strip():
+        _append_codex_verifier_stderr(
+            stderr, "empty verifier output: last-message contains no non-whitespace content")
+        return 65, ""
+    return 0, content
 
 
 def _run_claude_verifier(worktree: Path, model: str, focus: str,
@@ -2709,6 +2750,34 @@ def record_verdict(root: Path, did: str, input_path: Path, *,
     return 0
 
 
+def _process_returncode_diagnostic(rc: int) -> str:
+    """Render subprocess return codes without mislabeling signal termination as an exit code."""
+    if rc >= 0:
+        return f"rc {rc}"
+    number = -rc
+    try:
+        name = signal.Signals(number).name
+    except ValueError:
+        return f"signal {number}"
+    return f"signal {number} {name}"
+
+
+def _codex_verifier_failure_diagnostic(record_dir: Path, rc: int) -> str:
+    """Combine the process result with the current attempt's bounded stderr evidence."""
+    stderr_path = record_dir / "verify.stderr"
+    try:
+        stderr = stderr_path.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        stderr = ""
+    except OSError as e:
+        raise WorkflowError(f"cannot read Codex verifier stderr {stderr_path}: {e}") from e
+    tail = "\n".join(stderr.strip().splitlines()[-20:])
+    diagnostic = _process_returncode_diagnostic(rc)
+    if tail:
+        diagnostic += f"; verify.stderr tail: {tail}"
+    return diagnostic
+
+
 def verify_delegation(root: Path, did: str) -> int:
     _ensure_project_state_or_refuse(root)
     rec = _load_delegation(root, did)
@@ -2752,8 +2821,11 @@ def verify_delegation(root: Path, did: str) -> int:
             f"independent verifier transport failed ({transport_error}) — delegation remains "
             "needs-review") from transport_error
     if rc != 0:
+        diagnostic = (_codex_verifier_failure_diagnostic(rec, rc)
+                      if binding["execution"] == "codex-exec"
+                      else _process_returncode_diagnostic(rc))
         raise WorkflowError(
-            f"independent verifier failed (rc {rc}) — delegation remains needs-review")
+            f"independent verifier failed ({diagnostic}) — delegation remains needs-review")
     try:
         payload = json.loads(stdout)
     except json.JSONDecodeError as e:

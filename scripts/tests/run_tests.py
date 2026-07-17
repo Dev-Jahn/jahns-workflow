@@ -12639,6 +12639,156 @@ class DelegateVerifyTests(unittest.TestCase):
             self.assertEqual(cache, record / "runtime" / "uv-cache")
             self.assertFalse(cache.resolve().is_relative_to(worktree.resolve()))
 
+    def test_codex_verifier_timeout_and_abnormal_exit_preserve_only_current_evidence(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            worktree = root / "review-worktree"
+            record = root / "record"
+            worktree.mkdir()
+            record.mkdir()
+            (record / "verify-last-message.json").write_text("STALE OUTPUT")
+            (record / "verify-codex.jsonl").write_text("STALE JSONL")
+            (record / "verify.stderr").write_text("STALE STDERR")
+            original = delegate.subprocess.run
+
+            def timeout(cmd, **kwargs):
+                kwargs["stdout"].write("CURRENT EVENT\n")
+                kwargs["stderr"].write("current timeout cause\n")
+                raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+
+            delegate.subprocess.run = timeout
+            try:
+                rc, output = delegate._run_codex_verifier(
+                    worktree, "gpt-test", "review prompt", record)
+            finally:
+                delegate.subprocess.run = original
+
+            self.assertEqual(rc, 124)
+            self.assertEqual(output, "")
+            self.assertFalse((record / "verify-last-message.json").exists())
+            self.assertEqual((record / "verify-codex.jsonl").read_text(), "CURRENT EVENT\n")
+            stderr = (record / "verify.stderr").read_text()
+            self.assertIn("current timeout cause", stderr)
+            self.assertIn("timed out", stderr)
+            self.assertNotIn("STALE", stderr)
+
+            (record / "verify-last-message.json").write_text("STALE RETRY OUTPUT")
+
+            def killed(cmd, **kwargs):
+                kwargs["stdout"].write("RETRY EVENT\n")
+                kwargs["stderr"].write("killed by supervisor\n")
+                return subprocess.CompletedProcess(cmd, -9)
+
+            delegate.subprocess.run = killed
+            try:
+                rc, output = delegate._run_codex_verifier(
+                    worktree, "gpt-test", "retry prompt", record)
+            finally:
+                delegate.subprocess.run = original
+
+            self.assertEqual(rc, -9)
+            self.assertEqual(output, "")
+            self.assertFalse((record / "verify-last-message.json").exists())
+            self.assertEqual((record / "verify-codex.jsonl").read_text(), "RETRY EVENT\n")
+            self.assertEqual((record / "verify.stderr").read_text(), "killed by supervisor\n")
+
+    def test_codex_verifier_rejects_missing_empty_and_whitespace_output(self):
+        import types
+
+        variants = ((None, "missing"), ("", "empty"), (" \n\t", "whitespace"))
+        for content, label in variants:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                worktree = root / "review-worktree"
+                record = root / "record"
+                worktree.mkdir()
+                record.mkdir()
+                (record / "verify-last-message.json").write_text("STALE VALID OUTPUT")
+                (record / "verify-codex.jsonl").write_text("STALE JSONL")
+                (record / "verify.stderr").write_text("STALE STDERR")
+                original = delegate.subprocess.run
+
+                def fake(cmd, **_kwargs):
+                    if content is not None:
+                        Path(cmd[cmd.index("--output-last-message") + 1]).write_text(content)
+                    return types.SimpleNamespace(returncode=0)
+
+                delegate.subprocess.run = fake
+                try:
+                    rc, output = delegate._run_codex_verifier(
+                        worktree, "gpt-test", "review prompt", record)
+                finally:
+                    delegate.subprocess.run = original
+
+                self.assertEqual(rc, 65)
+                self.assertEqual(output, "")
+                self.assertEqual((record / "verify-codex.jsonl").read_text(), "")
+                stderr = (record / "verify.stderr").read_text()
+                self.assertIn("empty verifier output", stderr)
+                self.assertNotIn("STALE", stderr)
+
+    def test_codex_verifier_retry_cleanup_failure_is_fail_loud_without_stale_diagnostic(self):
+        import builtins
+        from unittest import mock
+
+        for filename in ("verify-codex.jsonl", "verify.stderr"):
+            with self.subTest(filename=filename), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                worktree = root / "review-worktree"
+                record = root / "record"
+                worktree.mkdir()
+                record.mkdir()
+                failed_path = record / filename
+                (record / "verify.stderr").write_text("STALE SECRET STDERR")
+                (record / "verify-codex.jsonl").write_text("STALE JSONL")
+                (record / "verify-last-message.json").write_text("STALE OUTPUT")
+                original_open = builtins.open
+                calls = {"runner": 0}
+
+                def fail_truncate(file, mode="r", *args, **kwargs):
+                    if Path(file) == failed_path and mode == "w":
+                        raise OSError(f"injected {filename} truncate failure")
+                    return original_open(file, mode, *args, **kwargs)
+
+                def runner(*_args, **_kwargs):
+                    calls["runner"] += 1
+
+                with mock.patch("builtins.open", fail_truncate), \
+                        mock.patch.object(delegate.subprocess, "run", runner):
+                    with self.assertRaises(delegate.WorkflowError) as cm:
+                        delegate._run_codex_verifier(
+                            worktree, "gpt-test", "review prompt", record)
+
+                message = str(cm.exception)
+                self.assertIn("cannot prepare Codex verifier transport file", message)
+                self.assertIn(f"injected {filename} truncate failure", message)
+                self.assertNotIn("STALE SECRET STDERR", message)
+                self.assertNotIn("STALE JSONL", message)
+                self.assertEqual(calls["runner"], 0)
+
+    def test_verifier_failure_diagnostic_includes_stderr_timeout_and_signal(self):
+        cases = (
+            (23, "transport rejected request", ("rc 23", "transport rejected request")),
+            (124, "codex verifier timed out", ("rc 124", "timed out")),
+            (-9, "worker killed", ("signal 9 SIGKILL", "worker killed")),
+        )
+        for rc, stderr, expected in cases:
+            with self.subTest(rc=rc), tempfile.TemporaryDirectory() as d:
+                root, home, rec, _worktree, _unused = self._setup(d, committed=False)
+
+                def fake(_wt, _model, _focus, record_dir):
+                    (record_dir / "verify.stderr").write_text(stderr)
+                    return (rc, "")
+
+                with self.assertRaises(delegate.WorkflowError) as cm:
+                    _run_with_home(home, lambda: self._with_codex_verifier(
+                        fake, lambda: delegate.verify_delegation(root, rec.name)))
+                message = str(cm.exception)
+                for part in expected:
+                    self.assertIn(part, message)
+                if rc < 0:
+                    self.assertNotIn("rc -9", message)
+
     def test_claude_verifier_requires_success_structured_output(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
