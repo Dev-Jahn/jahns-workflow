@@ -769,7 +769,7 @@ def _finding_evidence(value: str) -> tuple[list[str], list[str]]:
     without_urls = re.sub(r"\b[a-z][a-z0-9+.-]*://\S+", "", value, flags=re.I)
     for match in _FINDING_PATH_RE.finditer(without_urls):
         path = match.group(1).removeprefix("./")
-        if "://" not in path and ".." not in path.split("/"):
+        if "://" not in path:
             paths.add(path)
             if match.group(2):
                 pointers.add(f"{path}:{match.group(2)}")
@@ -1014,15 +1014,6 @@ def _review_binding(request_file: Path | None, round_id: str, mode: str,
         cycle=latest_cycle,
         reviewers=list(latest["reviewers"]) if isinstance(latest.get("reviewers"), list) else None,
         profile_fingerprint=latest.get("profile_fingerprint"))
-
-
-def _review_sha_binding(request_file: Path | None, round_id: str, mode: str,
-                        sidecars: list[dict]) -> tuple[str | None, str | None, str, str | None, str | None]:
-    """Compatibility projection for callers that only consume the historical SHA tuple."""
-    binding = _review_binding(request_file, round_id, mode, sidecars)
-    return tuple(binding[key] for key in (
-        "target_sha", "base_sha", "review_binding_provenance",
-        "review_binding_reason", "review_binding_source"))
 
 
 def _round_review_sidecars(rdir: Path) -> dict[str, list[dict]]:

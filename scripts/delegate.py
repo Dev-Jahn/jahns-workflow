@@ -1412,14 +1412,6 @@ def _claim_run(root: Path, plan: dict) -> tuple[str, Path]:
     if current_packet != plan["packet"]:
         raise WorkflowError(
             f"task {task_id} changed while preparing delegation — retry from current state")
-    if plan.get("expect_packet_sha") is not None:
-        # Re-derive on the freshly rebuilt packet BEFORE any record write — a stale fan-out dispatch
-        # is refused pre-claim (§4.2), never after a worktree/record has been created.
-        actual = _packet_core_digest(current_packet)
-        if actual != plan["expect_packet_sha"]:
-            raise WorkflowError(
-                f"packet digest mismatch at claim: expected {plan['expect_packet_sha']}, rebuilt "
-                f"{actual} — refusing before claim; re-plan from current state")
     active = _active_delegation_for_task(root, task_id)
     if active:
         raise WorkflowError(
@@ -2683,20 +2675,17 @@ def discard_delegation(root: Path, did: str, reason: str | None = None) -> int:
     non-terminal state, including a crash-remnant `running` (§4/R1) and a corrupt record — the
     cleanup path must not block itself on the corruption it clears (H3)."""
     _ensure_project_state_or_refuse(root)
-    if reason is None or not reason.strip():
-        raise WorkflowError("discard requires a non-empty --reason")
     rec = _load_delegation(root, did)
     st = _read_status_raw(rec)
     state = st.get("state") if st is not None else None
     if state in TERMINAL_STATES:
         raise WorkflowError(f"delegation {did} is already {state}")
-    if state == "discarding":
+    if state == "discarding" and (reason is None or not reason.strip()):
         transitions = st.get("at_transitions") if isinstance(st, dict) else None
-        recorded_reason = transitions[-1].get("reason") if transitions else None
-        if recorded_reason != reason:
-            raise WorkflowError(
-                "discard is resuming an interrupted cleanup; retry with the originally recorded --reason")
-    else:
+        reason = transitions[-1].get("reason") if transitions else None
+    if reason is None or not reason.strip():
+        raise WorkflowError("discard requires a non-empty --reason")
+    if state != "discarding":
         _set_state(rec, "discarding", reason=reason)
     _cleanup(root, did)
     _set_state(rec, "discarded", reason=reason)
@@ -3113,15 +3102,15 @@ def _cli_discard(rest: list[str]) -> int:
     pos, opts = _parse_opts(rest, value=("root", "reason"), boolean=("orphan",))
     if not pos:
         raise WorkflowError("discard requires a <delegation-id>")
-    if not opts.get("reason"):
-        raise WorkflowError("discard requires --reason")
     root = _resolve_root(opts.get("root"))
     if opts.get("orphan"):
+        if not opts.get("reason"):
+            raise WorkflowError("discard requires --reason")
         with hold_lock(project_lock_path(root)):
             return discard_orphan(root, pos[0], opts["reason"])
     rec = _load_delegation(root, pos[0])
     with hold_lock(rec / "record.lock"):
-        return discard_delegation(root, pos[0], opts["reason"])
+        return discard_delegation(root, pos[0], opts.get("reason"))
 
 
 def _cli_verify(rest: list[str]) -> int:

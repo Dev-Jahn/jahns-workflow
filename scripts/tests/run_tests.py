@@ -8181,35 +8181,40 @@ class DelegateApplyTests(unittest.TestCase):
                 self.assertNotEqual(git(root, "rev-parse", "--verify",
                                         f"refs/waystone/delegations/{did}{suffix}").returncode, 0)
 
-    def test_discard_records_intent_before_cleanup_and_resumes_after_interruption(self):
-        with tempfile.TemporaryDirectory() as d:
-            root, home = _deleg_project(d)
-            _deleg_run(root, home, _deleg_fake({"impl.py": "x\n"}))
-            rec = _latest_rec(root, home)
-            original_cleanup = delegate._cleanup
-            calls = {"value": 0}
+    def test_discard_records_intent_and_resumes_with_new_or_inherited_reason(self):
+        for resume_reason, final_reason in (("updated conclusion", "updated conclusion"),
+                                            (None, "review rejected")):
+            with self.subTest(resume_reason=resume_reason), tempfile.TemporaryDirectory() as d:
+                root, home = _deleg_project(d)
+                _deleg_run(root, home, _deleg_fake({"impl.py": "x\n"}))
+                rec = _latest_rec(root, home)
+                original_cleanup = delegate._cleanup
+                calls = {"value": 0}
 
-            def interrupted(*args, **kwargs):
-                calls["value"] += 1
-                raise delegate.WorkflowError("injected cleanup interruption")
+                def interrupted(*args, **kwargs):
+                    calls["value"] += 1
+                    raise delegate.WorkflowError("injected cleanup interruption")
 
-            delegate._cleanup = interrupted
-            try:
-                with self.assertRaises(delegate.WorkflowError):
-                    _run_with_home(
-                        home, lambda: delegate.discard_delegation(root, rec.name, "review rejected"))
-            finally:
-                delegate._cleanup = original_cleanup
+                delegate._cleanup = interrupted
+                try:
+                    with self.assertRaises(delegate.WorkflowError):
+                        _run_with_home(home, lambda: delegate.discard_delegation(
+                            root, rec.name, "review rejected"))
+                finally:
+                    delegate._cleanup = original_cleanup
 
-            status = delegate._read_status(rec)
-            self.assertEqual(status["state"], "discarding")
-            self.assertEqual(status["at_transitions"][-1]["reason"], "review rejected")
-            self.assertEqual(_run_with_home(
-                home, lambda: delegate.discard_delegation(root, rec.name, "review rejected")), 0)
-            transitions = delegate._read_status(rec)["at_transitions"]
-            self.assertEqual([item["state"] for item in transitions[-2:]],
-                             ["discarding", "discarded"])
-            self.assertEqual(calls["value"], 1)
+                status = delegate._read_status(rec)
+                self.assertEqual(status["state"], "discarding")
+                self.assertEqual(status["at_transitions"][-1]["reason"], "review rejected")
+                args = ["discard", rec.name, "--root", str(root)]
+                if resume_reason is not None:
+                    args += ["--reason", resume_reason]
+                self.assertEqual(_run_with_home(home, lambda: delegate.main(args)), 0)
+                transitions = delegate._read_status(rec)["at_transitions"]
+                self.assertEqual([item["state"] for item in transitions[-2:]],
+                                 ["discarding", "discarded"])
+                self.assertEqual(transitions[-1]["reason"], final_reason)
+                self.assertEqual(calls["value"], 1)
 
     def test_discard_orphan_is_project_locked_and_cleanup_failures_are_loud(self):
         import contextlib
@@ -11096,8 +11101,9 @@ class ImproveL2BAdversarialTests(unittest.TestCase):
             "## Findings (triage skeleton v2)\n"
             "| finding | severity | type | verdict | evidence | task id |\n"
             "|---|---|---|---|---|---|\n"
-            "| JW-GPT-001 — x | major | scope | REAL | `scripts/improve.py:731` | fix/x |\n")
-        self.assertEqual(parsed[0]["evidence_pointers"], ["scripts/improve.py:731"])
+            "| JW-GPT-001 — x | major | scope | REAL | "
+            "`../scripts/improve.py:731` | fix/x |\n")
+        self.assertEqual(parsed[0]["evidence_pointers"], ["../scripts/improve.py:731"])
         with tempfile.TemporaryDirectory() as d:
             out = Path(d)
             _write_jsonl(out / "sessions.jsonl", [{
@@ -15196,28 +15202,6 @@ class L3GapClosureAcceptanceTests(unittest.TestCase):
         self.assertIn("unknown", text)
         self.assertIn("reason", text.lower())
 
-    def test_pr_freeze_sidecar_is_local_reviewed_sha_evidence(self):
-        with tempfile.TemporaryDirectory() as d:
-            root = Path(d)
-            (root / ".waystone.yml").write_text(
-                "version: 1\nproject: demo\nreviews_dir: docs/reviews\n")
-            path = review.write_pr_freeze_binding(
-                root, "2026-07-15-r", 7, 2, "a" * 40, "b" * 40,
-                ["codex:test"], "sha256:abc", "docs/reviews")
-            row = _json.loads(path.read_text())
-            self.assertEqual(row["schema"], review.PR_FREEZE_BINDING_SCHEMA)
-            sidecars = improve._round_review_sidecars(root / "docs" / "reviews")
-            binding = improve._review_sha_binding(
-                None, "2026-07-15-r", "pr", sidecars["2026-07-15-r"])
-            self.assertEqual(binding, (
-                "a" * 40, "b" * 40, "explicit", None, "pr-freeze-sidecar"))
-            conflict = {**sidecars["2026-07-15-r"][0],
-                        "target_sha": "c" * 40, "_file": "conflict.json"}
-            self.assertEqual(improve._review_sha_binding(
-                None, "2026-07-15-r", "pr",
-                [*sidecars["2026-07-15-r"], conflict]), (
-                    None, None, "unknown", "conflicting-pr-freeze-sidecars", None))
-
     def test_exposure_fingerprints_cover_full_config_policy_and_routing(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
@@ -15487,6 +15471,27 @@ class L3GapClosureAcceptanceTests(unittest.TestCase):
             self.assertEqual(row["reviewers"], ["macro-reviewer"])
             self.assertEqual(row["review_profile_fingerprint"], "sha256:profile")
             self.assertEqual(row["review_binding_provenance"], "explicit")
+
+    def test_conflicting_same_cycle_pr_freeze_sidecars_fail_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / ".waystone.yml").write_text(
+                "version: 1\nproject: demo\nreviews_dir: docs/reviews\n")
+            review.write_pr_freeze_binding(
+                root, "2026-07-15-r", 7, 2, "a" * 40, "b" * 40,
+                ["codex:test"], "sha256:abc", "docs/reviews")
+            sidecars = improve._round_review_sidecars(root / "docs" / "reviews")["2026-07-15-r"]
+            binding = improve._review_binding(None, "2026-07-15-r", "pr", sidecars)
+            self.assertEqual(binding["target_sha"], "a" * 40)
+            self.assertEqual(binding["review_binding_provenance"], "explicit")
+            self.assertEqual(binding["review_binding_source"], "pr-freeze-sidecar")
+            conflict = {**sidecars[0], "target_sha": "c" * 40, "_file": "conflict.json"}
+            conflicted = improve._review_binding(
+                None, "2026-07-15-r", "pr", [*sidecars, conflict])
+            self.assertIsNone(conflicted["target_sha"])
+            self.assertEqual(
+                conflicted["review_binding_reason"], "conflicting-pr-freeze-sidecars")
+            self.assertEqual(conflicted["review_binding_provenance"], "unknown")
 
     def test_f5_apply_judgment_is_unresolved_until_applied_and_acceptance_uses_applied_transition(self):
         with tempfile.TemporaryDirectory() as d:
