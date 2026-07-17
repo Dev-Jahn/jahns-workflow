@@ -12,7 +12,7 @@ Groups:
   ssot     split|digest|check [root] SSOT generated views
   status   [--project N]             cross-project dashboard
   remote   verify|drift [root]       is HEAD pushed / how far behind; verify --round gates packets
-  review   freeze|status|prepare|ingest|triage ...  review publication, ingest, and marked triage
+  review   freeze|status|pending|prepare|ingest|triage ...  review publication, pending, ingest, and triage
   approve  --pr N --sha X            SHA-bound human approval
   round    merge --pr N ...          deterministic merge guard
   improve  trace|reviews|evidence|audit|metrics|decide ...  project evidence, metrics, and decisions

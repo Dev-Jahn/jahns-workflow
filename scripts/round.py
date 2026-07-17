@@ -387,6 +387,16 @@ def close(root: Path, round_id: str, done: list[str], touched: list[str], commit
     except Exception as e:  # noqa: BLE001
         print(f"round close: overlay warning/override expiry unavailable ({e}) — close still succeeded",
               file=sys.stderr)
+    try:
+        pending = review.pending_reviews(root)
+        if pending:
+            print(f"round close: reminder: {len(pending)} pending review(s) remain",
+                  file=sys.stderr)
+            for row in pending:
+                print(f"  {review.format_pending_review(row)}", file=sys.stderr)
+    except Exception as e:  # noqa: BLE001 — reminders never invalidate a durable close
+        print(f"round close: pending review reminder unavailable ({e}) — close still succeeded",
+              file=sys.stderr)
     return 0
 
 

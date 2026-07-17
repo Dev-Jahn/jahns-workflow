@@ -27,6 +27,7 @@ Markers (HTML comments embedded in PR comment bodies):
 Subcommands (also `waystone review <sub>`):
   freeze --pr N [--round ID] [root]   stamp the current PR head as a new review cycle + post request
   status [--pr N] [root]              show per-cycle review status (PR mode) or packet pairs (packet mode)
+  pending [root]                       list packet requests still awaiting ingested feedback
   prepare --round ID --narrative PATH [root]
                                        render and bind a request from the round exposure
   ingest [--round ID] [--force]  parse the reply header, byte-exact copy /tmp/review.md →
@@ -324,7 +325,7 @@ def write_round_request_binding(root: Path, round_id: str, target_sha: str, base
         "schema": ROUND_REQUEST_BINDING_SCHEMA, "round_id": round_id,
         "target_sha": target_sha, "base_sha": base_sha, "reviewers": reviewers,
         "mode": mode, "canonical_store": "github-pr-comment" if mode == "pr" else "local-packet",
-        "at": datetime.now(timezone.utc).isoformat(),
+        "at": datetime.now().astimezone().isoformat(),
     }
     contract = {key: value for key, value in row.items() if key != "at"}
     base = directory / f"{round_id}-request.binding.json"
@@ -373,11 +374,14 @@ def read_round_request_binding(path: Path, *, expected_round_id: str | None = No
     return data
 
 
-def round_request_binding_order(path: Path, row: dict) -> tuple[str, int, str]:
-    """Canonical newest-sidecar order shared by publication and improve projection."""
+def round_request_binding_order(path: Path, row: dict) -> tuple[int, float, str]:
+    """Canonical newest-sidecar order shared by publication and improve projection: the immutable
+    reissue sequence wins, and parsed offset-aware timestamps only break ties within a sequence —
+    raw local-offset strings must never decide recency (they invert across timezone changes)."""
     match = re.search(r"-request\.binding(?:-(\d+))?\.json$", Path(path).name)
     sequence = int(match.group(1)) if match and match.group(1) else 1
-    return str(row.get("at") or ""), sequence, str(path)
+    at = parse_iso_timestamp(str(row.get("at") or ""))
+    return sequence, (at.timestamp() if at is not None else float("-inf")), str(path)
 
 
 def ingest_round_binding(root: Path, round_id: str, cfg: dict) -> tuple[dict | None, str | None]:
@@ -472,6 +476,78 @@ def read_feedback_reply_metadata(path: Path, *, expected_round_id: str | None = 
         "reviewer_configured": assessment["reviewer_configured"],
         "reviewer_coverage_reason": assessment["reviewer_coverage_reason"],
     }
+
+
+def pending_reviews(root: Path, *, now: datetime | None = None) -> list[dict]:
+    """Derive packet requests whose latest binding has no matching ingested feedback."""
+    cfg = load_config(root)
+    directory = Path(root) / cfg["reviews_dir"]
+    if not directory.is_dir():
+        return []
+    local_now = now or datetime.now().astimezone()
+    local_timezone = local_now.tzinfo if now is not None else None
+    if local_now.tzinfo is None or local_now.utcoffset() is None:
+        raise WorkflowError("pending review age requires a timezone-aware local clock")
+
+    pending: list[dict] = []
+    for request in sorted(directory.glob("*-request.md")):
+        round_id = request.name.removesuffix("-request.md")
+        binding_paths = sorted(directory.glob(f"{round_id}-request.binding*.json"))
+        binding = None
+        binding_path = None
+        if binding_paths:
+            # One damaged sidecar must not abort every other round's derivation — the damaged
+            # round itself stays listed as pending with honest-unknown fields (binding None).
+            rows = []
+            for path in binding_paths:
+                try:
+                    rows.append((path, read_round_request_binding(path, expected_round_id=round_id)))
+                except WorkflowError:
+                    continue
+            if rows:
+                binding_path, binding = max(
+                    rows, key=lambda item: round_request_binding_order(item[0], item[1]))
+                if binding["mode"] != "packet":
+                    # PR-mode rounds are completion-tracked by the PR machinery, not this
+                    # packet-pending surface.
+                    continue
+
+        feedback = directory / f"{round_id}-feedback.md"
+        metadata = read_feedback_reply_metadata(
+            feedback, expected_round_id=round_id, binding=binding)
+        # Complete = an ingested reply whose declared review-target matches the LATEST binding.
+        # Reviewer-identity configuration is coverage reporting, not receipt — a reply from an
+        # unconfigured model still ends the wait.
+        if binding is not None and metadata["review_target_matches"] is True:
+            continue
+
+        requested_date = None
+        if binding is not None:
+            requested_at = parse_iso_timestamp(binding["at"])
+            if requested_at is None:  # read_round_request_binding already enforces this invariant
+                raise WorkflowError(f"review binding {binding_path} has no valid timestamp")
+            requested_date = requested_at.astimezone(local_timezone).date()
+        else:
+            try:
+                requested_date = datetime.strptime(round_id[:10], "%Y-%m-%d").date()
+            except ValueError:
+                pass
+        pending.append({
+            "round_id": round_id,
+            "age_days": ((local_now.date() - requested_date).days
+                         if requested_date is not None else None),
+            "target_sha": binding["target_sha"] if binding is not None else None,
+            "reviewers": list(binding["reviewers"]) if binding is not None else [],
+        })
+    return pending
+
+
+def format_pending_review(row: dict) -> str:
+    age = f"{row['age_days']}d" if row.get("age_days") is not None else "unknown"
+    target = row.get("target_sha") or "(binding unavailable)"
+    reviewers = ", ".join(row.get("reviewers") or []) or "(binding unavailable)"
+    return (f"round {row['round_id']} | age {age} | target {target} | "
+            f"reviewers {reviewers}")
 
 
 def read_pr_freeze_binding(path: Path, *, expected_round_id: str | None = None,
@@ -1494,11 +1570,18 @@ def status(root: Path, pr: int | None) -> int:
         print("no reviews dir yet")
         return 0
     reqs = sorted(p.stem[: -len("-request")] for p in rdir.glob("*-request.md"))
-    fbs = {p.stem[: -len("-feedback")] for p in rdir.glob("*-feedback.md")}
-    pending = [r for r in reqs if r not in fbs]
-    print(f"packet reviews: {len(reqs)} requested, {len(pending)} awaiting feedback")
-    for r in pending:
-        print(f"  pending: {r}")
+    awaiting = pending_reviews(root)
+    print(f"packet reviews: {len(reqs)} requested, {len(awaiting)} awaiting feedback")
+    for row in awaiting:
+        print(f"  pending: {row['round_id']}")
+    return 0
+
+
+def pending(root: Path) -> int:
+    rows = pending_reviews(root)
+    print(f"pending packet reviews: {len(rows)}")
+    for row in rows:
+        print(f"  {format_pending_review(row)}")
     return 0
 
 
@@ -1702,7 +1785,7 @@ def ingest(root: Path, round_id: str | None, src: Path = INBOX, reviewer: str | 
 
 
 def main(argv: list[str]) -> int:
-    if not argv or argv[0] not in ("freeze", "status", "prepare", "ingest", "triage"):
+    if not argv or argv[0] not in ("freeze", "status", "pending", "prepare", "ingest", "triage"):
         print(__doc__, file=sys.stderr)
         return 1
     sub, rest = argv[0], argv[1:]
@@ -1737,6 +1820,8 @@ def main(argv: list[str]) -> int:
                 return 1
             with hold_project_lock(root):
                 return triage(root, round_id, Path(source))
+        if sub == "pending":
+            return pending(root)
         pr_s = _opt(rest, "--pr")
         if sub == "freeze":
             if not pr_s:

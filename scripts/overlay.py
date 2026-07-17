@@ -2599,6 +2599,15 @@ def _cli_check(rest: list[str]) -> int:
         print(f"[{marker}] {e['rule']} [{identity['layer']}:{identity['id']}]: {e['message']}")
     for e in (e for e in events if e["event"] == "evaluation-error"):
         print(f"[eval-error] {e['rule']}: {e['message']}")
+    try:
+        import review
+        pending = review.pending_reviews(root)
+        if pending:
+            print(f"waystone warn: {len(pending)} pending review(s)", file=sys.stderr)
+            for row in pending:
+                print(f"  {review.format_pending_review(row)}", file=sys.stderr)
+    except Exception as e:  # noqa: BLE001 — pending reminders never change check's exit code
+        print(f"waystone warn: pending review check unavailable ({e})", file=sys.stderr)
     return 0
 
 

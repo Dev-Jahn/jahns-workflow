@@ -3598,6 +3598,202 @@ class IngestTests(unittest.TestCase):
             self.assertIn("synthetic warn crash", err.getvalue())
 
 
+class PendingReviewTests(unittest.TestCase):
+    def _root(self, d: str) -> Path:
+        root = Path(d) / "repo"
+        root.mkdir()
+        init_repo(root)
+        (root / ".waystone.yml").write_text(
+            "version: 1\nproject: pending-review-test\nreviews_dir: docs/reviews\n"
+            "state:\n  last_round_commit: null\n")
+        (root / "tasks.yaml").write_text(
+            "version: 1\nproject: pending-review-test\ntasks:\n"
+            "  - id: chore/close-me\n    title: close task now\n    status: active\n    deps: []\n")
+        (root / "docs" / "reviews").mkdir(parents=True)
+        git(root, "add", "-A")
+        git(root, "commit", "-qm", "pending review setup")
+        return root
+
+    def _request(self, root: Path, round_id: str, target: str, *, base: str = "b" * 40,
+                 reviewers: list[str] | None = None) -> Path:
+        rdir = root / "docs" / "reviews"
+        (rdir / f"{round_id}-request.md").write_text("request\n")
+        return review.write_round_request_binding(
+            root, round_id, target, base, reviewers or ["gpt-5.6-sol"], mode="packet")
+
+    def _reply(self, model: str, base: str, target: str) -> bytes:
+        return (f"model: {model}\neffort: xhigh\n"
+                f"review-target: {base[:12]}-{target[:12]}\n\nreviewed\n").encode()
+
+    def test_pending_is_derived_from_request_and_ingest_header_not_file_existence(self):
+        from datetime import datetime, timedelta, timezone
+
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root(d)
+            round_id = "2026-01-01-first"
+            target = "a" * 40
+            binding_path = self._request(root, round_id, target)
+            binding = _json.loads(binding_path.read_text())
+            binding["at"] = "2026-01-01T23:30:00-08:00"
+            binding_path.write_text(_json.dumps(binding) + "\n")
+            (root / "docs" / "reviews" / f"{round_id}-feedback.md").write_text(
+                "manually copied feedback without an ingest header\n")
+
+            now = datetime(2026, 1, 2, 0, 15, tzinfo=timezone(timedelta(hours=-8)))
+            pending = review.pending_reviews(root, now=now)
+
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(pending[0]["round_id"], round_id)
+            self.assertEqual(pending[0]["age_days"], 1)
+            self.assertEqual(pending[0]["target_sha"], target)
+            self.assertEqual(pending[0]["reviewers"], ["gpt-5.6-sol"])
+
+    def test_latest_binding_controls_pending_and_old_packet_feedback_cannot_silence_it(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root(d)
+            round_id = "2026-01-01-reissued"
+            base = "b" * 40
+            old_target = "a" * 40
+            new_target = "c" * 40
+            self._request(root, round_id, old_target, base=base, reviewers=["old-reviewer"])
+            source = root / "old-reply.md"
+            source.write_bytes(self._reply("old-reviewer", base, old_target))
+            self.assertEqual(review.ingest(root, round_id, src=source), 0)
+
+            review.write_round_request_binding(
+                root, round_id, new_target, base, ["new-reviewer"], mode="packet")
+            pending = review.pending_reviews(root)
+            self.assertEqual([(row["target_sha"], row["reviewers"]) for row in pending],
+                             [(new_target, ["new-reviewer"])])
+
+            corrected = root / "new-reply.md"
+            corrected.write_bytes(self._reply("new-reviewer", base, new_target))
+            self.assertEqual(review.ingest(root, round_id, src=corrected, force=True), 0)
+            self.assertEqual(review.pending_reviews(root), [])
+
+    def test_binding_sequence_outranks_raw_timestamp_strings_across_offsets(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root(d)
+            round_id = "2026-01-01-offsets"
+            base = "b" * 40
+            first = self._request(root, round_id, "a" * 40, base=base, reviewers=["r1"])
+            binding = _json.loads(first.read_text())
+            binding["at"] = "2026-01-01T23:00:00+09:00"  # sorts AFTER the newer stamp as a string
+            first.write_text(_json.dumps(binding) + "\n")
+            second = review.write_round_request_binding(
+                root, round_id, "c" * 40, base, ["r2"], mode="packet")
+            row2 = _json.loads(second.read_text())
+            row2["at"] = "2026-01-01T15:00:00+00:00"  # chronologically one hour newer
+            second.write_text(_json.dumps(row2) + "\n")
+
+            pending = review.pending_reviews(root)
+
+            self.assertEqual([(r["target_sha"], r["reviewers"]) for r in pending],
+                             [("c" * 40, ["r2"])])
+
+    def test_reply_matching_latest_target_completes_even_from_unconfigured_model(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root(d)
+            round_id = "2026-01-01-unconfigured"
+            base = "b" * 40
+            target = "a" * 40
+            self._request(root, round_id, target, base=base, reviewers=["expected-reviewer"])
+            source = root / "reply.md"
+            source.write_bytes(self._reply("someone-else", base, target))
+            self.assertEqual(review.ingest(root, round_id, src=source), 0)
+
+            self.assertEqual(review.pending_reviews(root), [])
+
+    def test_one_damaged_binding_isolates_to_its_round(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root(d)
+            rdir = root / "docs" / "reviews"
+            (rdir / "2026-01-01-damaged-request.md").write_text("request\n")
+            (rdir / "2026-01-01-damaged-request.binding.json").write_text("{not json")
+            self._request(root, "2026-01-02-healthy", "e" * 40, reviewers=["r"])
+
+            pending = review.pending_reviews(root)
+
+            self.assertEqual([row["round_id"] for row in pending],
+                             ["2026-01-01-damaged", "2026-01-02-healthy"])
+            self.assertIsNone(pending[0]["target_sha"])
+            self.assertEqual(pending[0]["reviewers"], [])
+
+    def test_review_pending_cli_lists_required_fields(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root(d)
+            round_id = "2026-01-01-cli"
+            target = "d" * 40
+            self._request(root, round_id, target, reviewers=["reviewer-one", "reviewer-two"])
+            out = io.StringIO()
+            home = Path(d) / "home"
+            with contextlib.redirect_stdout(out):
+                rc = _run_with_home(
+                    home, lambda: review.main(["pending", str(root)]))
+            rendered = out.getvalue()
+            self.assertEqual(rc, 0)
+            self.assertIn(round_id, rendered)
+            self.assertRegex(rendered, r"age \d+d")
+            self.assertIn(target, rendered)
+            self.assertIn("reviewer-one, reviewer-two", rendered)
+
+    def test_session_start_adds_one_summary_line_and_omits_zero(self):
+        import contextlib
+        import io
+
+        sys.path.insert(0, str(SCRIPTS.parent / "hooks" / "scripts"))
+        import session_context
+
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root(d)
+            home = Path(d) / "home"
+
+            def capture() -> str:
+                old_argv = sys.argv
+                output = io.StringIO()
+                try:
+                    sys.argv = ["session_context.py", str(root)]
+                    with contextlib.redirect_stdout(output):
+                        self.assertEqual(_run_with_home(home, session_context.main), 0)
+                finally:
+                    sys.argv = old_argv
+                return _json.loads(output.getvalue())["hookSpecificOutput"]["additionalContext"]
+
+            self.assertNotIn("pending reviews", capture())
+            self._request(root, "2026-01-01-session", "e" * 40)
+            pending_lines = [line for line in capture().splitlines()
+                             if line.startswith("pending reviews")]
+            self.assertEqual(len(pending_lines), 1)
+            self.assertIn("2026-01-01-session", pending_lines[0])
+
+    def test_check_and_round_close_warn_without_changing_success(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root(d)
+            round_id = "2026-01-01-boundaries"
+            self._request(root, round_id, "f" * 40)
+            err = io.StringIO()
+            home = Path(d) / "home"
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                check_rc = _run_with_home(
+                    home, lambda: overlay.main(["check", "--root", str(root)]))
+            self.assertEqual(check_rc, 0)
+            self.assertIn(round_id, err.getvalue())
+
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                close_rc = round.close(
+                    root, "2026-01-02-close", done=["chore/close-me"], touched=[], commit="HEAD")
+            self.assertEqual(close_rc, 0)
+            self.assertIn(round_id, err.getvalue())
+            self.assertIn("pending review", err.getvalue())
+
+
 class FrozenAcceptanceTests(unittest.TestCase):
     """The frozen v0.2 acceptance boundaries (GPT 6th review) — A: PR reducer, B: YAML mutation,
     C: closeout/views. Each test directly reproduces a defect that must stay closed."""
