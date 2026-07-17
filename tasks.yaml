@@ -292,7 +292,7 @@ tasks:
     origin: "dogfooding-20260717"
   - id: decision/deterministic-workflow-carrier-semantics
     title: "ADR: deterministic-workflow의 carrier·귀속 의미론 확정 (execution=절차 정의, carrier 축, Codex fail-loud, backend·effort 규칙)"
-    status: "pending"
+    status: "done"
   - id: feat/delegate-fanout-cli-contract
     scope: ["scripts/delegate.py"]
     title: "delegate CLI orchestration-safe 경화: plan --json(manifest·dep gate·corrupt fail-closed), run --expect-packet-sha/--expect-profile/--carrier/--json-events, status --json"
