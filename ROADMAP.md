@@ -2,7 +2,7 @@
      Source of truth: tasks.yaml. Regenerated automatically on tasks.yaml edits. -->
 # Roadmap — waystone
 
-**Progress:** 35/45 done · 0 active · 0 blocked · generated 2026-07-17 16:59 UTC @ `e9e5c14`
+**Progress:** 36/51 done · 0 active · 0 blocked · generated 2026-07-17 18:02 UTC @ `c7ea282`
 
 ```mermaid
 flowchart TD
@@ -52,6 +52,12 @@ flowchart TD
         fix_verifier_transport_hardening["<b>fix/verifier-transport-hardening</b><br/>codex exec verifier의<br/>transport 실패경로 경화:<br/>타임아웃·비정상 종료 시 stderr 보존, 빈<br/>출력 정직 처리, 재시도 시 stale<br/>output 정리 (verifier-<br/>hardening에서 legacy 하위호환 폐기<br/>후 승계)"]
         fix_publication_gate_direct_binding["<b>fix/publication-gate-direct-binding</b><br/>발행 게이트 직접-결속 재설계: 게이트는<br/>binding 사이드카가 가리키는<br/>closeout SHA의 원격<br/>containment와 그 커밋 트리 안<br/>packet 파일(request/binding)<br/>바이트 대조만 검증 — 조상 추론(merge<br/>topology·first-parent·HEAD<br/>재해석) 클래스 제거 (audit 새 항아리,<br/>사용자 승인 2026-07-17, Fable<br/>fork 구현)"]
         docs_readme_staleness_sweep["<b>docs/readme-staleness-sweep</b><br/>dev 이력 대비 살아있는 문서<br/>staleness 감사·정정 (README<br/>표면·배지, ADR-0001 SSOT 포인터,<br/>CLAUDE.md 릴리스 메커니즘, docs<br/>gate 확장)"]
+        fix_remote_verify_live_ref["<b>fix/remote-verify-live-ref</b><br/>remote verify가 stale<br/>remote-tracking ref로 삭제된<br/>upstream을 published로 오판 —<br/>명시적 refspec<br/>fetch(FETCH_HEAD) 기반 라이브<br/>원격 증명으로 재작성"]
+        fix_packet_digest_prompt_coverage["<b>fix/packet-digest-prompt-coverage</b><br/>packet-core digest가 prompt<br/>렌더 필드(milestone/round/anch<br/>or/notes)를 누락 — 디스패치 내용에<br/>영향 주는 모든 필드를 digest에 포함,<br/>미소비 registry_fingerprint<br/>정직화"]
+        fix_pending_corrupt_binding_honesty["<b>fix/pending-corrupt-binding-honesty</b><br/>pending 파생이 corrupt 최신<br/>binding을 건너뛰고 구 binding+구<br/>feedback으로 완료 처리 — 시퀀스 우선<br/>최신 판정(corrupt면 pending 유지)<br/>+ sidecar crash-atomic 발행"]
+        fix_binding_narrative_digest["<b>fix/binding-narrative-digest</b><br/>binding contract에<br/>narrative/request digest<br/>부재 — 동일 target 재-prepare가<br/>구 sidecar·구 feedback 재사용.<br/>narrative digest를<br/>contract에 포함해 재발행 시<br/>pending 재개"]
+        fix_probe_proof_machine_scope["<b>fix/probe-proof-machine-scope</b><br/>codex 프로브 증명이 커밋 추적<br/>.waystone.yml에 저장돼 머신 간<br/>전파(상태 격리 위반) — 미커밋<br/>티어({root}/.waystone)로 이동"]
+        docs_release_single_writer_assumption["<b>docs/release-single-writer-assumption</b><br/>release 스크립트의 단일 사용자·단일<br/>프로세스 동시성 전제를 명시 (lease 기계<br/>도입 대신 제한 문서화 — SSOT §3)"]
     end
     decision_verifier_hook_isolation_contract --> fix_verifier_hook_hermeticity
     feat_review_pending_ledger --> feat_waystone_statusline
@@ -60,14 +66,17 @@ flowchart TD
     decision_deterministic_workflow_carrier_semantics --> feat_deterministic_workflow_carrier_contract
     feat_delegate_fanout_cli_contract --> feat_delegate_fanout_workflow_template
     fix_review_feedback_triage_discipline --> fix_reply_header_parser_simplification
+    fix_binding_narrative_digest --> fix_remote_verify_live_ref
+    fix_pending_corrupt_binding_honesty --> fix_binding_narrative_digest
+    fix_packet_digest_prompt_coverage --> fix_probe_proof_machine_scope
     classDef pending fill:#f5f5f5,stroke:#9e9e9e,color:#424242
     classDef active fill:#bbdefb,stroke:#1565c0,color:#0d2b56,stroke-width:2px
     classDef blocked fill:#ffcdd2,stroke:#c62828,color:#7f1d1d
     classDef done fill:#c8e6c9,stroke:#2e7d32,color:#1b4332
     classDef dropped fill:#eeeeee,stroke:#bdbdbd,color:#9e9e9e,stroke-dasharray: 4 4
-    class fix_boundary_hook_cli_resolution,fix_verify_worktree_self_contamination,docs_adopt_waystone_harness,fix_round_packet_remote_visibility,feat_effort_pro_ultra,fix_release_staging_isolation,decision_verifier_hook_isolation_contract,decision_release_ship_manifest,fix_verifier_hook_hermeticity,feat_task_status_parked,fix_runner_env_failure_detection,fix_execution_surface_dep_gating,chore_release_script_hardening,feat_review_reply_structured_header,fix_effort_drop_pro,feat_deterministic_review_packet,feat_review_pending_ledger,feat_waystone_statusline,fix_preflight_probe_isolation,fix_release_checked_out_main,fix_drop_codex_companion,chore_hook_matrix_normal_mode_coverage,decision_lanes_verify_round_scope,fix_review_feedback_triage_discipline,decision_deterministic_workflow_carrier_semantics,feat_delegate_fanout_cli_contract,feat_deterministic_workflow_carrier_contract,feat_delegate_fanout_workflow_template,chore_overengineering_prune_batch1,fix_reply_header_parser_simplification,fix_cli_uninitialized_root_gate,fix_probe_once_config_gate,fix_verifier_transport_hardening,fix_publication_gate_direct_binding,docs_readme_staleness_sweep done
+    class fix_boundary_hook_cli_resolution,fix_verify_worktree_self_contamination,docs_adopt_waystone_harness,fix_round_packet_remote_visibility,feat_effort_pro_ultra,fix_release_staging_isolation,decision_verifier_hook_isolation_contract,decision_release_ship_manifest,fix_verifier_hook_hermeticity,feat_task_status_parked,fix_runner_env_failure_detection,fix_execution_surface_dep_gating,chore_release_script_hardening,feat_review_reply_structured_header,fix_effort_drop_pro,feat_deterministic_review_packet,feat_review_pending_ledger,feat_waystone_statusline,fix_preflight_probe_isolation,fix_release_checked_out_main,fix_drop_codex_companion,chore_hook_matrix_normal_mode_coverage,decision_lanes_verify_round_scope,fix_review_feedback_triage_discipline,decision_deterministic_workflow_carrier_semantics,feat_delegate_fanout_cli_contract,feat_deterministic_workflow_carrier_contract,feat_delegate_fanout_workflow_template,chore_overengineering_prune_batch1,fix_reply_header_parser_simplification,fix_cli_uninitialized_root_gate,fix_probe_once_config_gate,fix_verifier_transport_hardening,fix_publication_gate_direct_binding,docs_readme_staleness_sweep,docs_release_single_writer_assumption done
     class chore_verifier_session_guard_hardening,feat_reviewer_self_declared_identity,chore_verifier_guard_residuals_2,fix_publication_gate_bypasses,fix_companion_verifier_effort_forwarding,fix_reply_header_residuals,fix_codex_exec_verifier_hardening,fix_task_cli_arg_validation,chore_remove_codex_companion_transport dropped
-    class chore_migration_sunset pending
+    class chore_migration_sunset,fix_remote_verify_live_ref,fix_packet_digest_prompt_coverage,fix_pending_corrupt_binding_honesty,fix_binding_narrative_digest,fix_probe_proof_machine_scope pending
 ```
 
 ## Tasks
@@ -75,6 +84,11 @@ flowchart TD
 | ID | Title | Status | Round | Deps | Anchor |
 |---|---|---|---|---|---|
 | `chore/migration-sunset` | legacy migration 서브시스템 sunset: 모든 머신이 0.11+ 이관 완료 확인 후 pre-0.9 마커·재개·자동 repair 상태기계 통째 삭제 (audit 부위 5, 사용자 승인 — 실행은 이관 확인 후) | ⬜ pending | — | — | — |
+| `fix/binding-narrative-digest` | binding contract에 narrative/request digest 부재 — 동일 target 재-prepare가 구 sidecar·구 feedback 재사용. narrative digest를 contract에 포함해 재발행 시 pending 재개 | ⬜ pending | — | fix/pending-corrupt-binding-honesty | — |
+| `fix/packet-digest-prompt-coverage` | packet-core digest가 prompt 렌더 필드(milestone/round/anchor/notes)를 누락 — 디스패치 내용에 영향 주는 모든 필드를 digest에 포함, 미소비 registry_fingerprint 정직화 | ⬜ pending | — | — | — |
+| `fix/pending-corrupt-binding-honesty` | pending 파생이 corrupt 최신 binding을 건너뛰고 구 binding+구 feedback으로 완료 처리 — 시퀀스 우선 최신 판정(corrupt면 pending 유지) + sidecar crash-atomic 발행 | ⬜ pending | — | — | — |
+| `fix/probe-proof-machine-scope` | codex 프로브 증명이 커밋 추적 .waystone.yml에 저장돼 머신 간 전파(상태 격리 위반) — 미커밋 티어({root}/.waystone)로 이동 | ⬜ pending | — | fix/packet-digest-prompt-coverage | — |
+| `fix/remote-verify-live-ref` | remote verify가 stale remote-tracking ref로 삭제된 upstream을 published로 오판 — 명시적 refspec fetch(FETCH_HEAD) 기반 라이브 원격 증명으로 재작성 | ⬜ pending | — | fix/binding-narrative-digest | — |
 | `chore/hook-matrix-normal-mode-coverage` | hook-matrix 회귀를 정상 모드(가드 부재)까지 확장: nudge, session_context, resume 포함 전 hook의 실 subprocess 동작을 양 모드에서 고정 (HOME 상속 정리 포함) | ✅ done | 2026-07-18-carrier-lanes | — | — |
 | `chore/overengineering-prune-batch1` | 오버엔지니어링 전수조사 A-2 순삭제 묶음: discard 재개 시 reason 정확 재현 강제 제거, packet 3중 검사에서 claim측 다이제스트 재도출 축약, improve._review_sha_binding dead wrapper 삭제, _finding_evidence의 '..' 경로 거부 제거 (근거: dev_docs/overengineering-audit-2026-07-17.md) | ✅ done | 2026-07-18-carrier-lanes | — | — |
 | `chore/release-script-hardening` | release 스크립트 경화 잔여: 체크아웃된 main worktree에서 update-ref 시 불일치, no-op 판정의 CAS 부재(동시 갱신 race), onbranch:main 서명 설정 미적용(의미 변화 기록), 미래 manifest 누락 가드(unknown-toplevel 경고+실 repo 동등성 회귀 테스트), 실패 게이트 테스트 부재, commit-tree의 hook 생략 기록, TMPDIR 저장소 내부 지정 방어, ref 갱신 후 cleanup 실패 시 결과 코드 순서 | ✅ done | 2026-07-18-carrier-lanes | — | — |
@@ -84,6 +98,7 @@ flowchart TD
 | `decision/verifier-hook-isolation-contract` | WAYSTONE_VERIFIER_SESSION 계약 범위 ruling 필요: 기록 hook 2종만 차단(현행) vs 모든 waystone host hook no-op(hermetic verifier) — 리뷰어는 hermetic이 일관된 경계라고 권고 | ✅ done | 2026-07-16-fix-wave | — | — |
 | `docs/adopt-waystone-harness` | waystone 자기채택 bootstrap: SSOT.md 합성(ideate), init(패킷 리뷰·warn-allowed·delegation on), ADR-0000, 부산물 dev-only 릴리스 제외(EXCLUDES), 3축 profile 구성 | ✅ done | 2026-07-16-adopt-dogfooding | — | — |
 | `docs/readme-staleness-sweep` | dev 이력 대비 살아있는 문서 staleness 감사·정정 (README 표면·배지, ADR-0001 SSOT 포인터, CLAUDE.md 릴리스 메커니즘, docs gate 확장) | ✅ done | 2026-07-18-carrier-lanes | — | — |
+| `docs/release-single-writer-assumption` | release 스크립트의 단일 사용자·단일 프로세스 동시성 전제를 명시 (lease 기계 도입 대신 제한 문서화 — SSOT §3) | ✅ done | — | — | — |
 | `feat/delegate-fanout-cli-contract` | delegate CLI orchestration-safe 경화: plan --json(manifest·dep gate·corrupt fail-closed), run --expect-packet-sha/--expect-profile/--carrier/--json-events, status --json | ✅ done | 2026-07-18-carrier-lanes | decision/deterministic-workflow-carrier-semantics | — |
 | `feat/delegate-fanout-workflow-template` | CC 캐리어 템플릿 templates/hosts/claude-code/delegate-fanout.workflow.js + validateOnly compile gate + 시나리오 matrix bake | ✅ done | 2026-07-18-carrier-lanes | feat/delegate-fanout-cli-contract | — |
 | `feat/deterministic-review-packet` | 리뷰 packet의 결정론 렌더링 분리: 정확 참조 필드(Reviewing/diff base sha, 프로젝트·브랜치, 리뷰어, 회신 header 블록)는 script가 git/binding에서 채우고, 모델은 서사 섹션만 별도 입력으로 작성 — round skill은 packet 생성을 마감의 무조건 단계로 수행(생성 여부 질문 금지) | ✅ done | 2026-07-18-carrier-lanes | — | — |

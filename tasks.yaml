@@ -412,3 +412,47 @@ tasks:
     round: 2026-07-18-carrier-lanes
     title: "dev 이력 대비 살아있는 문서 staleness 감사·정정 (README 표면·배지, ADR-0001 SSOT 포인터, CLAUDE.md 릴리스 메커니즘, docs gate 확장)"
     status: done
+  - id: fix/remote-verify-live-ref
+    notes: "JW-GPT-001 (REAL major, 동적 재현으로 실제 false PASS 확인). 원칙: publication 증명은 라이브 원격에서 — 정확한 branch를 명시 refspec으로 fetch해 FETCH_HEAD(또는 전용 임시 ref)의 SHA를 증거로 사용, branch 부재·fetch 실패는 fail-closed. remote.py:46 verify와 common.py:1596 head_pushed 공통 경로 모두 수정 (persisted refs/remotes/* 신뢰 제거가 근본 해소, --prune 단독은 땜질). RED 2건: 원격 branch 삭제 상태 / fetch refspec 제외 상태에서 gate 거부."
+    deps: ["fix/binding-narrative-digest"]
+    scope: ["scripts/remote.py", "scripts/common.py", "scripts/review.py", "scripts/tests/run_tests.py"]
+    title: "remote verify가 stale remote-tracking ref로 삭제된 upstream을 published로 오판 — 명시적 refspec fetch(FETCH_HEAD) 기반 라이브 원격 증명으로 재작성"
+    status: "pending"
+    severity: "major"
+    origin: "review-2026-07-18-carrier-lanes"
+  - id: fix/packet-digest-prompt-coverage
+    notes: "JW-GPT-002 (REAL major, 동일 digest 재현 확인). 원칙: implementer prompt에 렌더되는 모든 registry 필드가 곧 digest 커버리지 — _packet_core_digest(delegate.py:611-621)에 milestone/round/anchor/notes 포함(_render_prompt 645-647과 정합). 미소비 registry_fingerprint는 검증 경로 연결 또는 제거로 정직화. 필드별 RED 4건: plan 후 각 필드 변조 → 기존 --expect-packet-sha로 run 시 claim record 생성 전 거부."
+    scope: ["scripts/delegate.py", "scripts/tests/run_tests.py"]
+    title: "packet-core digest가 prompt 렌더 필드(milestone/round/anchor/notes)를 누락 — 디스패치 내용에 영향 주는 모든 필드를 digest에 포함, 미소비 registry_fingerprint 정직화"
+    status: "pending"
+    severity: "major"
+    origin: "review-2026-07-18-carrier-lanes"
+  - id: fix/pending-corrupt-binding-honesty
+    notes: "JW-GPT-003 (REAL major). 원칙: 최신 후보를 파일명 시퀀스로 먼저 결정하고 그것이 corrupt면 round는 pending/unknown 유지 — 구 binding으로 완료 처리 금지 (review.py:502-509의 corrupt-continue-후-max 제거). sidecar 발행(review.py:344-351)은 tmp 완전 기록 후 exclusive publish로 crash-atomic화. RED 계약: valid binding-1 + corrupt/빈 binding-2 + binding-1 target과 일치하는 feedback → 여전히 pending."
+    scope: ["scripts/review.py", "scripts/tests/run_tests.py"]
+    title: "pending 파생이 corrupt 최신 binding을 건너뛰고 구 binding+구 feedback으로 완료 처리 — 시퀀스 우선 최신 판정(corrupt면 pending 유지) + sidecar crash-atomic 발행"
+    status: "pending"
+    severity: "major"
+    origin: "review-2026-07-18-carrier-lanes"
+  - id: fix/binding-narrative-digest
+    notes: "JW-GPT-004 (REAL major). binding contract(review.py:324-330)에 canonical narrative digest(필요시 rendered request digest) 포함 — narrative만 바뀐 재-prepare(810-816 통과 경로)가 새 sidecar를 만들어 pending이 재개되게. freeze는 stored narrative digest를 binding과 대조 후 게시. RED: prepare(narrative A) → feedback ingest → prepare(narrative B, 같은 target) 후 pending 재개 또는 prepare 거부."
+    deps: ["fix/pending-corrupt-binding-honesty"]
+    scope: ["scripts/review.py", "scripts/tests/run_tests.py"]
+    title: "binding contract에 narrative/request digest 부재 — 동일 target 재-prepare가 구 sidecar·구 feedback 재사용. narrative digest를 contract에 포함해 재발행 시 pending 재개"
+    status: "pending"
+    severity: "major"
+    origin: "review-2026-07-18-carrier-lanes"
+  - id: fix/probe-proof-machine-scope
+    notes: "리뷰어 open question 1 승격 (REAL major, 상태 격리 위반). proof 저장을 커밋 추적 .waystone.yml(delegate.py:1137-1158, 973-1104)에서 미커밋 티어 {root}/.waystone(self-ignored, per-checkout)으로 이동. .waystone.yml 스키마에서 codex_runner_verified 제거 — legacy 키 발견 시 무시+제거 안내(조용한 수용 금지). 진단 메시지(1239-1258, 3090-3093)의 키 제거 안내 경로 갱신. RED: 커밋된 true 값이 있어도 로컬 마커 없으면 프로브 실행."
+    deps: ["fix/packet-digest-prompt-coverage"]
+    scope: ["scripts/delegate.py", "scripts/common.py", "scripts/tests/run_tests.py"]
+    title: "codex 프로브 증명이 커밋 추적 .waystone.yml에 저장돼 머신 간 전파(상태 격리 위반) — 미커밋 티어({root}/.waystone)로 이동"
+    status: "pending"
+    severity: "major"
+    origin: "review-2026-07-18-carrier-lanes"
+  - id: docs/release-single-writer-assumption
+    notes: "release-to-main.sh에 단일 사용자·단일 프로세스 전제 주석 명시 (SSOT §3 근거, lease 기계는 speculative라 배제). 리뷰어 open question 2 해소."
+    title: "release 스크립트의 단일 사용자·단일 프로세스 동시성 전제를 명시 (lease 기계 도입 대신 제한 문서화 — SSOT §3)"
+    status: "done"
+    severity: "minor"
+    origin: "review-2026-07-18-carrier-lanes"
