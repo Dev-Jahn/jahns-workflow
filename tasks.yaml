@@ -336,7 +336,7 @@ tasks:
     severity: "major"
     origin: "dogfooding-20260717"
   - id: fix/probe-once-config-gate
-    accept: [".waystone.yml delegation 아래 codex_runner_verified key — 미설정이면 기존 프로브를 1회 실행하고, 성공 시 true를 주석 보존 서지컬 편집으로 기록하며, true로 설정된 뒤에는 프로브를 완전히 생략한다 (생략 계약 테스트 포함)", "프로브 실패 시 key를 기록하지 않고 기존 거부 동작을 유지한다(다음 실행이 재프로브); 사후 검출기의 failed-env 진단 힌트에 key 재검토 안내를 추가한다", "config normalize/스키마에 key가 반영되고, 기존 프로브 계약 테스트는 key-부재 경로로 전부 유지된다", "전체 테스트 스위트(신규 계약 RED-first)와 ruff F401,F841 검사가 통과한다"]
+    accept: [".waystone.yml delegation 아래 codex_runner_verified key — 미설정이면 기존 프로브를 1회 실행하고, 성공 시 true를 주석 보존 서지컬 편집으로 기록하며, true로 설정된 뒤에는 프로브를 완전히 생략한다 (생략 계약 테스트 포함)", "프로브 실패 시 key를 기록하지 않고 기존 거부 동작을 유지한다(다음 실행이 재프로브); 사후 검출기의 failed-env 진단 힌트에 key 재검토 안내를 추가한다", "config normalize/스키마에 key가 반영되고, 기존 프로브 계약 테스트는 key-부재 경로로 전부 유지된다", "전체 테스트 스위트(신규 계약 RED-first)와 ruff F401,F841 검사가 통과한다", "서지컬 편집이 개행 스타일(CRLF 포함)을 바이트 그대로 보존하고, delegation 블록이 YAML alias/anchor를 경유하면 편집을 거부하며 수동 추가를 안내한다 (실파일 계약 테스트 — in-memory 문자열 아님)", "config가 쓰기 불가(읽기 전용 포함)면 조용한 교체 없이 기존 쓰기 실패와 동일하게 시끄럽게 실패한다"]
     scope: ["scripts", "templates"]
     title: "프리플라이트 프로브를 1회성 검증으로: .waystone.yml delegation.codex_runner_verified key가 미설정일 때만 프로브 실행, 성공 시 true를 주석 보존 편집으로 기록, 이후 참조만 하고 프로브 생략 (사용자 설계 2026-07-17)"
     status: "pending"
@@ -356,9 +356,10 @@ tasks:
     severity: "major"
     origin: "review-raw-adversarial-20260716"
   - id: fix/publication-gate-direct-binding
+    result: "@ 커밋 (Fable fork + codex 리뷰 2회전 + main 마감): 직접-결속 2검사 판정, 조상-추론 클래스 전면 삭제(remote --round head_pushed 포함), committed-unpushed RED 고정, 핀 SHA 출력 재결속, 재발행 중간상태 거부, source 계약 공백-정규화. 706 OK, ruff 클린. 기준 17→6 순감의 새 항아리 완성"
     accept: ["remote verify --round의 발행 판정은 (1) binding이 가리키는 closeout SHA가 원격 추적 ref에 containment (2) 그 커밋 트리에서 request와 binding 사이드카의 바이트가 로컬과 일치 — 두 가지만으로 결정되고 merge topology·first-parent 체인·HEAD 재해석 검사는 존재하지 않는다", "검증 시작 시 대상 SHA를 1회 해석해 이후 모든 git 접근이 그 불변 SHA를 쓴다 (심볼릭 재해석 금지 — 값싼 정확성)", "round id 재사용/재마감 시 최신 binding(sequence 우선, 9fbf838 정렬)이 기준이고 낡은 request/binding은 발행 근거가 되지 않는다", "reviews 디렉터리 심링크로 존재검사를 속일 수 없고(실파일 요구), 들여쓴/중복 Reviewing 줄 모호성은 기존 strict 파서 계약 유지", "정상 흐름 무회귀: linear extend·재마감(reclose 포함)·legacy 라운드 정직 강등이 기존 계약대로 통과하고, 제거되는 조상-추론 전용 테스트만 새 직접-결속 계약으로 교체된다", "전체 테스트 스위트(신규 계약 RED-first)와 ruff F401,F841 검사가 통과한다"]
     scope: ["scripts"]
     title: "발행 게이트 직접-결속 재설계: 게이트는 binding 사이드카가 가리키는 closeout SHA의 원격 containment와 그 커밋 트리 안 packet 파일(request/binding) 바이트 대조만 검증 — 조상 추론(merge topology·first-parent·HEAD 재해석) 클래스 제거 (audit 새 항아리, 사용자 승인 2026-07-17, Fable fork 구현)"
-    status: "pending"
+    status: "done"
     severity: "major"
     origin: "review-raw-adversarial-20260716"
