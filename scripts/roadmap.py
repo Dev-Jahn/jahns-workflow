@@ -18,10 +18,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import (  # noqa: E402
-    WorkflowError, find_project_root, git, hold_lock, load_tasks, migrate_project_state,
-    project_lock_path, write_text_atomic,
-)
+from common import (
+    WorkflowError, find_project_root, git, hold_project_lock, load_tasks,
+    migrate_project_state, write_text_atomic,
+)  # noqa: E402
 
 STATUS_CLASS = {"pending": "pending", "active": "active", "blocked": "blocked",
                 "parked": "parked", "done": "done", "dropped": "dropped"}
@@ -130,9 +130,9 @@ def main() -> int:
         print("roadmap: no initialized project (missing .waystone.yml / tasks.yaml)", file=sys.stderr)
         return 1
     try:
-        with hold_lock(project_lock_path(root)):
+        with hold_project_lock(root):
             migrate_project_state(root)
-        with hold_lock(project_lock_path(root)):
+        with hold_project_lock(root):
             out = root / "ROADMAP.md"
             write_text_atomic(out, render(root))
             print(f"wrote {out}")

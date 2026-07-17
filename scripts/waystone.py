@@ -144,7 +144,7 @@ def _consent_main(argv: list[str]) -> int:
             else:
                 raise common.WorkflowError(f"unexpected argument {rest[i]!r}")
         root = _command_root(root_value)
-        with common.hold_lock(common.project_lock_path(root)):
+        with common.hold_project_lock(root):
             if surface == "materialize":
                 import overlay
 
@@ -248,7 +248,7 @@ def _install_main(argv: list[str]) -> int:
                 raise common.WorkflowError(f"unexpected argument {rest[i]!r}")
         root = _command_root(root_value)
         surface = f"install.{kind}"
-        with common.hold_lock(common.project_lock_path(root)):
+        with common.hold_project_lock(root):
             context, _source, target, payload = _install_candidate(root, kind)
             if consent_recorded:
                 common.record_consent(root, surface, "accept", context)
@@ -469,7 +469,7 @@ def _migrate_command_project(argv: list[str]) -> None:
         if root is None or root in seen:
             continue
         seen.add(root)
-        with common.hold_lock(common.project_lock_path(root)):
+        with common.hold_project_lock(root):
             common.migrate_project_state(root)
 
 

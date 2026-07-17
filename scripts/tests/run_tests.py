@@ -999,6 +999,7 @@ class MarkerTests(unittest.TestCase):
         captured = {}
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
+            (root / ".waystone.yml").write_text("version: 1\nproject: x\n")
             state = common.ensure_project_state_dir(root)
             (state / "profile.yml").write_text(
                 "schema: waystone-profile-1\nbindings:\n"
@@ -1034,6 +1035,7 @@ class MarkerTests(unittest.TestCase):
         head = "c" * 40
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
+            (root / ".waystone.yml").write_text("version: 1\nproject: x\n")
             state = common.ensure_project_state_dir(root)
             (state / "profile.yml").write_text(
                 "schema: waystone-profile-1\nbindings:\n"
@@ -1069,6 +1071,7 @@ class MarkerTests(unittest.TestCase):
         base = "d" * 40
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
+            (root / ".waystone.yml").write_text("version: 1\nproject: x\n")
             state = common.ensure_project_state_dir(root)
             profile_path = state / "profile.yml"
             profile_path.write_text(
@@ -1108,6 +1111,7 @@ class MarkerTests(unittest.TestCase):
         head = "c" * 40
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
+            (root / ".waystone.yml").write_text("version: 1\nproject: x\n")
             state = common.ensure_project_state_dir(root)
             (state / "profile.yml").write_text(
                 "schema: waystone-profile-1\nbindings:\n"
@@ -1140,6 +1144,7 @@ class MarkerTests(unittest.TestCase):
     def test_reviewer_role_without_profile_binding_fails_loud(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
+            (root / ".waystone.yml").write_text("version: 1\nproject: x\n")
             state = common.ensure_project_state_dir(root)
             (state / "profile.yml").write_text(
                 "schema: waystone-profile-1\nbindings:\n"
@@ -1499,6 +1504,7 @@ class ResumeStartHereTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d) / "proj"
             root.mkdir()
+            (root / ".waystone.yml").write_text("version: 1\nproject: x\n")
             target = common.resume_path(root)
             original_snapshot = resume.snapshot
             original_replace = common.os.replace
@@ -1644,6 +1650,7 @@ class StoragePathTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d) / "repo"
             root.mkdir()
+            (root / ".waystone.yml").write_text("version: 1\nproject: x\n")
             state = common.project_state_path(root)
             self.assertEqual(state, root / ".waystone")
             self.assertFalse(state.exists())
@@ -1690,19 +1697,20 @@ class DashboardLockingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d) / "repo"
             root.mkdir()
+            (root / ".waystone.yml").write_text("version: 1\nproject: demo\n")
             entered = threading.Event()
             released = threading.Event()
             migrated = threading.Event()
             calls = []
             failures = []
-            originals = (getattr(dashboard, "hold_lock", None), dashboard.migrate_project_state,
+            originals = (dashboard.hold_project_lock, dashboard.migrate_project_state,
                          dashboard.git_branch_info, dashboard.load_tasks)
 
             @contextlib.contextmanager
-            def observed_lock(path, timeout=None):
-                self.assertEqual(Path(path), common.project_lock_path(root))
+            def observed_lock(project, timeout=None):
+                self.assertEqual(Path(project), root)
                 entered.set()
-                with originals[0](path, timeout=timeout):
+                with originals[0](project, timeout=timeout):
                     yield
 
             def migrate(path):
@@ -1716,7 +1724,7 @@ class DashboardLockingTests(unittest.TestCase):
                 except BaseException as e:  # capture thread assertion for the main test thread
                     failures.append(e)
 
-            dashboard.hold_lock = observed_lock
+            dashboard.hold_project_lock = observed_lock
             dashboard.migrate_project_state = migrate
             dashboard.git_branch_info = lambda _root: {
                 "branch": "dev", "dirty": 0, "ahead": 0, "behind": 0,
@@ -1733,10 +1741,7 @@ class DashboardLockingTests(unittest.TestCase):
             finally:
                 released.set()
                 worker.join(1)
-                if originals[0] is None:
-                    del dashboard.hold_lock
-                else:
-                    dashboard.hold_lock = originals[0]
+                dashboard.hold_project_lock = originals[0]
                 dashboard.migrate_project_state = originals[1]
                 dashboard.git_branch_info = originals[2]
                 dashboard.load_tasks = originals[3]
@@ -3511,6 +3516,113 @@ class TaskCliTests(unittest.TestCase):
         self.assertEqual(validate.validate(data), [])
         self.assertEqual([t["id"] for t in data["tasks"]], ["feat/first"])
 
+    def test_unknown_option_never_creates_state_at_a_bogus_root(self):
+        # The `task drop --reason <text>` incident: an unknown option used to become a boolean
+        # and its value fell through to the positionals, where it was treated as a project root.
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            bogus = Path(d) / "no such project: 사유 문장"
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = tasks.main(["drop", "fix/x", "--bogus", str(bogus)])
+            self.assertEqual(rc, 1)
+            self.assertIn("unknown option --bogus", err.getvalue())
+            self.assertFalse(bogus.exists())
+
+    def test_uninitialized_explicit_root_is_refused_without_state_creation(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            plain = Path(d) / "plain-dir"
+            plain.mkdir()
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = tasks.main(["set", "feat/alpha", "status", "done", str(plain)])
+            self.assertEqual(rc, 1)
+            self.assertIn("not an initialized waystone project", err.getvalue())
+            self.assertFalse((plain / ".waystone").exists())
+
+    def test_dash_dash_values_use_equals_form_and_bare_form_refuses_loudly(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / ".waystone.yml").write_text("version: 1\nproject: x\n")
+            (root / "tasks.yaml").write_text(TASKS_FIXTURE)
+            self.assertEqual(tasks.main(
+                ["add", "fix/dashy", str(root), "--title=-- follow-up work"]), 0)
+            data = yaml.safe_load((root / "tasks.yaml").read_text())
+            self.assertEqual(
+                next(t for t in data["tasks"] if t["id"] == "fix/dashy")["title"],
+                "-- follow-up work")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = tasks.main(["add", "fix/dashy2", str(root), "--title", "--not-a-flag"])
+            self.assertEqual(rc, 1)
+            self.assertIn("--title=<value>", err.getvalue())
+            self.assertNotIn("fix/dashy2", (root / "tasks.yaml").read_text())
+
+    def test_value_option_at_end_of_argv_is_a_loud_error(self):
+        # `task drop <id> --reason` (no value) must not silently drop without a reason.
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / ".waystone.yml").write_text("version: 1\nproject: x\n")
+            (root / "tasks.yaml").write_text(TASKS_FIXTURE)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = tasks.main(["drop", "gate/beta", str(root), "--reason"])
+            self.assertEqual(rc, 1)
+            self.assertIn("--reason requires a value", err.getvalue())
+            data = yaml.safe_load((root / "tasks.yaml").read_text())
+            beta = next(t for t in data["tasks"] if t["id"] == "gate/beta")
+            self.assertNotEqual(beta["status"], "dropped")
+
+    def test_misplaced_known_option_is_rejected_per_subcommand(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / ".waystone.yml").write_text("version: 1\nproject: x\n")
+            (root / "tasks.yaml").write_text(TASKS_FIXTURE)
+            cases = [
+                (["drop", "gate/beta", str(root), "--title", "x"],
+                 "--title is not valid for 'drop'"),
+                (["list", str(root), "--reason", "x"],
+                 "--reason is not valid for 'list'"),
+            ]
+            for args, expected in cases:
+                with self.subTest(sub=args[0]):
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err), \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        rc = tasks.main(args)
+                    self.assertEqual(rc, 1)
+                    self.assertIn(expected, err.getvalue())
+            data = yaml.safe_load((root / "tasks.yaml").read_text())
+            beta = next(t for t in data["tasks"] if t["id"] == "gate/beta")
+            self.assertNotEqual(beta["status"], "dropped")
+
+    def test_drop_reason_is_recorded_in_notes(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / ".waystone.yml").write_text("version: 1\nproject: x\n")
+            (root / "tasks.yaml").write_text(TASKS_FIXTURE)
+            rc = tasks.main(["drop", "gate/beta", str(root), "--reason", "superseded by feat/x"])
+            self.assertEqual(rc, 0)
+            data = yaml.safe_load((root / "tasks.yaml").read_text())
+            beta = next(t for t in data["tasks"] if t["id"] == "gate/beta")
+            self.assertEqual(beta["status"], "dropped")
+            self.assertIn("dropped: superseded by feat/x", beta["notes"])
+            self.assertEqual(validate.validate(data), [])
+
     def test_main_add_set_drop_end_to_end(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
@@ -3603,6 +3715,98 @@ def _registry(n_done, n_active=2):
     for i in range(n_active):
         rows.append(f'  - id: feat/active-{i:03d}\n    title: "active task number {i}"\n    status: active\n')
     return "version: 1\nproject: x\ntasks:\n" + "".join(rows)
+
+
+class UninitializedRootGateTests(unittest.TestCase):
+    """The single chokepoint (hold_project_lock / ensure_project_state_dir) refuses to create
+    project state under roots without a project config; module grammars stay untouched."""
+
+    def test_state_primitives_refuse_uninitialized_roots_without_writes(self):
+        with tempfile.TemporaryDirectory() as d:
+            plain = Path(d) / "not-a-project"
+            plain.mkdir()
+            with self.assertRaisesRegex(common.WorkflowError, "not an initialized"):
+                with common.hold_project_lock(plain):
+                    pass
+            with self.assertRaisesRegex(common.WorkflowError, "not an initialized"):
+                common.ensure_project_state_dir(plain)
+            self.assertFalse((plain / ".waystone").exists())
+
+    def test_initialized_root_passes_gate_and_init_order_still_works(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / ".waystone.yml").write_text("version: 1\nproject: x\n")
+            with common.hold_project_lock(root):
+                pass
+            self.assertTrue((root / ".waystone" / "lock").is_file())
+            # init order: the skill writes .waystone.yml (Step 3) before the first
+            # state-creating CLI call, so consent recording passes the gate.
+            common.record_consent(root, "init.start-level", "warn-allowed", {})
+            self.assertTrue((root / ".waystone" / "consents.jsonl").is_file())
+
+    def test_delegate_entry_point_is_gated_via_the_same_chokepoint(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            plain = Path(d) / "stale-or-typo-path"
+            plain.mkdir()
+            home = Path(d) / "home"
+            home.mkdir()
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                rc = _run_with_home(
+                    home, lambda: delegate.main(["status", "--root", str(plain)]))
+            self.assertNotEqual(rc, 0)
+            self.assertIn("not an initialized waystone project", err.getvalue())
+            self.assertFalse((plain / ".waystone").exists())
+
+    def test_resume_refuses_uninitialized_explicit_root_without_state_creation(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            plain = Path(d) / "not-a-project"
+            plain.mkdir()
+            for args in (["resume.py", str(plain)],
+                         ["resume.py", "--start-here-path", str(plain)]):
+                with self.subTest(args=args[1:]):
+                    old_argv = sys.argv
+                    sys.argv = args
+                    err = io.StringIO()
+                    try:
+                        with contextlib.redirect_stderr(err), \
+                                contextlib.redirect_stdout(io.StringIO()):
+                            rc = resume.main()
+                    finally:
+                        sys.argv = old_argv
+                    self.assertEqual(rc, 1)
+                    self.assertIn("not an initialized waystone project", err.getvalue())
+                    self.assertFalse((plain / ".waystone").exists())
+
+    def test_stale_registered_project_can_still_be_unregistered(self):
+        import shutil
+        import waystone
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "repo"
+            root.mkdir()
+            (root / ".waystone.yml").write_text("version: 1\nproject: demo\n")
+            (root / "tasks.yaml").write_text("version: 1\nproject: demo\ntasks: []\n")
+            home = Path(d) / "home"
+            home.mkdir()
+            import contextlib
+            import io
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(_run_with_home(
+                    home, lambda: waystone.main(["project", "register", str(root)])), 0)
+            shutil.rmtree(root)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = _run_with_home(
+                    home, lambda: waystone.main(["project", "unregister", str(root)]))
+            self.assertEqual(rc, 0)
+            self.assertIn("unregistered:", out.getvalue())
 
 
 class TaskArchiveTests(unittest.TestCase):
@@ -6266,6 +6470,9 @@ _PROFILE_BODY = ('schema: waystone-profile-1\nbindings:\n'
 
 
 def _write_profile(root: Path, body: str = _PROFILE_BODY):
+    config = root / ".waystone.yml"
+    if not config.exists():
+        config.write_text("version: 1\nproject: x\n")
     (common.ensure_project_state_dir(root) / "profile.yml").write_text(body, encoding="utf-8")
 
 
@@ -6913,7 +7120,7 @@ class DelegateRunTests(unittest.TestCase):
             observed = {"preflight": [], "packet": [], "overlay": [], "composition": []}
             originals = (delegate.hold_lock, delegate._check_snapshot_preconditions,
                          delegate._build_packet, delegate._active_overlays,
-                         delegate._run_codex)
+                         delegate._run_codex, delegate.hold_project_lock)
 
             @contextlib.contextmanager
             def tracked_lock(path, timeout=None):
@@ -6922,6 +7129,9 @@ class DelegateRunTests(unittest.TestCase):
                     yield
                 finally:
                     depth["value"] -= 1
+
+            def tracked_project_lock(project, timeout=None):
+                return tracked_lock(common.project_lock_path(project), timeout=timeout)
 
             def preflight(project):
                 observed["preflight"].append(depth["value"])
@@ -6937,6 +7147,7 @@ class DelegateRunTests(unittest.TestCase):
                 return originals[3](project, composition)
 
             delegate.hold_lock = tracked_lock
+            delegate.hold_project_lock = tracked_project_lock
             delegate._check_snapshot_preconditions = preflight
             delegate._build_packet = build_packet
             delegate._active_overlays = active_overlays
@@ -6948,7 +7159,7 @@ class DelegateRunTests(unittest.TestCase):
             finally:
                 (delegate.hold_lock, delegate._check_snapshot_preconditions,
                  delegate._build_packet, delegate._active_overlays,
-                 delegate._run_codex) = originals
+                 delegate._run_codex, delegate.hold_project_lock) = originals
             self.assertEqual(rc, 0)
             self.assertEqual(observed["preflight"], [0])
             self.assertEqual(observed["packet"], [0, 1])
@@ -7941,8 +8152,13 @@ class DelegateApplyTests(unittest.TestCase):
             _write_apply_verdict(rec)
             original_apply = delegate.apply_delegation
             original_hold_lock = delegate.hold_lock
+            original_hold_project_lock = delegate.hold_project_lock
             original_resolve_root = delegate._resolve_root
             acquired = []
+
+            def recording_project_lock(project, timeout=None):
+                acquired.append("project")
+                return original_hold_project_lock(project, timeout=timeout)
 
             @contextlib.contextmanager
             def recording_lock(path, timeout=None):
@@ -7967,6 +8183,7 @@ class DelegateApplyTests(unittest.TestCase):
 
             delegate.apply_delegation = checked_apply
             delegate.hold_lock = recording_lock
+            delegate.hold_project_lock = recording_project_lock
             delegate._resolve_root = lambda _explicit: root
             try:
                 with contextlib.redirect_stdout(io.StringIO()):
@@ -7975,6 +8192,7 @@ class DelegateApplyTests(unittest.TestCase):
             finally:
                 delegate.apply_delegation = original_apply
                 delegate.hold_lock = original_hold_lock
+                delegate.hold_project_lock = original_hold_project_lock
                 delegate._resolve_root = original_resolve_root
             self.assertEqual(rc, 0)
             self.assertEqual(acquired, ["project", "record"])
@@ -11467,8 +11685,8 @@ class DelegateVerifyTests(unittest.TestCase):
         expected_worktree_writes = {
             "PreToolUse": set(),
             "SessionStart": {".waystone/.gitignore", ".waystone/lock"},
-            "PreCompact": {".waystone/resume.md"},
-            "SessionEnd": {".waystone/resume.md"},
+            "PreCompact": {".waystone/resume.md", ".waystone/.gitignore"},
+            "SessionEnd": {".waystone/resume.md", ".waystone/.gitignore"},
             "PostToolUse": {".waystone/.gitignore", ".waystone/lock", "ROADMAP.md"},
             "Stop": {".waystone/.gitignore", ".waystone/lock"},
         }
@@ -13089,6 +13307,7 @@ class MigrationV2HookTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root, home = self._project(Path(d))
             original_hold = getattr(module, "hold_lock", None)
+            original_hold_project = getattr(module, "hold_project_lock", None)
             original_time = getattr(module, "time", None)
             seen = []
             ticks = iter((100.0, 100.0, 101.25))
@@ -13097,6 +13316,9 @@ class MigrationV2HookTests(unittest.TestCase):
             def tracked(path, timeout=None):
                 seen.append((Path(path), timeout))
                 yield
+
+            def tracked_project(project, timeout=None):
+                return tracked(common.project_lock_path(project), timeout=timeout)
 
             class FakeTime:
                 @staticmethod
@@ -13108,6 +13330,7 @@ class MigrationV2HookTests(unittest.TestCase):
                     return 1
 
             module.hold_lock = tracked
+            module.hold_project_lock = tracked_project
             module.time = FakeTime
             try:
                 rc, payload, err = self._run_context(module, root, home)
@@ -13116,6 +13339,10 @@ class MigrationV2HookTests(unittest.TestCase):
                     del module.hold_lock
                 else:
                     module.hold_lock = original_hold
+                if original_hold_project is None:
+                    del module.hold_project_lock
+                else:
+                    module.hold_project_lock = original_hold_project
                 if original_time is None:
                     del module.time
                 else:
@@ -13482,22 +13709,22 @@ class CodexHookTests(unittest.TestCase):
                 "tool_input": {"file_path": str(root / "tasks.yaml")},
             }
             before = (root / "ROADMAP.md").read_bytes()
-            original_hold = tasks_guard.hold_lock
+            original_hold = tasks_guard.hold_project_lock
             old_stdin = sys.stdin
 
             @contextlib.contextmanager
-            def broken(_path, timeout=None):
+            def broken(_root, timeout=None):
                 raise OSError("synthetic lock filesystem failure")
                 yield
 
-            tasks_guard.hold_lock = broken
+            tasks_guard.hold_project_lock = broken
             sys.stdin = io.StringIO(_json.dumps(payload))
             err = io.StringIO()
             try:
                 with contextlib.redirect_stderr(err):
                     rc = tasks_guard.main()
             finally:
-                tasks_guard.hold_lock = original_hold
+                tasks_guard.hold_project_lock = original_hold
                 sys.stdin = old_stdin
             self.assertEqual(rc, 0)
             self.assertEqual((root / "ROADMAP.md").read_bytes(), before)
@@ -14738,7 +14965,11 @@ class L2DAdversarialFindingTests(unittest.TestCase):
                 replaced.append((Path(source), Path(target)))
                 return real_replace(source, target)
 
+            def observed_project_lock(project, timeout=None):
+                return observed_lock(common.project_lock_path(project), timeout=timeout)
+
             with mock.patch.object(overlay, "hold_lock", observed_lock), \
+                    mock.patch.object(overlay, "hold_project_lock", observed_project_lock), \
                     mock.patch.object(overlay.os, "replace", observed_replace):
                 _run_with_home(home, lambda: overlay.promote_user(root, delta_id))
             self.assertEqual(entered, _run_with_home(home, lambda: [

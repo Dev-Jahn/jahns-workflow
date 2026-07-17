@@ -45,11 +45,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import yaml  # noqa: E402
 
-from common import (  # noqa: E402
-    CONFIG_NAME, WorkflowError, find_project_root, git_full_sha, git_rc, hold_lock, is_ancestor,
-    load_config, migrate_project_state, normalize_config, parse_iso_timestamp, project_lock_path,
+from common import (
+    CONFIG_NAME, WorkflowError, find_project_root, git_full_sha, git_rc, hold_project_lock,
+    is_ancestor, load_config, migrate_project_state, normalize_config, parse_iso_timestamp,
     write_bytes_atomic,
-)
+)  # noqa: E402
 
 CODEX_BOT = "chatgpt-codex-connector[bot]"  # REST `user.login` form
 INBOX = Path("/tmp/review.md")  # fixed drop-file: user saves the reviewer reply here, byte-exact
@@ -1480,7 +1480,7 @@ def main(argv: list[str]) -> int:
         print("review: no initialized project (missing .waystone.yml)", file=sys.stderr)
         return 1
     try:
-        with hold_lock(project_lock_path(root)):
+        with hold_project_lock(root):
             migrate_project_state(root)
     except (WorkflowError, OSError) as e:
         print(f"waystone review: migration failed: {e}", file=sys.stderr)
@@ -1491,10 +1491,10 @@ def main(argv: list[str]) -> int:
             if not round_id:
                 print("review prepare: --round ID is required", file=sys.stderr)
                 return 1
-            with hold_lock(project_lock_path(root)):
+            with hold_project_lock(root):
                 return prepare_packet_request(root, round_id)
         if sub == "ingest":
-            with hold_lock(project_lock_path(root)):
+            with hold_project_lock(root):
                 return ingest(root, _opt(rest, "--round"), reviewer=_opt(rest, "--reviewer"),
                               force="--force" in rest)
         if sub == "triage":
@@ -1503,7 +1503,7 @@ def main(argv: list[str]) -> int:
             if not round_id or not source:
                 print("review triage: --round ID and --file PATH are required", file=sys.stderr)
                 return 1
-            with hold_lock(project_lock_path(root)):
+            with hold_project_lock(root):
                 return triage(root, round_id, Path(source))
         pr_s = _opt(rest, "--pr")
         if sub == "freeze":

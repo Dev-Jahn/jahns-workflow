@@ -34,11 +34,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import yaml  # noqa: E402
 
-from common import (  # noqa: E402
+from common import (
     WorkflowError, _project_slug, canonical_scope_prefixes, ensure_project_state_dir,
-    find_project_root, git_full_sha, hold_lock, load_config, load_tasks, migrate_project_state,
-    project_lock_path, project_state_path, worktrees_cache_dir, write_text_atomic,
-)
+    find_project_root, git_full_sha, hold_lock, hold_project_lock, load_config, load_tasks,
+    migrate_project_state, project_state_path, worktrees_cache_dir, write_text_atomic,
+)  # noqa: E402
 
 DELEG_REF_NS = "refs/waystone/delegations"
 TERMINAL_STATES = ("applied", "discarded")
@@ -3023,7 +3023,7 @@ def _resolve_root(explicit: str | None) -> Path:
     root = Path(explicit).resolve() if explicit else find_project_root(Path.cwd())
     if root is None:
         raise WorkflowError("no initialized project (run inside one, or pass --root DIR)")
-    with hold_lock(project_lock_path(root)):
+    with hold_project_lock(root):
         migrate_project_state(root)
     return root
 
@@ -3062,7 +3062,7 @@ def _cli_run(rest: list[str]) -> int:
         json_events=bool(opts.get("json-events")))
     # Constant-level lock span: only local task/overlay revalidation, owner scan, and one claim write.
     # Git preflight, profile/packet preparation, snapshot/worktree setup, and the runner stay outside.
-    with hold_lock(project_lock_path(root)):
+    with hold_project_lock(root):
         did, record_dir = _claim_run(root, plan_)
     with hold_lock(record_dir / "record.lock"):
         return _run_claimed(root, plan_, did, record_dir)
@@ -3092,7 +3092,7 @@ def _cli_apply(rest: list[str]) -> int:
     root = _resolve_root(opts.get("root"))
     # Required nested order: registry -> project -> record. Apply mutates the live tree, so it must
     # serialize with round close/task mutations for the whole record check -> git apply -> state span.
-    with hold_lock(project_lock_path(root)):
+    with hold_project_lock(root):
         rec = _load_delegation(root, pos[0])
         with hold_lock(rec / "record.lock"):
             return apply_delegation(root, pos[0])
@@ -3106,7 +3106,7 @@ def _cli_discard(rest: list[str]) -> int:
     if opts.get("orphan"):
         if not opts.get("reason"):
             raise WorkflowError("discard requires --reason")
-        with hold_lock(project_lock_path(root)):
+        with hold_project_lock(root):
             return discard_orphan(root, pos[0], opts["reason"])
     rec = _load_delegation(root, pos[0])
     with hold_lock(rec / "record.lock"):

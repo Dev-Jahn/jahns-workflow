@@ -27,10 +27,10 @@ from pathlib import Path
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import (  # noqa: E402
-    ROUND_RE, WorkflowError, canonical_scope_prefixes, find_project_root, git_full_sha, hold_lock, load_config,
-    migrate_project_state, project_lock_path, write_text_atomic,
-)
+from common import (
+    ROUND_RE, WorkflowError, canonical_scope_prefixes, find_project_root, git_full_sha,
+    hold_project_lock, load_config, migrate_project_state, write_text_atomic,
+)  # noqa: E402
 
 
 # ---- structure-bounded text surgery ------------------------------------------
@@ -420,9 +420,9 @@ def main() -> int:
         routes = _parse_route_notes(repeated("--route-note"))
         # Phase-2 migration is a separate pre-verb span; close then owns one project-lock span from
         # preflight through exposure/warn recording. Nested libraries must not acquire it again.
-        with hold_lock(project_lock_path(root)):
+        with hold_project_lock(root):
             migrate_project_state(root)
-        with hold_lock(project_lock_path(root)):
+        with hold_project_lock(root):
             return close(root, round_id, _parse_ids(opt("--done")),
                          _parse_ids(opt("--touched")), opt("--commit") or "HEAD", routes)
     except WorkflowError as e:

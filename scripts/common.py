@@ -126,6 +126,7 @@ def _ensure_project_self_ignore(state: Path) -> None:
 
 def ensure_project_state_dir(root: Path) -> Path:
     """Create the project-local state root and restore its self-ignore file when needed."""
+    require_initialized_root(root)
     state = project_state_path(root)
     state.mkdir(parents=True, exist_ok=True)
     _real_directory(state, "project state directory")
@@ -224,6 +225,27 @@ def overlay_lock_path(home: Path | None = None) -> Path:
 def project_lock_path(root: Path) -> Path:
     """Return the project lock path without touching the filesystem."""
     return project_state_path(root) / "lock"
+
+
+def require_initialized_root(root: Path) -> None:
+    """The single write gate for project-local state: creating .waystone under a root that has no
+    project config scaffolds state at an arbitrary path (the `task drop --reason` incident seeded a
+    profile into a typo'd directory). Initialization needs no bypass here — init writes .waystone.yml
+    before the first state-creating CLI call (skills/init: Step 3 precedes consent recording), so an
+    uninitialized root reaching this gate is always a caller error."""
+    if has_project_config(Path(root)):
+        return
+    raise WorkflowError(
+        f"waystone: {root} is not an initialized waystone project (.waystone.yml missing) — "
+        "refusing to create project state there; check the path or initialize the project first")
+
+
+def hold_project_lock(root: Path, timeout: float | None = None):
+    """Project-lock chokepoint: every flow that creates or mutates project-local state acquires
+    the lock through here, so the initialized-root gate lives at this one point instead of being
+    re-checked per entry point."""
+    require_initialized_root(root)
+    return hold_lock(project_lock_path(root), timeout=timeout)
 
 
 def _lock_verb() -> str:

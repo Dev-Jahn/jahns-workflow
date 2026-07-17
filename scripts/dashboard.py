@@ -23,10 +23,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import yaml  # noqa: E402
 
-from common import (  # noqa: E402
-    WorkflowError, git_branch_info, hold_lock, load_tasks, migrate_project_state,
-    project_lock_path, registry_path,
-)
+from common import (
+    WorkflowError, git_branch_info, hold_project_lock, load_tasks, migrate_project_state,
+    registry_path,
+)  # noqa: E402
 
 BOLD, DIM, RESET = "\033[1m", "\033[2m", "\033[0m"
 BLUE, RED, GREEN, YELLOW = "\033[34m", "\033[31m", "\033[32m", "\033[33m"
@@ -66,7 +66,7 @@ def render_tasks(data: dict) -> None:
 
 
 def show_local(name: str, path: Path) -> None:
-    with hold_lock(project_lock_path(path)):
+    with hold_project_lock(path):
         migrate_project_state(path)
     g = git_branch_info(path)
     dirty = c(YELLOW, f"±{g['dirty']}") if g["dirty"] else c(GREEN, "clean")

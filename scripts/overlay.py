@@ -24,14 +24,13 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from common import (  # noqa: E402
+from common import (
     ROUND_RE, WorkflowError, _project_slug, _read_registry, canonical_payload_hash,
     content_hash, ensure_project_state_dir, find_project_root, has_accepted_consent, hold_lock,
-    load_config, load_tasks,
-    machine_dir, migrate_project_state, overlay_lock_path, parse_iso_timestamp, project_lock_path,
-    project_state_path, record_consent, registry_entry_paths, registry_lock_path, registry_path,
-    write_text_atomic,
-)
+    hold_project_lock, load_config, load_tasks, machine_dir, migrate_project_state,
+    overlay_lock_path, parse_iso_timestamp, project_state_path, record_consent,
+    registry_entry_paths, registry_lock_path, registry_path, write_text_atomic,
+)  # noqa: E402
 
 # delta-id grammar mirrors the improve rec_id (`<lens>/<kebab-gist>`, S2) so a rec materialises to a
 # delta under the same id and the same recommendation keeps a stable identity across cycles.
@@ -842,7 +841,7 @@ def promote_user(root: Path, delta_id: str) -> dict:
     """Atomically promote one independently observed candidate under the global lock order."""
     with hold_lock(registry_lock_path()):
         with hold_lock(overlay_lock_path()):
-            with hold_lock(project_lock_path(root)):
+            with hold_project_lock(root):
                 return _promote_user_locked(root, delta_id)
 
 
@@ -2408,7 +2407,7 @@ def _resolve_root(explicit: str | None) -> Path:
     root = Path(explicit).resolve() if explicit else find_project_root(Path.cwd())
     if root is None:
         raise WorkflowError("no initialized project (run inside one, or pass --root DIR)")
-    with hold_lock(project_lock_path(root)):
+    with hold_project_lock(root):
         migrate_project_state(root)
     return root
 
@@ -2425,7 +2424,7 @@ def _cli_add(rest: list[str]) -> int:
     if opts.get("summary") is None:
         raise WorkflowError("add requires --summary <text>")
     root = _resolve_root(opts.get("root"))
-    with hold_lock(project_lock_path(root)):
+    with hold_project_lock(root):
         delta = add_delta(
             root, pos[0], rule=opts["rule"], summary=opts["summary"],
             pointers=opts.get("pointers"), expected_effect=opts.get("expected-effect", ""),
@@ -2459,7 +2458,7 @@ def _cli_promote(rest: list[str]) -> int:
     if not pos:
         raise WorkflowError("promote requires a <delta-id>")
     root = _resolve_root(opts.get("root"))
-    with hold_lock(project_lock_path(root)):
+    with hold_project_lock(root):
         delta = promote(root, pos[0])
     print(f"promoted {delta['id']} -> {delta['status']}")
     return 0
@@ -2470,7 +2469,7 @@ def _cli_demote(rest: list[str]) -> int:
     if not pos:
         raise WorkflowError("demote requires a <delta-id>")
     root = _resolve_root(opts.get("root"))
-    with hold_lock(project_lock_path(root)):
+    with hold_project_lock(root):
         delta = demote(root, pos[0])
     print(f"demoted {delta['id']} -> {delta['status']}")
     return 0
@@ -2481,7 +2480,7 @@ def _cli_suspend(rest: list[str]) -> int:
     if not pos:
         raise WorkflowError("suspend requires a <delta-id>")
     root = _resolve_root(opts.get("root"))
-    with hold_lock(project_lock_path(root)):
+    with hold_project_lock(root):
         delta = suspend(root, pos[0], note=opts.get("note"))
     print(f"suspended {delta['id']}")
     return 0
@@ -2492,7 +2491,7 @@ def _cli_retire(rest: list[str]) -> int:
     if not pos:
         raise WorkflowError("retire requires a <delta-id>")
     root = _resolve_root(opts.get("root"))
-    with hold_lock(project_lock_path(root)):
+    with hold_project_lock(root):
         delta = retire(root, pos[0], note=opts.get("note"))
     print(f"retired {delta['id']}")
     return 0
@@ -2503,7 +2502,7 @@ def _cli_replay(rest: list[str]) -> int:
     if not pos:
         raise WorkflowError("replay requires a <delta-id>")
     root = _resolve_root(opts.get("root"))
-    with hold_lock(project_lock_path(root)):
+    with hold_project_lock(root):
         report = replay(root, pos[0])
     print(json.dumps(report, ensure_ascii=False, sort_keys=True))
     rate = "null" if report["fire_rate"] is None else f"{report['fire_rate']:.4f}"
@@ -2531,7 +2530,7 @@ def _cli_override(rest: list[str]) -> int:
         if not opts.get(name):
             raise WorkflowError(f"override requires --{name}")
     root = _resolve_root(opts.get("root"))
-    with hold_lock(project_lock_path(root)):
+    with hold_project_lock(root):
         entry = set_round_override(
             root, opts["round"], pos[0], opts["stage"], opts["reason"])
     print(f"round override {entry['rule']} -> {entry['stage']} ({opts['round']})")
@@ -2543,7 +2542,7 @@ def _cli_materialize(rest: list[str]) -> int:
     if len(pos) != 1:
         raise WorkflowError("materialize requires one <delta-id>")
     root = _resolve_root(opts.get("root"))
-    with hold_lock(project_lock_path(root)):
+    with hold_project_lock(root):
         path = materialize(root, pos[0], consent_recorded=bool(opts.get("consent-recorded")))
     print(f"materialized {pos[0]} -> {path} (left uncommitted)")
     return 0
