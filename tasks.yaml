@@ -140,10 +140,10 @@ tasks:
     origin: "review-raw-adversarial-20260716"
   - id: fix/publication-gate-bypasses
     accept: ["publication 게이트는 working tree가 아니라 HEAD tree를 증거 소스로 사용한다 — request와 binding을 git ls-tree의 정확한 lexical path로 찾아 HEAD blob에서 직접 읽어 파싱하고, symlink mode는 거부하며, 사이드카 후보 열거도 filesystem glob이 아니라 HEAD tree에서 한다", "skip-worktree나 assume-unchanged로 위장한 tracked 변경이 게이트를 통과하지 못한다", "round id 재사용 시 binding이 현재 closeout에 결속됨이 검증된다 (조상 검사만으로 불충분)", "improve의 파일명과 내장 round_id 불일치 사이드카가 무경고 오귀속되지 않는다 (PR freeze 동일)", "들여쓴 중복 Reviewing 줄이 모호성으로 탐지된다", "삭제된 upstream의 stale tracking ref로 게이트가 통과하지 않는다", "전체 테스트 스위트(신규 계약 테스트는 RED-first)와 ruff F401,F841 검사가 통과한다", "publication 게이트의 config(review.mode, reviews_dir)는 working tree가 아니라 검증 대상 HEAD의 .waystone.yml에서 읽는다 — 위장된 config 변경이 게이트 대상을 재지정할 수 없다", "closeout 결속이 merge 부모 트릭에 안전하다 — 단일 부모 publication 커밋 요구 또는 first-parent 체인 검증으로, 낡은 closeout을 first-parent에 둔 merge가 통과하지 못한다 (real-repo 테스트)", "publication과 improve가 동일한 사이드카 파일명 규칙(binding.json 또는 binding-N.json만)을 단일 소스로 공유한다", "upstream 존재·포함 확인이 축약 DWIM 이름이 아니라 완전한 refs/remotes 참조로 수행되어 tag 섀도잉이나 비활성 refspec 잔존 ref에 속지 않는다", "HEAD 열거가 게이트에 필요한 직계 자식으로 한정되고 무관 경로의 비UTF-8 이름이나 대형 첨부 트리가 게이트를 실패시키지 않는다", "발행 커밋의 변경 경로가 해당 라운드 packet 파일(request/binding sidecar)로 제한되며, 그 외 경로 변경이 포함되면 게이트가 거부한다", "게이트의 모든 git 객체 접근이 시작 시 핀한 불변 SHA 기준으로 일관 수행되고(HEAD 재해석 금지), refs/replace/graft 치환이 무효화된 상태에서 검증된다", "negative refspec으로 fetch에서 제외된 stale remote-tracking ref는 containment 근거로 인정되지 않는다", "sidecar 최신 선택이 timestamp 문자열이 아닌 불변 sequence 우선으로 정렬되어 linear extend/re-close가 통과한다 (positive 재-close 회귀 테스트 포함)", "reviews-tree 열거와 binding-N suffix 파싱이 개수·크기 bounded이며 oversized suffix가 crash가 아닌 명시적 거부로 처리된다", "reviews_dir 경로 검증이 runtime config loader와 단일 공유 규칙이고, stale-closeout-첫부모 거부를 실제 재현하는 fixture가 존재한다"]
-    notes: "출처: fix/round-packet-remote-visibility 2차 패치의 raw codex 적대 리뷰(blocker 2·major 3). 사용자 결정(2026-07-16): 2차 패치는 일반 경로 계약(미추적·부분커밋 거부, 실 bare-remote RED-first 증명)을 달성했으므로 apply하고 edge 우회는 본 task로 이관. 수정 방향: 심링크 비추적 검사(과거 bundle 심링크 교훈 재적용), binding을 현재 closeout에 결속(조상 검사 불충분), improve 사이드카 로드에 expected_round_id 강제, 모호성 탐지 확장, head_pushed의 prune/존재 확인."
+    notes: "사용자 재정(2026-07-17, audit 부위 1): 조상-추론 구조를 폐기하고 직접-결속 새 항아리로 재설계 — fix/publication-gate-direct-binding으로 재등록, 구현은 Fable fork. 기존 17기준 중 로컬 공격자 4건(refs/replace·negative-refspec·merge-parent·bounded 열거) 폐기, 사이드카 정렬은 9fbf838로 기해소"
     scope: ["scripts"]
     title: "publication 게이트 edge 우회 5건: reviews 디렉터리 심링크 추적으로 존재검사 오통과, round id 재사용 시 낡은 request/binding이 조상 검사만으로 통과(현재 closeout과 미결속), improve의 파일명↔내장 round_id 불일치 사이드카 무경고 오귀속(PR freeze 동일), 들여쓴 중복 Reviewing 줄 모호성 미탐지, 삭제된 upstream의 stale tracking ref 통과"
-    status: "pending"
+    status: "dropped"
     severity: "major"
     origin: "review-raw-adversarial-20260716"
   - id: fix/companion-verifier-effort-forwarding
@@ -261,10 +261,10 @@ tasks:
     severity: "minor"
     origin: "review-raw-adversarial-20260716"
   - id: fix/codex-exec-verifier-hardening
-    notes: "출처: fix/drop-codex-companion 적대 리뷰 major 2·minor 2 중 이관분(blocker와 schema 어휘는 main-session 즉시 해소). 릴리스 전 착지 권장 — 구 artifact 하위호환은 다른 머신의 in-flight 위임 보호."
+    notes: "사용자 재정(2026-07-17): legacy 하위호환 2건(구 waystone-verify-1 artifact, on-disk legacy profile e2e)은 audit 판정대로 폐기 — 사용자 1명·in-flight 위임 0인 지금이 폐기 적기. transport 실패경로만 fix/verifier-transport-hardening으로 재등록"
     scope: ["scripts"]
     title: "codex exec 단일 verifier의 잔여 경화: 구 waystone-verify-1 artifact(requested/effective effort 부재)의 하위호환 검증(in-flight 위임이 upgrade를 넘어도 verdict 가능), on-disk 레거시 profile(codex-cli|codex-companion+entry)의 e2e 회귀, transport 실패경로(timeout·비정상 종료 stderr 보존·빈 출력·재시도 시 stale output 정리) 계약 테스트"
-    status: "pending"
+    status: "dropped"
     severity: "major"
     origin: "review-raw-adversarial-20260717"
   - id: decision/lanes-verify-round-scope
@@ -335,3 +335,30 @@ tasks:
     status: "done"
     severity: "major"
     origin: "dogfooding-20260717"
+  - id: fix/probe-once-config-gate
+    accept: [".waystone.yml delegation 아래 codex_runner_verified key — 미설정이면 기존 프로브를 1회 실행하고, 성공 시 true를 주석 보존 서지컬 편집으로 기록하며, true로 설정된 뒤에는 프로브를 완전히 생략한다 (생략 계약 테스트 포함)", "프로브 실패 시 key를 기록하지 않고 기존 거부 동작을 유지한다(다음 실행이 재프로브); 사후 검출기의 failed-env 진단 힌트에 key 재검토 안내를 추가한다", "config normalize/스키마에 key가 반영되고, 기존 프로브 계약 테스트는 key-부재 경로로 전부 유지된다", "전체 테스트 스위트(신규 계약 RED-first)와 ruff F401,F841 검사가 통과한다"]
+    scope: ["scripts", "templates"]
+    title: "프리플라이트 프로브를 1회성 검증으로: .waystone.yml delegation.codex_runner_verified key가 미설정일 때만 프로브 실행, 성공 시 true를 주석 보존 편집으로 기록, 이후 참조만 하고 프로브 생략 (사용자 설계 2026-07-17)"
+    status: "pending"
+    severity: "minor"
+    origin: "overengineering-audit-20260717"
+  - id: chore/migration-sunset
+    notes: "실행 보류(사실상 parked — 릴리스판 하네스가 parked 상태를 아직 몰라 pending 유지): 모든 머신 0.11+ 이관 확인 후 착수. 2026-07-17 사용자 승인"
+    title: "legacy migration 서브시스템 sunset: 모든 머신이 0.11+ 이관 완료 확인 후 pre-0.9 마커·재개·자동 repair 상태기계 통째 삭제 (audit 부위 5, 사용자 승인 — 실행은 이관 확인 후)"
+    status: "pending"
+    severity: "minor"
+    origin: "overengineering-audit-20260717"
+  - id: fix/verifier-transport-hardening
+    accept: ["verifier codex exec 호출의 타임아웃과 비정상 종료에서 stderr가 record에 보존되고 원인이 진단에 나타난다", "빈 출력(0바이트 last-message)은 성공으로 위장되지 않고 명시 실패로 분류된다", "verify 재시도 시 이전 시도의 stale output 파일이 새 결과로 오인되지 않는다 (정리 또는 시도별 격리)", "전체 테스트 스위트(신규 계약 RED-first)와 ruff F401,F841 검사가 통과한다"]
+    scope: ["scripts"]
+    title: "codex exec verifier의 transport 실패경로 경화: 타임아웃·비정상 종료 시 stderr 보존, 빈 출력 정직 처리, 재시도 시 stale output 정리 (verifier-hardening에서 legacy 하위호환 폐기 후 승계)"
+    status: "pending"
+    severity: "major"
+    origin: "review-raw-adversarial-20260716"
+  - id: fix/publication-gate-direct-binding
+    accept: ["remote verify --round의 발행 판정은 (1) binding이 가리키는 closeout SHA가 원격 추적 ref에 containment (2) 그 커밋 트리에서 request와 binding 사이드카의 바이트가 로컬과 일치 — 두 가지만으로 결정되고 merge topology·first-parent 체인·HEAD 재해석 검사는 존재하지 않는다", "검증 시작 시 대상 SHA를 1회 해석해 이후 모든 git 접근이 그 불변 SHA를 쓴다 (심볼릭 재해석 금지 — 값싼 정확성)", "round id 재사용/재마감 시 최신 binding(sequence 우선, 9fbf838 정렬)이 기준이고 낡은 request/binding은 발행 근거가 되지 않는다", "reviews 디렉터리 심링크로 존재검사를 속일 수 없고(실파일 요구), 들여쓴/중복 Reviewing 줄 모호성은 기존 strict 파서 계약 유지", "정상 흐름 무회귀: linear extend·재마감(reclose 포함)·legacy 라운드 정직 강등이 기존 계약대로 통과하고, 제거되는 조상-추론 전용 테스트만 새 직접-결속 계약으로 교체된다", "전체 테스트 스위트(신규 계약 RED-first)와 ruff F401,F841 검사가 통과한다"]
+    scope: ["scripts"]
+    title: "발행 게이트 직접-결속 재설계: 게이트는 binding 사이드카가 가리키는 closeout SHA의 원격 containment와 그 커밋 트리 안 packet 파일(request/binding) 바이트 대조만 검증 — 조상 추론(merge topology·first-parent·HEAD 재해석) 클래스 제거 (audit 새 항아리, 사용자 승인 2026-07-17, Fable fork 구현)"
+    status: "pending"
+    severity: "major"
+    origin: "review-raw-adversarial-20260716"
