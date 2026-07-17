@@ -482,7 +482,7 @@ def _now_iso() -> str:
 
 def record_review_feedback(root: Path, round_id: str, *, source: str, event_id: str,
                            reviewer: str | None = None, reply_header: dict | None = None,
-                           binding: dict | None = None, force: bool = False) -> dict:
+                           force: bool = False) -> dict:
     """Append one canonical review-feedback event shared by packet ingest and completed PR markers."""
     if not isinstance(round_id, str) or not round_id:
         raise WorkflowError("review feedback round_id must be non-empty")
@@ -494,16 +494,8 @@ def record_review_feedback(root: Path, round_id: str, *, source: str, event_id: 
         raise WorkflowError("review feedback reviewer must be a non-empty string when provided")
     reviewer_effort = None
     review_target = None
-    review_target_matches = None
     reply_metadata = None
-    binding_target_sha = None
-    binding_base_sha = None
-    binding_source = None
-    if source == "pr-marker":
-        reviewer_configured, reviewer_reason = True, None
-    else:
-        import review
-
+    if source == "packet-ingest":
         reply_header = reply_header if isinstance(reply_header, dict) else {
             "metadata": {}, "model": reviewer, "effort": None, "review_target": None,
         }
@@ -511,28 +503,18 @@ def record_review_feedback(root: Path, round_id: str, *, source: str, event_id: 
         reviewer_effort = reply_header.get("effort")
         review_target = reply_header.get("review_target")
         reply_metadata = reply_header.get("metadata") or {}
-        assessment = review.assess_review_reply(reply_header, binding)
-        review_target_matches = assessment["review_target_matches"]
-        reviewer_configured = assessment["reviewer_configured"]
-        reviewer_reason = assessment["reviewer_coverage_reason"]
-        if isinstance(binding, dict):
-            binding_target_sha = binding.get("target_sha")
-            binding_base_sha = binding.get("base_sha")
-            binding_source = binding.get("source")
     row = {
         "schema": REVIEW_FEEDBACK_SCHEMA, "event": "review-feedback", "at": _now_iso(),
         "round_id": round_id, "source": source, "event_id": event_id,
-        "reviewer": reviewer, "reviewer_configured": reviewer_configured,
-        "reviewer_coverage_reason": reviewer_reason, "provenance": "observed",
+        "reviewer": reviewer, "provenance": "observed",
     }
     if source == "packet-ingest":
         row.update({
             "reviewer_effort": reviewer_effort, "review_target": review_target,
-            "review_target_matches": review_target_matches,
             "reply_metadata": reply_metadata,
-            "binding_target_sha": binding_target_sha, "binding_base_sha": binding_base_sha,
-            "review_binding_source": binding_source,
         })
+    else:
+        row.update({"reviewer_configured": True, "reviewer_coverage_reason": None})
     _ensure_project_state_or_refuse(root)
     path = _review_ingests_path(root)
     _mkdir_or_refuse(path.parent)
@@ -573,13 +555,12 @@ def record_review_feedback(root: Path, round_id: str, *, source: str, event_id: 
 
 
 def record_review_ingest(root: Path, round_id: str, reviewer: str | None = None,
-                         *, reply_header: dict | None = None, binding: dict | None = None,
-                         force: bool = False) -> dict:
+                         *, reply_header: dict | None = None, force: bool = False) -> dict:
     """Compatibility wrapper: a packet ingest projects to the canonical feedback event."""
     return record_review_feedback(
         root, round_id, source="packet-ingest",
         event_id=f"packet:{round_id}", reviewer=reviewer, reply_header=reply_header,
-        binding=binding, force=force)
+        force=force)
 
 
 def load_review_ingests(root: Path) -> tuple[list[dict], int]:
@@ -592,6 +573,10 @@ def load_review_ingests(root: Path) -> tuple[list[dict], int]:
         lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeDecodeError):
         return [], 1
+    try:
+        cfg = load_config(root)
+    except (OSError, WorkflowError):
+        cfg = None
     for line_number, line in enumerate(lines, 1):
         if not line.strip():
             continue
@@ -609,26 +594,34 @@ def load_review_ingests(root: Path) -> tuple[list[dict], int]:
                 or (row.get("reviewer") is not None
                     and (not isinstance(row.get("reviewer"), str)
                          or not row["reviewer"].strip()))
-                or (row.get("reviewer_configured") is not None
-                    and row.get("reviewer_configured") is not True)
                 or (row.get("reviewer_coverage_reason") is not None
                     and not isinstance(row.get("reviewer_coverage_reason"), str))):
-            skipped += 1
-            continue
-        if (row["source"] == "packet-ingest" and row.get("reviewer_configured") is True
-                and not isinstance(row.get("reviewer"), str)):
             skipped += 1
             continue
         if row["source"] == "pr-marker":
             row = {**row, "reviewer_configured": True,
                    "reviewer_coverage_reason": None}
-        elif row.get("reviewer_configured") is not True:
+        else:
+            import review
+
+            binding = None
+            if cfg is not None:
+                binding, _binding_reason = review.ingest_round_binding(
+                    root, row["round_id"], cfg)
+                feedback = root / cfg["reviews_dir"] / f"{row['round_id']}-feedback.md"
+            else:
+                feedback = root / "__unavailable-feedback__"
+            projected = review.read_feedback_reply_metadata(
+                feedback, expected_round_id=row["round_id"], binding=binding)
             row = {
-                **row, "reviewer_configured": None,
-                "reviewer_coverage_reason": (
-                    row.get("reviewer_coverage_reason")
-                    if isinstance(row.get("reviewer_coverage_reason"), str)
-                    else "reviewer-identity-unavailable"),
+                **row,
+                "reviewer": projected["model"],
+                "reviewer_effort": projected["effort"],
+                "review_target": projected["review_target"],
+                "review_target_matches": projected["review_target_matches"],
+                "reviewer_configured": projected["reviewer_configured"],
+                "reviewer_coverage_reason": projected["reviewer_coverage_reason"],
+                "reply_metadata": projected["metadata"],
             }
         rows.append({**row, "source_pointer": f"{path}:{line_number}"})
     deduped = {row["event_id"]: row for row in rows}

@@ -2677,6 +2677,15 @@ class IngestTests(unittest.TestCase):
         self.assertIn("missing-review-target", partial["warnings"])
         self.assertEqual(partial["metadata"]["foo"], "kept")
 
+    def test_damaged_duplicate_standard_key_cannot_restore_first_value(self):
+        parsed = review.parse_review_reply_header(
+            b"model: gpt-5.6-sol\nmodel: gpt-5.6-\xff\neffort: high\n"
+            + f"review-target: {'b' * 12}-{'a' * 12}\n".encode())
+        self.assertTrue(parsed["detected"])
+        self.assertIsNone(parsed["model"])
+        self.assertNotIn("model", parsed["metadata"])
+        self.assertIn("invalid-utf8", parsed["warnings"])
+
     def test_reviewer_model_normalization_is_bounded_not_alias_guessing(self):
         self.assertTrue(review.reviewer_model_matches(
             "gpt-5.6-sol", "codex:gpt-5.6-sol"))
@@ -2725,7 +2734,7 @@ class IngestTests(unittest.TestCase):
                 "metadata": {"model": "forged", "effort": "high",
                              "review-target": "aaaaaaaaaaaa"}}, separators=(",", ":"))
             feedback.write_text(
-                "<!-- waystone feedback -->\n"
+                "<!-- waystone feedback -->\nround: r1\n"
                 f"reply-metadata-json: {payload}\n\n---\n\n"
                 "review body\n"
                 f"reply-metadata-json: {body_payload}\n")
@@ -2745,6 +2754,82 @@ class IngestTests(unittest.TestCase):
             self.assertIsNone(missing["model"])
             self.assertEqual(missing["metadata"], {})
 
+    def test_feedback_separator_crossing_header_cap_is_accepted(self):
+        with tempfile.TemporaryDirectory() as d:
+            feedback = Path(d) / "r1-feedback.md"
+            payload = _json.dumps({
+                "metadata": {"model": "gpt-5.6-sol", "effort": "high",
+                             "review-target": "bbbbbbbbbbbb-aaaaaaaaaaaa"},
+                "review_target_matches": False, "reviewer_configured": None,
+                "reviewer_coverage_reason": "forged-stored-result",
+            }, separators=(",", ":"))
+            fixed = ("<!-- waystone feedback -->\nround: r1\n"
+                     f"reply-metadata-json: {payload}\n")
+            separator = b"\n\n---\n\n"
+            padding = "x" * (review.FEEDBACK_HEADER_MAX_BYTES - 1 - len(fixed.encode()))
+            content = (fixed + padding).encode() + separator + b"reply body\n"
+            start = content.index(separator)
+            self.assertLess(start, review.FEEDBACK_HEADER_MAX_BYTES)
+            self.assertGreater(start + len(separator), review.FEEDBACK_HEADER_MAX_BYTES)
+            feedback.write_bytes(content)
+            binding = {"target_sha": "a" * 40, "base_sha": "b" * 40,
+                       "reviewers": ["codex:gpt-5.6-sol"]}
+            projected = review.read_feedback_reply_metadata(
+                feedback, expected_round_id="r1", binding=binding)
+            self.assertIs(projected["review_target_matches"], True)
+            self.assertIs(projected["reviewer_configured"], True)
+
+    def test_projection_recomputes_binding_and_rejects_feedback_round_mismatch(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root(d)
+            self._binding(root, "r1")
+            src = root / "reply.md"
+            src.write_bytes(self._reply())
+            self.assertEqual(review.ingest(root, "r1", src=src), 0)
+            feedback = root / "docs/reviews/r1-feedback.md"
+            binding, reason = review.ingest_round_binding(root, "r1", common.load_config(root))
+            self.assertIsNone(reason)
+
+            content = feedback.read_bytes()
+            stored = _json.loads(next(
+                line.removeprefix("reply-metadata-json: ")
+                for line in content.split(review.FEEDBACK_HEADER_SEPARATOR, 1)[0]
+                .decode().splitlines() if line.startswith("reply-metadata-json: ")))
+            self.assertEqual(set(stored), {"metadata"})
+            projected = review.read_feedback_reply_metadata(
+                feedback, expected_round_id="r1", binding=binding)
+            self.assertIs(projected["review_target_matches"], True)
+            self.assertIs(projected["reviewer_configured"], True)
+
+            copied = feedback.with_name("r2-feedback.md")
+            copied.write_bytes(content)
+            mismatch = review.read_feedback_reply_metadata(
+                copied, expected_round_id="r2", binding=binding)
+            self.assertIsNone(mismatch["review_target_matches"])
+            self.assertIsNone(mismatch["reviewer_configured"])
+            self.assertEqual(mismatch["reviewer_coverage_reason"], "feedback-round-mismatch")
+
+    def test_projection_drops_invalid_standard_values_from_raw_metadata(self):
+        with tempfile.TemporaryDirectory() as d:
+            feedback = Path(d) / "r1-feedback.md"
+            payload = _json.dumps({
+                "metadata": {"model": "bad value", "effort": "extreme",
+                             "review-target": "not-a-target", "foo": "kept"},
+                "review_target_matches": True, "reviewer_configured": True,
+            }, separators=(",", ":"))
+            feedback.write_text(
+                "<!-- waystone feedback -->\nround: r1\n"
+                f"reply-metadata-json: {payload}\n\n---\n\nreply body\n")
+            projected = review.read_feedback_reply_metadata(
+                feedback, expected_round_id="r1", binding={
+                    "target_sha": "a" * 40, "base_sha": "b" * 40,
+                    "reviewers": ["codex:gpt-5.6-sol"],
+                })
+            self.assertEqual(projected["metadata"], {"foo": "kept"})
+            self.assertIsNone(projected["model"])
+            self.assertIsNone(projected["effort"])
+            self.assertIsNone(projected["review_target"])
+
     def test_invalid_utf8_identity_ingests_as_unknown_without_replacement(self):
         import contextlib
         import io
@@ -2760,7 +2845,9 @@ class IngestTests(unittest.TestCase):
                 self.assertEqual(review.ingest(root, "r1", src=src), 0)
             self.assertIn("invalid-utf8", err.getvalue())
             feedback = root / "docs/reviews/r1-feedback.md"
-            projected = review.read_feedback_reply_metadata(feedback)
+            binding, _reason = review.ingest_round_binding(root, "r1", common.load_config(root))
+            projected = review.read_feedback_reply_metadata(
+                feedback, expected_round_id="r1", binding=binding)
             self.assertIsNone(projected["model"])
             self.assertEqual(projected["effort"], "high")
             self.assertIs(projected["review_target_matches"], True)
@@ -2788,18 +2875,106 @@ class IngestTests(unittest.TestCase):
             content = dest.read_bytes()
             self.assertIn(body, content)                     # body byte-exact, verbatim (within the file)
             # verbatim body sits between the header separator and the appended triage skeleton
-            self.assertIn(body + b"\n\n---\n\n## Findings (triage skeleton", content)
+            self.assertIn(
+                body + b"\n\n---\n\n" + review.TRIAGE_BEGIN
+                + b"\n## Findings (triage skeleton", content)
             self.assertIn(b"round: 2026-06-22-x", content)
             self.assertIn(b"reviewer: gpt-5.6-sol", content)
             self.assertFalse(src.exists())                   # drop-file consumed
 
-            metadata = review.read_feedback_reply_metadata(dest)
+            binding, _reason = review.ingest_round_binding(
+                root, "2026-06-22-x", common.load_config(root))
+            metadata = review.read_feedback_reply_metadata(
+                dest, expected_round_id="2026-06-22-x", binding=binding)
             self.assertEqual(metadata["model"], "gpt-5.6-sol")
             self.assertEqual(metadata["effort"], "high")
             self.assertEqual(metadata["review_target"], f"{'b' * 12}-{'a' * 12}")
             self.assertEqual(metadata["metadata"]["foo"], "bar")
             self.assertIs(metadata["review_target_matches"], True)
             self.assertIs(metadata["reviewer_configured"], True)
+
+    def test_triage_command_replaces_only_marked_tail_with_quoted_markers_in_reply(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root(d)
+            self._binding(root, "r1")
+            src = root / "reply.md"
+            body = self._reply() + (
+                b"\nQuoted protocol text:\n" + review.TRIAGE_BEGIN + b"\n"
+                + review.TRIAGE_END + b"\n")
+            src.write_bytes(body)
+            self.assertEqual(review.ingest(root, "r1", src=src), 0)
+            feedback = root / "docs/reviews/r1-feedback.md"
+            before = feedback.read_bytes()
+            actual_begin = before.rfind(review.TRIAGE_BEGIN)
+            self.assertGreater(actual_begin, before.index(body))
+            immutable_prefix = before[:actual_begin]
+
+            replacement = root / "triage.md"
+            replacement.write_bytes(
+                b"## Findings (triage skeleton v2)\n\n"
+                b"| finding | severity | type | verdict | evidence | task id |\n"
+                b"|---|---|---|---|---|---|\n")
+            self.assertEqual(review.triage(root, "r1", replacement), 0)
+            after = feedback.read_bytes()
+            self.assertEqual(after[:actual_begin], immutable_prefix)
+            self.assertIn(replacement.read_bytes(), after[actual_begin:])
+            self.assertTrue(after.endswith(review.TRIAGE_END + b"\n"))
+            self.assertIn(body, after[:actual_begin])
+
+    def test_triage_command_refuses_missing_or_damaged_markers(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root(d)
+            rdir = root / "docs/reviews"
+            rdir.mkdir(parents=True)
+            replacement = root / "triage.md"
+            replacement.write_text("## Findings (triage skeleton v2)\n")
+            feedback = rdir / "r1-feedback.md"
+            for damaged in (b"header\nreply\n", review.TRIAGE_BEGIN + b"\nno end\n",
+                            review.TRIAGE_BEGIN + b"\ncontent\n" + review.TRIAGE_END
+                            + b"\ntrailing bytes"):
+                feedback.write_bytes(damaged)
+                before = feedback.read_bytes()
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    self.assertEqual(review.main([
+                        "triage", "--round", "r1", "--file", str(replacement), str(root),
+                    ]), 1)
+                self.assertEqual(feedback.read_bytes(), before)
+                self.assertIn("triage marker", err.getvalue())
+
+    def test_triage_refuses_masked_canonical_marker_via_offset_anchor(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root(d)
+            self._binding(root, "r1")
+            src = root / "reply.md"
+            body = self._reply() + (
+                b"\nQuoted protocol line:\n" + review.TRIAGE_BEGIN + b"\n")
+            src.write_bytes(body)
+            self.assertEqual(review.ingest(root, "r1", src=src), 0)
+            feedback = root / "docs/reviews/r1-feedback.md"
+            content = feedback.read_bytes()
+            # Hand-damage ONLY the canonical BEGIN (a discipline violation); the quoted BEGIN in
+            # the verbatim reply and the canonical END at EOF remain — the masking case.
+            canonical = content.rfind(b"\n" + review.TRIAGE_BEGIN + b"\n")
+            damaged = (content[:canonical] + b"\n<!-- damaged -->\n"
+                       + content[canonical + len(review.TRIAGE_BEGIN) + 2:])
+            feedback.write_bytes(damaged)
+            replacement = root / "triage.md"
+            replacement.write_text("## Findings (triage v2)\n")
+
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(review.main([
+                    "triage", "--round", "r1", "--file", str(replacement), str(root),
+                ]), 1)
+            self.assertEqual(feedback.read_bytes(), damaged)
+            self.assertIn("triage marker", err.getvalue())
 
     def test_packet_feedback_identity_uses_declared_model_and_frozen_binding(self):
         with tempfile.TemporaryDirectory() as d:
@@ -2845,6 +3020,32 @@ class IngestTests(unittest.TestCase):
             self.assertEqual(result["fires"], ["r3"])
             self.assertIsNone(result["by_round"][-1]["feedback_observed"])
             self.assertEqual(result["unknown_reviewer_feedback"], 1)
+
+    def test_overlay_projection_ignores_stored_packet_identity_assessment(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root(d)
+            self._binding(root, "r1")
+            src = root / "reply.md"
+            src.write_bytes(self._reply())
+            self.assertEqual(review.ingest(root, "r1", src=src), 0)
+
+            event_path = common.ensure_project_state_dir(root) / "overlay/review-ingests.jsonl"
+            stored = _json.loads(event_path.read_text())
+            stored.update({
+                "reviewer": "forged-model",
+                "review_target_matches": False,
+                "reviewer_configured": None,
+                "reviewer_coverage_reason": "forged-stored-result",
+                "reply_metadata": {"model": "forged-model"},
+            })
+            event_path.write_text(_json.dumps(stored) + "\n")
+
+            events, skipped = overlay.load_review_ingests(root)
+            self.assertEqual(skipped, 0)
+            self.assertEqual(events[0]["reviewer"], "gpt-5.6-sol")
+            self.assertIs(events[0]["review_target_matches"], True)
+            self.assertIs(events[0]["reviewer_configured"], True)
+            self.assertEqual(events[0]["reply_metadata"]["model"], "gpt-5.6-sol")
 
     def test_target_mismatch_and_sidecarless_legacy_are_not_configured_feedback(self):
         import contextlib
@@ -2898,7 +3099,8 @@ class IngestTests(unittest.TestCase):
             self.assertEqual(len(raw_rows), 1)
             self.assertEqual(raw_rows[0]["event_id"], "packet:r1")
             self.assertEqual(raw_rows[0]["reviewer"], "gpt-5.6-sol")
-            self.assertIs(raw_rows[0]["reviewer_configured"], True)
+            self.assertNotIn("reviewer_configured", raw_rows[0])
+            self.assertNotIn("review_target_matches", raw_rows[0])
 
     def test_force_reingest_rolls_feedback_back_if_event_correction_fails(self):
         import contextlib
@@ -4544,12 +4746,17 @@ class ImproveReviewsTests(unittest.TestCase):
             payload = _json.dumps({
                 "metadata": {"model": "gpt-5.6-sol", "effort": "xhigh",
                              "review-target": "bbbbbbbbbbbb-aaaaaaaaaaaa", "foo": "bar"},
-                "review_target_matches": True, "reviewer_configured": True,
-                "reviewer_coverage_reason": None,
+                "review_target_matches": False, "reviewer_configured": None,
+                "reviewer_coverage_reason": "forged-stored-result",
             }, separators=(",", ":"))
+            review.write_round_request_binding(
+                root, "r1", "a" * 40, "b" * 40,
+                ["codex:gpt-5.6-sol"], mode="packet")
             (rdir / "r1-feedback.md").write_text(
                 "<!-- waystone feedback -->\nround: r1\n"
                 f"reply-metadata-json: {payload}\n\n---\n\nreply body\n")
+            (rdir / "r1-request.md").write_text(
+                f"# request\n\n- Reviewing: {'a' * 40}   (diff against {'b' * 40})\n")
             registry = base / "projects.json"
             registry.write_text(_json.dumps({
                 "projects": [{"name": "demo", "path": str(root)}]}))
@@ -13453,7 +13660,9 @@ class L2CGuardTests(unittest.TestCase):
             self.assertEqual(row["round_id"], "2026-07-15-r1")
             loaded, skipped = _run_with_home(home, lambda: overlay.load_review_ingests(root))
             self.assertEqual(skipped, 0)
-            self.assertEqual({key: loaded[0][key] for key in row}, row)
+            self.assertIsNone(loaded[0]["reviewer_configured"])
+            self.assertEqual(loaded[0]["reviewer_coverage_reason"],
+                             "feedback-file-unavailable")
             self.assertTrue(loaded[0]["source_pointer"].endswith("review-ingests.jsonl:1"))
 
 

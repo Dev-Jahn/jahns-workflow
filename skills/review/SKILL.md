@@ -49,9 +49,18 @@ matches the same bare model slug; two provider-qualified identities must match c
 Missing/mismatched identity or target does not count as configured feedback for
 `review-skipped-closes-v1`.
 
-Besides the byte-exact copy, ingest **appends** (never edits the verbatim body) a *finding triage
-skeleton*: if the reply has `JW-GPT-NNN` finding blocks it builds a table, else it notes "triage the
-verbatim reply directly". Then read `<reviews_dir>/<round-id>-feedback.md` to triage.
+Besides the byte-exact copy, ingest **appends** (never edits the verbatim body) a marker-delimited
+*finding triage skeleton*: if the reply has `JW-GPT-NNN` finding blocks it builds a table, else it
+notes "triage the verbatim reply directly". Then read `<reviews_dir>/<round-id>-feedback.md` to
+triage. Never edit that feedback file directly: write only the replacement triage content (without
+the BEGIN/END markers) to a separate file such as `/tmp/review-triage.md`, then run:
+
+```bash
+waystone review triage . --round <round-id> --file /tmp/review-triage.md
+```
+
+The command replaces only the marked tail and preserves every preceding byte. Missing or damaged
+markers are a refusal, not permission to reconstruct the file.
 
 Relay any review-ingest adaptive-rule output with tri-state wording: **fired**, **did not fire
 (evaluable)**, or **unevaluable (<coverage reason>)**. Never turn an unevaluable result into a
@@ -79,10 +88,12 @@ Reviewer findings are claims, not facts. For each distinct finding:
    A blank type is not a completed triage row.
 3. Register each REAL finding via the CLI — `waystone task add <fix|perf|docs>/<slug> . --title "..." --severity <blocker|major|minor> --origin review-<round-id> [--anchor §...]` — not by editing `tasks.yaml`. The add is validated and comment-preserving.
 
-If ingest parsed a `JW-GPT-NNN` triage-skeleton table, fill each row (in the user's configured
-language; quoted reviewer text verbatim): verdict → taxonomy type → evidence/reason → task id. A free-form reply has no
-such rows — triage each finding in the verbatim body directly (verdict → taxonomy type → evidence → register REAL
-ones).
+If ingest parsed a `JW-GPT-NNN` triage-skeleton table, prepare the complete replacement triage
+section in `/tmp/review-triage.md`, filling each row (in the user's configured language; quoted
+reviewer text verbatim): verdict → taxonomy type → evidence/reason → task id. A free-form reply has
+no such rows — prepare a replacement section that records each finding from the verbatim body
+directly (verdict → taxonomy type → evidence → register REAL ones). After task registration, run
+`waystone review triage` as shown above; do not patch or rewrite the feedback file itself.
 
 ## Step 4 — Report
 

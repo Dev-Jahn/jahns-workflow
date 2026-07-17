@@ -1077,11 +1077,18 @@ def _project_review_rows(name: str, root: Path, cfg: dict) -> list[dict]:
         round_tasks = tasks_by_round.get(rid, [])
         tasks_by_id = {t["id"]: t for t in round_tasks if t.get("id")}
         referenced_task_ids: set[str] = set()
+        req = request_files.get(rid)
+        mode = (cfg.get("review") or {}).get("mode", "packet")
+        review_binding = _review_binding(req, rid, mode, request_sidecars.get(rid, []))
+        projection_binding = (review_binding
+                              if review_binding["review_binding_provenance"] == "explicit"
+                              else None)
         fb = feedback_files.get(rid)
         if fb is not None:
             import review
 
-            reply_metadata = review.read_feedback_reply_metadata(fb)
+            reply_metadata = review.read_feedback_reply_metadata(
+                fb, expected_round_id=rid, binding=projection_binding)
             try:
                 text = fb.read_text(encoding="utf-8", errors="replace")
             except OSError:
@@ -1118,9 +1125,6 @@ def _project_review_rows(name: str, root: Path, cfg: dict) -> list[dict]:
         counts = {"blocker": 0, "major": 0, "minor": 0, "unknown": 0}
         for f in findings:
             counts[f["severity"] if f["severity"] in SEVERITIES else "unknown"] += 1
-        req = request_files.get(rid)
-        mode = (cfg.get("review") or {}).get("mode", "packet")
-        review_binding = _review_binding(req, rid, mode, request_sidecars.get(rid, []))
         session_id, session_provenance, session_reason = _round_session_binding(
             rid, latest_round_exposures)
         rows.append({

@@ -30,6 +30,7 @@ Subcommands (also `waystone review <sub>`):
   prepare --round ID [root]           bind an authored packet request to the closeout HEAD
   ingest [--round ID] [--force]  parse the reply header, byte-exact copy /tmp/review.md →
                                  <id>-feedback.md, then append triage
+  triage --round ID --file PATH [root] replace only the marked triage tail
 """
 from __future__ import annotations
 
@@ -63,6 +64,7 @@ PACKET_REVIEWING_FORMAT = (
 REVIEW_REPLY_HEADER_MAX_LINES = 32
 REVIEW_REPLY_HEADER_MAX_BYTES = 16 * 1024
 FEEDBACK_HEADER_MAX_BYTES = 32 * 1024
+FEEDBACK_HEADER_SEPARATOR = b"\n\n---\n\n"
 REVIEW_EFFORT_VALUES = ("none", "minimal", "low", "medium", "high", "xhigh", "ultra")
 _REPLY_KEY_RE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9_-]*)\s*:\s*(.*?)\s*$")
 _REPLY_MODEL_RE = re.compile(
@@ -70,6 +72,8 @@ _REPLY_MODEL_RE = re.compile(
 _REVIEW_TARGET_RE = re.compile(
     r"(?P<first>[0-9a-fA-F]{12,40})(?:-(?P<second>[0-9a-fA-F]{12,40}))?")
 _FEEDBACK_METADATA_PREFIX = "reply-metadata-json: "
+TRIAGE_BEGIN = b"<!-- waystone triage: BEGIN -->"
+TRIAGE_END = b"<!-- waystone triage: END -->"
 
 
 def is_codex(login: str | None) -> bool:
@@ -189,6 +193,7 @@ def parse_review_reply_header(body: bytes) -> dict:
                 key = ""
             if key and re.fullmatch(r"[a-z][a-z0-9-]*", key):
                 started = True
+                metadata.pop(key, None)
                 damaged.add(key)
                 seen.add(key)
             warnings.append("invalid-utf8")
@@ -228,6 +233,8 @@ def parse_review_reply_header(body: bytes) -> dict:
             warnings.append(f"missing-{key}")
         elif value is None and key not in damaged:
             warnings.append(invalid)
+        if value is None:
+            metadata.pop(key, None)
     return {
         "detected": True, "metadata": metadata, "model": model, "effort": effort,
         "review_target": target, "warnings": list(dict.fromkeys(warnings)),
@@ -380,39 +387,52 @@ def ingest_round_binding(root: Path, round_id: str, cfg: dict) -> tuple[dict | N
         return None, f"corrupt-round-binding:{type(e).__name__}"
 
 
-def feedback_metadata_payload(parsed: dict, assessment: dict) -> dict:
+def _unknown_feedback_metadata(reason: str) -> dict:
     return {
-        "metadata": parsed.get("metadata") if isinstance(parsed.get("metadata"), dict) else {},
-        "review_target_matches": assessment.get("review_target_matches"),
-        "reviewer_configured": assessment.get("reviewer_configured"),
-        "reviewer_coverage_reason": assessment.get("reviewer_coverage_reason"),
-    }
-
-
-def read_feedback_reply_metadata(path: Path) -> dict:
-    """Read and revalidate ingest metadata from the bounded feedback-file header only."""
-    unknown = {
         "metadata": {}, "model": None, "effort": None, "review_target": None,
         "review_target_matches": None, "reviewer_configured": None,
-        "reviewer_coverage_reason": "reply-metadata-unavailable",
+        "reviewer_coverage_reason": reason,
     }
+
+
+def _normalized_feedback_metadata(metadata: dict) -> tuple[dict[str, str], str | None,
+                                                            str | None, str | None]:
+    """Keep unknown reply fields, but never expose an invalid standard value as raw metadata."""
+    normalized = dict(metadata)
+    model = normalize_reviewer_model(metadata.get("model"))
+    effort = normalize_review_effort(metadata.get("effort"))
+    target = normalize_review_target(metadata.get("review-target"))
+    for key, value in (("model", model), ("effort", effort), ("review-target", target)):
+        if value is None:
+            normalized.pop(key, None)
+    return normalized, model, effort, target
+
+
+def read_feedback_reply_metadata(path: Path, *, expected_round_id: str | None = None,
+                                 binding: dict | None = None) -> dict:
+    """Project reply identity from the bounded feedback header and the supplied round binding.
+
+    Stored assessment booleans are deliberately ignored. Every projection normalizes the declared
+    values again and compares them with current binding evidence.
+    """
+    unknown = _unknown_feedback_metadata("reply-metadata-unavailable")
     try:
         with Path(path).open("rb") as stream:
-            prefix = stream.read(FEEDBACK_HEADER_MAX_BYTES + 1)
+            prefix = stream.read(FEEDBACK_HEADER_MAX_BYTES + len(FEEDBACK_HEADER_SEPARATOR))
     except OSError:
-        return unknown
-    if len(prefix) > FEEDBACK_HEADER_MAX_BYTES:
-        return unknown
-    separator = prefix.find(b"\n\n---\n\n")
-    if separator < 0:
+        return _unknown_feedback_metadata("feedback-file-unavailable")
+    separator = prefix.find(FEEDBACK_HEADER_SEPARATOR)
+    if separator < 0 or separator >= FEEDBACK_HEADER_MAX_BYTES:
         return unknown
     try:
         header = prefix[:separator].decode("utf-8")
     except UnicodeDecodeError:
         return unknown
+    lines = header.splitlines()
     candidates = [line[len(_FEEDBACK_METADATA_PREFIX):]
-                  for line in header.splitlines() if line.startswith(_FEEDBACK_METADATA_PREFIX)]
-    if len(candidates) != 1:
+                  for line in lines if line.startswith(_FEEDBACK_METADATA_PREFIX)]
+    rounds = [line[len("round: "):] for line in lines if line.startswith("round: ")]
+    if len(candidates) != 1 or len(rounds) != 1 or not rounds[0]:
         return unknown
     try:
         payload = json.loads(candidates[0])
@@ -423,23 +443,21 @@ def read_feedback_reply_metadata(path: Path) -> dict:
             or any(not isinstance(key, str) or not isinstance(value, str)
                    for key, value in metadata.items())):
         return unknown
-    model = normalize_reviewer_model(metadata.get("model"))
-    effort = normalize_review_effort(metadata.get("effort"))
-    target = normalize_review_target(metadata.get("review-target"))
-    raw_target_matches = payload.get("review_target_matches")
-    target_matches = (raw_target_matches
-                      if target is not None and type(raw_target_matches) is bool else None)
-    configured = payload.get("reviewer_configured")
-    reason = payload.get("reviewer_coverage_reason")
+    metadata, model, effort, target = _normalized_feedback_metadata(metadata)
+    projected = {
+        "metadata": metadata, "model": model, "effort": effort, "review_target": target,
+    }
+    if expected_round_id is not None and rounds[0] != expected_round_id:
+        return {
+            **projected, "review_target_matches": None, "reviewer_configured": None,
+            "reviewer_coverage_reason": "feedback-round-mismatch",
+        }
+    assessment = assess_review_reply(projected, binding)
     return {
-        "metadata": metadata,
-        "model": model,
-        "effort": effort,
-        "review_target": target,
-        "review_target_matches": target_matches,
-        "reviewer_configured": (
-            True if configured is True and model is not None and target_matches is True else None),
-        "reviewer_coverage_reason": reason if isinstance(reason, str) else None,
+        **projected,
+        "review_target_matches": assessment["review_target_matches"],
+        "reviewer_configured": assessment["reviewer_configured"],
+        "reviewer_coverage_reason": assessment["reviewer_coverage_reason"],
     }
 
 
@@ -1141,7 +1159,7 @@ def _opt(argv: list[str], name: str) -> str | None:
 
 
 def _root(argv: list[str]) -> Path | None:
-    flags = ("--pr", "--round", "--sha", "--commit", "--reviewer")
+    flags = ("--pr", "--round", "--sha", "--commit", "--reviewer", "--file")
     positional = [a for i, a in enumerate(argv)
                   if not a.startswith("--") and (i == 0 or argv[i - 1] not in flags)]
     if positional:
@@ -1274,6 +1292,56 @@ def _parse_findings(text: str) -> list[dict]:
     return out
 
 
+_FEEDBACK_HEADER_SEPARATOR = b"\n\n---\n\n"
+_VERBATIM_BYTES_RE = re.compile(rb"^verbatim-bytes: (\d{1,12})$", re.MULTILINE)
+
+
+def _triage_marker_start(content: bytes) -> int:
+    """Derive the canonical tail-marker offset from the script-written header's verbatim-bytes
+    record — arithmetic, never a content search, so a reply quoting the marker strings can
+    neither mask a damaged canonical marker nor be mistaken for it."""
+    sep = content.find(_FEEDBACK_HEADER_SEPARATOR)
+    if sep < 0:
+        raise WorkflowError(
+            "feedback triage marker anchor missing: no ingest header separator")
+    header_match = _VERBATIM_BYTES_RE.search(content[:sep])
+    if header_match is None:
+        raise WorkflowError(
+            "feedback triage marker anchor missing: no verbatim-bytes header — "
+            "re-ingest with --force to record it")
+    body_start = sep + len(_FEEDBACK_HEADER_SEPARATOR)
+    marker_start = body_start + int(header_match.group(1)) + len(_FEEDBACK_HEADER_SEPARATOR)
+    end_suffix = b"\n" + TRIAGE_END + b"\n"
+    if (not content.endswith(end_suffix)
+            or content[marker_start - 1:marker_start + len(TRIAGE_BEGIN) + 1]
+            != b"\n" + TRIAGE_BEGIN + b"\n"
+            or marker_start + len(TRIAGE_BEGIN) >= len(content) - len(end_suffix) + 1):
+        raise WorkflowError("feedback triage markers are missing or damaged")
+    return marker_start
+
+
+def _marked_triage(content: bytes) -> bytes:
+    return TRIAGE_BEGIN + b"\n" + content + (b"" if content.endswith(b"\n") else b"\n") \
+        + TRIAGE_END + b"\n"
+
+
+def triage(root: Path, round_id: str, src: Path) -> int:
+    """Replace the marked feedback tail while leaving every preceding byte untouched."""
+    cfg = load_config(root)
+    dest = root / cfg["reviews_dir"] / f"{round_id}-feedback.md"
+    try:
+        content = dest.read_bytes()
+        replacement = Path(src).read_bytes()
+    except OSError as e:
+        raise WorkflowError(f"review triage input unavailable: {e}") from e
+    marker_start = _triage_marker_start(content)
+    if TRIAGE_BEGIN in replacement or TRIAGE_END in replacement:
+        raise WorkflowError("review triage input must not contain triage marker strings")
+    write_bytes_atomic(dest, content[:marker_start] + _marked_triage(replacement))
+    print(f"updated triage section → {dest}")
+    return 0
+
+
 def ingest(root: Path, round_id: str | None, src: Path = INBOX, reviewer: str | None = None,
            force: bool = False) -> int:
     """Byte-exact ingest of an external review reply.
@@ -1331,8 +1399,8 @@ def ingest(root: Path, round_id: str | None, src: Path = INBOX, reviewer: str | 
 
     findings = _parse_findings(body.decode("utf-8", "replace"))
 
-    # --- appended triage skeleton (beneath the verbatim body, which is never edited) ---
-    lines = ["", "", "---", "", "## Findings (triage skeleton — verify each before registering)", ""]
+    # --- marked triage skeleton (beneath the verbatim body, which is never edited) ---
+    lines = ["## Findings (triage skeleton — verify each before registering)", ""]
     if findings:
         lines.append("| finding | severity | type | verdict (REAL/REJECTED/NEEDS-RULING) | evidence | task id |")
         lines.append("|---|---|---|---|---|---|")
@@ -1340,10 +1408,11 @@ def ingest(root: Path, round_id: str | None, src: Path = INBOX, reviewer: str | 
             lines.append(f"| {f['id']} — {f['title']} | {f['severity']} |  |  |  |  |")
     else:
         lines.append("_No `JW-GPT-NNN` finding blocks parsed — triage the verbatim reply directly._")
-    appended = ("\n".join(lines) + "\n").encode("utf-8")
+    triage_body = ("\n".join(lines) + "\n").encode("utf-8")
+    appended = b"\n\n---\n\n" + _marked_triage(triage_body)
 
     metadata_json = json.dumps(
-        feedback_metadata_payload(parsed_header, assessment), ensure_ascii=False,
+        {"metadata": parsed_header["metadata"]}, ensure_ascii=False,
         sort_keys=True, separators=(",", ":"))
     header = (
         "<!-- waystone feedback: the body below is the reviewer reply VERBATIM (byte-exact "
@@ -1354,7 +1423,8 @@ def ingest(root: Path, round_id: str | None, src: Path = INBOX, reviewer: str | 
         f"review-target: {parsed_header['review_target'] or '(unknown)'}\n"
         f"{_FEEDBACK_METADATA_PREFIX}{metadata_json}\n"
         f"ingested: {datetime.date.today().isoformat()}\n"
-        f"source: {src}\n\n---\n\n"
+        f"source: {src}\n"
+        f"verbatim-bytes: {len(body)}\n\n---\n\n"
     )
     content = header.encode("utf-8") + body + appended
     prior_content = dest.read_bytes() if force and dest.is_file() else None
@@ -1372,7 +1442,7 @@ def ingest(root: Path, round_id: str | None, src: Path = INBOX, reviewer: str | 
         try:
             import overlay
             overlay.record_review_ingest(
-                root, round_id, reply_header=parsed_header, binding=binding, force=True)
+                root, round_id, reply_header=parsed_header, force=True)
         except Exception as e:  # noqa: BLE001 — rollback keeps the correction surfaces coherent
             try:
                 if prior_content is None:
@@ -1395,7 +1465,7 @@ def ingest(root: Path, round_id: str | None, src: Path = INBOX, reviewer: str | 
         try:
             import overlay
             overlay.record_review_ingest(
-                root, round_id, reply_header=parsed_header, binding=binding)
+                root, round_id, reply_header=parsed_header)
         except Exception as e:  # noqa: BLE001
             print(f"review ingest: overlay ingest observation unavailable ({e}) — "
                   "ingest still succeeded", file=sys.stderr)
@@ -1410,7 +1480,7 @@ def ingest(root: Path, round_id: str | None, src: Path = INBOX, reviewer: str | 
 
 
 def main(argv: list[str]) -> int:
-    if not argv or argv[0] not in ("freeze", "status", "prepare", "ingest"):
+    if not argv or argv[0] not in ("freeze", "status", "prepare", "ingest", "triage"):
         print(__doc__, file=sys.stderr)
         return 1
     sub, rest = argv[0], argv[1:]
@@ -1436,6 +1506,14 @@ def main(argv: list[str]) -> int:
             with hold_lock(project_lock_path(root)):
                 return ingest(root, _opt(rest, "--round"), reviewer=_opt(rest, "--reviewer"),
                               force="--force" in rest)
+        if sub == "triage":
+            round_id = _opt(rest, "--round")
+            source = _opt(rest, "--file")
+            if not round_id or not source:
+                print("review triage: --round ID and --file PATH are required", file=sys.stderr)
+                return 1
+            with hold_lock(project_lock_path(root)):
+                return triage(root, round_id, Path(source))
         pr_s = _opt(rest, "--pr")
         if sub == "freeze":
             if not pr_s:
