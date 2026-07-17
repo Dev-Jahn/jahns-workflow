@@ -51,9 +51,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import yaml  # noqa: E402
 
 from common import (
-    CONFIG_NAME, WorkflowError, find_project_root, git_full_sha, git_rc, hold_project_lock,
-    is_ancestor, load_config, migrate_project_state, normalize_config, parse_iso_timestamp,
-    project_state_path, upstream_ref, write_bytes_atomic,
+    CONFIG_NAME, WorkflowError, ancestry_status, fetch_upstream_head, find_project_root,
+    git_full_sha, hold_project_lock, load_config, migrate_project_state, normalize_config,
+    parse_iso_timestamp, project_state_path, write_bytes_atomic,
 )  # noqa: E402
 
 CODEX_BOT = "chatgpt-codex-connector[bot]"  # REST `user.login` form
@@ -936,12 +936,22 @@ def _remote_blob(root: Path, spec: str) -> bytes | None:
     return proc.stdout if proc.returncode == 0 else None
 
 
+def _binding_matches_exposure(binding: dict, exposure: dict) -> bool:
+    """The immutable request binding and render exposure must name one exact contract."""
+    return (
+        binding["target_sha"] == exposure["head_sha"]
+        and binding.get("base_sha") == exposure.get("base_sha")
+        and binding["reviewers"] == exposure["reviewers"]
+        and binding["mode"] == exposure["review_mode"]
+    )
+
+
 def verify_packet_publication(root: Path, round_id: str) -> int:
     """Direct-binding publication gate. The only proposition proven: this round's packet
-    (request + LATEST binding sidecar) is byte-identical in the remote-tracking tree, and the
-    closeout SHA the binding names is contained in that same remote. Reviewed-commit identity
-    comes from the binding literal; publication comes from ONE pinned remote SHA resolved at the
-    start. No ancestry topology — merge parents, first-parent chains, HEAD — is inspected
+    (request + LATEST binding sidecar) is byte-identical in the live upstream tree, and the
+    closeout SHA the binding names is contained in that same tree. Reviewed-commit identity comes
+    from the binding literal; publication comes from ONE pinned temporary-ref SHA. No ancestry
+    topology — merge parents, first-parent chains, HEAD — is inspected
     (direct-binding ruling 2026-07-17; the ancestry class was the audited pot crack)."""
     cfg = load_config(root)
     if (cfg.get("review") or {}).get("mode", "packet") != "packet":
@@ -990,10 +1000,8 @@ def verify_packet_publication(root: Path, round_id: str) -> int:
         narrative = _read_review_narrative(stored_narrative_path(root, round_id))
         if _canonical_narrative_digest(narrative) != binding["narrative_digest"]:
             raise WorkflowError("stored narrative digest does not match the latest binding")
-        if (exposure["review_mode"] != "packet"
-                or exposure["head_sha"] != binding["target_sha"]
-                or exposure.get("base_sha") != binding.get("base_sha")
-                or exposure["reviewers"] != binding["reviewers"]):
+        if exposure["review_mode"] != "packet" or not _binding_matches_exposure(
+                binding, exposure):
             raise WorkflowError("round exposure does not match the latest binding")
         reproduced = _render_review_request(round_id, exposure, narrative).encode("utf-8")
     except (OSError, UnicodeDecodeError, WorkflowError) as e:
@@ -1007,19 +1015,23 @@ def verify_packet_publication(root: Path, round_id: str) -> int:
             file=sys.stderr)
         return 1
 
-    # Pin the publication evidence once: the remote-tracking ref resolves to one immutable SHA
-    # here, and every git access below uses that literal or the binding's literal target.
-    up = upstream_ref(root)
-    if not up:
-        print("remote: no upstream tracking branch — packet publication unverifiable",
-              file=sys.stderr)
+    # Pin publication once from the exact live upstream refspec. All object access below uses
+    # this immutable SHA or the binding's literal target; persisted tracking refs are not evidence.
+    remote_sha, live = fetch_upstream_head(root)
+    if remote_sha is None:
+        print(f"remote: packet publication unverifiable — {live['reason']}", file=sys.stderr)
         return 1
-    rc, remote_sha, error = git_rc(root, "rev-parse", "--verify", f"refs/remotes/{up}^{{commit}}")
-    if rc != 0 or not remote_sha:
-        print(f"remote: cannot resolve refs/remotes/{up}: {error or 'unknown ref'}",
-              file=sys.stderr)
+    up = live["upstream"]
+    contained, ancestry_error = ancestry_status(
+        root, binding["target_sha"], remote_sha)
+    if contained is None:
+        print(
+            f"remote: cannot determine whether packet Reviewing target "
+            f"{binding['target_sha']} is contained in {up}; the repository may be shallow: "
+            f"{ancestry_error}",
+            file=sys.stderr)
         return 1
-    if not is_ancestor(root, binding["target_sha"], remote_sha):
+    if not contained:
         print(
             f"remote: packet Reviewing target {binding['target_sha']} is not contained in {up}",
             file=sys.stderr)
@@ -1615,6 +1627,9 @@ def freeze(root: Path, pr: int, round_id: str | None) -> int:
                     != request_sidecar["narrative_digest"]):
                 raise WorkflowError(
                     "stored narrative digest does not match the latest request binding")
+            if not _binding_matches_exposure(request_sidecar, exposure):
+                raise WorkflowError(
+                    "round exposure does not match the latest request binding")
             request_text = _render_review_request(round_id, exposure, narrative)
         except (OSError, UnicodeDecodeError, WorkflowError) as e:
             print(

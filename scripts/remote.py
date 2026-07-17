@@ -21,7 +21,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import find_project_root, git_rc, head_pushed, upstream_ref  # noqa: E402
+from common import find_project_root, head_pushed  # noqa: E402
 
 
 def _root(argv: list[str]) -> Path | None:
@@ -35,18 +35,9 @@ def _root(argv: list[str]) -> Path | None:
 
 def verify(root: Path, round_id: str | None = None) -> int:
     if round_id is not None:
-        # Packet publication is judged ONLY by the direct-binding gate: fetch so the pinned
-        # remote-tracking SHA is fresh, then hand over. The local HEAD's relationship to the
-        # remote is deliberately not consulted — a diverged/force-pushed local HEAD must not
-        # refuse a remote that genuinely contains the closeout and packet bytes.
-        up = upstream_ref(root)
-        if not up:
-            print("remote: cannot verify — no upstream tracking branch", file=sys.stderr)
-            return 3
-        rc, _out, err = git_rc(root, "fetch", "--quiet", up.split("/", 1)[0])
-        if rc != 0:
-            print(f"remote: cannot verify — fetch failed: {err or 'error'}", file=sys.stderr)
-            return 3
+        # The direct-binding gate fetches and pins the exact live upstream branch. The local
+        # HEAD's relationship to that branch is deliberately not consulted — a diverged local
+        # HEAD must not reject a genuinely published packet.
         import review
         return 0 if review.verify_packet_publication(root, round_id) == 0 else 3
     pushed, info = head_pushed(root, fetch=True)

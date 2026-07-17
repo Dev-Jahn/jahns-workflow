@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1584,32 +1585,134 @@ def git_full_sha(root: Path, ref: str = "HEAD") -> str | None:
 
 def upstream_ref(root: Path) -> str | None:
     """The tracked upstream (e.g. 'origin/main') of the current branch, or None."""
-    rc, out, _ = git_rc(root, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
-    return out if rc == 0 and out else None
+    tracking = _upstream_tracking(root)
+    return tracking[0] if tracking is not None else None
+
+
+def _upstream_tracking(root: Path) -> tuple[str, str, str] | None:
+    """Return (display name, remote, exact remote branch ref) without resolving its SHA."""
+    rc, local_ref, _ = git_rc(root, "symbolic-ref", "--quiet", "HEAD")
+    if rc != 0 or not local_ref.startswith("refs/heads/"):
+        return None
+    fmt = "%(upstream:short)%00%(upstream:remotename)%00%(upstream:remoteref)"
+    rc, out, _ = git_rc(root, "for-each-ref", f"--format={fmt}", local_ref)
+    fields = out.split("\0") if rc == 0 and out else []
+    if (len(fields) != 3 or not all(fields)
+            or not fields[2].startswith("refs/heads/")):
+        return None
+    return fields[0], fields[1], fields[2]
+
+
+def fetch_upstream_head(root: Path) -> tuple[str | None, dict]:
+    """Fetch the exact tracked branch into a private ref and return its live commit.
+
+    A command-line refspec deliberately bypasses configured fetch mappings. The fetched SHA is
+    read from a unique temporary ref, then the ref is deleted, so concurrent writes to the shared
+    FETCH_HEAD pseudoref cannot change the publication evidence.
+    """
+    tracking = _upstream_tracking(root)
+    if tracking is None:
+        return (None, {"reason": "no upstream tracking branch"})
+    upstream, remote_name, branch_ref = tracking
+    info = {"upstream": upstream, "remote": remote_name, "branch_ref": branch_ref}
+    if remote_name == ".":
+        return (None, {
+            **info,
+            "reason": "upstream remote '.' is local repository state, not remote publication",
+        })
+    temporary_ref = (
+        f"refs/waystone/verify-fetch-{os.getpid()}-{uuid.uuid4().hex}")
+    rc, _, fetch_error = git_rc(
+        root, "fetch", "--quiet", "--no-tags", "--force", remote_name,
+        f"+{branch_ref}:{temporary_ref}")
+    if rc != 0:
+        cleanup_rc, _, cleanup_error = git_rc(root, "update-ref", "-d", temporary_ref)
+        if cleanup_rc != 0:
+            return (None, {
+                **info,
+                "reason": (
+                    "fetch failed and temporary fetch ref cleanup failed — remote unverifiable: "
+                    f"{cleanup_error or 'error'}"),
+            })
+        probe_rc, _, probe_error = git_rc(
+            root, "ls-remote", "--exit-code", "--refs", remote_name, branch_ref)
+        if probe_rc == 2:
+            return (None, {
+                **info,
+                "reason": f"upstream branch {branch_ref} is absent on remote {remote_name}",
+            })
+        detail = fetch_error or probe_error or "error"
+        return (None, {
+            **info, "reason": f"fetch failed — remote unverifiable: {detail}",
+        })
+    sha_rc, remote_sha, sha_error = git_rc(
+        root, "rev-parse", "--verify", f"{temporary_ref}^{{commit}}")
+    cleanup_rc, _, cleanup_error = git_rc(root, "update-ref", "-d", temporary_ref)
+    if cleanup_rc != 0:
+        return (None, {
+            **info,
+            "reason": (
+                "temporary fetch ref cleanup failed — remote unverifiable: "
+                f"{cleanup_error or 'error'}"),
+        })
+    if sha_rc != 0 or not re.fullmatch(r"[0-9a-f]{40}", remote_sha):
+        return (None, {
+            **info,
+            "reason": (
+                "fetch succeeded but temporary fetch ref is empty or invalid: "
+                f"{sha_error or 'no commit'}"),
+        })
+    return remote_sha, info
+
+
+def ancestry_status(root: Path, a: str, b: str) -> tuple[bool | None, str]:
+    """Return True/False for containment, or None when Git cannot decide."""
+    rc, _, error = git_rc(root, "merge-base", "--is-ancestor", a, b)
+    if rc == 0:
+        return True, ""
+    if rc == 1:
+        return False, ""
+    return None, error or f"git merge-base exited {rc}"
 
 
 def is_ancestor(root: Path, a: str, b: str) -> bool:
     """True iff commit `a` is an ancestor of (i.e. contained in) commit `b`."""
-    rc, _, _ = git_rc(root, "merge-base", "--is-ancestor", a, b)
-    return rc == 0
+    status, _ = ancestry_status(root, a, b)
+    return status is True
 
 
 def head_pushed(root: Path, fetch: bool = True) -> tuple[bool, dict]:
     """Is the current HEAD contained in its tracked upstream (i.e. actually pushed)?
     Returns (pushed, info). Fail-closed: a fetch failure (network/auth/remote) returns
-    (False, reason) rather than trusting a stale ref. Pass fetch=False for explicit offline use."""
-    up = upstream_ref(root)
-    if not up:
-        return (False, {"reason": "no upstream tracking branch"})
-    if fetch:
-        rc, _, err = git_rc(root, "fetch", "--quiet", up.split("/", 1)[0])
-        if rc != 0:
-            return (False, {"reason": f"fetch failed — remote unverifiable: {err or 'error'}", "upstream": up})
+    (False, reason) rather than trusting a stale ref. Offline verification cannot prove
+    publication and therefore also fails closed."""
+    if not fetch:
+        tracking = _upstream_tracking(root)
+        if tracking is None:
+            return (False, {"reason": "no upstream tracking branch"})
+        return (False, {
+            "reason": "live remote fetch required — offline state cannot prove publication",
+            "upstream": tracking[0],
+        })
+    remote_sha, info = fetch_upstream_head(root)
+    if remote_sha is None:
+        return (False, info)
     head = git_full_sha(root, "HEAD")
-    pushed = is_ancestor(root, "HEAD", up)
-    rc, out, _ = git_rc(root, "rev-list", "--count", f"HEAD..{up}")
+    if head is None:
+        return (False, {**info, "reason": "local HEAD is not a commit"})
+    pushed, ancestry_error = ancestry_status(root, head, remote_sha)
+    if pushed is None:
+        return (False, {
+            **info,
+            "reason": (
+                "cannot determine whether local HEAD is contained in the live upstream: "
+                f"{ancestry_error}"),
+            "head": head,
+            "remote_sha": remote_sha,
+        })
+    rc, out, _ = git_rc(root, "rev-list", "--count", f"{head}..{remote_sha}")
     behind = int(out) if rc == 0 and out.isdigit() else None
-    return (pushed, {"upstream": up, "head": head, "behind": behind})
+    return (pushed, {**info, "head": head, "remote_sha": remote_sha, "behind": behind})
 
 
 def load_tasks(root: Path) -> dict:

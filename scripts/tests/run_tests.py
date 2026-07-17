@@ -1345,6 +1345,9 @@ class RemoteTests(unittest.TestCase):
             git(work, "push", "-q", "-u", "origin", "main")
             pushed, info = common.head_pushed(work, fetch=True)
             self.assertTrue(pushed, info)
+            offline, offline_info = common.head_pushed(work, fetch=False)
+            self.assertFalse(offline)
+            self.assertIn("live remote fetch required", offline_info.get("reason", ""))
             # new local commit, not pushed
             (work / "f.txt").write_text("1")
             git(work, "commit", "-aqm", "c1")
@@ -1373,6 +1376,70 @@ class RemoteTests(unittest.TestCase):
             pushed, info = common.head_pushed(work, fetch=True)
             self.assertFalse(pushed)  # must NOT trust the stale ref
             self.assertIn("fetch failed", info.get("reason", ""))
+
+    def test_empty_temporary_fetch_ref_fails_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            bare, work = d / "remote.git", d / "work"
+            subprocess.run(
+                ["git", "init", "-q", "--bare", "-b", "main", str(bare)], check=True)
+            work.mkdir()
+            init_repo(work)
+            git(work, "remote", "add", "origin", str(bare))
+            git(work, "push", "-q", "-u", "origin", "main")
+
+            original_git_rc = common.git_rc
+
+            def empty_temporary_ref(root, *args):
+                if (len(args) == 3 and args[:2] == ("rev-parse", "--verify")
+                        and args[2].startswith("refs/waystone/verify-fetch-")
+                        and args[2].endswith("^{commit}")):
+                    return (0, "", "")
+                return original_git_rc(root, *args)
+
+            common.git_rc = empty_temporary_ref
+            try:
+                pushed, info = common.head_pushed(work, fetch=True)
+            finally:
+                common.git_rc = original_git_rc
+            self.assertFalse(pushed)
+            self.assertIn("temporary fetch ref", info.get("reason", ""))
+
+    def test_live_fetch_evidence_ignores_fetch_head_overwrite_and_cleans_ref(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            bare, work = d / "remote.git", d / "work"
+            subprocess.run(
+                ["git", "init", "-q", "--bare", "-b", "main", str(bare)], check=True)
+            work.mkdir()
+            init_repo(work)
+            git(work, "remote", "add", "origin", str(bare))
+            git(work, "push", "-q", "-u", "origin", "main")
+            remote_tip = git(work, "rev-parse", "HEAD").stdout.strip()
+            (work / "local.txt").write_text("not pushed\n")
+            git(work, "add", "-A")
+            git(work, "commit", "-qm", "local only")
+            other_sha = git(work, "rev-parse", "HEAD").stdout.strip()
+
+            original_git_rc = common.git_rc
+
+            def overwrite_fetch_head(root, *args):
+                result = original_git_rc(root, *args)
+                if args and args[0] == "fetch" and result[0] == 0:
+                    (Path(root) / ".git" / "FETCH_HEAD").write_text(f"{other_sha}\n")
+                return result
+
+            common.git_rc = overwrite_fetch_head
+            try:
+                fetched, info = common.fetch_upstream_head(work)
+            finally:
+                common.git_rc = original_git_rc
+            self.assertEqual(fetched, remote_tip, info)
+            self.assertEqual(git(work, "rev-parse", "FETCH_HEAD").stdout.strip(), other_sha)
+            refs = git(
+                work, "for-each-ref", "--format=%(refname)",
+                "refs/waystone/verify-fetch-").stdout.strip()
+            self.assertEqual(refs, "")
 
 
 class PacketPublicationTests(unittest.TestCase):
@@ -1573,6 +1640,54 @@ Fail-loud protocol boundaries.
                 review.pr_context, review._gh = saved
         self.assertIn(f"- Reviewing: {target}", captured["body"])
         self.assertNotIn("TAMPERED-AFTER-PREPARE", captured["body"])
+
+    def test_pr_freeze_rejects_exposure_only_binding_field_tamper(self):
+        import contextlib
+        import io
+        import json
+
+        mutations = {
+            "target_sha": lambda exposure: exposure.update(head_sha="a" * 40),
+            "base_sha": lambda exposure: exposure.update(base_sha="b" * 40),
+            "reviewers": lambda exposure: exposure.update(reviewers=["reviewer-y"]),
+            "mode": lambda exposure: exposure.update(review_mode="packet"),
+        }
+        for field, mutate in mutations.items():
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as d:
+                root, target, narrative = self._closed_project(Path(d), mode="pr")
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(review.prepare_review_request(
+                        root, self.ROUND_ID, narrative), 0)
+                exposure_path, exposure = review.read_round_closeout_exposure(
+                    root, self.ROUND_ID)
+                mutate(exposure)
+                exposure_path.write_text(json.dumps(exposure) + "\n")
+                cfg = common.load_config(root)
+                ctx = {
+                    "repo": "o/r", "pr": 9, "head": target, "base_sha": "c" * 40,
+                    "base": "main", "bundle": {
+                        "head": target, "base_sha": "c" * 40, "bodies": []},
+                    "policy": cfg,
+                }
+                posted = []
+                saved = review.pr_context, review._gh
+                review.pr_context = lambda _root, _pr: ctx
+                review._gh = lambda _root, *args: (posted.append(args) or (0, "ok"))
+                err = io.StringIO()
+                try:
+                    with contextlib.redirect_stderr(err):
+                        self.assertEqual(review.freeze(root, 9, self.ROUND_ID), 1)
+                finally:
+                    review.pr_context, review._gh = saved
+                self.assertEqual(posted, [])
+                self.assertIn("round exposure", err.getvalue())
+
+    def test_pr_freeze_keeps_explicit_prepared_pair_pr_mode_check(self):
+        import inspect
+        import re
+
+        source = re.sub(r"\s+", "", inspect.getsource(review.freeze))
+        self.assertIn('request_sidecar["mode"]!="pr"', source)
 
     def test_prepare_rejects_stale_exposure_with_reclose_guidance(self):
         import contextlib
@@ -1916,12 +2031,114 @@ Fail-loud protocol boundaries.
 
     def _remote_project(self, base: Path) -> tuple[Path, str, Path]:
         bare = base / "remote.git"
-        subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+        subprocess.run(
+            ["git", "init", "-q", "--bare", "-b", "main", str(bare)], check=True)
         root, target, narrative = self._closed_project(base)
         git(root, "remote", "add", "origin", str(bare))
         git(root, "push", "-q", "-u", "origin", "main")
         self.assertEqual(review.prepare_review_request(root, self.ROUND_ID, narrative), 0)
         return root, target, narrative
+
+    def _publish_remote_packet(self, base: Path) -> tuple[Path, Path, str]:
+        publisher, target, _narrative = self._remote_project(base)
+        git(publisher, "add", "-A")
+        git(publisher, "commit", "-qm", "publish packet")
+        git(publisher, "push", "-q")
+        bare = base / "remote.git"
+        validator = base / "validator"
+        subprocess.run(["git", "clone", "-q", str(bare), str(validator)], check=True)
+        shutil.copytree(publisher / ".waystone", validator / ".waystone", dirs_exist_ok=True)
+        return validator, bare, target
+
+    def test_round_verify_rejects_deleted_upstream_despite_stale_tracking_ref(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            root, bare, _target = self._publish_remote_packet(base)
+            stale = git(root, "rev-parse", "refs/remotes/origin/main").stdout.strip()
+            deleter = base / "deleter"
+            subprocess.run(["git", "clone", "-q", str(bare), str(deleter)], check=True)
+            git(bare, "config", "receive.denyDeleteCurrent", "ignore")
+            self.assertEqual(
+                git(deleter, "push", "-q", "origin", "--delete", "main").returncode, 0)
+            self.assertEqual(
+                git(root, "rev-parse", "refs/remotes/origin/main").stdout.strip(), stale)
+
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(remote.verify(root, self.ROUND_ID), 3)
+            self.assertIn("upstream branch", err.getvalue())
+            self.assertIn("absent", err.getvalue())
+
+    def test_round_verify_ignores_excluded_stale_tracking_ref(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            root, bare, target = self._publish_remote_packet(base)
+            stale = git(root, "rev-parse", "refs/remotes/origin/main").stdout.strip()
+            git(root, "config", "--add", "remote.origin.fetch", "^refs/heads/main")
+
+            publisher = base / "publisher"
+            subprocess.run(["git", "clone", "-q", str(bare), str(publisher)], check=True)
+            git(publisher, "config", "user.email", "t@t")
+            git(publisher, "config", "user.name", "t")
+            self.assertEqual(
+                git(publisher, "checkout", "-q", "--orphan", "replacement").returncode, 0)
+            git(publisher, "rm", "-qrf", ".")
+            (publisher / "replacement.txt").write_text("unrelated remote history\n")
+            git(publisher, "add", "-A")
+            git(publisher, "commit", "-qm", "replace upstream")
+            replacement = git(publisher, "rev-parse", "HEAD").stdout.strip()
+            self.assertEqual(
+                git(publisher, "push", "-q", "--force", "origin", "HEAD:main").returncode, 0)
+            self.assertNotEqual(replacement, target)
+            self.assertEqual(git(root, "fetch", "-q", "origin").returncode, 0)
+            self.assertEqual(
+                git(root, "rev-parse", "refs/remotes/origin/main").stdout.strip(), stale)
+
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(remote.verify(root, self.ROUND_ID), 3)
+            self.assertIn("not contained", err.getvalue())
+
+    def test_round_verify_rejects_local_dot_upstream(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            root, _bare, _target = self._publish_remote_packet(Path(d))
+            git(root, "config", "branch.main.remote", ".")
+            git(root, "config", "branch.main.merge", "refs/heads/main")
+
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(remote.verify(root, self.ROUND_ID), 3)
+            self.assertIn("local repository", err.getvalue())
+            self.assertIn("not remote publication", err.getvalue())
+
+    def test_shallow_validator_reports_unknown_ancestry(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            full_validator, bare, _target = self._publish_remote_packet(base)
+            shallow = base / "shallow-validator"
+            subprocess.run([
+                "git", "clone", "-q", "--depth=1", f"file://{bare}", str(shallow),
+            ], check=True)
+            shutil.copytree(
+                full_validator / ".waystone", shallow / ".waystone", dirs_exist_ok=True)
+
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(review.verify_packet_publication(shallow, self.ROUND_ID), 1)
+            self.assertIn("cannot determine", err.getvalue())
+            self.assertIn("shallow", err.getvalue())
 
     def test_direct_binding_rejects_committed_but_unpushed_packet(self):
         import contextlib
@@ -2008,12 +2225,16 @@ Fail-loud protocol boundaries.
         source = inspect.getsource(review.verify_packet_publication)
         # Whitespace-normalized so `is_ancestor (` spellings cannot slip past the count.
         flat = re.sub(r"\s+", "", source)
+        topology_flat = flat.replace("fetch_upstream_head", "")
         for banned in ("HEAD", "first_parent", "parents", "head_pushed"):
-            self.assertNotIn(banned, flat.replace("mergeparents,first-parentchains,HEAD", ""))
+            self.assertNotIn(
+                banned, topology_flat.replace("mergeparents,first-parentchains,HEAD", ""))
         # Exactly ONE containment primitive, and it binds the two pinned literals — any second
-        # is_ancestor (or one anchored to a symbolic ref) is ancestry-inference creeping back.
-        self.assertEqual(flat.count("is_ancestor("), 1)
-        self.assertIn('ifnotis_ancestor(root,binding["target_sha"],remote_sha):', flat)
+        # ancestry_status (or one anchored to a symbolic ref) is topology inference creeping back.
+        self.assertEqual(flat.count("ancestry_status("), 1)
+        self.assertIn(
+            'contained,ancestry_error=ancestry_status('
+            'root,binding["target_sha"],remote_sha)', flat)
         # The CLI boundary must not re-introduce a HEAD-topology precheck on the --round path:
         # head_pushed belongs to the no-round question only (asserted as exactly one call site).
         remote_flat = re.sub(r"\s+", "", inspect.getsource(remote.verify))
