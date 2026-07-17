@@ -2651,15 +2651,15 @@ class IngestTests(unittest.TestCase):
         self.assertIsNone(parsed["review_target"])
         self.assertEqual(parsed["metadata"], {})
 
-    def test_reply_header_invalid_utf8_and_semantics_are_unknown_without_guessing(self):
+    def test_reply_header_invalid_utf8_block_is_absent_and_invalid_semantics_are_unknown(self):
         corrupt = review.parse_review_reply_header(
             b"model: gpt-5.6-\xff\neffort: extreme\nreview-target: not-a-range\n")
-        self.assertTrue(corrupt["detected"])
+        self.assertFalse(corrupt["detected"])
+        self.assertEqual(corrupt["metadata"], {})
         self.assertIsNone(corrupt["model"])
         self.assertIsNone(corrupt["effort"])
         self.assertIsNone(corrupt["review_target"])
-        self.assertNotIn("\ufffd", str(corrupt))
-        self.assertIn("invalid-utf8", corrupt["warnings"])
+        self.assertEqual(corrupt["warnings"], [])
 
         invalid = review.parse_review_reply_header(
             b"model: gpt-5.6-sol\neffort: extreme\nreview-target: not-a-range\n")
@@ -2677,14 +2677,28 @@ class IngestTests(unittest.TestCase):
         self.assertIn("missing-review-target", partial["warnings"])
         self.assertEqual(partial["metadata"]["foo"], "kept")
 
-    def test_damaged_duplicate_standard_key_cannot_restore_first_value(self):
+    def test_duplicate_standard_key_is_unknown_instead_of_last_wins(self):
         parsed = review.parse_review_reply_header(
-            b"model: gpt-5.6-sol\nmodel: gpt-5.6-\xff\neffort: high\n"
+            b"model: gpt-5.6-sol\nmodel: gpt-5.6-pro\neffort: high\n"
             + f"review-target: {'b' * 12}-{'a' * 12}\n".encode())
         self.assertTrue(parsed["detected"])
         self.assertIsNone(parsed["model"])
         self.assertNotIn("model", parsed["metadata"])
-        self.assertIn("invalid-utf8", parsed["warnings"])
+        self.assertIn("duplicate-model", parsed["warnings"])
+
+    def test_reply_header_decode_excludes_long_non_ascii_body_at_byte_boundary(self):
+        header = (b"model: gpt-5.6-sol\neffort: high\n"
+                  + f"review-target: {'b' * 12}-{'a' * 12}\n\n".encode())
+        padding = b"x" * (review.REVIEW_REPLY_HEADER_MAX_BYTES - len(header) - 1)
+        body = header + padding + "한글 장문 회신".encode()
+        with self.assertRaises(UnicodeDecodeError):
+            body[:review.REVIEW_REPLY_HEADER_MAX_BYTES].decode("utf-8")
+
+        parsed = review.parse_review_reply_header(body)
+        self.assertTrue(parsed["detected"])
+        self.assertEqual(parsed["model"], "gpt-5.6-sol")
+        self.assertEqual(parsed["effort"], "high")
+        self.assertEqual(parsed["review_target"], f"{'b' * 12}-{'a' * 12}")
 
     def test_reviewer_model_normalization_is_bounded_not_alias_guessing(self):
         self.assertTrue(review.reviewer_model_matches(
@@ -2721,7 +2735,7 @@ class IngestTests(unittest.TestCase):
             self.assertIn(token, review_skill)
         self.assertIn("12–40 hex", review_skill)
 
-    def test_stored_metadata_reader_is_header_bounded_and_revalidates_meaning(self):
+    def test_stored_metadata_reader_is_header_bounded_and_projects_stored_fields(self):
         with tempfile.TemporaryDirectory() as d:
             feedback = Path(d) / "feedback.md"
             payload = _json.dumps({
@@ -2739,9 +2753,9 @@ class IngestTests(unittest.TestCase):
                 "review body\n"
                 f"reply-metadata-json: {body_payload}\n")
             projected = review.read_feedback_reply_metadata(feedback)
-            self.assertEqual(projected["model"], "gpt-5.6-sol")
-            self.assertIsNone(projected["effort"])
-            self.assertIsNone(projected["review_target"])
+            self.assertEqual(projected["model"], "GPT-5.6-SOL")
+            self.assertEqual(projected["effort"], "extreme")
+            self.assertEqual(projected["review_target"], "not-a-target")
             self.assertIsNone(projected["review_target_matches"])
             self.assertIsNone(projected["reviewer_configured"])
             self.assertEqual(projected["metadata"]["foo"], "bar")
@@ -2809,7 +2823,7 @@ class IngestTests(unittest.TestCase):
             self.assertIsNone(mismatch["reviewer_configured"])
             self.assertEqual(mismatch["reviewer_coverage_reason"], "feedback-round-mismatch")
 
-    def test_projection_drops_invalid_standard_values_from_raw_metadata(self):
+    def test_projection_does_not_revalidate_structurally_valid_stored_metadata(self):
         with tempfile.TemporaryDirectory() as d:
             feedback = Path(d) / "r1-feedback.md"
             payload = _json.dumps({
@@ -2825,12 +2839,15 @@ class IngestTests(unittest.TestCase):
                     "target_sha": "a" * 40, "base_sha": "b" * 40,
                     "reviewers": ["codex:gpt-5.6-sol"],
                 })
-            self.assertEqual(projected["metadata"], {"foo": "kept"})
-            self.assertIsNone(projected["model"])
-            self.assertIsNone(projected["effort"])
-            self.assertIsNone(projected["review_target"])
+            self.assertEqual(projected["metadata"], {
+                "model": "bad value", "effort": "extreme",
+                "review-target": "not-a-target", "foo": "kept",
+            })
+            self.assertEqual(projected["model"], "bad value")
+            self.assertEqual(projected["effort"], "extreme")
+            self.assertEqual(projected["review_target"], "not-a-target")
 
-    def test_invalid_utf8_identity_ingests_as_unknown_without_replacement(self):
+    def test_invalid_utf8_header_ingests_as_absent_without_replacement(self):
         import contextlib
         import io
         with tempfile.TemporaryDirectory() as d:
@@ -2843,14 +2860,15 @@ class IngestTests(unittest.TestCase):
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
                 self.assertEqual(review.ingest(root, "r1", src=src), 0)
-            self.assertIn("invalid-utf8", err.getvalue())
+            self.assertIn("structured reply header not found", err.getvalue())
             feedback = root / "docs/reviews/r1-feedback.md"
             binding, _reason = review.ingest_round_binding(root, "r1", common.load_config(root))
             projected = review.read_feedback_reply_metadata(
                 feedback, expected_round_id="r1", binding=binding)
             self.assertIsNone(projected["model"])
-            self.assertEqual(projected["effort"], "high")
-            self.assertIs(projected["review_target_matches"], True)
+            self.assertIsNone(projected["effort"])
+            self.assertIsNone(projected["review_target"])
+            self.assertIsNone(projected["review_target_matches"])
             self.assertIsNone(projected["reviewer_configured"])
             self.assertNotIn("\ufffd", feedback.read_bytes().split(b"\n\n---\n\n", 1)[0]
                              .decode("utf-8"))

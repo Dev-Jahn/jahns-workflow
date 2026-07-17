@@ -112,7 +112,7 @@ def normalize_reviewer_model(value: object) -> str | None:
     if not isinstance(value, str):
         return None
     candidate = value.strip()
-    if "\ufffd" in candidate or _REPLY_MODEL_RE.fullmatch(candidate) is None:
+    if _REPLY_MODEL_RE.fullmatch(candidate) is None:
         return None
     return candidate.lower()
 
@@ -153,18 +153,26 @@ def parse_review_reply_header(body: bytes) -> dict:
     Leading blank lines and one optional Markdown fence are ignored; key case, order, and colon
     whitespace are insignificant. The block ends at its first blank/non-key line (or closing
     fence), is bounded to 32 lines/16 KiB, and is classified only if it contains ``model`` or
-    ``review-target``. Unknown keys are retained. Damaged UTF-8 and duplicate fields are never
-    replacement-decoded or guessed.
+    ``review-target``. Unknown keys are retained. The whole header block must be valid UTF-8;
+    duplicate fields are never guessed.
     """
+    not_detected = {
+        "detected": False, "metadata": {}, "model": None, "effort": None,
+        "review_target": None, "warnings": [],
+    }
+    raw_header: list[bytes] = []
     metadata: dict[str, str] = {}
-    damaged: set[str] = set()
+    duplicates: set[str] = set()
     warnings: list[str] = []
     seen: set[str] = set()
     started = False
     fenced = False
     consumed = 0
 
-    for line_number, raw in enumerate(body.splitlines(), 1):
+    # Slice before splitting so the scan is bounded by construction — body bytes past the cap
+    # never participate (a line truncated by the slice always trips the consumed check below).
+    for line_number, raw in enumerate(
+            body[:REVIEW_REPLY_HEADER_MAX_BYTES + 1].splitlines(), 1):
         if line_number > REVIEW_REPLY_HEADER_MAX_LINES:
             warnings.append("header-limit-exceeded")
             break
@@ -174,41 +182,38 @@ def parse_review_reply_header(body: bytes) -> dict:
             break
         stripped = raw.strip()
         if not started and not stripped:
+            raw_header.append(raw)
             continue
         if not started and re.fullmatch(rb"```[^`]*", stripped):
             started = True
             fenced = True
+            raw_header.append(raw)
             continue
         if fenced and stripped == b"```":
             break
         if started and not stripped:
             break
-        try:
-            line = raw.decode("utf-8")
-        except UnicodeDecodeError:
-            raw_key, separator, _raw_value = raw.partition(b":")
-            try:
-                key = _reply_key(raw_key.decode("ascii")) if separator else ""
-            except UnicodeDecodeError:
-                key = ""
-            if key and re.fullmatch(r"[a-z][a-z0-9-]*", key):
-                started = True
-                metadata.pop(key, None)
-                damaged.add(key)
-                seen.add(key)
-            warnings.append("invalid-utf8")
-            if not started:
-                break
-            continue
+        raw_key, separator, _raw_value = raw.partition(b":")
+        if (not separator
+                or re.fullmatch(rb"[A-Za-z][A-Za-z0-9_-]*", raw_key.strip()) is None):
+            break
+        raw_header.append(raw)
+        started = True
+
+    try:
+        header = b"\n".join(raw_header).decode("utf-8")
+    except UnicodeDecodeError:
+        return not_detected
+
+    for line in header.splitlines():
         match = _REPLY_KEY_RE.fullmatch(line)
         if match is None:
-            break
-        started = True
+            continue
         key = _reply_key(match.group(1))
         value = match.group(2).strip()
         if key in seen:
             metadata.pop(key, None)
-            damaged.add(key)
+            duplicates.add(key)
             warnings.append(f"duplicate-{key}")
             continue
         seen.add(key)
@@ -216,14 +221,11 @@ def parse_review_reply_header(body: bytes) -> dict:
 
     detected = "model" in seen or "review-target" in seen
     if not detected:
-        return {
-            "detected": False, "metadata": {}, "model": None, "effort": None,
-            "review_target": None, "warnings": [],
-        }
+        return not_detected
 
-    model = None if "model" in damaged else normalize_reviewer_model(metadata.get("model"))
-    effort = None if "effort" in damaged else normalize_review_effort(metadata.get("effort"))
-    target = (None if "review-target" in damaged
+    model = None if "model" in duplicates else normalize_reviewer_model(metadata.get("model"))
+    effort = None if "effort" in duplicates else normalize_review_effort(metadata.get("effort"))
+    target = (None if "review-target" in duplicates
               else normalize_review_target(metadata.get("review-target")))
     for key, value, invalid in (
             ("model", model, "invalid-model"),
@@ -231,7 +233,7 @@ def parse_review_reply_header(body: bytes) -> dict:
             ("review-target", target, "invalid-review-target")):
         if key not in seen:
             warnings.append(f"missing-{key}")
-        elif value is None and key not in damaged:
+        elif value is None and key not in duplicates:
             warnings.append(invalid)
         if value is None:
             metadata.pop(key, None)
@@ -395,25 +397,12 @@ def _unknown_feedback_metadata(reason: str) -> dict:
     }
 
 
-def _normalized_feedback_metadata(metadata: dict) -> tuple[dict[str, str], str | None,
-                                                            str | None, str | None]:
-    """Keep unknown reply fields, but never expose an invalid standard value as raw metadata."""
-    normalized = dict(metadata)
-    model = normalize_reviewer_model(metadata.get("model"))
-    effort = normalize_review_effort(metadata.get("effort"))
-    target = normalize_review_target(metadata.get("review-target"))
-    for key, value in (("model", model), ("effort", effort), ("review-target", target)):
-        if value is None:
-            normalized.pop(key, None)
-    return normalized, model, effort, target
-
-
 def read_feedback_reply_metadata(path: Path, *, expected_round_id: str | None = None,
                                  binding: dict | None = None) -> dict:
     """Project reply identity from the bounded feedback header and the supplied round binding.
 
-    Stored assessment booleans are deliberately ignored. Every projection normalizes the declared
-    values again and compares them with current binding evidence.
+    Stored declaration fields are parser output and are projected as-is. Stored assessment
+    booleans are ignored; every projection compares the declarations with current binding evidence.
     """
     unknown = _unknown_feedback_metadata("reply-metadata-unavailable")
     try:
@@ -443,9 +432,11 @@ def read_feedback_reply_metadata(path: Path, *, expected_round_id: str | None = 
             or any(not isinstance(key, str) or not isinstance(value, str)
                    for key, value in metadata.items())):
         return unknown
-    metadata, model, effort, target = _normalized_feedback_metadata(metadata)
     projected = {
-        "metadata": metadata, "model": model, "effort": effort, "review_target": target,
+        "metadata": metadata,
+        "model": metadata.get("model"),
+        "effort": metadata.get("effort"),
+        "review_target": metadata.get("review-target"),
     }
     if expected_round_id is not None and rounds[0] != expected_round_id:
         return {
