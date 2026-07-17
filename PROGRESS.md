@@ -2,6 +2,23 @@
 
 round 단위 작업 이력이 이 파일에 축적된다. 활성 task와 의존성은 `tasks.yaml`(CLI: `waystone task`)과 생성 파일 `ROADMAP.md` 참조.
 
+## 2026-07-18-carrier-lanes
+
+- **Goal**: fix-wave 리뷰 큐를 3-lane 병렬 체인(R: review.py / D: delegate.py / A: release)으로 전량 해소하고, deterministic-workflow carrier(CC Workflow 통합)를 편입.
+- **Shipped** (lane 항목은 전부 implementer=external-runner/codex:gpt-5.6-sol, 각 건 raw codex 적대 리뷰 + main-session agent_checks로 인수):
+  - **R lane**: fix/publication-gate-direct-binding — ancestry 추론 전삭제, 단일 명제(원격 ref가 closeout SHA + byte-identical sidecar 보유) 직접 증명 · fix/reply-header-parser-simplification — 헤더 블록 한정 단일 decode 규칙 · feat/deterministic-review-packet — script 렌더링 + freeze 재렌더(3차) · feat/review-pending-ledger — pending 파생 전용(저장 없음) · feat/waystone-statusline — 파생 1줄, consent 설치
+  - **D lane**: fix/drop-codex-companion — companion transport 전면 삭제, verify=codex exec 단일화 (ruling 2026-07-17) · fix/execution-surface-dep-gating — done 의존 게이트 · fix/preflight-probe-isolation + fix/probe-once-config-gate — 프로브 격리·1회 실행 · fix/verifier-transport-hardening — timeout/signal/빈 출력 정직 보고 · chore/hook-matrix-normal-mode-coverage — 양 모드 mutation-kill
+  - **A lane**: fix/release-checked-out-main · chore/release-script-hardening — env-allowlist smoke, TMPDIR guard, fail-loud manifest
+  - **Carrier**: decision/deterministic-workflow-carrier-semantics — ADR-0001 사용자 비준(2026-07-18) · feat/delegate-fanout-cli-contract + feat/deterministic-workflow-carrier-contract + feat/delegate-fanout-workflow-template — 14b0cff로 구현·merge, 비준으로 의존 충족 후 인수(e9e5c14)
+  - **기타**: chore/overengineering-prune-batch1 (감사 batch 1) · fix/cli-uninitialized-root-gate (Fable subagent, lock chokepoint) · fix/review-feedback-triage-discipline (마커 섹션 + 읽기 시점 재계산) · decision/lanes-verify-round-scope · docs/readme-staleness-sweep — README 표면·배지(543→719)·ADR-0001 SSOT 포인터 정정 + docs gate 3표면 확장 (main-session, Workflow carrier 분석)
+  - **Dropped 7건**: publication-gate-bypasses·reply-header-residuals·codex-exec-verifier-hardening(각 direct-binding·parser-simplification·transport-hardening으로 재설계 대체), companion 계열 2건(제거로 obsolete), verifier-guard-residuals-2, task-cli-arg-validation(strict options로 흡수)
+- **Gates**: 전체 테스트 600→719 green (112s, 2026-07-18 2회 실측) + ruff F401/F841 clean. docs gate에 신규 CLI 표면 3종 편입.
+- **SSOT**: unchanged; ADR-0001 ratified (2026-07-18).
+- **Decisions pending**: none.
+- **Review**: requested (docs/reviews/2026-07-18-carrier-lanes-request.md).
+- **Adaptive rules**: unevaluable (활성 overlay 규칙 0개).
+- **Next**: 릴리스 0.11 사용자 지시 대기 — 릴리스 후 /plugin update → hooks 마커 설치 → verifier binding 복원 → 라이브 검증. chore/migration-sunset은 전 머신 0.11+ 이관 확인 후 착수.
+
 ## 2026-07-16-fix-wave
 
 - **Goal**: 첫 라운드 리뷰 지적 2건 + 현장 dogfooding 보고 3건(사용자·bw2·spark1) + 회신 프로토콜 재설계를 최대 병렬 위임으로 해소.
