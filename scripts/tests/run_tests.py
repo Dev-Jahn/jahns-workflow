@@ -14783,6 +14783,8 @@ class M2DocsTests(unittest.TestCase):
             "waystone task set <id> --scope-add <prefix>", "waystone improve metrics",
             "waystone overlay compose", "waystone overlay promote-user",
             "waystone overlay materialize", "waystone consent record", "waystone install",
+            "waystone delegate plan --json", "waystone statusline",
+            "waystone install statusline",
         ):
             self.assertIn(f"`{surface}`", readme)
         self.assertIn("**v0.10 — Bind & Compose**", readme)

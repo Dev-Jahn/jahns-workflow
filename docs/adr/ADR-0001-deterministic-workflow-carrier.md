@@ -3,7 +3,7 @@
 - Status: accepted
 - Date: 2026-07-17
 - Round: —
-- SSOT sections affected: §8.3 (deterministic-workflow 실행 모드)
+- SSOT sections affected: 없음 — §8.3은 `dev_docs/waystone-0.7-0.9-design.md`의 절 번호(deterministic-workflow 실행 모드)이며, `SSOT.md`에는 §8이 존재하지 않는다 (2026-07-18 staleness 감사에서 좌표 정정)
 - Tasks: decision/deterministic-workflow-carrier-semantics
 - Provenance: 통합 설계안(`.claude/plans/waystone-plugin-harness-delegate-atomic-sunbeam.md` §3) 외부 리뷰 판정 **"Architecture approved, implementation changes requested"** 반영
 

@@ -13,7 +13,7 @@
 <img alt="version" src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2FDev-Jahn%2Fwaystone%2Fmain%2F.claude-plugin%2Fplugin.json&query=%24.version&prefix=v&label=version&style=flat-square">
 <img alt="Claude Code plugin" src="https://img.shields.io/badge/Claude%20Code-plugin-8A5CF6?style=flat-square">
 <img alt="Codex plugin" src="https://img.shields.io/badge/Codex-plugin-111111?style=flat-square">
-<img alt="tests" src="https://img.shields.io/badge/tests-543-success?style=flat-square">
+<img alt="tests" src="https://img.shields.io/badge/tests-719-success?style=flat-square">
 <img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square">
 </p>
 
@@ -154,8 +154,8 @@ Most validation, rendering, bookkeeping, log parsing, and policy checks are plai
 | `waystone task set <id> --scope-add <prefix>` | Appends a validated repo-relative task boundary for scope-drift evaluation. |
 | `waystone paths` | Shows the resolved project-state, machine-state, and worktree-cache locations. |
 | `waystone project` | Registers, unregisters, and lists projects through the machine-wide registry. |
-| `waystone delegate plan` | Emits an immutable fan-out manifest (with `--json`) for a set of decided tasks — dependency-gated, corrupt-fail-closed — that a deterministic-workflow carrier carries. |
-| `waystone delegate run --json-events --expect-packet-sha` | Runs one delegation; `--json-events` streams pure NDJSON on stdout and `--expect-packet-sha` (with `--expect-profile`) refuses a stale dispatch before any work starts. |
+| `waystone delegate plan --json` | Emits an immutable fan-out manifest for a set of decided tasks — dependency-gated, corrupt-fail-closed — that a deterministic-workflow carrier carries. |
+| `waystone delegate run --json-events --expect-packet-sha` | Runs one delegation; `--json-events` streams pure NDJSON on stdout, `--expect-packet-sha` (with `--expect-profile`) refuses a stale dispatch before any work starts, and `--carrier` / `--carrier-instance` record carrier attribution in the immutable packet. |
 | `waystone delegate status --json` | Reports delegation state (including `corrupt`) with an exact `task_id` field for machine consumption. |
 | `waystone delegate verify` | Re-runs independent read-only verification of a delegation result in its preserved worktree. |
 | `waystone delegate verdict` | Records the main session's evidence-backed apply or discard decision before resolution. |
@@ -167,6 +167,8 @@ Most validation, rendering, bookkeeping, log parsing, and policy checks are plai
 | `waystone consent record` | Records candidate-bound user consent for materialization or managed installation. The command group is `waystone consent`. |
 | `waystone install agents` / `waystone install hooks` | Installs a consent-approved managed project agent or enables the plugin-owned boundary hook. Hook enablement creates `.waystone/boundary-hooks-enabled` for both Claude Code and Codex and never writes `.claude/settings.json`; remove the marker to roll it back. The command group is `waystone install`. |
 | `waystone check` | Evaluates active overlay rules against the current project state; warnings are visible but never block the host command. |
+| `waystone statusline` | Renders one read-only derived-state line (tasks done/total, round, pending reviews, blockers) for the host status line; degrades to an empty segment in cold or corrupt environments. |
+| `waystone install statusline` | Consent-gated managed install of the statusline command hook; refuses to overwrite an existing `statusLine` setting. |
 | `waystone improve evidence` | Deterministically joins review findings and delegation records by task ID into a local evidence log. |
 | `waystone improve metrics` | Appends named §15 metrics and a factual comparison with the previous same-scope snapshot. |
 
