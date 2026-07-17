@@ -249,11 +249,12 @@ tasks:
     severity: "major"
     origin: "사용자 결정 (2026-07-17)"
   - id: chore/hook-matrix-normal-mode-coverage
+    result: "위임 2차 패치(양모드 실 subprocess 매트릭스+mutation-kill 6/6+명시 env) + main 마무리(스냅샷 약화 복원: _verify_worktree_state 동등성, lstat mode·symlink identity, 정상모드 HEAD/status 불변) @ 커밋. 661 OK, ruff 클린."
     accept: ["plugin hooks.json에 등록된 전 hook 스크립트(boundary_check + verifier_guard 경유 전체, nudge/session_context/resume 포함)가 정상 모드(WAYSTONE_VERIFIER_SESSION 부재)에서 실 subprocess로 기대 동작을 내는 회귀 테스트가 존재한다", "hermetic 모드(WAYSTONE_VERIFIER_SESSION=1)와 정상 모드의 hook별 동작 차이가 같은 매트릭스에서 명시적으로 고정된다", "hook 테스트가 호출 환경의 HOME을 상속하지 않는다 (테스트 자체 HOME 고정)", "전체 테스트 스위트(신규 계약은 RED-first)와 ruff F401,F841 검사가 통과한다", "매 hooks.json entry가 선행 hook 실행 상태에 오염되지 않는 인과 독립 단언을 가진다 — 해당 entry 명령을 no-op으로 치환하면 그 단언이 실패함을 mutation 실행으로 실증하고 보고서에 기록 (SessionEnd 포함)", "정상/hermetic 쓰기 차이가 hook별로 고정된다 — 각 hook 실행 후 worktree와 synthetic HOME 양쪽을 대조하고, session_context 정상 모드의 WAYSTONE_HOME 쓰기는 존재(정상)/부재(hermetic)로 명시 단언", "HOME 격리의 의미를 명확화: hook subprocess 환경은 명시 구성되어 호출자 HOME이 hook 프로세스에 도달하지 않으면 충족 — fixture 준비 명령(git, uv cache dir)의 caller-env 사용은 스위트 관례상 허용"]
     notes: "전신 chore/verifier-guard-residuals-2(드롭됨)에서 생존한 항목 — broker 관련 항목(RPC 완료 대기, pre-cleanup fail-closed)은 fix/drop-codex-companion의 companion 전면 제거로 소멸."
     scope: ["scripts", "hooks"]
     title: "hook-matrix 회귀를 정상 모드(가드 부재)까지 확장: nudge, session_context, resume 포함 전 hook의 실 subprocess 동작을 양 모드에서 고정 (HOME 상속 정리 포함)"
-    status: "pending"
+    status: "done"
     severity: "minor"
     origin: "review-raw-adversarial-20260716"
   - id: fix/codex-exec-verifier-hardening
@@ -279,6 +280,8 @@ tasks:
     severity: "major"
     origin: "review-raw-adversarial-20260716"
   - id: fix/task-cli-arg-validation
+    accept: ["task 서브커맨드(add/set/drop/show/list/archive)가 미지원 옵션을 즉시 오류로 거부하며 옵션 문자열을 root 경로로 오인하지 않는다 (drop --reason 사고 재현 계약 테스트, RED-first)", "migration/profile seeding은 초기화된 프로젝트 root(.waystone.yml 존재)에서만 동작하고 임의 경로에 디렉터리를 생성하지 않는다", "task drop이 --reason 옵션을 지원해 사유가 해당 task notes에 기록된 뒤 drop된다", "전체 테스트 스위트(신규 계약 RED-first)와 ruff F401,F841 검사가 통과한다"]
+    scope: ["scripts"]
     title: "task CLI 인자 검증 부재: task drop <id> --reason <문장>이 미지원 플래그를 조용히 root 경로로 오인 — 존재하지 않는 root에 migration이 profile을 auto-seed(디렉터리 생성 부작용)한 뒤 crash. 미지원 옵션은 즉시 거부하고, migration seeding은 초기화된 프로젝트 root에서만 동작해야 함"
     status: "pending"
     severity: "major"
@@ -305,6 +308,8 @@ tasks:
     title: "codex-companion transport 완전 제거 — codex backend verifier를 호스트 불문 codex exec로 통일, ultra effort 관통, WAYSTONE_HOST 분기·legacy transport 정리"
     status: "dropped"
   - id: chore/overengineering-prune-batch1
+    accept: ["discard가 discarding 상태 재개 시 원래 reason의 정확 재현을 요구하지 않는다 — 새 reason 또는 자동 승계로 discarded 전이하며 관련 테스트는 새 계약으로 교체된다", "claim 경로의 packet 검증에서 중복 다이제스트 재도출이 제거되어 단일 검증만 남는다 — run --expect-packet-sha의 fan-out 스테일 차단은 유지", "improve._review_sha_binding wrapper와 전용 테스트가 삭제된다 (프로덕션 호출자 0 재확인 포함)", "_finding_evidence의 '..' 경로 거부 분기가 제거된다 (해당 문자열은 어디서도 dereference되지 않음을 근거로)", "전체 테스트 스위트와 ruff F401,F841 통과 — 기존 계약 약화는 삭제 대상 자체의 전용 테스트에 한정"]
+    scope: ["scripts"]
     title: "오버엔지니어링 전수조사 A-2 순삭제 묶음: discard 재개 시 reason 정확 재현 강제 제거, packet 3중 검사에서 claim측 다이제스트 재도출 축약, improve._review_sha_binding dead wrapper 삭제, _finding_evidence의 '..' 경로 거부 제거 (근거: dev_docs/overengineering-audit-2026-07-17.md)"
     status: "pending"
     severity: "minor"
