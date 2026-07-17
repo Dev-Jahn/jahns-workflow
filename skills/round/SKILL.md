@@ -85,76 +85,73 @@ PROGRESS.md with the current month + the header pointers.
 
 ## Step 4 — Request review
 
-The reviewer reads the repository from its git remote, so packet publication is part of round
-closeout, not a local-only handoff. First commit the closeout (`docs(round): close <round-id>`) so
-`tasks.yaml` / PROGRESS and generated views are fixed in one **closeout SHA**. Do not push or report
-the request yet.
+Review-request generation is an unconditional part of round closeout. Never ask whether to create
+it and never end the round without either passing its publication gate or reporting that gate's
+failure.
 
-Write `<reviews_dir>/<round-id>-request.md` from `$WAYSTONE_PLUGIN_ROOT/templates/review-request.md`: what
-changed and *why*, the files to read first, falsifiable "claims to attack", evidence pointers (to
-where logs/PROGRESS already live — do **not** copy them), known weak spots, and the domain lens. Fill
-`Reviewing` with the closeout SHA from `git rev-parse HEAD` and the diff base with the
-**`review diff base`** value
-`waystone round close` printed in Step 2 (the previous round's tip, or `(root)` for the first round — the
-live `state.last_round_commit` is no longer it, having just advanced to this round's tip).
+Write only the model-authored narrative to `/tmp/<round-id>-review-narrative.md`. It must contain
+these six `##` sections exactly once and in this order: `What changed and why`, `Read these first`,
+`Claims to attack`, `Evidence already produced (mine — inspect, don't trust)`, `Known weak spots`,
+and `Domain lens`. Point to existing logs/PROGRESS evidence rather than copying it. Do not add
+project, branch, reviewer, Reviewing/diff-base, or response fields; the renderer owns every protocol
+surface and rejects lookalikes.
 
-The structured line is a protocol field. It must be one literal line with no suffix, annotation,
-tab, wrapping, or spacing variation:
-
-```text
-- Reviewing: <40-lowercase-hex-closeout-sha>   (diff against <40-lowercase-hex-base-sha-or-(root)>)
-```
-
-Keep the template's reply-header block verbatim — it is the machine-parsed reviewer contract.
-Its semantics are stated once, statically, in the template itself (and, for ingest behavior, in
-the review skill); do not restate or paraphrase them here or in the handoff prompt.
-
-**Packet mode** (`review.mode: packet`, default): bind the authored request while HEAD is still the
-closeout SHA, commit the request and generated binding together, push, then run the round-aware
-publication gate:
+**Packet mode** (`review.mode: packet`, default): while `HEAD` still equals the immutable exposure
+written by `round close`, render and bind the request, then commit all round-close outputs and the
+two generated review artifacts together. The model never opens or edits the rendered request.
 
 ```bash
-waystone review prepare --round <round-id> .
-git add -- <reviews_dir>/<round-id>-request.md <reviews_dir>/<round-id>-request.binding*.json
-git commit -m "docs(review): publish <round-id> request"
+waystone review prepare --round <round-id> \
+  --narrative /tmp/<round-id>-review-narrative.md .
+git add -- <round-close outputs> \
+  <reviews_dir>/<round-id>-request.md <reviews_dir>/<round-id>-request.binding*.json
+git commit -m "docs(round): close and publish <round-id>"
 git push
 waystone remote verify . --round <round-id>
 ```
 
-`review prepare` fails if `Reviewing` is not the current closeout HEAD. `remote verify --round`
-fetches the tracked remote and fails unless pushed HEAD contains both the request and its matching
-binding unchanged; an untracked file, staged-only file, partial commit, malformed line, corrupt
-binding, or unpushed HEAD cannot pass. If any command fails, STOP without reporting a review-ready
-packet.
+`review prepare` derives the exact target/base, project, branch, and resolved reviewer from the
+round exposure, renders the plugin template, and refuses a stale `HEAD`, a mismatched immutable
+sidecar, an invalid narrative, or an unresolved template token. `remote verify --round` then proves
+the request and matching binding are committed unchanged in the pushed publication commit. If a
+command fails, stop without reporting a review-ready packet.
 
-After the gate passes, give the user a remote locator containing the upstream ref, publication SHA,
-and repo-relative request path — for example
-`origin/dev@<publication-sha>:docs/reviews/<round-id>-request.md` — plus a one-line prompt, e.g.:
+After the gate passes, give the user the verified upstream ref, publication SHA, and repo-relative
+request path, followed only by a short instruction to review that request at that remote commit.
 
-> remote의 `origin/dev@<publication-sha>:docs/reviews/<round-id>-request.md`를 읽고, 거기 적힌
-> claim이 코드/테스트로 성립하는지 같은 remote commit의 repo를 직접 확인하며 major 위주로
-> 도메인 리뷰해줘.
+**PR mode** (`review.mode: pr`): a request cannot be committed into the SHA it names. Commit and
+push the round-close outputs first, record a host-local exposure at that fixed commit, render the
+host-local request, and let `freeze` post that rendered document as the PR-comment carrier:
 
-If a repo-local `docs/review-profile.md` exists (the project's standing domain lens), the reviewer
-reads it too — the brief points there.
+```bash
+git add -- <round-close outputs>
+git commit -m "docs(round): close <round-id>"
+git push
+waystone remote verify .
+waystone round reclose . --round <round-id>
+waystone review prepare --round <round-id> \
+  --narrative /tmp/<round-id>-review-narrative.md .
+waystone review freeze --pr <N> --round <round-id> .
+waystone review status --pr <N> .
+```
 
-**PR mode** (`review.mode: pr`): commit and push the request, run `waystone remote verify .`, then
-freeze a SHA-bound review cycle and post the `@codex` request:
-`waystone review freeze --pr <N> --round <round-id> .` (stamps the current
-PR head as cycle N + posts the request). The macro reviewer reads the PR + the request file. Check
-progress with `waystone review status --pr <N>`; never treat "a comment appeared" as "review done" — a
-review is `(reviewer, cycle, reviewed_sha)`.
+`round reclose` changes only host-local immutable exposure evidence and preserves the original round
+diff base. It refuses while tracked closeout changes are uncommitted; untracked files are
+deliberately outside that check — commit every closeout artifact before reclosing. `freeze` refuses unless the prepared request and binding target the exact current PR head
+and configured reviewer set. Never treat comment presence as review completion; the formal identity
+remains `(reviewer, cycle, reviewed_sha)`.
 
 ## Step 5 — Report
 
 Report in the user's configured language: shipped tasks (id — title), registry/roadmap state, and
-the verified remote locator (`<upstream>@<publication-sha>:<reviews_dir>/<round-id>-request.md`).
-Do not describe a local-only path as review-ready.
+the packet mode's verified remote locator
+(`<upstream>@<publication-sha>:<reviews_dir>/<round-id>-request.md`) or the PR mode's frozen cycle,
+PR number, and reviewed SHA. Do not describe a local-only path as review-ready.
 
 End with the **next-step reminder** (so the reply is preserved byte-exact, not re-typed by a model):
 
-> Give the reviewer the verified remote round-request locator and the prompt; the reviewer fetches
-> that remote SHA and reads the repo there. To ingest the reply, save it **in a separate shell**:
+> For packet mode, give the reviewer the verified remote round-request locator; PR mode already
+> carries the rendered request in its frozen comment. To ingest the reply, save it **in a separate shell**:
 > `cat > /tmp/review.md` → paste → `Ctrl-D`. Then run `/waystone:review <round-id>` in Claude
 > Code or `$waystone:review <round-id>` in Codex; it copies `/tmp/review.md` verbatim into the
 > reviews dir (no model retyping) and triages it.

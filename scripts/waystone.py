@@ -479,7 +479,7 @@ def _module_handles_phase2(argv: list[str]) -> bool:
         return False
     if argv[0] in {"task", "review", "delegate", "overlay", "check", "roadmap"}:
         return True
-    return argv[0] == "round" and len(argv) > 1 and argv[1] == "close"
+    return argv[0] == "round" and len(argv) > 1 and argv[1] in {"close", "reclose"}
 
 
 def main(argv: list[str]) -> int:
@@ -544,9 +544,9 @@ def main(argv: list[str]) -> int:
         if rest and rest[0] == "merge":
             import merge
             return merge.main(["merge", *rest[1:]])
-        if rest and rest[0] == "close":
+        if rest and rest[0] in {"close", "reclose"}:
             return _run_module_main("round", rest)
-        print("waystone round: expected 'close' or 'merge'", file=sys.stderr)
+        print("waystone round: expected 'close', 'reclose', or 'merge'", file=sys.stderr)
         return 1
     if group == "lanes":
         return _run_module_main("lanes", rest)

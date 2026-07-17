@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import (
     ROUND_RE, WorkflowError, _project_slug, _read_registry, canonical_payload_hash,
     content_hash, ensure_project_state_dir, find_project_root, has_accepted_consent, hold_lock,
-    hold_project_lock, load_config, load_tasks, machine_dir, migrate_project_state,
+    git_rc, hold_project_lock, load_config, load_tasks, machine_dir, migrate_project_state,
     overlay_lock_path, parse_iso_timestamp, project_state_path, record_consent,
     registry_entry_paths, registry_lock_path, registry_path, write_text_atomic,
 )  # noqa: E402
@@ -2292,12 +2292,51 @@ def _capture_round_evidence(root: Path, base_sha: str | None, head_sha: str | No
     }
 
 
+def _write_round_exposure_file(root: Path, round_id: str, exposure: dict):
+    edir = _exposure_dir(root)
+    _mkdir_or_refuse(edir)
+    base = edir / f"round-{round_id}.json"
+    path = base
+    number = 2
+    content = json.dumps(exposure, ensure_ascii=False, indent=2) + "\n"
+    while True:
+        try:
+            with path.open("x", encoding="utf-8") as stream:
+                stream.write(content)
+            return path, exposure
+        except FileExistsError:
+            path = base.with_name(f"{base.stem}-{number}{base.suffix}")
+            number += 1
+        except BaseException:
+            # open('x') made this path ours; a failed write must not leave a partial immutable record.
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+
+
+def reclose_round_exposure(root: Path, previous_path: Path, previous: dict, head_sha: str):
+    """Rebind an already closed round to its committed PR closeout without touching repo files."""
+    _ensure_project_state_or_refuse(root)
+    exposure = json.loads(json.dumps(previous))
+    branch_rc, branch, _branch_error = git_rc(root, "branch", "--show-current")
+    if branch_rc != 0 or not branch:
+        branch = "(detached)"
+    exposure["at"] = _now_iso()
+    exposure["head_sha"] = head_sha
+    exposure["project"]["branch"] = branch
+    exposure["reclosed_from"] = str(previous_path)
+    return _write_round_exposure_file(root, exposure["round_id"], exposure)
+
+
 def write_round_exposure(root: Path, round_id: str, head_sha: str | None, watermark: str | None,
                          session_id: str | None = None, *, base_sha: str | None = None,
                          task_scopes: dict[str, list[str]] | None = None,
                          task_scope_coverage: dict[str, str] | None = None,
                          done_task_ids: list[str] | None = None,
-                         routes: list[dict] | None = None):
+                         routes: list[dict] | None = None,
+                         reviewers: list[str] | None = None):
     """Immutable per-round exposure record written at close (§9/#4). A re-close of the same round-id
     gets a `-2`/`-3` suffix (H4 precedent — existing records are never overwritten)."""
     _ensure_project_state_or_refuse(root)
@@ -2328,12 +2367,19 @@ def write_round_exposure(root: Path, round_id: str, head_sha: str | None, waterm
             "done_task_ids": sorted(set(done_task_ids or [])), "done_evidence": [],
         }
     policy_composition = compose_policy(root, round_id=round_id)
+    branch_rc, branch, _branch_error = git_rc(root, "branch", "--show-current")
+    if branch_rc != 0 or not branch:
+        branch = "(detached)"
     exposure = {
         "schema": "waystone-round-exposure-1", "round_id": round_id, "at": _now_iso(),
         "session_id": session_id,
-        "project": {"pslug": _project_slug(root), "root": str(Path(root).resolve())},
+        "project": {
+            "pslug": _project_slug(root), "root": str(Path(root).resolve()),
+            "name": cfg.get("project"), "branch": branch,
+        },
         "head_sha": head_sha, "config_watermark": watermark, "base_sha": base_sha,
         "profile_fingerprint": fp, "bindings": bindings,
+        "reviewers": list(reviewers or []),
         "start_level": cfg["policy"]["start_level"],
         "routes": list(routes or []),
         "config_fingerprint": config_fingerprint,
@@ -2350,27 +2396,7 @@ def write_round_exposure(root: Path, round_id: str, head_sha: str | None, waterm
         # recorded waivers. These are truthful contract values, not missing-data fallbacks.
         "guards": None, "waivers": [],
     }
-    edir = _exposure_dir(root)
-    _mkdir_or_refuse(edir)
-    base = edir / f"round-{round_id}.json"
-    p = base
-    n = 2
-    content = json.dumps(exposure, ensure_ascii=False, indent=2) + "\n"
-    while True:
-        try:
-            with p.open("x", encoding="utf-8") as stream:
-                stream.write(content)
-            return p, exposure
-        except FileExistsError:
-            p = base.with_name(f"{base.stem}-{n}{base.suffix}")
-            n += 1
-        except BaseException:
-            # open('x') made this path ours; a failed write must not leave a partial immutable record.
-            try:
-                p.unlink()
-            except FileNotFoundError:
-                pass
-            raise
+    return _write_round_exposure_file(root, round_id, exposure)
 
 
 # ---- CLI (hand-rolled parsing; {0,1,2} exit contract) --------------------------

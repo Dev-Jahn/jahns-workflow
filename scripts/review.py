@@ -27,7 +27,8 @@ Markers (HTML comments embedded in PR comment bodies):
 Subcommands (also `waystone review <sub>`):
   freeze --pr N [--round ID] [root]   stamp the current PR head as a new review cycle + post request
   status [--pr N] [root]              show per-cycle review status (PR mode) or packet pairs (packet mode)
-  prepare --round ID [root]           bind an authored packet request to the closeout HEAD
+  prepare --round ID --narrative PATH [root]
+                                       render and bind a request from the round exposure
   ingest [--round ID] [--force]  parse the reply header, byte-exact copy /tmp/review.md →
                                  <id>-feedback.md, then append triage
   triage --round ID --file PATH [root] replace only the marked triage tail
@@ -48,7 +49,7 @@ import yaml  # noqa: E402
 from common import (
     CONFIG_NAME, WorkflowError, find_project_root, git_full_sha, git_rc, hold_project_lock,
     is_ancestor, load_config, migrate_project_state, normalize_config, parse_iso_timestamp,
-    write_bytes_atomic,
+    project_state_path, write_bytes_atomic,
 )  # noqa: E402
 
 CODEX_BOT = "chatgpt-codex-connector[bot]"  # REST `user.login` form
@@ -74,6 +75,23 @@ _REVIEW_TARGET_RE = re.compile(
 _FEEDBACK_METADATA_PREFIX = "reply-metadata-json: "
 TRIAGE_BEGIN = b"<!-- waystone triage: BEGIN -->"
 TRIAGE_END = b"<!-- waystone triage: END -->"
+REVIEW_REQUEST_TEMPLATE = Path(__file__).resolve().parent.parent / "templates" / "review-request.md"
+NARRATIVE_HEADINGS = (
+    "## What changed and why",
+    "## Read these first",
+    "## Claims to attack",
+    "## Evidence already produced (mine — inspect, don't trust)",
+    "## Known weak spots",
+    "## Domain lens",
+)
+# Matched per line AFTER wrapper normalization (leading whitespace / blockquote / list markers
+# stripped) so indentation or quoting cannot smuggle a protocol lookalike past the renderer.
+_NARRATIVE_REFERENCE_RE = re.compile(
+    r"^(?:[-*+]\s*)?(?:Reviewing|Reviewer|Project|Branch)\s*:")
+_NARRATIVE_REPLY_KEY_RE = re.compile(
+    r"(?i)^(?:[-*+]\s*)?(?:model|effort|review-target)\s*:")
+_NARRATIVE_WRAPPER_RE = re.compile(r"^(?:\s+|>\s*|[-*+]\s+|\d{1,9}[.)]\s+|\[[ xX]\]\s+)")
+_TEMPLATE_TOKEN_RE = re.compile(r"\[\[[A-Z_]+\]\]")
 
 
 def is_codex(login: str | None) -> bool:
@@ -285,7 +303,8 @@ def assess_review_reply(parsed: dict, binding: dict | None) -> dict:
 
 
 def write_round_request_binding(root: Path, round_id: str, target_sha: str, base_sha: str | None,
-                                reviewers: list[str], *, mode: str) -> Path:
+                                reviewers: list[str], *, mode: str,
+                                directory: Path | None = None) -> Path:
     """Append an immutable round-bound sidecar for packet request projection.
 
     A PR request row records the pre-freeze relationship but is never promoted to a reviewed-SHA
@@ -295,8 +314,11 @@ def write_round_request_binding(root: Path, round_id: str, target_sha: str, base
         raise WorkflowError("round request binding requires full target/base commit SHAs")
     if mode not in ("packet", "pr") or not _is_strlist(reviewers):
         raise WorkflowError("round request binding requires packet|pr mode and literal reviewers")
-    cfg = load_config(root)
-    directory = Path(root) / cfg["reviews_dir"]
+    if directory is None:
+        cfg = load_config(root)
+        directory = Path(root) / cfg["reviews_dir"]
+    else:
+        directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     row = {
         "schema": ROUND_REQUEST_BINDING_SCHEMA, "round_id": round_id,
@@ -542,34 +564,204 @@ def parse_packet_request_binding(path: Path) -> tuple[str, str | None] | None:
     return target_sha, None if raw_base == "(root)" else raw_base
 
 
-def prepare_packet_request(root: Path, round_id: str) -> int:
-    """Create the request sidecar while HEAD is still the closeout commit being reviewed."""
+def stored_narrative_path(root: Path, round_id: str) -> Path:
+    """Host-local copy of the validated narrative prepare rendered with — freeze re-renders from
+    it instead of re-trusting the on-disk request file."""
+    return project_state_path(root) / "review-requests" / f"{round_id}-narrative.md"
+
+
+def prepared_request_path(root: Path, round_id: str, *, mode: str | None = None) -> Path:
+    """Mode-specific request carrier: tracked packet file or host-local PR comment source."""
     cfg = load_config(root)
-    if (cfg.get("review") or {}).get("mode", "packet") != "packet":
-        print("review prepare: review.mode is not packet", file=sys.stderr)
-        return 1
-    request = root / cfg["reviews_dir"] / f"{round_id}-request.md"
-    request_binding = parse_packet_request_binding(request)
-    if request_binding is None:
-        return 1
-    target_sha, base_sha = request_binding
-    head = git_full_sha(root, "HEAD")
-    if target_sha != head:
-        print(
-            f"review prepare: Reviewing target {target_sha} is not the closeout HEAD {head or '?'}; "
-            "author the request after the closeout commit and before the publication commit",
-            file=sys.stderr)
-        return 1
+    selected = mode or (cfg.get("review") or {}).get("mode", "packet")
+    if selected == "packet":
+        return Path(root) / cfg["reviews_dir"] / f"{round_id}-request.md"
+    if selected == "pr":
+        return project_state_path(root) / "review-requests" / f"{round_id}-request.md"
+    raise WorkflowError(f"review prepare: unsupported review.mode {selected!r}")
+
+
+def _round_exposure_order(path: Path, row: dict) -> tuple[str, int, str]:
+    base = f"round-{row['round_id']}"
+    match = re.fullmatch(rf"{re.escape(base)}-(\d+)\.json", path.name)
+    return str(row["at"]), int(match.group(1)) if match else 1, str(path)
+
+
+def read_round_closeout_exposure(root: Path, round_id: str) -> tuple[Path, dict]:
+    """Load the newest immutable exposure for exactly ``round_id`` as the render binding."""
+    import overlay
+
+    directory = overlay._exposure_dir(root)
+    filename_re = re.compile(rf"^round-{re.escape(round_id)}(?:-(\d+))?\.json$")
+    paths = [path for path in sorted(directory.glob("round-*.json"))
+             if filename_re.fullmatch(path.name)] if directory.is_dir() else []
+    if not paths:
+        raise WorkflowError(
+            f"round exposure is missing for {round_id}; reclose the round before preparing review")
+    rows: list[tuple[Path, dict]] = []
+    for path in paths:
+        try:
+            row = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+            raise WorkflowError(f"corrupt round exposure {path}: {type(e).__name__}") from e
+        project = row.get("project") if isinstance(row, dict) else None
+        if (not isinstance(row, dict) or row.get("schema") != "waystone-round-exposure-1"
+                or row.get("round_id") != round_id or parse_iso_timestamp(row.get("at")) is None
+                or not _is_sha(row.get("head_sha"))
+                or (row.get("base_sha") is not None and not _is_sha(row.get("base_sha")))
+                or row.get("review_mode") not in ("packet", "pr")
+                or not _is_strlist(row.get("reviewers")) or not row["reviewers"]
+                or not isinstance(project, dict) or not _nonempty_str(project.get("name"))
+                or not _nonempty_str(project.get("branch"))):
+            raise WorkflowError(
+                f"round exposure {path} lacks a deterministic review binding; "
+                "reclose the round with the current Waystone version")
+        rows.append((path, row))
+    return max(rows, key=lambda item: _round_exposure_order(*item))
+
+
+def _narrative_lookalike_line(text: str) -> str | None:
+    """Return the first narrative line that impersonates a protocol surface, else None.
+
+    Each line is normalized by repeatedly stripping leading whitespace, blockquote (>) and
+    list markers before matching, so wrappers cannot hide a lookalike; fenced code blocks
+    get no exemption — the renderer owns every protocol surface."""
+    for raw in text.splitlines():
+        line = raw
+        while True:
+            stripped = _NARRATIVE_WRAPPER_RE.sub("", line, count=1)
+            if stripped == line:
+                break
+            line = stripped
+        if _NARRATIVE_REFERENCE_RE.match(line) or _NARRATIVE_REPLY_KEY_RE.match(line):
+            return raw
+    return None
+
+
+def _read_review_narrative(path: Path) -> str:
     try:
-        path = write_round_request_binding(
-            root, round_id, target_sha, base_sha,
-            resolve_reviewers(root, (cfg.get("review") or {}).get("reviewers", [])),
-            mode="packet")
-    except (OSError, WorkflowError) as e:
-        print(f"review prepare: packet request binding unavailable ({e})", file=sys.stderr)
+        text = Path(path).read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        raise WorkflowError(f"cannot read UTF-8 review narrative {path}: {e}") from e
+    if "\r" in text:
+        text = text.replace("\r\n", "\n")
+        if "\r" in text:
+            raise WorkflowError("review narrative contains unsupported bare carriage returns")
+    headings = re.findall(r"(?m)^## .+$", text)
+    if tuple(headings) != NARRATIVE_HEADINGS:
+        raise WorkflowError(
+            "review narrative must contain exactly the six canonical narrative sections in order")
+    for index, heading in enumerate(NARRATIVE_HEADINGS):
+        start = text.index(heading) + len(heading)
+        end = text.index(NARRATIVE_HEADINGS[index + 1]) if index + 1 < len(headings) else len(text)
+        if not text[start:end].strip():
+            raise WorkflowError(f"review narrative section is empty: {heading}")
+    lookalike = _narrative_lookalike_line(text)
+    if lookalike is not None:
+        raise WorkflowError(
+            f"review narrative contains a protocol-field lookalike ({lookalike.strip()!r}); "
+            "reference and reply-header fields are rendered only by the template")
+    if _TEMPLATE_TOKEN_RE.search(text):
+        raise WorkflowError("review narrative contains a reserved template token")
+    return text.strip() + "\n"
+
+
+def _render_review_request(round_id: str, exposure: dict, narrative: str) -> str:
+    try:
+        template = REVIEW_REQUEST_TEMPLATE.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        raise WorkflowError(f"review request template unavailable: {e}") from e
+    project = exposure["project"]
+    reviewers = exposure["reviewers"]
+    target_sha = exposure["head_sha"]
+    replacements = {
+        "[[ROUND_ID]]": round_id,
+        "[[PROJECT]]": project["name"],
+        "[[BRANCH]]": project["branch"],
+        "[[REVIEWERS]]": ", ".join(reviewers),
+        "[[REVIEWING_SHA]]": target_sha,
+        "[[DIFF_BASE]]": exposure.get("base_sha") or "(root)",
+        "[[NARRATIVE]]": narrative.rstrip(),
+        "[[REPLY_MODEL]]": reviewers[0],
+        "[[REVIEW_TARGET]]": target_sha,
+    }
+    found = set(_TEMPLATE_TOKEN_RE.findall(template))
+    if found != set(replacements) or any(template.count(token) != 1 for token in replacements):
+        raise WorkflowError("review request template token contract is incomplete or ambiguous")
+    rendered = template
+    for token, value in replacements.items():
+        if "\n" in value and token != "[[NARRATIVE]]":
+            raise WorkflowError(f"review request binding contains a newline for {token}")
+        rendered = rendered.replace(token, value)
+    if _TEMPLATE_TOKEN_RE.search(rendered):
+        raise WorkflowError("review request rendering left an unresolved template token")
+    canonical_lines = (
+        "- Project:", "- Branch:", "- Reviewer:", "- Reviewing:",
+    )
+    for prefix in canonical_lines:
+        if len(re.findall(rf"(?m)^{re.escape(prefix)}.*$", rendered)) != 1:
+            raise WorkflowError(f"rendered review request must contain one canonical {prefix} line")
+    for key in ("model", "effort", "review-target"):
+        if len(re.findall(rf"(?mi)^{re.escape(key)}\s*:", rendered)) != 1:
+            raise WorkflowError(f"rendered review request must contain one canonical {key} key")
+    candidates = re.findall(r"(?m)^- Reviewing:.*$", rendered)
+    match = PACKET_REVIEWING_RE.fullmatch(candidates[0]) if len(candidates) == 1 else None
+    if match is None or match.group(1) != target_sha:
+        raise WorkflowError("rendered Reviewing field does not match the round exposure target")
+    return rendered if rendered.endswith("\n") else rendered + "\n"
+
+
+def prepare_review_request(root: Path, round_id: str, narrative_path: Path) -> int:
+    """Render exact fields from the round exposure and merge only validated narrative input."""
+    try:
+        cfg = load_config(root)
+        mode = (cfg.get("review") or {}).get("mode", "packet")
+        _exposure_path, exposure = read_round_closeout_exposure(root, round_id)
+        if exposure["review_mode"] != mode:
+            raise WorkflowError(
+                f"round exposure review.mode {exposure['review_mode']!r} differs from current "
+                f"mode {mode!r}; reclose the round")
+        head = git_full_sha(root, "HEAD")
+        if head != exposure["head_sha"]:
+            raise WorkflowError(
+                f"current HEAD {head or '?'} differs from round exposure closeout head "
+                f"{exposure['head_sha']}; reclose the round before preparing review")
+        request = prepared_request_path(root, round_id, mode=mode)
+        expected = {
+            "target_sha": exposure["head_sha"], "base_sha": exposure.get("base_sha"),
+            "reviewers": exposure["reviewers"], "mode": mode,
+        }
+        existing_paths = sorted(request.parent.glob(f"{round_id}-request.binding*.json"))
+        for path in existing_paths:
+            row = read_round_request_binding(path, expected_round_id=round_id)
+            if any(row.get(key) != value for key, value in expected.items()):
+                raise WorkflowError(
+                    f"existing request sidecar {path} disagrees with the round exposure; "
+                    "reclose and prepare with a new round id instead of superseding immutable evidence")
+        narrative = _read_review_narrative(narrative_path)
+        rendered = _render_review_request(round_id, exposure, narrative)
+        request.parent.mkdir(parents=True, exist_ok=True)
+        write_bytes_atomic(request, rendered.encode("utf-8"))
+        narrative_store = stored_narrative_path(root, round_id)
+        narrative_store.parent.mkdir(parents=True, exist_ok=True)
+        write_bytes_atomic(narrative_store, narrative.encode("utf-8"))
+        binding_path = write_round_request_binding(
+            root, round_id, expected["target_sha"], expected["base_sha"],
+            expected["reviewers"], mode=mode, directory=request.parent)
+    except (OSError, WorkflowError, ValueError) as e:
+        print(f"review prepare: {e}", file=sys.stderr)
         return 1
-    print(f"prepared packet request binding: {path}")
+    print(f"prepared {mode} review request: {request}")
+    print(f"prepared review request binding: {binding_path}")
     return 0
+
+
+def prepare_packet_request(root: Path, round_id: str, narrative_path: Path | None = None) -> int:
+    """Compatibility name for callers of the former packet-only prepare function."""
+    if narrative_path is None:
+        print("review prepare: --narrative PATH is required", file=sys.stderr)
+        return 1
+    return prepare_review_request(root, round_id, narrative_path)
 
 
 def _committed_unchanged(root: Path, path: Path) -> tuple[bool, str | None]:
@@ -1150,7 +1342,7 @@ def _opt(argv: list[str], name: str) -> str | None:
 
 
 def _root(argv: list[str]) -> Path | None:
-    flags = ("--pr", "--round", "--sha", "--commit", "--reviewer", "--file")
+    flags = ("--pr", "--round", "--sha", "--commit", "--reviewer", "--file", "--narrative")
     positional = [a for i, a in enumerate(argv)
                   if not a.startswith("--") and (i == 0 or argv[i - 1] not in flags)]
     if positional:
@@ -1179,6 +1371,44 @@ def freeze(root: Path, pr: int, round_id: str | None) -> int:
     n = next_cycle_number(markers)
     reviewers, profile_fingerprint = resolve_reviewer_set(
         root, policy["review"]["reviewers"])
+    request_text = None
+    if round_id is not None:
+        request = prepared_request_path(root, round_id, mode="pr")
+        sidecar_paths = sorted(request.parent.glob(f"{round_id}-request.binding*.json"))
+        if not request.is_file() or not sidecar_paths:
+            print(
+                "review freeze: prepared PR request or its binding is missing; run "
+                f"waystone review prepare --round {round_id} --narrative PATH first",
+                file=sys.stderr)
+            return 1
+        try:
+            rows = [(path, read_round_request_binding(path, expected_round_id=round_id))
+                    for path in sidecar_paths]
+            _binding_path, request_sidecar = max(
+                rows, key=lambda item: round_request_binding_order(*item))
+            # The published carrier is RE-RENDERED from the same inputs prepare used (round
+            # exposure + stored narrative) — the on-disk request file is never re-trusted, so
+            # a post-prepare edit cannot reach the PR comment. Re-rendering IS the integrity.
+            _exposure_path, exposure = read_round_closeout_exposure(root, round_id)
+            narrative = _read_review_narrative(stored_narrative_path(root, round_id))
+            request_text = _render_review_request(round_id, exposure, narrative)
+        except (OSError, UnicodeDecodeError, WorkflowError) as e:
+            print(
+                f"review freeze: prepared PR request is not reproducible ({e}); re-run "
+                f"waystone review prepare --round {round_id} --narrative PATH",
+                file=sys.stderr)
+            return 1
+        request_binding = (exposure["head_sha"], exposure.get("base_sha"))
+        if (request_sidecar["mode"] != "pr"
+                or (request_sidecar["target_sha"], request_sidecar.get("base_sha"))
+                != request_binding
+                or request_sidecar["target_sha"] != head
+                or request_sidecar["reviewers"] != reviewers):
+            print(
+                "review freeze: prepared PR request does not match the current PR head/reviewer "
+                "binding; reclose and prepare again with a new round id",
+                file=sys.stderr)
+            return 1
     marker = emit_marker("review-cycle", {
         "round_id": round_id or "(unset)", "cycle": n, "target_sha": head,
         "base_sha": base_sha, "reviewers": reviewers,
@@ -1192,6 +1422,7 @@ def freeze(root: Path, pr: int, round_id: str | None) -> int:
             + (f"Macro reviewer(s) — {', '.join(macro)}: review at the SHA above; end your reply with "
                f"a `waystone-review-result` footer carrying `reviewed_sha: {head}` and `review_cycle: {n}`.\n\n"
                if macro else "")
+            + ((request_text.rstrip() + "\n\n") if request_text is not None else "")
             + marker + "\n")
     rc, out = _gh(root, "pr", "comment", str(pr), "--body", body)
     if rc != 0:
@@ -1488,11 +1719,12 @@ def main(argv: list[str]) -> int:
     try:
         if sub == "prepare":
             round_id = _opt(rest, "--round")
-            if not round_id:
-                print("review prepare: --round ID is required", file=sys.stderr)
+            narrative = _opt(rest, "--narrative")
+            if not round_id or not narrative:
+                print("review prepare: --round ID and --narrative PATH are required", file=sys.stderr)
                 return 1
             with hold_project_lock(root):
-                return prepare_packet_request(root, round_id)
+                return prepare_review_request(root, round_id, Path(narrative))
         if sub == "ingest":
             with hold_project_lock(root):
                 return ingest(root, _opt(rest, "--round"), reviewer=_opt(rest, "--reviewer"),

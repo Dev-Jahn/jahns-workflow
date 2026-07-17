@@ -572,6 +572,42 @@ class LockWiringTests(unittest.TestCase):
             self.assertFalse((home / ".waystone" / "projects.json").exists())
 
 
+_PR_NARRATIVE = "\n".join([
+    "## What changed and why", "The round made packet rendering deterministic.",
+    "## Read these first", "scripts/review.py",
+    "## Claims to attack", "Freeze republishes only rendered bytes.",
+    "## Evidence already produced (mine — inspect, don't trust)", "Full suite green.",
+    "## Known weak spots", "None recorded.",
+    "## Domain lens", "Fail-loud protocol boundaries.", ""])
+
+
+def _pr_prepared_round(base: Path, reviewers: str, *, pre_close=None) -> tuple[Path, str, str]:
+    """Closed + prepared pr-mode fixture for round-bound freeze paths: (root, head, round_id)."""
+    import contextlib
+    import io
+
+    root = base / "repo"
+    root.mkdir()
+    init_repo(root)
+    (root / ".waystone.yml").write_text(
+        "version: 1\nproject: demo\nreviews_dir: docs/reviews\n"
+        f"review:\n  mode: pr\n  reviewers: [{reviewers}]\n"
+        "state:\n  last_round_commit: null\n")
+    (root / "tasks.yaml").write_text("version: 1\nproject: demo\ntasks: []\n")
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", "setup")
+    head = git(root, "rev-parse", "HEAD").stdout.strip()
+    if pre_close is not None:
+        pre_close(root)
+    rid = "2026-07-17-prfix"
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert round.close(root, rid, done=[], touched=[], commit="HEAD") == 0
+        narrative = base / "narrative.md"
+        narrative.write_text(_PR_NARRATIVE)
+        assert review.prepare_review_request(root, rid, narrative) == 0
+    return root, head, rid
+
+
 class MarkerTests(unittest.TestCase):
     def test_emit_parse_roundtrip(self):
         s = review.emit_marker("review-cycle", {"round_id": "2026-06-15-x", "cycle": 1,
@@ -974,40 +1010,50 @@ class MarkerTests(unittest.TestCase):
 
     def test_freeze_request_lists_custom_macro_reviewer(self):
         captured = {}
-        # freeze reads the BASE policy via pr_context; a custom non-codex reviewer must be prompted
-        ctx = {"repo": "o/r", "pr": 3, "head": "a" * 40, "base_sha": "b" * 40, "base": "main",
-               "bundle": {"head": "a" * 40, "base_sha": "b" * 40, "bodies": []},
-               "policy": common.normalize_config(
-                   {"version": 1, "project": "x", "review": {"mode": "pr", "reviewers": ["codex", "research-auditor"]}})}
+        # freeze reads the BASE policy via pr_context; a custom non-codex reviewer must be
+        # prompted. Round-bound: the frozen carrier path requires a real prepared round.
+        with tempfile.TemporaryDirectory() as d:
+            root, head, rid = _pr_prepared_round(Path(d), "codex, research-auditor")
+            ctx = {"repo": "o/r", "pr": 3, "head": head, "base_sha": "b" * 40, "base": "main",
+                   "bundle": {"head": head, "base_sha": "b" * 40, "bodies": []},
+                   "policy": common.normalize_config(
+                       {"version": 1, "project": "x",
+                        "review": {"mode": "pr", "reviewers": ["codex", "research-auditor"]}})}
 
-        def fake_gh(root, *args):
-            if len(args) >= 2 and args[0] == "pr" and args[1] == "comment":
-                captured["body"] = args[args.index("--body") + 1]
-            return (0, "")
+            def fake_gh(root, *args):
+                if len(args) >= 2 and args[0] == "pr" and args[1] == "comment":
+                    captured["body"] = args[args.index("--body") + 1]
+                return (0, "")
 
-        saved = (review.pr_context, review._gh)
-        review.pr_context = lambda root, pr: ctx
-        review._gh = fake_gh
-        try:
-            review.freeze(Path("/x"), 3, "2026-06-22-r")
-        finally:
-            review.pr_context, review._gh = saved
+            saved = (review.pr_context, review._gh)
+            review.pr_context = lambda root, pr: ctx
+            review._gh = fake_gh
+            try:
+                import contextlib
+                import io
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(review.freeze(root, 3, rid), 0)
+            finally:
+                review.pr_context, review._gh = saved
         self.assertIn("research-auditor", captured.get("body", ""))  # custom reviewer prompted, not name-guessed
         self.assertIn("@codex review", captured["body"])
+        self.assertIn(f"- Reviewing: {head}", captured["body"])  # round-bound carrier present
 
     def test_reviewer_role_freezes_full_backend_identity_and_profile_fingerprint(self):
         captured = {}
         with tempfile.TemporaryDirectory() as d:
-            root = Path(d)
-            (root / ".waystone.yml").write_text("version: 1\nproject: x\n")
-            state = common.ensure_project_state_dir(root)
-            (state / "profile.yml").write_text(
-                "schema: waystone-profile-1\nbindings:\n"
-                "  reviewer: {execution: forked-subagent, backend: 'claude:opus-4.1'}\n")
+            def write_profile(root: Path) -> None:
+                state = common.ensure_project_state_dir(root)
+                (state / "profile.yml").write_text(
+                    "schema: waystone-profile-1\nbindings:\n"
+                    "  reviewer: {execution: forked-subagent, backend: 'claude:opus-4.1'}\n")
+
+            root, head, rid = _pr_prepared_round(
+                Path(d), "codex, role:reviewer", pre_close=write_profile)
             ctx = {
-                "repo": "o/r", "pr": 3, "head": "a" * 40, "base_sha": "b" * 40,
+                "repo": "o/r", "pr": 3, "head": head, "base_sha": "b" * 40,
                 "base": "main", "bundle": {
-                    "head": "a" * 40, "base_sha": "b" * 40, "bodies": []},
+                    "head": head, "base_sha": "b" * 40, "bodies": []},
                 "policy": common.normalize_config({
                     "version": 1, "project": "x", "review": {
                         "mode": "pr", "reviewers": ["codex", "role:reviewer"]}}),
@@ -1021,7 +1067,10 @@ class MarkerTests(unittest.TestCase):
             review.pr_context = lambda _root, _pr: ctx
             review._gh = fake_gh
             try:
-                self.assertEqual(review.freeze(root, 3, "2026-07-15-l2-a"), 0)
+                import contextlib
+                import io
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(review.freeze(root, 3, rid), 0)
             finally:
                 review.pr_context, review._gh = saved
 
@@ -1328,6 +1377,33 @@ class RemoteTests(unittest.TestCase):
 class PacketPublicationTests(unittest.TestCase):
     ROUND_ID = "2026-07-16-packet"
 
+    NARRATIVE = """## What changed and why
+
+The round made packet rendering deterministic.
+
+## Read these first
+
+1. `scripts/review.py` — renderer and binding checks
+
+## Claims to attack
+
+1. Narrative text cannot override protocol fields.
+
+## Evidence already produced (mine — inspect, don't trust)
+
+| Claim | Command / artifact | My reading | Where it lives |
+|---|---|---|---|
+| renderer | `tests` | deterministic | `scripts/tests/run_tests.py` |
+
+## Known weak spots
+
+PR publication has a different carrier.
+
+## Domain lens
+
+Fail-loud protocol boundaries.
+"""
+
     def _request(self, root: Path, target: str, base: str = "(root)") -> Path:
         request = root / "docs" / "reviews" / f"{self.ROUND_ID}-request.md"
         request.parent.mkdir(parents=True, exist_ok=True)
@@ -1335,6 +1411,274 @@ class PacketPublicationTests(unittest.TestCase):
             f"# Review Request — {self.ROUND_ID}\n\n"
             f"- Reviewing: {target}   (diff against {base})\n")
         return request
+
+    def _closed_project(self, base: Path, *, mode: str = "packet") -> tuple[Path, str, Path]:
+        root = base / "repo"
+        root.mkdir()
+        init_repo(root)
+        (root / ".waystone.yml").write_text(
+            "version: 1\nproject: demo\nreviews_dir: docs/reviews\n"
+            f"review:\n  mode: {mode}\n  reviewers: [reviewer-x]\n"
+            "state:\n  last_round_commit: null\n")
+        (root / "tasks.yaml").write_text("version: 1\nproject: demo\ntasks: []\n")
+        git(root, "add", "-A")
+        git(root, "commit", "-qm", "setup")
+        target = git(root, "rev-parse", "HEAD").stdout.strip()
+        self.assertEqual(round.close(
+            root, self.ROUND_ID, done=[], touched=[], commit="HEAD"), 0)
+        narrative = base / "narrative.md"
+        narrative.write_text(self.NARRATIVE)
+        return root, target, narrative
+
+    def test_prepare_renders_template_from_round_exposure_and_narrative(self):
+        import re
+
+        with tempfile.TemporaryDirectory() as d:
+            root, target, narrative = self._closed_project(Path(d))
+            self.assertEqual(review.prepare_review_request(
+                root, self.ROUND_ID, narrative), 0)
+
+            request = root / "docs" / "reviews" / f"{self.ROUND_ID}-request.md"
+            rendered = request.read_text()
+            for line in (
+                    "- Project: demo", "- Branch: main", "- Reviewer: reviewer-x",
+                    f"- Reviewing: {target}   (diff against (root))"):
+                self.assertEqual(rendered.count(line), 1, line)
+            for heading in review.NARRATIVE_HEADINGS:
+                self.assertEqual(rendered.count(heading), 1, heading)
+            for key in ("model:", "effort:", "review-target:"):
+                self.assertEqual(len(re.findall(rf"(?m)^{re.escape(key)}", rendered)), 1, key)
+            self.assertIn(f"review-target: {target}", rendered)
+            self.assertNotRegex(rendered, r"\[\[[A-Z_]+\]\]")
+            for old_placeholder in (
+                    "{round-id}", "{project}", "{branch}",
+                    "{40-lowercase-hex-closeout-sha}"):
+                self.assertNotIn(old_placeholder, rendered)
+
+            binding = review.read_round_request_binding(next(
+                (root / "docs" / "reviews").glob(
+                    f"{self.ROUND_ID}-request.binding*.json")))
+            self.assertEqual(binding["target_sha"], target)
+            self.assertIsNone(binding["base_sha"])
+            self.assertEqual(binding["reviewers"], ["reviewer-x"])
+
+    def test_prepare_rejects_narrative_protocol_lookalikes(self):
+        lookalikes = (
+            "- Reviewing: deadbeef", "- Reviewer: somebody", "- Project: foreign",
+            "- Branch: other", "model: other", "effort: low", "review-target: deadbeef",
+        )
+        for index, lookalike in enumerate(lookalikes):
+            with self.subTest(lookalike=lookalike), tempfile.TemporaryDirectory() as d:
+                root, _target, narrative = self._closed_project(Path(d))
+                narrative.write_text(self.NARRATIVE.replace(
+                    "Fail-loud protocol boundaries.",
+                    f"Fail-loud protocol boundaries.\n{lookalike}"))
+                import contextlib
+                import io
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    self.assertEqual(review.prepare_review_request(
+                        root, self.ROUND_ID, narrative), 1, index)
+                self.assertIn("narrative", err.getvalue().lower())
+                self.assertIn("protocol", err.getvalue().lower())
+                self.assertFalse((root / "docs" / "reviews" /
+                                  f"{self.ROUND_ID}-request.md").exists())
+
+    def test_prepare_rejects_wrapped_narrative_lookalikes(self):
+        wrapped = (
+            "  - Reviewer: somebody",
+            "> - Reviewing: deadbeef",
+            "* model: other",
+            ">   effort: low",
+            "```\n- Reviewing: deadbeef\n```",
+            "- -Reviewer: tight",
+            "1. model: other",
+            "- [ ] review-target: deadbeef",
+        )
+        for index, lookalike in enumerate(wrapped):
+            with self.subTest(lookalike=lookalike), tempfile.TemporaryDirectory() as d:
+                root, _target, narrative = self._closed_project(Path(d))
+                narrative.write_text(self.NARRATIVE.replace(
+                    "Fail-loud protocol boundaries.",
+                    f"Fail-loud protocol boundaries.\n{lookalike}"))
+                import contextlib
+                import io
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    self.assertEqual(review.prepare_review_request(
+                        root, self.ROUND_ID, narrative), 1, index)
+                self.assertIn("lookalike", err.getvalue().lower())
+                self.assertFalse((root / "docs" / "reviews" /
+                                  f"{self.ROUND_ID}-request.md").exists())
+
+    def test_prepare_allows_ordinary_bullets_tables_and_quotes_in_narrative(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            root, _target, narrative = self._closed_project(Path(d))
+            narrative.write_text(self.NARRATIVE.replace(
+                "Fail-loud protocol boundaries.",
+                "Fail-loud protocol boundaries.\n- 일반 불릿: 설명\n"
+                "| model 열 | 값 |\n> 인용 문장입니다."))
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(
+                    review.prepare_review_request(root, self.ROUND_ID, narrative), 0)
+
+    def test_reclose_refuses_dirty_tracked_tree_even_at_same_head(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            root, _target, _narrative = self._closed_project(Path(d))
+            (root / "tasks.yaml").write_text(
+                "version: 1\nproject: demo\ntasks: []\n# dirty\n")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(round.reclose(root, self.ROUND_ID), 1)
+            self.assertIn("commit the closeout", err.getvalue())
+
+    def test_pr_freeze_republishes_rendered_request_not_disk_file(self):
+        import contextlib
+        import io
+
+        captured = {}
+        with tempfile.TemporaryDirectory() as d:
+            root, target, narrative = self._closed_project(Path(d), mode="pr")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(review.prepare_review_request(
+                    root, self.ROUND_ID, narrative), 0)
+            request = review.prepared_request_path(root, self.ROUND_ID, mode="pr")
+            request.write_text(request.read_text() + "\nTAMPERED-AFTER-PREPARE\n")
+            ctx = {"repo": "o/r", "pr": 9, "head": target, "base_sha": "b" * 40,
+                   "base": "main",
+                   "bundle": {"head": target, "base_sha": "b" * 40, "bodies": []},
+                   "policy": common.normalize_config(
+                       {"version": 1, "project": "demo",
+                        "review": {"mode": "pr", "reviewers": ["reviewer-x"]}})}
+
+            def fake_gh(_root, *args):
+                if len(args) >= 2 and args[0] == "pr" and args[1] == "comment":
+                    captured["body"] = args[args.index("--body") + 1]
+                return (0, "")
+
+            saved = (review.pr_context, review._gh)
+            review.pr_context = lambda _root, _pr: ctx
+            review._gh = fake_gh
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(review.freeze(root, 9, self.ROUND_ID), 0)
+            finally:
+                review.pr_context, review._gh = saved
+        self.assertIn(f"- Reviewing: {target}", captured["body"])
+        self.assertNotIn("TAMPERED-AFTER-PREPARE", captured["body"])
+
+    def test_prepare_rejects_stale_exposure_with_reclose_guidance(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            root, _target, narrative = self._closed_project(Path(d))
+            (root / "after.txt").write_text("new head\n")
+            git(root, "add", "-A")
+            git(root, "commit", "-qm", "advance after close")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(review.prepare_review_request(
+                    root, self.ROUND_ID, narrative), 1)
+            self.assertIn("reclose", err.getvalue().lower())
+            self.assertFalse((root / "docs" / "reviews" /
+                              f"{self.ROUND_ID}-request.md").exists())
+
+    def test_prepare_rejects_existing_mismatched_sidecar_without_supersede(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            root, target, narrative = self._closed_project(Path(d))
+            foreign = "a" * 40 if target != "a" * 40 else "b" * 40
+            existing = review.write_round_request_binding(
+                root, self.ROUND_ID, foreign, None, ["reviewer-x"], mode="packet")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(review.prepare_review_request(
+                    root, self.ROUND_ID, narrative), 1)
+            self.assertIn("new round id", err.getvalue().lower())
+            self.assertEqual(list((root / "docs" / "reviews").glob(
+                f"{self.ROUND_ID}-request.binding*.json")), [existing])
+            self.assertFalse((root / "docs" / "reviews" /
+                              f"{self.ROUND_ID}-request.md").exists())
+
+    def test_prepare_supports_pr_mode_without_unrendered_placeholders(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, target, narrative = self._closed_project(Path(d), mode="pr")
+            self.assertEqual(review.prepare_review_request(
+                root, self.ROUND_ID, narrative), 0)
+            request = review.prepared_request_path(root, self.ROUND_ID, mode="pr")
+            rendered = request.read_text()
+            self.assertIn(f"- Reviewing: {target}   (diff against (root))", rendered)
+            self.assertNotRegex(rendered, r"\[\[[A-Z_]+\]\]")
+            binding = review.read_round_request_binding(next(
+                request.parent.glob(f"{self.ROUND_ID}-request.binding*.json")))
+            self.assertEqual(binding["mode"], "pr")
+            self.assertEqual(binding["target_sha"], target)
+
+    def test_round_reclose_rebinds_only_host_local_exposure_to_current_head(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, _target, _narrative = self._closed_project(Path(d), mode="pr")
+            git(root, "add", "-A")
+            git(root, "commit", "-qm", "closeout state")
+            closeout = git(root, "rev-parse", "HEAD").stdout.strip()
+            config_before = (root / ".waystone.yml").read_bytes()
+
+            self.assertEqual(round.reclose(root, self.ROUND_ID), 0)
+            _path, exposure = review.read_round_closeout_exposure(root, self.ROUND_ID)
+            self.assertEqual(exposure["head_sha"], closeout)
+            self.assertIsNone(exposure["base_sha"])
+            self.assertEqual((root / ".waystone.yml").read_bytes(), config_before)
+            self.assertEqual(git(root, "status", "--short").stdout, "")
+
+    def test_waystone_dispatches_round_reclose(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, _target, _narrative = self._closed_project(Path(d), mode="pr")
+            git(root, "add", "-A")
+            git(root, "commit", "-qm", "closeout state")
+            closeout = git(root, "rev-parse", "HEAD").stdout.strip()
+            env = os.environ.copy()
+            env.update({"HOME": str(Path(d) / "home"),
+                        "WAYSTONE_HOME": str(Path(d) / "home" / ".waystone")})
+            result = subprocess.run(
+                [sys.executable, str(SCRIPTS / "waystone.py"), "round", "reclose",
+                 str(root), "--round", self.ROUND_ID],
+                cwd=root, env=env, capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            _path, exposure = review.read_round_closeout_exposure(root, self.ROUND_ID)
+            self.assertEqual(exposure["head_sha"], closeout)
+
+    def test_pr_freeze_posts_prepared_request_as_the_comment_carrier(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, target, narrative = self._closed_project(Path(d), mode="pr")
+            self.assertEqual(review.prepare_review_request(
+                root, self.ROUND_ID, narrative), 0)
+            cfg = common.load_config(root)
+            ctx = {
+                "repo": "o/r", "pr": 7, "head": target, "base_sha": "b" * 40,
+                "base": "main", "bundle": {
+                    "head": target, "base_sha": "b" * 40, "bodies": []},
+                "policy": cfg,
+            }
+            posted = []
+            original_context, original_gh = review.pr_context, review._gh
+            review.pr_context = lambda _root, _pr: ctx
+            review._gh = lambda _root, *args: (posted.append(args) or (0, "ok"))
+            try:
+                self.assertEqual(review.freeze(root, 7, self.ROUND_ID), 0)
+            finally:
+                review.pr_context, review._gh = original_context, original_gh
+            body = posted[0][posted[0].index("--body") + 1]
+            self.assertIn(f"# Review Request — {self.ROUND_ID}", body)
+            self.assertIn(f"- Reviewing: {target}   (diff against (root))", body)
+            self.assertEqual(body.count("## Response wanted"), 1)
 
     def test_reviewing_line_is_exact_and_malformed_input_warns(self):
         import contextlib
@@ -1366,24 +1710,23 @@ class PacketPublicationTests(unittest.TestCase):
 
     def test_prepare_binds_request_to_closeout_head_and_is_idempotent(self):
         with tempfile.TemporaryDirectory() as d:
-            root = Path(d)
-            init_repo(root)
-            (root / ".waystone.yml").write_text(
-                "version: 1\nproject: demo\nreviews_dir: docs/reviews\n")
-            head = git(root, "rev-parse", "HEAD").stdout.strip()
-            self._request(root, head)
+            root, head, narrative = self._closed_project(Path(d))
 
-            self.assertEqual(review.prepare_packet_request(root, self.ROUND_ID), 0)
+            self.assertEqual(review.prepare_packet_request(
+                root, self.ROUND_ID, narrative), 0)
             bindings = list((root / "docs" / "reviews").glob(
                 f"{self.ROUND_ID}-request.binding*.json"))
             self.assertEqual(len(bindings), 1)
-            self.assertEqual(review.prepare_packet_request(root, self.ROUND_ID), 0)
+            self.assertEqual(review.prepare_packet_request(
+                root, self.ROUND_ID, narrative), 0)
             self.assertEqual(list((root / "docs" / "reviews").glob(
                 f"{self.ROUND_ID}-request.binding*.json")), bindings)
 
-            other = "a" * 40 if head != "a" * 40 else "b" * 40
-            self._request(root, other)
-            self.assertEqual(review.prepare_packet_request(root, self.ROUND_ID), 1)
+            (root / "advance.txt").write_text(head)
+            git(root, "add", "-A")
+            git(root, "commit", "-qm", "advance")
+            self.assertEqual(review.prepare_packet_request(
+                root, self.ROUND_ID, narrative), 1)
 
     def test_packet_publication_gate_uses_real_remote_and_rejects_partial_commit(self):
         import os
@@ -1396,14 +1739,18 @@ class PacketPublicationTests(unittest.TestCase):
             home.mkdir()
             init_repo(root)
             (root / ".waystone.yml").write_text(
-                "version: 1\nproject: demo\nreviews_dir: docs/reviews\n")
+                "version: 1\nproject: demo\nreviews_dir: docs/reviews\n"
+                "review:\n  mode: packet\n  reviewers: [reviewer-x]\n"
+                "state:\n  last_round_commit: null\n")
             (root / "tasks.yaml").write_text("version: 1\nproject: demo\ntasks: []\n")
             git(root, "add", "-A")
             git(root, "commit", "-qm", "closeout")
+            self.assertEqual(round.close(
+                root, self.ROUND_ID, done=[], touched=[], commit="HEAD"), 0)
             git(root, "remote", "add", "origin", str(bare))
             git(root, "push", "-q", "-u", "origin", "main")
-            closeout = git(root, "rev-parse", "HEAD").stdout.strip()
-            request = self._request(root, closeout)
+            narrative = base / "narrative.md"
+            narrative.write_text(self.NARRATIVE)
             env = os.environ.copy()
             env.update({"HOME": str(home), "WAYSTONE_HOME": str(home / ".waystone")})
 
@@ -1412,8 +1759,11 @@ class PacketPublicationTests(unittest.TestCase):
                     [sys.executable, str(SCRIPTS / "waystone.py"), *args],
                     cwd=root, env=env, capture_output=True, text=True, timeout=15)
 
-            prepared = cli("review", "prepare", "--round", self.ROUND_ID, str(root))
+            prepared = cli(
+                "review", "prepare", "--round", self.ROUND_ID,
+                "--narrative", str(narrative), str(root))
             self.assertEqual(prepared.returncode, 0, prepared.stderr)
+            request = root / "docs" / "reviews" / f"{self.ROUND_ID}-request.md"
             binding = next((root / "docs" / "reviews").glob(
                 f"{self.ROUND_ID}-request.binding*.json"))
 
@@ -2722,7 +3072,10 @@ class IngestTests(unittest.TestCase):
             r"Start the reply with this block.*?```text\n(.*?)\n```", template, re.DOTALL)
         self.assertIsNotNone(block)
         self.assertEqual(len(block.group(1).splitlines()), 3)
-        parsed = review.parse_review_reply_header(block.group(1).encode())
+        rendered_block = (block.group(1)
+                          .replace("[[REPLY_MODEL]]", "gpt-5.6-sol")
+                          .replace("[[REVIEW_TARGET]]", "a1b2c3d4e5f6-a2b3c4d5e6f7"))
+        parsed = review.parse_review_reply_header(rendered_block.encode())
         self.assertEqual(parsed["model"], "gpt-5.6-sol")
         self.assertEqual(parsed["effort"], "high")
         self.assertEqual(parsed["review_target"], "a1b2c3d4e5f6-a2b3c4d5e6f7")
@@ -2731,10 +3084,12 @@ class IngestTests(unittest.TestCase):
         round_skill = (SCRIPTS.parent / "skills/round/SKILL.md").read_text()
         review_skill = (SCRIPTS.parent / "skills/review/SKILL.md").read_text()
         # Reviewer-facing semantics live ONCE, statically, in the template (user ruling
-        # 2026-07-17); the round skill only pins keep-the-block-verbatim, ingest semantics
-        # stay in the review skill.
-        self.assertIn("reply-header block verbatim", round_skill)
-        self.assertNotIn("Markdown fence", round_skill)
+        # 2026-07-17); the round skill discusses only the narrative/render command and ingest
+        # semantics stay in the review skill.
+        for token in ("reply-header block verbatim", "Markdown fence", "ordinary prose"):
+            self.assertNotIn(token, round_skill)
+        self.assertIn("unconditional part of round closeout", round_skill)
+        self.assertIn("--narrative", round_skill)
         for token in ("model", "effort", "review-target", "Markdown fence", "extra keys",
                       "ordinary prose"):
             self.assertIn(token, review_skill)
@@ -10369,13 +10724,11 @@ class RoundExposureTests(unittest.TestCase):
                 "2026-01-02-close-request.binding*.json"))
             self.assertEqual(bindings, [])
 
-            git(root, "add", "-A")
-            git(root, "commit", "-qm", "closeout")
             closeout = git(root, "rev-parse", "HEAD").stdout.strip()
-            (root / "docs" / "reviews" / "2026-01-02-close-request.md").write_text(
-                "# Review Request\n\n"
-                f"- Reviewing: {closeout}   (diff against (root))\n")
-            self.assertEqual(review.prepare_packet_request(root, "2026-01-02-close"), 0)
+            narrative = Path(d) / "narrative.md"
+            narrative.write_text(PacketPublicationTests.NARRATIVE)
+            self.assertEqual(review.prepare_packet_request(
+                root, "2026-01-02-close", narrative), 0)
             binding_path = next((root / "docs" / "reviews").glob(
                 "2026-01-02-close-request.binding*.json"))
             binding = _json.loads(binding_path.read_text())
