@@ -116,12 +116,15 @@ def project_state_path(root: Path) -> Path:
 
 
 def _ensure_project_self_ignore(state: Path) -> None:
-    """Create the project-state self-ignore once without racing another bootstrapper."""
+    """Atomically restore the canonical project-state self-ignore when absent or damaged."""
+    ignore = state / ".gitignore"
     try:
-        with (state / ".gitignore").open("x", encoding="utf-8") as stream:
-            stream.write("*\n")
-    except FileExistsError:
+        info = ignore.lstat()
+        if stat.S_ISREG(info.st_mode) and ignore.read_bytes() == b"*\n":
+            return
+    except FileNotFoundError:
         pass
+    write_text_atomic(ignore, "*\n")
 
 
 def ensure_project_state_dir(root: Path) -> Path:
@@ -978,9 +981,7 @@ def _ensure_project_state_raw(root: Path) -> Path:
     state = Path(root) / ".waystone"
     if not _real_directory(state, "project state directory"):
         state.mkdir(parents=True)
-    ignore = state / ".gitignore"
-    if not ignore.is_file() or ignore.read_text(encoding="utf-8") != "*\n":
-        ignore.write_text("*\n", encoding="utf-8")
+    _ensure_project_self_ignore(state)
     return state
 
 
@@ -1484,7 +1485,7 @@ def load_yaml(path: Path):
         return yaml.safe_load(f)
 
 
-def normalize_config(cfg: dict | None) -> dict:
+def normalize_config(cfg: dict | None, *, source: Path | None = None) -> dict:
     """Apply defaults + validation to a parsed config mapping (from disk OR from a PR head)."""
     cfg = dict(cfg or {})
     cfg.setdefault("progress", "PROGRESS.md")
@@ -1530,7 +1531,17 @@ def normalize_config(cfg: dict | None) -> dict:
     dl = cfg.setdefault("delegation", {})
     if not isinstance(dl, dict):
         raise ValueError(
-            "delegation: must be a mapping (enabled/env_prep/codex_runner_verified)")
+            "delegation: must be a mapping (enabled/env_prep)")
+    if "codex_runner_verified" in dl:
+        if source is not None:
+            marker_path = source.parent / ".waystone" / "codex-runner-verified"
+            print(
+                f"waystone: legacy delegation.codex_runner_verified in {source} is ignored; "
+                f"remove the key from {source}; Codex runner proof is checkout-local at "
+                f"{marker_path}",
+                file=sys.stderr,
+            )
+        dl.pop("codex_runner_verified")
     dl.setdefault("enabled", True)
     if not isinstance(dl["enabled"], bool):
         raise ValueError("delegation.enabled must be a boolean")
@@ -1538,9 +1549,6 @@ def normalize_config(cfg: dict | None) -> dict:
     ep = dl["env_prep"]
     if ep is not None and not (isinstance(ep, list) and all(isinstance(x, str) for x in ep)):
         raise ValueError("delegation.env_prep must be a list of shell command strings")
-    dl.setdefault("codex_runner_verified", None)
-    if dl["codex_runner_verified"] is not None and dl["codex_runner_verified"] is not True:
-        raise ValueError("delegation.codex_runner_verified must be true when set")
     policy = cfg.setdefault("policy", {})
     if not isinstance(policy, dict):
         raise ValueError("policy: must be a mapping (start_level)")
@@ -1553,7 +1561,8 @@ def normalize_config(cfg: dict | None) -> dict:
 
 
 def load_config(root: Path) -> dict:
-    return normalize_config(load_yaml(_migrate_project_config(root)))
+    path = _migrate_project_config(root)
+    return normalize_config(load_yaml(path), source=path)
 
 
 def git_rc(root: Path, *args: str) -> tuple[int, str, str]:

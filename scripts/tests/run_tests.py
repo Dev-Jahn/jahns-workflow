@@ -1729,6 +1729,134 @@ Fail-loud protocol boundaries.
             self.assertEqual(review.prepare_packet_request(
                 root, self.ROUND_ID, narrative), 1)
 
+    def test_narrative_only_reprepare_reissues_binding_and_reopens_pending(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, target, narrative = self._closed_project(Path(d))
+            self.assertEqual(review.prepare_review_request(
+                root, self.ROUND_ID, narrative), 0)
+            first_path = next((root / "docs/reviews").glob(
+                f"{self.ROUND_ID}-request.binding*.json"))
+            first = review.read_round_request_binding(first_path)
+            self.assertRegex(first["narrative_digest"], r"^sha256:[0-9a-f]{64}$")
+
+            reply = Path(d) / "reply.md"
+            reply.write_text(
+                "model: reviewer-x\neffort: high\n"
+                f"review-target: {target}\n\nreviewed\n")
+            self.assertEqual(review.ingest(root, self.ROUND_ID, src=reply), 0)
+            self.assertEqual(review.pending_reviews(root), [])
+
+            narrative.write_text(self.NARRATIVE.replace(
+                "Fail-loud protocol boundaries.",
+                "Fail-loud protocol boundaries after a narrative correction."))
+            self.assertEqual(review.prepare_review_request(
+                root, self.ROUND_ID, narrative), 0)
+            paths = sorted((root / "docs/reviews").glob(
+                f"{self.ROUND_ID}-request.binding*.json"))
+            self.assertEqual(len(paths), 2)
+            _latest_path, latest = review.latest_round_request_binding(
+                paths, expected_round_id=self.ROUND_ID)
+            self.assertIsNotNone(latest)
+            self.assertNotEqual(first["narrative_digest"], latest["narrative_digest"])
+            self.assertEqual(
+                [(row["round_id"], row["target_sha"]) for row in review.pending_reviews(root)],
+                [(self.ROUND_ID, target)],
+            )
+
+    def test_stamped_feedback_blocks_legacy_fallback_if_latest_digest_is_stripped(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, target, narrative = self._closed_project(Path(d))
+            self.assertEqual(review.prepare_review_request(
+                root, self.ROUND_ID, narrative), 0)
+            reply = Path(d) / "reply.md"
+            reply.write_text(
+                "model: reviewer-x\neffort: high\n"
+                f"review-target: {target}\n\nreviewed\n")
+            self.assertEqual(review.ingest(root, self.ROUND_ID, src=reply), 0)
+
+            narrative.write_text(self.NARRATIVE.replace(
+                "Fail-loud protocol boundaries.", "A second valid narrative."))
+            self.assertEqual(review.prepare_review_request(
+                root, self.ROUND_ID, narrative), 0)
+            latest_path, _latest = review.latest_round_request_binding(
+                list((root / "docs/reviews").glob(
+                    f"{self.ROUND_ID}-request.binding*.json")),
+                expected_round_id=self.ROUND_ID)
+            self.assertIsNotNone(latest_path)
+            latest = _json.loads(latest_path.read_text())
+            latest.pop("narrative_digest")
+            latest_path.write_text(_json.dumps(latest) + "\n")
+
+            feedback = root / "docs/reviews" / f"{self.ROUND_ID}-feedback.md"
+            metadata = review.read_feedback_reply_metadata(
+                feedback, expected_round_id=self.ROUND_ID,
+                binding=review.read_round_request_binding(latest_path))
+            self.assertIs(metadata["narrative_digest_matches"], False)
+            self.assertEqual(metadata["narrative_coverage_reason"],
+                             "narrative-digest-mismatch")
+            self.assertEqual([row["round_id"] for row in review.pending_reviews(root)],
+                             [self.ROUND_ID])
+
+    def test_pr_freeze_rejects_stored_narrative_digest_mismatch(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            root, target, narrative = self._closed_project(Path(d), mode="pr")
+            self.assertEqual(review.prepare_review_request(
+                root, self.ROUND_ID, narrative), 0)
+            review.stored_narrative_path(root, self.ROUND_ID).write_text(
+                self.NARRATIVE.replace(
+                    "Fail-loud protocol boundaries.", "A different stored narrative."))
+            cfg = common.load_config(root)
+            ctx = {
+                "repo": "o/r", "pr": 9, "head": target, "base_sha": "b" * 40,
+                "base": "main", "bundle": {
+                    "head": target, "base_sha": "b" * 40, "bodies": []},
+                "policy": cfg,
+            }
+            posted = []
+            saved = review.pr_context, review._gh
+            review.pr_context = lambda _root, _pr: ctx
+            review._gh = lambda _root, *args: (posted.append(args) or (0, "ok"))
+            err = io.StringIO()
+            try:
+                with contextlib.redirect_stderr(err):
+                    self.assertEqual(review.freeze(root, 9, self.ROUND_ID), 1)
+            finally:
+                review.pr_context, review._gh = saved
+            self.assertEqual(posted, [])
+            self.assertIn("narrative digest", err.getvalue())
+
+    def test_packet_gate_rejects_post_prepare_narrative_edit(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            root, _target, _narrative = self._remote_project(Path(d))
+            request = root / "docs/reviews" / f"{self.ROUND_ID}-request.md"
+            request.write_text(request.read_text().replace(
+                "The round made packet rendering deterministic.",
+                "The packet narrative was altered after prepare."))
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(review.verify_packet_publication(root, self.ROUND_ID), 1)
+            self.assertIn("does not reproduce", err.getvalue())
+
+    def test_packet_gate_rejects_legacy_digestless_binding(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            root, target, _narrative = self._closed_project(Path(d))
+            self._request(root, target)
+            review.write_round_request_binding(
+                root, self.ROUND_ID, target, None, ["reviewer-x"], mode="packet")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(review.verify_packet_publication(root, self.ROUND_ID), 1)
+            self.assertIn("legacy-pre-digest", err.getvalue())
+
     def test_packet_publication_gate_uses_real_remote_and_rejects_partial_commit(self):
         import os
 
@@ -1821,32 +1949,25 @@ Fail-loud protocol boundaries.
             base = Path(d)
             bare = base / "remote.git"
             subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
-            root = base / "repo"
-            root.mkdir()
-            init_repo(root)
-            (root / ".waystone.yml").write_text(
-                "version: 1\nproject: demo\nreviews_dir: docs/reviews\n"
-                "review:\n  mode: packet\n  reviewers: [reviewer-x]\n"
-                "state:\n  last_round_commit: null\n")
-            (root / "tasks.yaml").write_text("version: 1\nproject: demo\ntasks: []\n")
-            git(root, "add", "-A")
-            git(root, "commit", "-qm", "setup")
-            old_target = git(root, "rev-parse", "HEAD").stdout.strip()
-            self._request(root, old_target)
-            review.write_round_request_binding(
-                root, self.ROUND_ID, old_target, None, ["reviewer-x"], mode="packet")
+            root, target, narrative_path = self._closed_project(base)
             git(root, "remote", "add", "origin", str(bare))
+            self.assertEqual(review.prepare_review_request(
+                root, self.ROUND_ID, narrative_path), 0)
             git(root, "add", "-A")
             git(root, "commit", "-qm", "publish first packet")
             git(root, "push", "-q", "-u", "origin", "main")
 
-            (root / "advance.txt").write_text("reissue\n")
-            git(root, "add", "-A")
-            git(root, "commit", "-qm", "new closeout")
-            new_target = git(root, "rev-parse", "HEAD").stdout.strip()
-            self._request(root, new_target)
+            _exposure_path, exposure = review.read_round_closeout_exposure(
+                root, self.ROUND_ID)
+            narrative = review._read_review_narrative(narrative_path).replace(
+                "Fail-loud protocol boundaries.", "Reissued narrative contract.")
+            review.stored_narrative_path(root, self.ROUND_ID).write_text(narrative)
+            request = review.prepared_request_path(root, self.ROUND_ID, mode="packet")
+            request.write_text(review._render_review_request(
+                self.ROUND_ID, exposure, narrative))
             review.write_round_request_binding(
-                root, self.ROUND_ID, new_target, None, ["reviewer-x"], mode="packet")
+                root, self.ROUND_ID, target, None, ["reviewer-x"], mode="packet",
+                narrative_digest=review._canonical_narrative_digest(narrative))
             git(root, "add", "-A")
             git(root, "commit", "-qm", "reissued packet committed locally only")
 
@@ -1855,8 +1976,7 @@ Fail-loud protocol boundaries.
                 self.assertEqual(review.verify_packet_publication(root, self.ROUND_ID), 1)
             # The LATEST binding's target is what gets judged — the stale published packet
             # must not be the publication evidence.
-            self.assertIn(new_target, err.getvalue())
-            self.assertNotIn(old_target, err.getvalue())
+            self.assertIn("differs from the published copy", err.getvalue())
 
             git(root, "push", "-q")
             with contextlib.redirect_stderr(io.StringIO()):
@@ -1939,19 +2059,24 @@ Fail-loud protocol boundaries.
             git(root, "add", "-A")
             git(root, "commit", "-qm", "publish first packet")
             git(root, "push", "-q")
-            # Reissue mid-state: the new closeout and REWRITTEN request are published, but the
+            # Reissue mid-state: the REWRITTEN request is published, but the
             # newest binding-2 exists only locally — the stale published sidecar must not be
             # accepted as the publication evidence.
-            (root / "advance.txt").write_text("reissue\n")
-            git(root, "add", "-A")
-            git(root, "commit", "-qm", "new closeout")
-            new_target = git(root, "rev-parse", "HEAD").stdout.strip()
-            self._request(root, new_target)
+            _exposure_path, exposure = review.read_round_closeout_exposure(
+                root, self.ROUND_ID)
+            narrative = review._read_review_narrative(
+                review.stored_narrative_path(root, self.ROUND_ID)).replace(
+                    "Fail-loud protocol boundaries.", "Reissued narrative contract.")
+            review.stored_narrative_path(root, self.ROUND_ID).write_text(narrative)
+            request = review.prepared_request_path(root, self.ROUND_ID, mode="packet")
+            request.write_text(review._render_review_request(
+                self.ROUND_ID, exposure, narrative))
             git(root, "add", "-A")
             git(root, "commit", "-qm", "publish rewritten request only")
             git(root, "push", "-q")
             review.write_round_request_binding(
-                root, self.ROUND_ID, new_target, None, ["reviewer-x"], mode="packet")
+                root, self.ROUND_ID, exposure["head_sha"], None, ["reviewer-x"], mode="packet",
+                narrative_digest=review._canonical_narrative_digest(narrative))
 
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
@@ -2449,13 +2574,13 @@ class WaystoneStorageCliTests(unittest.TestCase):
 
             registry = home / ".waystone" / "projects.json"
             self.assertEqual(_json.loads(registry.read_text()), {"projects": []})
-            self.assertEqual(len(calls), 2)
-            self.assertTrue(all(dst == registry for _src, dst in calls))
-            self.assertTrue(all(src.parent == registry.parent for src, _dst in calls))
-            self.assertEqual(len({src for src, _dst in calls}), 2)
+            registry_calls = [(src, dst) for src, dst in calls if dst == registry]
+            self.assertEqual(len(registry_calls), 2)
+            self.assertTrue(all(src.parent == registry.parent for src, _dst in registry_calls))
+            self.assertEqual(len({src for src, _dst in registry_calls}), 2)
             self.assertTrue(all(src.name.startswith(".projects.json.") and src.suffix == ".tmp"
-                                for src, _dst in calls))
-            self.assertTrue(all(not src.exists() for src, _dst in calls))
+                                for src, _dst in registry_calls))
+            self.assertTrue(all(not src.exists() for src, _dst in registry_calls))
 
     def test_project_register_replace_failure_preserves_registry_and_cleans_temp(self):
         import json as _json
@@ -2472,7 +2597,13 @@ class WaystoneStorageCliTests(unittest.TestCase):
             original = _json.dumps({"projects": [{"name": "existing", "repo": "org/repo"}]})
             registry.write_text(original)
             original_replace = waystone.os.replace
-            waystone.os.replace = lambda *_args: (_ for _ in ()).throw(OSError("replace failed"))
+
+            def fail_registry_replace(src, dst):
+                if Path(dst) == registry:
+                    raise OSError("replace failed")
+                return original_replace(src, dst)
+
+            waystone.os.replace = fail_registry_replace
             try:
                 rc, _out, err = self._capture(home, root, ["project", "register", str(root)])
             finally:
@@ -2623,7 +2754,7 @@ class ConfigTests(unittest.TestCase):
     def test_delegation_default_env_prep_none_no_sandbox_knob(self):
         cfg = self._cfg("version: 1\nproject: x\n")
         self.assertIsNone(cfg["delegation"]["env_prep"])
-        self.assertIsNone(cfg["delegation"]["codex_runner_verified"])
+        self.assertNotIn("codex_runner_verified", cfg["delegation"])
         self.assertNotIn("sandbox", cfg["delegation"])  # R7: no sandbox config knob in M1
 
     def test_delegation_env_prep_list_ok(self):
@@ -2636,16 +2767,35 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._cfg("version: 1\nproject: x\ndelegation:\n  env_prep:\n    - 42\n")
 
-    def test_codex_runner_verified_is_optional_true_only(self):
-        cfg = self._cfg(
-            "version: 1\nproject: x\ndelegation:\n  codex_runner_verified: true\n")
-        self.assertIs(cfg["delegation"]["codex_runner_verified"], True)
-        for value in ("false", "'yes'", "1"):
-            with self.subTest(value=value), self.assertRaisesRegex(
-                    ValueError, "codex_runner_verified"):
-                self._cfg(
+    def test_legacy_codex_runner_verified_warns_only_for_real_config_source(self):
+        import contextlib
+        import io
+
+        for value in ("true", "false", "'yes'", "1"):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                config = root / ".waystone.yml"
+                config.write_text(
                     "version: 1\nproject: x\ndelegation:\n"
                     f"  codex_runner_verified: {value}\n")
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    cfg = common.load_config(root)
+                self.assertNotIn("codex_runner_verified", cfg["delegation"])
+                self.assertIn(
+                    f"remove the key from {config}", stderr.getvalue())
+                self.assertIn(
+                    str(root / ".waystone" / "codex-runner-verified"), stderr.getvalue())
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            projected = common.normalize_config({
+                "version": 1,
+                "project": "historical-ref",
+                "delegation": {"codex_runner_verified": True},
+            })
+        self.assertNotIn("codex_runner_verified", projected["delegation"])
+        self.assertEqual(stderr.getvalue(), "")
 
     def test_reviewers_accept_literal_models_and_reviewer_role_reference(self):
         cfg = self._cfg(
@@ -3037,7 +3187,11 @@ class BasePolicyTests(unittest.TestCase):
     so a branch can't make itself an operator/approver, drop reviewers, or disable CI."""
 
     def test_policy_read_from_base_not_head(self):
-        STRICT_BASE = ("version: 1\nproject: x\nreview:\n  mode: pr\n  reviewers: [codex, gpt-5.5-pro]\n"
+        import contextlib
+        import io
+
+        STRICT_BASE = ("version: 1\nproject: x\ndelegation:\n  codex_runner_verified: true\n"
+                       "review:\n  mode: pr\n  reviewers: [codex, gpt-5.5-pro]\n"
                        "  require_ci: true\n  operators: [owner]\n  approvers: [owner]\n")
         RELAXED_HEAD = ("version: 1\nproject: x\nreview:\n  mode: pr\n  reviewers: []\n"
                         "  require_ci: false\n  operators: [attacker]\n  approvers: [attacker]\n")
@@ -3063,12 +3217,14 @@ class BasePolicyTests(unittest.TestCase):
         review.pr_bundle = lambda root, pr, repo=None: bundle
         review.file_at_ref = fake_file_at_ref
         review._gh = lambda root, *a: (0, "main")
+        stderr = io.StringIO()
         try:
             with tempfile.TemporaryDirectory() as d:
                 # a local config must exist for the load_config fallback; the gate must ignore it
                 # in favour of the base-SHA policy
                 (Path(d) / ".waystone.yml").write_text("version: 1\nproject: x\nreview:\n  mode: pr\n")
-                g = merge._gather(Path(d), 7)
+                with contextlib.redirect_stderr(stderr):
+                    g = merge._gather(Path(d), 7)
         finally:
             review.resolve_repo, review.pr_bundle, review.file_at_ref, review._gh = saved
         # policy taken from the STRICT base, not the RELAXED head
@@ -3080,6 +3236,7 @@ class BasePolicyTests(unittest.TestCase):
         self.assertIn((".waystone.yml", bundle["base_sha"]), calls)
         self.assertIn(("tasks.yaml", bundle["head"]), calls)
         self.assertNotIn((".waystone.yml", bundle["head"]), calls)
+        self.assertEqual(stderr.getvalue(), "")
 
     def test_custom_named_macro_reviewer_is_mandatory(self):
         # a reviewer that isn't 'codex' and isn't named gpt/pro must still gate the merge
@@ -3987,6 +4144,28 @@ class PendingReviewTests(unittest.TestCase):
 
             self.assertEqual(review.pending_reviews(root), [])
 
+    def test_digestless_legacy_completion_is_labeled_independently_of_reviewer_coverage(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root(d)
+            round_id = "2026-01-01-legacy-unconfigured"
+            base = "b" * 40
+            target = "a" * 40
+            binding_path = self._request(
+                root, round_id, target, base=base, reviewers=["expected-reviewer"])
+            source = root / "reply.md"
+            source.write_bytes(self._reply("someone-else", base, target))
+            self.assertEqual(review.ingest(root, round_id, src=source), 0)
+
+            binding = review.read_round_request_binding(binding_path)
+            metadata = review.read_feedback_reply_metadata(
+                root / "docs/reviews" / f"{round_id}-feedback.md",
+                expected_round_id=round_id, binding=binding)
+            self.assertIs(metadata["review_target_matches"], True)
+            self.assertEqual(metadata["reviewer_coverage_reason"], "reviewer-not-configured")
+            self.assertIsNone(metadata["narrative_digest_matches"])
+            self.assertEqual(metadata["narrative_coverage_reason"], "legacy-pre-digest")
+            self.assertEqual(review.pending_reviews(root), [])
+
     def test_one_damaged_binding_isolates_to_its_round(self):
         with tempfile.TemporaryDirectory() as d:
             root = self._root(d)
@@ -4134,6 +4313,8 @@ class StatuslineTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as d:
             root = self._project(d)
+            with (root / ".waystone.yml").open("a") as stream:
+                stream.write("delegation:\n  codex_runner_verified: true\n")
             nested = root / "nested"
             nested.mkdir()
             with mock.patch.object(review, "pending_reviews", wraps=review.pending_reviews) as pending:
@@ -4692,6 +4873,54 @@ class UninitializedRootGateTests(unittest.TestCase):
             # state-creating CLI call, so consent recording passes the gate.
             common.record_consent(root, "init.start-level", "warn-allowed", {})
             self.assertTrue((root / ".waystone" / "consents.jsonl").is_file())
+
+    def test_state_self_ignore_is_restored_atomically_before_marker_write(self):
+        from unittest import mock
+
+        for initial in (None, "", "delegations/\n"):
+            with self.subTest(initial=initial), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                (root / ".waystone.yml").write_text("version: 1\nproject: x\n")
+                init_repo(root)
+                state = root / ".waystone"
+                state.mkdir()
+                ignore = state / ".gitignore"
+                if initial is not None:
+                    ignore.write_text(initial)
+
+                with mock.patch.object(
+                        common, "write_text_atomic", wraps=common.write_text_atomic) as atomic:
+                    self.assertEqual(common.ensure_project_state_dir(root), state)
+                    atomic.assert_called_once_with(ignore, "*\n")
+                delegate._record_codex_runner_verified(
+                    state / "codex-runner-verified")
+
+                self.assertEqual(ignore.read_text(), "*\n")
+                self.assertEqual(git(
+                    root, "check-ignore", "--quiet",
+                    ".waystone/codex-runner-verified").returncode, 0)
+
+    def test_migration_raw_state_uses_atomic_helper_without_following_ignore_symlink(self):
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "repo"
+            state = root / ".waystone"
+            state.mkdir(parents=True)
+            external = Path(d) / "external-ignore"
+            external.write_text("external\n")
+            ignore = state / ".gitignore"
+            ignore.symlink_to(external)
+
+            with mock.patch.object(
+                    common, "_ensure_project_self_ignore",
+                    wraps=common._ensure_project_self_ignore) as ensure_ignore:
+                self.assertEqual(common._ensure_project_state_raw(root), state)
+
+            ensure_ignore.assert_called_once_with(state)
+            self.assertEqual(external.read_text(), "external\n")
+            self.assertFalse(ignore.is_symlink())
+            self.assertEqual(ignore.read_text(), "*\n")
 
     def test_delegate_entry_point_is_gated_via_the_same_chokepoint(self):
         import contextlib
@@ -5975,6 +6204,83 @@ class ImproveReviewsTests(unittest.TestCase):
             self.assertIsNone(row["target_sha"])
             self.assertEqual(row["review_binding_provenance"], "unknown")
             self.assertEqual(row["review_binding_reason"], "corrupt-round-request-sidecar")
+
+    def test_review_projection_preserves_binding_digest_and_reports_stamped_mismatch(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            root = base / "repo"
+            root.mkdir()
+            (root / ".waystone.yml").write_text(
+                "version: 1\nproject: demo\nreviews_dir: docs/reviews\n")
+            (root / "tasks.yaml").write_text("version: 1\nproject: demo\ntasks: []\n")
+            rdir = root / "docs/reviews"
+            rdir.mkdir(parents=True)
+            target, base_sha = "a" * 40, "b" * 40
+            (rdir / "r1-request.md").write_text(
+                f"# request\n\n- Reviewing: {target}   (diff against {base_sha})\n")
+            binding_path = review.write_round_request_binding(
+                root, "r1", target, base_sha, ["expected-reviewer"], mode="packet")
+            binding = _json.loads(binding_path.read_text())
+            binding_digest = "sha256:" + "2" * 64
+            reply_digest = "sha256:" + "1" * 64
+            binding["narrative_digest"] = binding_digest
+            binding_path.write_text(_json.dumps(binding) + "\n")
+            payload = _json.dumps({
+                "metadata": {
+                    "model": "expected-reviewer", "effort": "high",
+                    "review-target": f"{base_sha[:12]}-{target[:12]}",
+                },
+                "narrative_digest": reply_digest,
+            }, separators=(",", ":"))
+            (rdir / "r1-feedback.md").write_text(
+                "<!-- waystone feedback -->\nround: r1\n"
+                f"reply-metadata-json: {payload}\n\n---\n\nreply body\n")
+            registry = base / "projects.json"
+            registry.write_text(_json.dumps({
+                "projects": [{"name": "demo", "path": str(root)}]}))
+            out = base / "out"
+
+            improve.run_reviews(registry, out)
+
+            row = self._load(out)[0][0]
+            self.assertEqual(row["narrative_digest"], binding_digest)
+            self.assertEqual(row["reply_narrative_digest"], reply_digest)
+            self.assertIs(row["narrative_digest_matches"], False)
+            self.assertEqual(row["narrative_coverage_reason"],
+                             "narrative-digest-mismatch")
+
+    def test_legacy_label_survives_unconfigured_reviewer_in_real_file_projection(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            root = base / "repo"
+            root.mkdir()
+            (root / ".waystone.yml").write_text(
+                "version: 1\nproject: demo\nreviews_dir: docs/reviews\n")
+            (root / "tasks.yaml").write_text("version: 1\nproject: demo\ntasks: []\n")
+            rdir = root / "docs/reviews"
+            rdir.mkdir(parents=True)
+            target, base_sha = "a" * 40, "b" * 40
+            (rdir / "r1-request.md").write_text(
+                f"# request\n\n- Reviewing: {target}   (diff against {base_sha})\n")
+            review.write_round_request_binding(
+                root, "r1", target, base_sha, ["expected-reviewer"], mode="packet")
+            reply = root / "reply.md"
+            reply.write_text(
+                "model: someone-else\neffort: high\n"
+                f"review-target: {base_sha[:12]}-{target[:12]}\n\nreviewed\n")
+            self.assertEqual(review.ingest(root, "r1", src=reply), 0)
+            registry = base / "projects.json"
+            registry.write_text(_json.dumps({
+                "projects": [{"name": "demo", "path": str(root)}]}))
+            out = base / "out"
+
+            improve.run_reviews(registry, out)
+
+            row = self._load(out)[0][0]
+            self.assertIs(row["review_target_matches"], True)
+            self.assertEqual(row["reviewer_coverage_reason"], "reviewer-not-configured")
+            self.assertEqual(row["narrative_coverage_reason"], "legacy-pre-digest")
+            self.assertEqual(review.pending_reviews(root), [])
 
     def test_triage_ignores_verbatim_body(self):
         # the verbatim body's `### JW-GPT-*` blocks must not be parsed — only the appended table
@@ -8267,7 +8573,7 @@ class DelegateRunTests(unittest.TestCase):
             failure = io.StringIO()
             with contextlib.redirect_stdout(failure):
                 self.assertEqual(delegate.show(root, rec.name, "failure"), 0)
-            self.assertIn("delegation.codex_runner_verified", failure.getvalue())
+            self.assertIn(".waystone/codex-runner-verified", failure.getvalue())
 
     def test_empty_diff_with_report_is_not_misclassified_by_sandbox_stderr(self):
         import contextlib
@@ -9034,50 +9340,85 @@ class CodexRunnerVerificationGateTests(unittest.TestCase):
         worktree.mkdir()
         record.mkdir()
         (root / ".waystone.yml").write_bytes(config)
+        init_repo(root)
         (record / "exposure.json").write_text(
             json.dumps({"project": {"root": str(root)}}) + "\n", encoding="utf-8")
         prompt = base / "prompt.txt"
         prompt.write_text("implement", encoding="utf-8")
         return root, worktree, record, prompt
 
-    def test_merge_key_delegation_refuses_surgical_append(self):
-        original = (
-            b"version: 1\nproject: demo\n"
-            b"defaults: &d\n  delegation:\n    enabled: true\n"
-            b"<<: *d\n"
-        )
-        with tempfile.TemporaryDirectory() as d:
-            root, _worktree, _record, _prompt = self._fixture(Path(d), original)
-            with self.assertRaisesRegex(delegate.WorkflowError, "merge/anchor indirection"):
-                delegate._record_codex_runner_verified(root / ".waystone.yml")
-            self.assertEqual((root / ".waystone.yml").read_bytes(), original)
+    def test_concurrent_runner_paths_probe_once_under_checkout_local_lock(self):
+        import concurrent.futures
+        import threading
+        import types
 
-    def test_existing_null_or_false_value_is_rewritten_to_true(self):
-        for variant in (b"  codex_runner_verified: null\n", b"  codex_runner_verified:\n",
-                        b"  codex_runner_verified: false\n"):
-            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as d:
-                original = (
-                    b"version: 1\nproject: demo\ndelegation:\n"
-                    b"  enabled: true # keep\n" + variant)
-                root, _worktree, _record, _prompt = self._fixture(Path(d), original)
-                config = root / ".waystone.yml"
-                delegate._record_codex_runner_verified(config)
-                text = config.read_text()
-                self.assertIn("codex_runner_verified: true", text)
-                self.assertEqual(text.count("codex_runner_verified"), 1)
-                self.assertIn("enabled: true # keep", text)
-
-    def test_surgical_write_preserves_file_mode(self):
         original = b"version: 1\nproject: demo\ndelegation:\n  enabled: true\n"
         with tempfile.TemporaryDirectory() as d:
-            root, _worktree, _record, _prompt = self._fixture(Path(d), original)
-            config = root / ".waystone.yml"
-            config.chmod(0o664)
-            delegate._record_codex_runner_verified(config)
-            self.assertEqual(oct(config.stat().st_mode & 0o777), oct(0o664))
-            self.assertIn("codex_runner_verified: true", config.read_text())
+            root, worktree, first_record, prompt = self._fixture(Path(d), original)
+            second_record = Path(d) / "record-2"
+            second_record.mkdir()
+            (second_record / "exposure.json").write_bytes(
+                (first_record / "exposure.json").read_bytes())
+            probe_started = threading.Event()
+            release_probe = threading.Event()
+            initial_check_barrier = threading.Barrier(2)
+            initial_check_local = threading.local()
+            counter_lock = threading.Lock()
+            calls = {"initial_absent": 0, "probe": 0, "runner": 0}
+            original_verification = delegate._codex_runner_verification_marker
+            original_probe = delegate._run_codex_sandbox_probe
+            original_run = delegate.subprocess.run
 
-    def test_success_records_true_preserving_comments_and_crlf_then_skips_probe(self):
+            def verification(record):
+                result = original_verification(record)
+                if not getattr(initial_check_local, "passed", False):
+                    initial_check_local.passed = True
+                    with counter_lock:
+                        calls["initial_absent"] += int(result is not None and not result[1])
+                    initial_check_barrier.wait(5)
+                return result
+
+            def probe(*args, **kwargs):
+                with counter_lock:
+                    calls["probe"] += 1
+                probe_started.set()
+                if not release_probe.wait(5):
+                    raise AssertionError("test did not release the first probe")
+                return {"schema": "waystone-sandbox-probe-1", "outcome": "passed"}
+
+            def run(*args, **kwargs):
+                if args and args[0] and args[0][0] == "git":
+                    return original_run(*args, **kwargs)
+                with counter_lock:
+                    calls["runner"] += 1
+                return types.SimpleNamespace(returncode=0)
+
+            delegate._codex_runner_verification_marker = verification
+            delegate._run_codex_sandbox_probe = probe
+            delegate.subprocess.run = run
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                    futures = [
+                        executor.submit(
+                            delegate._run_codex, worktree, "gpt-test", prompt, record)
+                        for record in (first_record, second_record)
+                    ]
+                    try:
+                        self.assertTrue(probe_started.wait(5))
+                    finally:
+                        release_probe.set()
+                    self.assertEqual([future.result()[0] for future in futures], [0, 0])
+            finally:
+                delegate.subprocess.run = original_run
+                delegate._run_codex_sandbox_probe = original_probe
+                delegate._codex_runner_verification_marker = original_verification
+
+            self.assertEqual(calls, {"initial_absent": 2, "probe": 1, "runner": 2})
+            self.assertEqual((root / ".waystone.yml").read_bytes(), original)
+            self.assertEqual(
+                (root / ".waystone" / "codex-runner-verified").read_text(), "verified\n")
+
+    def test_success_records_local_marker_and_skips_probe(self):
         import types
 
         original = (
@@ -9096,6 +9437,8 @@ class CodexRunnerVerificationGateTests(unittest.TestCase):
                 return {"schema": "waystone-sandbox-probe-1", "outcome": "passed"}
 
             def run(*args, **kwargs):
+                if args and args[0] and args[0][0] == "git":
+                    return original_run(*args, **kwargs)
                 calls["runner"] += 1
                 return types.SimpleNamespace(returncode=0)
 
@@ -9111,13 +9454,189 @@ class CodexRunnerVerificationGateTests(unittest.TestCase):
                 delegate._run_codex_sandbox_probe = original_probe
 
             self.assertEqual(calls, {"probe": 1, "runner": 2})
-            self.assertEqual((root / ".waystone.yml").read_bytes(), original.replace(
-                b"  # keep enabled comment\r\n",
-                b"  # keep enabled comment\r\n  codex_runner_verified: true\r\n",
-            ))
+            self.assertEqual((root / ".waystone.yml").read_bytes(), original)
+            self.assertEqual(
+                (root / ".waystone" / "codex-runner-verified").read_text(), "verified\n")
+            self.assertEqual((root / ".waystone" / ".gitignore").read_text(), "*\n")
             self.assertFalse(any(record.glob("sandbox-probe*")))
 
-    def test_probe_failure_does_not_record_key_and_next_call_reprobes(self):
+    def test_committed_legacy_true_does_not_skip_probe_without_local_marker(self):
+        import contextlib
+        import io
+        import types
+
+        original = (
+            b"version: 1\nproject: demo\ndelegation:\n"
+            b"  enabled: true\n  codex_runner_verified: true\n"
+        )
+        with tempfile.TemporaryDirectory() as d:
+            root, worktree, record, prompt = self._fixture(Path(d), original)
+            self.assertEqual(
+                git(root, "ls-files", "--error-unmatch", ".waystone.yml").returncode, 0)
+            calls = {"probe": 0, "runner": 0}
+            original_probe = delegate._run_codex_sandbox_probe
+            original_run = delegate.subprocess.run
+
+            def probe(*args, **kwargs):
+                calls["probe"] += 1
+                return {"schema": "waystone-sandbox-probe-1", "outcome": "passed"}
+
+            def run(*args, **kwargs):
+                if args and args[0] and args[0][0] == "git":
+                    return original_run(*args, **kwargs)
+                calls["runner"] += 1
+                return types.SimpleNamespace(returncode=0)
+
+            delegate._run_codex_sandbox_probe = probe
+            delegate.subprocess.run = run
+            stderr = io.StringIO()
+            try:
+                with contextlib.redirect_stderr(stderr):
+                    self.assertEqual(delegate._run_codex(
+                        worktree, "gpt-test", prompt, record)[0], 0)
+            finally:
+                delegate.subprocess.run = original_run
+                delegate._run_codex_sandbox_probe = original_probe
+
+            self.assertEqual(calls, {"probe": 1, "runner": 1})
+            self.assertEqual((root / ".waystone.yml").read_bytes(), original)
+            self.assertTrue((root / ".waystone" / "codex-runner-verified").is_file())
+            self.assertEqual(git(
+                root, "check-ignore", "--quiet",
+                ".waystone/codex-runner-verified").returncode, 0)
+            self.assertIn("legacy delegation.codex_runner_verified", stderr.getvalue())
+            self.assertIn("remove the key from", stderr.getvalue())
+
+    def test_existing_local_marker_skips_probe(self):
+        import types
+
+        original = b"version: 1\nproject: demo\ndelegation:\n  enabled: true\n"
+        with tempfile.TemporaryDirectory() as d:
+            root, worktree, record, prompt = self._fixture(Path(d), original)
+            state = root / ".waystone"
+            state.mkdir()
+            (state / ".gitignore").write_text("*\n")
+            (state / "codex-runner-verified").write_text("verified\n")
+            calls = {"runner": 0}
+            original_probe = delegate._run_codex_sandbox_probe
+            original_run = delegate.subprocess.run
+
+            def probe(*args, **kwargs):
+                raise AssertionError("existing local marker must skip the probe")
+
+            def run(*args, **kwargs):
+                if args and args[0] and args[0][0] == "git":
+                    return original_run(*args, **kwargs)
+                calls["runner"] += 1
+                return types.SimpleNamespace(returncode=0)
+
+            delegate._run_codex_sandbox_probe = probe
+            delegate.subprocess.run = run
+            try:
+                self.assertEqual(delegate._run_codex(
+                    worktree, "gpt-test", prompt, record)[0], 0)
+            finally:
+                delegate.subprocess.run = original_run
+                delegate._run_codex_sandbox_probe = original_probe
+
+            self.assertEqual(calls, {"runner": 1})
+
+    def test_git_tracked_marker_is_ignored_and_reprobed_with_untrack_guidance(self):
+        import contextlib
+        import io
+        import types
+
+        original = b"version: 1\nproject: demo\ndelegation:\n  enabled: true\n"
+        with tempfile.TemporaryDirectory() as d:
+            root, worktree, record, prompt = self._fixture(Path(d), original)
+            marker = root / ".waystone" / "codex-runner-verified"
+            marker.parent.mkdir()
+            marker.write_text("verified\n")
+            self.assertEqual(git(root, "add", "-f", str(marker)).returncode, 0)
+            self.assertEqual(git(root, "commit", "-qm", "track invalid proof").returncode, 0)
+            self.assertEqual(git(
+                root, "ls-files", "--error-unmatch",
+                ".waystone/codex-runner-verified").returncode, 0)
+            calls = {"probe": 0, "runner": 0}
+            original_probe = delegate._run_codex_sandbox_probe
+            original_run = delegate.subprocess.run
+
+            def probe(*args, **kwargs):
+                calls["probe"] += 1
+                return {"schema": "waystone-sandbox-probe-1", "outcome": "passed"}
+
+            def run(*args, **kwargs):
+                if args and args[0] and args[0][0] == "git":
+                    return original_run(*args, **kwargs)
+                calls["runner"] += 1
+                return types.SimpleNamespace(returncode=0)
+
+            delegate._run_codex_sandbox_probe = probe
+            delegate.subprocess.run = run
+            stderr = io.StringIO()
+            try:
+                with contextlib.redirect_stderr(stderr):
+                    self.assertEqual(delegate._run_codex(
+                        worktree, "gpt-test", prompt, record)[0], 0)
+            finally:
+                delegate.subprocess.run = original_run
+                delegate._run_codex_sandbox_probe = original_probe
+
+            self.assertEqual(calls, {"probe": 1, "runner": 1})
+            self.assertIn("tracked", stderr.getvalue())
+            self.assertIn("git rm --cached", stderr.getvalue())
+            self.assertIn(".waystone/codex-runner-verified", stderr.getvalue())
+
+    def test_invalid_marker_content_is_reprobed_and_atomically_rewritten(self):
+        import contextlib
+        import io
+        import types
+        from unittest import mock
+
+        original = b"version: 1\nproject: demo\ndelegation:\n  enabled: true\n"
+        for content in (b"", b"corrupt\n", b"verified"):
+            with self.subTest(content=content), tempfile.TemporaryDirectory() as d:
+                root, worktree, record, prompt = self._fixture(Path(d), original)
+                marker = root / ".waystone" / "codex-runner-verified"
+                marker.parent.mkdir()
+                (marker.parent / ".gitignore").write_text("*\n")
+                marker.write_bytes(content)
+                init_repo(root)
+                calls = {"probe": 0, "runner": 0}
+                original_probe = delegate._run_codex_sandbox_probe
+                original_run = delegate.subprocess.run
+
+                def probe(*args, **kwargs):
+                    calls["probe"] += 1
+                    return {"schema": "waystone-sandbox-probe-1", "outcome": "passed"}
+
+                def run(*args, **kwargs):
+                    if args and args[0] and args[0][0] == "git":
+                        return original_run(*args, **kwargs)
+                    calls["runner"] += 1
+                    return types.SimpleNamespace(returncode=0)
+
+                delegate._run_codex_sandbox_probe = probe
+                delegate.subprocess.run = run
+                stderr = io.StringIO()
+                try:
+                    with mock.patch.object(
+                            delegate, "write_text_atomic",
+                            wraps=delegate.write_text_atomic) as atomic:
+                        with contextlib.redirect_stderr(stderr):
+                            self.assertEqual(delegate._run_codex(
+                                worktree, "gpt-test", prompt, record)[0], 0)
+                        atomic.assert_called_once_with(marker, "verified\n")
+                finally:
+                    delegate.subprocess.run = original_run
+                    delegate._run_codex_sandbox_probe = original_probe
+
+                self.assertEqual(calls, {"probe": 1, "runner": 1})
+                self.assertEqual(marker.read_bytes(), b"verified\n")
+                self.assertIn("invalid", stderr.getvalue())
+                self.assertIn("fresh preflight probe", stderr.getvalue())
+
+    def test_probe_failure_does_not_record_marker_and_next_call_reprobes(self):
         original = b"version: 1\nproject: demo\ndelegation:\n  enabled: true\n"
         with tempfile.TemporaryDirectory() as d:
             root, worktree, record, prompt = self._fixture(Path(d), original)
@@ -9139,51 +9658,14 @@ class CodexRunnerVerificationGateTests(unittest.TestCase):
 
             self.assertEqual(calls["probe"], 2)
             self.assertEqual((root / ".waystone.yml").read_bytes(), original)
-            self.assertNotIn(
-                "codex_runner_verified", (root / ".waystone.yml").read_text(encoding="utf-8"))
+            self.assertFalse((root / ".waystone" / "codex-runner-verified").exists())
 
-    def test_real_file_surgery_refuses_delegation_anchors_and_aliases(self):
-        cases = (
-            b"version: 1\nproject: demo\ndelegation: &shared\n  enabled: true\n",
-            b"version: 1\nproject: demo\nshared: &shared\n  enabled: true\ndelegation: *shared\n",
-        )
-        with tempfile.TemporaryDirectory() as d:
-            for index, original in enumerate(cases):
-                with self.subTest(index=index):
-                    path = Path(d) / f"config-{index}.yml"
-                    path.write_bytes(original)
-                    with self.assertRaisesRegex(
-                            delegate.WorkflowError, "anchor|alias|manually"):
-                        delegate._record_codex_runner_verified(path)
-                    self.assertEqual(path.read_bytes(), original)
+    def test_marker_write_failure_is_loud_and_does_not_start_runner(self):
+        from unittest import mock
 
-    def test_real_file_surgery_supports_legacy_missing_and_flow_delegation(self):
-        cases = (
-            (
-                b"# keep\nversion: 1\nproject: demo\n",
-                b"# keep\nversion: 1\nproject: demo\ndelegation:\n"
-                b"  codex_runner_verified: true\n",
-            ),
-            (
-                b"version: 1\nproject: demo\ndelegation: {enabled: true} # keep\n",
-                b"version: 1\nproject: demo\n"
-                b"delegation: {enabled: true, codex_runner_verified: true} # keep\n",
-            ),
-        )
-        with tempfile.TemporaryDirectory() as d:
-            for index, (original, expected) in enumerate(cases):
-                with self.subTest(index=index):
-                    path = Path(d) / f"config-{index}.yml"
-                    path.write_bytes(original)
-                    delegate._record_codex_runner_verified(path)
-                    self.assertEqual(path.read_bytes(), expected)
-
-    def test_read_only_config_fails_loud_after_probe_without_starting_runner(self):
         original = b"version: 1\nproject: demo\ndelegation:\n  enabled: true\n"
         with tempfile.TemporaryDirectory() as d:
             root, worktree, record, prompt = self._fixture(Path(d), original)
-            config = root / ".waystone.yml"
-            config.chmod(0o444)
             calls = {"runner": 0}
             original_probe = delegate._run_codex_sandbox_probe
             original_run = delegate.subprocess.run
@@ -9196,14 +9678,17 @@ class CodexRunnerVerificationGateTests(unittest.TestCase):
 
             delegate.subprocess.run = run
             try:
-                with self.assertRaisesRegex(delegate._RunnerProbeFailure, "read-only|writable"):
-                    delegate._run_codex(worktree, "gpt-test", prompt, record)
+                with mock.patch.object(
+                        delegate, "write_text_atomic", side_effect=OSError("read-only")):
+                    with self.assertRaisesRegex(
+                            delegate._RunnerProbeFailure, "codex-runner-verified|read-only"):
+                        delegate._run_codex(worktree, "gpt-test", prompt, record)
             finally:
-                config.chmod(0o644)
                 delegate.subprocess.run = original_run
                 delegate._run_codex_sandbox_probe = original_probe
             self.assertEqual(calls["runner"], 0)
-            self.assertEqual(config.read_bytes(), original)
+            self.assertEqual((root / ".waystone.yml").read_bytes(), original)
+            self.assertFalse((root / ".waystone" / "codex-runner-verified").exists())
 
 
 def _write_apply_verdict(rec):
@@ -10817,7 +11302,7 @@ class DelegateCliTests(unittest.TestCase):
                 rc = _run_with_home(home, lambda: delegate.main([
                     "show", rec.name, "--failure", "--root", str(root)]))
             self.assertEqual(rc, 0)
-            self.assertIn("codex_runner_verified", out.getvalue())
+            self.assertIn(".waystone/codex-runner-verified", out.getvalue())
 
     def test_unknown_subcommand(self):
         import contextlib

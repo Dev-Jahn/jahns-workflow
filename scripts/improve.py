@@ -950,9 +950,11 @@ def _round_session_binding(round_id: str, exposures: list[dict] | dict[str, dict
 def _review_binding(request_file: Path | None, round_id: str, mode: str,
                     sidecars: list[dict]) -> dict:
     def result(target_sha=None, base_sha=None, provenance="unknown", reason=None, source=None,
-               *, cycle=None, reviewers=None, profile_fingerprint=None) -> dict:
+               *, cycle=None, reviewers=None, profile_fingerprint=None,
+               narrative_digest=None) -> dict:
         return {
             "target_sha": target_sha, "base_sha": base_sha,
+            "narrative_digest": narrative_digest,
             "review_cycle": cycle, "reviewers": reviewers,
             "review_profile_fingerprint": profile_fingerprint,
             "review_binding_provenance": provenance,
@@ -997,7 +999,8 @@ def _review_binding(request_file: Path | None, round_id: str, mode: str,
             return result(reason="request-binding-sidecar-mismatch")
         return result(
             latest["target_sha"], latest.get("base_sha"), "explicit", None,
-            "round-request-sidecar", reviewers=list(latest.get("reviewers") or []))
+            "round-request-sidecar", reviewers=list(latest.get("reviewers") or []),
+            narrative_digest=latest.get("narrative_digest"))
     try:
         text = request_file.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
@@ -1083,6 +1086,8 @@ def _project_review_rows(name: str, root: Path, cfg: dict) -> list[dict]:
             "metadata": {}, "model": None, "effort": None, "review_target": None,
             "review_target_matches": None, "reviewer_configured": None,
             "reviewer_coverage_reason": "reply-metadata-unavailable",
+            "narrative_digest": None, "narrative_digest_matches": None,
+            "narrative_coverage_reason": None,
         }
         round_tasks = tasks_by_round.get(rid, [])
         tasks_by_id = {t["id"]: t for t in round_tasks if t.get("id")}
@@ -1150,6 +1155,9 @@ def _project_review_rows(name: str, root: Path, cfg: dict) -> list[dict]:
             "review_target_matches": reply_metadata["review_target_matches"],
             "reviewer_configured": reply_metadata["reviewer_configured"],
             "reviewer_coverage_reason": reply_metadata["reviewer_coverage_reason"],
+            "reply_narrative_digest": reply_metadata["narrative_digest"],
+            "narrative_digest_matches": reply_metadata["narrative_digest_matches"],
+            "narrative_coverage_reason": reply_metadata["narrative_coverage_reason"],
             "reply_metadata": reply_metadata["metadata"],
             **review_binding,
             "session_id": session_id,

@@ -39,8 +39,7 @@ import yaml  # noqa: E402
 from common import (
     WorkflowError, _project_slug, canonical_scope_prefixes, ensure_project_state_dir,
     find_project_root, git_full_sha, hold_lock, hold_project_lock, load_config, load_tasks,
-    migrate_project_state, normalize_config, project_state_path, worktrees_cache_dir,
-    write_bytes_atomic, write_text_atomic,
+    migrate_project_state, project_state_path, worktrees_cache_dir, write_text_atomic,
 )  # noqa: E402
 
 DELEG_REF_NS = "refs/waystone/delegations"
@@ -89,6 +88,8 @@ _LEGACY_VERIFIER_EXECUTIONS = ("codex-cli", "codex-companion")
 _EXTERNAL_RUNNERS = ("codex", "claude")
 _CLAUDE_EFFORT_VALUES = ("low", "medium", "high", "xhigh")
 _VERIFIER_SESSION_ENV = "WAYSTONE_VERIFIER_SESSION"
+_CODEX_RUNNER_VERIFIED_MARKER = "codex-runner-verified"
+_CODEX_RUNNER_VERIFICATION_LOCK = "codex-runner-verification.lock"
 # Fan-out carrier attribution (§4.2 / ADR-0001): recorded in the immutable packet as an
 # improve/cclog join key. v1 has a single carrier; the instance id is a pre-generated correlation id.
 _CARRIER_NAMES = ("claude-workflow",)
@@ -989,162 +990,58 @@ def _run_codex_sandbox_probe(worktree: Path, model: str, record_dir: Path,
     return result
 
 
-def _record_codex_runner_verified(config_path: Path) -> None:
-    """Insert the one-time Codex runner proof without reserializing project configuration."""
+def _record_codex_runner_verified(marker_path: Path) -> None:
+    """Record the checkout-local one-time Codex runner proof atomically."""
     try:
-        original = config_path.read_bytes()
-        mode = config_path.stat().st_mode
+        write_text_atomic(marker_path, "verified\n")
     except OSError as e:
-        raise WorkflowError(f"cannot read project config {config_path}: {e}") from e
-    if mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH) == 0:
-        raise WorkflowError(
-            f"project config is read-only; manually add "
-            f"delegation.codex_runner_verified: true to {config_path}")
+        raise WorkflowError(f"cannot record Codex runner proof at {marker_path}: {e}") from e
+
+
+def _codex_runner_marker_recorded(marker_path: Path, *, diagnose: bool = True) -> bool:
     try:
-        descriptor = os.open(config_path, os.O_WRONLY)
-        os.close(descriptor)
+        info = marker_path.lstat()
+    except FileNotFoundError:
+        return False
     except OSError as e:
-        raise WorkflowError(
-            f"project config is not writable; manually add "
-            f"delegation.codex_runner_verified: true to {config_path}: {e}") from e
+        raise WorkflowError(f"cannot inspect Codex runner proof at {marker_path}: {e}") from e
+    project_root = marker_path.parent.parent
     try:
-        text = original.decode("utf-8")
-        root = yaml.compose(text)
-    except (UnicodeDecodeError, yaml.YAMLError) as e:
-        raise WorkflowError(f"cannot parse project config {config_path}: {e}") from e
-    if not isinstance(root, yaml.MappingNode):
-        raise WorkflowError(f"project config top level must be a mapping: {config_path}")
-
-    pairs = [
-        (key, value) for key, value in root.value
-        if isinstance(key, yaml.ScalarNode) and key.value == "delegation"
-    ]
-    if len(pairs) > 1:
+        relative = marker_path.relative_to(project_root).as_posix()
+    except ValueError as e:
         raise WorkflowError(
-            f"cannot automatically edit ambiguous project config with duplicate delegation keys: "
-            f"{config_path}")
-
-    if not pairs:
-        # No literal `delegation:` pair — but the EFFECTIVE config may still carry one through a
-        # top-level YAML merge (`<<: *defaults`). Appending a direct block would shadow those
-        # inherited values, so refuse instead of silently changing semantics.
-        try:
-            effective = yaml.safe_load(text)
-        except yaml.YAMLError as e:
-            raise WorkflowError(f"cannot parse project config {config_path}: {e}") from e
-        if isinstance(effective, dict) and effective.get("delegation") is not None:
-            raise WorkflowError(
-                "delegation is provided through YAML merge/anchor indirection; manually add "
-                f"delegation.codex_runner_verified: true to {config_path}")
-        match = re.search(r"\r\n|\n", text)
-        newline = match.group(0) if match else "\n"
-        separator = "" if not text or text.endswith(("\n", "\r")) else newline
-        updated = (
-            text + separator + "delegation:" + newline
-            + "  codex_runner_verified: true" + newline
-        )
-    else:
-        section_key, section = pairs[0]
-        anchor_or_alias = False
-        try:
-            for token in yaml.scan(text):
-                if not isinstance(token, (yaml.tokens.AnchorToken, yaml.tokens.AliasToken)):
-                    continue
-                after_key = token.start_mark.index >= section_key.end_mark.index
-                on_key_line = token.start_mark.line == section_key.start_mark.line
-                inside_value = (
-                    section.start_mark.index <= token.start_mark.index
-                    < section.end_mark.index
-                )
-                if after_key and (on_key_line or inside_value):
-                    anchor_or_alias = True
-                    break
-        except yaml.YAMLError as e:
-            raise WorkflowError(f"cannot scan project config {config_path}: {e}") from e
-        if anchor_or_alias:
-            raise WorkflowError(
-                "cannot automatically edit delegation through a YAML anchor or alias; manually "
-                f"add delegation.codex_runner_verified: true to {config_path}")
-        if not isinstance(section, yaml.MappingNode):
-            raise WorkflowError(
-                f"delegation must be a direct mapping before automatically recording "
-                f"codex_runner_verified; manually add it to {config_path}")
-
-        verified_pairs = [
-            (key, value) for key, value in section.value
-            if isinstance(key, yaml.ScalarNode) and key.value == "codex_runner_verified"
-        ]
-        if len(verified_pairs) > 1:
-            raise WorkflowError(
-                f"cannot automatically edit duplicate delegation.codex_runner_verified keys: "
-                f"{config_path}")
-        if verified_pairs:
-            # An existing key must end up `true`, or every later run re-probes forever. A plain
-            # null/false scalar is spliced in place; anything else is refused, not guessed.
-            _key_node, value_node = verified_pairs[0]
-            if (isinstance(value_node, yaml.ScalarNode)
-                    and yaml.safe_load(text)["delegation"]["codex_runner_verified"] is True):
-                return
-            if not isinstance(value_node, yaml.ScalarNode):
-                raise WorkflowError(
-                    "cannot automatically rewrite a non-scalar delegation.codex_runner_verified "
-                    f"value; manually set it to true in {config_path}")
-            start, end = value_node.start_mark.index, value_node.end_mark.index
-            replacement = "true" if end > start else (
-                (" " if start > 0 and not text[start - 1].isspace() else "") + "true")
-            updated = text[:start] + replacement + text[end:]
-            _finalize_codex_runner_verified(config_path, updated)
-            return
-
-        if section.flow_style:
-            closing = section.end_mark.index - 1
-            if closing < 0 or text[closing] != "}":
-                raise WorkflowError(
-                    f"cannot locate flow-style delegation mapping end in {config_path}; "
-                    "manually add delegation.codex_runner_verified: true")
-            prefix = ", " if section.value else ""
-            updated = (
-                text[:closing] + prefix + "codex_runner_verified: true" + text[closing:]
+            f"Codex runner proof is outside its project root: {marker_path}") from e
+    rc, tracked, error = _git(project_root, "ls-files", "--stage", "--", relative)
+    if rc != 0:
+        raise WorkflowError(
+            f"cannot verify that Codex runner proof is checkout-local with git ls-files: "
+            f"{error or f'rc {rc}'}")
+    if tracked:
+        if diagnose:
+            print(
+                f"waystone: checkout-local Codex runner proof {marker_path} is git-tracked "
+                f"and is ignored; from {project_root}, run git rm --cached -- {relative}; "
+                "a fresh preflight probe will run",
+                file=sys.stderr,
             )
-        else:
-            if not section.value:
-                raise WorkflowError(
-                    f"cannot locate delegation child indentation in {config_path}; manually add "
-                    "delegation.codex_runner_verified: true")
-            first_key = section.value[0][0]
-            lines = text.splitlines(keepends=True)
-            insert_at = first_key.start_mark.line
-            key_line = lines[section_key.start_mark.line]
-            newline = "\r\n" if key_line.endswith("\r\n") else "\n"
-            indent = " " * first_key.start_mark.column
-            lines.insert(insert_at, f"{indent}codex_runner_verified: true{newline}")
-            updated = "".join(lines)
-
-    _finalize_codex_runner_verified(config_path, updated)
-
-
-def _finalize_codex_runner_verified(config_path: Path, updated: str) -> None:
-    """Validate and write the surgical edit, preserving the config's original file mode."""
-    try:
-        normalized = normalize_config(yaml.safe_load(updated))
-    except (ValueError, yaml.YAMLError) as e:
-        raise WorkflowError(
-            f"refusing invalid project config edit for {config_path}: {e}") from e
-    if normalized["delegation"]["codex_runner_verified"] is not True:
-        raise WorkflowError(
-            f"project config edit did not record delegation.codex_runner_verified: true: "
-            f"{config_path}")
-    try:
-        original_mode = stat.S_IMODE(config_path.stat().st_mode)
-        write_bytes_atomic(config_path, updated.encode("utf-8"))
-        os.chmod(config_path, original_mode)
-    except OSError as e:
-        raise WorkflowError(
-            f"cannot record delegation.codex_runner_verified in {config_path}: {e}") from e
+        return False
+    valid = stat.S_ISREG(info.st_mode)
+    if valid:
+        try:
+            valid = marker_path.read_bytes() == b"verified\n"
+        except OSError as e:
+            raise WorkflowError(f"cannot read Codex runner proof at {marker_path}: {e}") from e
+    if not valid and diagnose:
+        print(
+            f"waystone: invalid checkout-local Codex runner proof at {marker_path} is ignored; "
+            "a fresh preflight probe will run and replace it with the verified contract value",
+            file=sys.stderr,
+        )
+    return valid
 
 
-def _codex_runner_verification_config(record_dir: Path) -> tuple[Path, bool] | None:
-    """The live project config and whether its one-time runner proof is already recorded."""
+def _codex_runner_verification_marker(record_dir: Path) -> tuple[Path, bool] | None:
+    """The checkout-local marker and whether its one-time runner proof is already recorded."""
     if not (record_dir / "exposure.json").exists():
         return None  # low-level probe contracts have no project exposure and always exercise probe
     exposure = _load_exposure(record_dir)
@@ -1153,9 +1050,9 @@ def _codex_runner_verification_config(record_dir: Path) -> tuple[Path, bool] | N
     if not isinstance(root, str) or not root:
         raise WorkflowError(f"corrupt exposure project root: {record_dir / 'exposure.json'}")
     project_root = Path(root)
-    cfg = load_config(project_root)
-    verified = cfg["delegation"]["codex_runner_verified"] is True
-    return project_root / ".waystone.yml", verified
+    load_config(project_root)  # validate config and surface legacy-key removal guidance
+    marker_path = ensure_project_state_dir(project_root) / _CODEX_RUNNER_VERIFIED_MARKER
+    return marker_path, _codex_runner_marker_recorded(marker_path)
 
 
 def _run_codex(worktree: Path, model: str, prompt_path: Path, record_dir: Path,
@@ -1177,24 +1074,27 @@ def _run_codex(worktree: Path, model: str, prompt_path: Path, record_dir: Path,
                 _record_codex_runner_verified(verification[0])
             except WorkflowError as e:
                 raise _RunnerProbeEvidenceFailure(
-                    f"runner preflight passed but its project config proof could not be "
+                    f"runner preflight passed but its checkout-local proof could not be "
                     f"recorded: {e}", probe) from e
 
-        verification = _codex_runner_verification_config(record_dir)
+        verification = _codex_runner_verification_marker(record_dir)
         if verification is None:
             probe_if_needed(None)
         else:
+            lock_path = verification[0].parent / _CODEX_RUNNER_VERIFICATION_LOCK
             lock_stream = None
             try:
-                lock_stream = verification[0].open("rb")
+                lock_stream = lock_path.open("a+", encoding="utf-8")
                 fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
             except OSError as e:
                 if lock_stream is not None:
                     lock_stream.close()
                 raise _RunnerProbeEvidenceFailure(
-                    f"cannot lock project config for Codex runner verification: {e}") from e
+                    f"cannot lock checkout-local Codex runner proof {lock_path}: {e}") from e
             try:
-                probe_if_needed(_codex_runner_verification_config(record_dir))
+                probe_if_needed(
+                    (verification[0], _codex_runner_marker_recorded(
+                        verification[0], diagnose=False)))
             finally:
                 fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
                 lock_stream.close()
@@ -1256,7 +1156,7 @@ def _runner_sandbox_diagnostic_hint(text: str) -> str | None:
     if failure_line is None:
         return None
     verified_hint = (
-        "; review delegation.codex_runner_verified in .waystone.yml and remove the key to "
+        "; remove .waystone/codex-runner-verified to "
         "require a fresh preflight probe after runner-environment changes"
     )
     lower = failure_line.lower()
@@ -3112,7 +3012,7 @@ def show(root: Path, did: str, opt: str | None) -> int:
             # Even without a recognized sandbox-mechanism line, an environment failure on a
             # machine that skipped the probe deserves the one-time-verification pointer.
             print("diagnostic hint: this machine hit an environment failure; if "
-                  "delegation.codex_runner_verified is true in .waystone.yml, remove the key so "
+                  ".waystone/codex-runner-verified exists, remove the marker so "
                   "the next run re-probes this machine")
         return 0
     if opt in ("patch", "report"):

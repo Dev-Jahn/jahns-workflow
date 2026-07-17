@@ -92,7 +92,6 @@ policy:
 delegation:
   enabled: true                 # use the recorded Step 2 choice
   env_prep: null                # null = lockfile auto-detection
-  # codex_runner_verified: true # waystone records this after the first successful Codex preflight
 state:
   last_round_commit: null
 ```
