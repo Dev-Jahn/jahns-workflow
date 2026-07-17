@@ -336,10 +336,11 @@ tasks:
     severity: "major"
     origin: "dogfooding-20260717"
   - id: fix/probe-once-config-gate
+    result: "위임 2차 패치(1회 프로브+서지컬 기록+skip, CRLF/alias/0444 편입) + main 마감 4건(merge-key 거부, null/false→true 치환 — 영구 재프로브 차단, mode 보존, generic failed-env 힌트). RED x4(사전 6 failures). 715 OK, ruff 클린. 명시 null 거부는 기각 유지"
     accept: [".waystone.yml delegation 아래 codex_runner_verified key — 미설정이면 기존 프로브를 1회 실행하고, 성공 시 true를 주석 보존 서지컬 편집으로 기록하며, true로 설정된 뒤에는 프로브를 완전히 생략한다 (생략 계약 테스트 포함)", "프로브 실패 시 key를 기록하지 않고 기존 거부 동작을 유지한다(다음 실행이 재프로브); 사후 검출기의 failed-env 진단 힌트에 key 재검토 안내를 추가한다", "config normalize/스키마에 key가 반영되고, 기존 프로브 계약 테스트는 key-부재 경로로 전부 유지된다", "전체 테스트 스위트(신규 계약 RED-first)와 ruff F401,F841 검사가 통과한다", "서지컬 편집이 개행 스타일(CRLF 포함)을 바이트 그대로 보존하고, delegation 블록이 YAML alias/anchor를 경유하면 편집을 거부하며 수동 추가를 안내한다 (실파일 계약 테스트 — in-memory 문자열 아님)", "config가 쓰기 불가(읽기 전용 포함)면 조용한 교체 없이 기존 쓰기 실패와 동일하게 시끄럽게 실패한다"]
-    scope: ["scripts", "templates"]
+    scope: ["scripts", "templates", "skills"]
     title: "프리플라이트 프로브를 1회성 검증으로: .waystone.yml delegation.codex_runner_verified key가 미설정일 때만 프로브 실행, 성공 시 true를 주석 보존 편집으로 기록, 이후 참조만 하고 프로브 생략 (사용자 설계 2026-07-17)"
-    status: "pending"
+    status: "done"
     severity: "minor"
     origin: "overengineering-audit-20260717"
   - id: chore/migration-sunset
