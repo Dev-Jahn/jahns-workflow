@@ -119,8 +119,9 @@ When the project uses PR-mode review, the same verify-then-register discipline a
   see it — a PR comment containing `<!-- waystone-findings:v1\ncycle: <N>\nresolved: true\n-->`
   (only after every REAL finding is fixed/deferred-with-cause).
 - A finding fixed in code produces a NEW head SHA, which makes the frozen cycle stale. Do not
-  merge against a stale cycle — re-freeze (`waystone review freeze --pr <N>`) so reviewers re-examine
-  the new SHA. Codex re-reviews the new head; the macro reviewer does a full or delta review.
+  merge against a stale cycle — re-freeze (`waystone review freeze --pr <N> --round <round-id>`;
+  freezes are digest-bound, so `--round` is required) so reviewers re-examine the new SHA. Codex
+  re-reviews the new head; the macro reviewer does a full or delta review.
 - The merge is gated, not judged: `waystone round merge --pr <N> .`
   prints PASS only when the cycle is fresh, CI ok (if required), a fresh Codex review + resolved
   findings + a macro result are all bound to the current head, zero open blockers/decisions, and
