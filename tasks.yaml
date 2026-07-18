@@ -522,6 +522,7 @@ tasks:
     severity: "major"
     origin: "review-2026-07-18-carrier-lanes-fixes"
   - id: fix/reprepare-generation-atomicity
+    accept: ["reprepare 순서가 fail-closed다 — 새 binding(v2)을 먼저 발행해 구 feedback을 무효화한 뒤 request·stored narrative projection을 갱신한다(또는 동등한 원자적 generation 전환) — 시퀀스 어느 지점에서 프로세스가 중단돼도 구 binding+구 feedback 조합이 완료로 남지 않는다", "RED-first: prepare A → ingest A(완료) → reprepare B 중 request 기록 직후 강제 종료 → pending에 해당 round가 반드시 남는다; stored narrative 기록 직후 종료도 별도 계약으로 고정", "pending 완료 판정이 최신 binding에서 request·narrative의 재현성을 확인한다 — 디스크 request가 최신 binding과 불일치하면 완료로 숨기지 않고 pending 유지(정직한 사유 노출)", "전체 테스트 스위트 green + ruff F401,F841 clean — schema-v2·digest·publication 계약(rendered digest 대조·재-prepare pending 재개·legacy 처분) 무회귀"]
     scope: ["scripts/review.py", "scripts/tests/run_tests.py"]
     title: "reprepare generation(request+narrative+binding)이 비원자 — request 기록 직후 crash 시 구 binding+구 feedback이 완료를 유지한 채 디스크에 B request 잔존(fail-open). 새 binding 선발행으로 구 feedback 무효화 후 projection 갱신 + pending이 request/narrative의 최신 binding 재현성 확인 (RED: request write 직후 강제 종료 → pending 잔존) (JW-GPT-005)"
     status: "pending"
