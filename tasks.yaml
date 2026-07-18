@@ -564,10 +564,11 @@ tasks:
     severity: "major"
     origin: "review-2026-07-18-generation-binding"
   - id: fix/round-mint-anchor-immutable
+    result: "@ b3354c8 (attempt-1, 위임 20260718T134046Z): PROGRESS heading 분기 삭제 — exposure 단독 앵커. live 778 green"
     accept: ["round 기존성 판정은 유효한 immutable round exposure만 인정한다 — mutable PROGRESS.md heading은 기존성 증거에서 제거된다 (RED: exposure 없는 과거-dated round id를 PROGRESS heading만 추가한 상태로 close 시도 → 신규 mint로 취급되어 현재일 검증이 거부)", "정당 흐름 무회귀 — 기존 exposure가 있는 round의 익일 재close(확장)는 계속 허용된다", "전체 테스트 스위트 green + ruff F401,F841 clean"]
     scope: ["scripts/round.py", "scripts/tests/run_tests.py"]
     title: "round 기존성 판정에서 mutable PROGRESS.md heading 제거 — 유효한 immutable round exposure만 기존 round로 인정(또는 migration 시점 고정 allowlist), 임의 과거-dated round의 신규 mint로 v1 legacy 창을 여는 경로 차단 — '유한 전환일 잔여' 전제 복원 (JW-GPT-009)"
-    status: "pending"
+    status: "done"
     severity: "major"
     origin: "review-2026-07-18-generation-binding"
   - id: fix/probe-proof-principal-binding
