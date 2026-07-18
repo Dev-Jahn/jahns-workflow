@@ -16,11 +16,13 @@ keep the waystone harness out of scope unless asked.
 
 Start the reply with this block (replace values; key case/order/spacing and a Markdown fence are
 optional; extra keys are preserved). Echo the `Reviewing` target, alone or as a 12–40 hex
-`base-target` range; missing/damaged values stay unknown, and no model/target means ordinary prose:
+`base-target` range, and copy the request digest exactly; missing/damaged values stay unknown, and
+no model/target means ordinary prose:
 ```text
 model: [[REPLY_MODEL]]
 effort: high
 review-target: [[REVIEW_TARGET]]
+request-digest: [[REQUEST_DIGEST]]
 ```
 
 Major / critical issues only. For each: a concrete failure mechanism and where you confirmed it.

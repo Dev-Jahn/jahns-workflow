@@ -85,10 +85,12 @@ _REPLY_MODEL_RE = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._/-]*(?::[A-Za-z0-9][A-Za-z0-9._/-]*)?")
 _REVIEW_TARGET_RE = re.compile(
     r"(?P<first>[0-9a-fA-F]{12,40})(?:-(?P<second>[0-9a-fA-F]{12,40}))?")
+_REQUEST_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
 _FEEDBACK_METADATA_PREFIX = "reply-metadata-json: "
 TRIAGE_BEGIN = b"<!-- waystone triage: BEGIN -->"
 TRIAGE_END = b"<!-- waystone triage: END -->"
 REVIEW_REQUEST_TEMPLATE = Path(__file__).resolve().parent.parent / "templates" / "review-request.md"
+_REQUEST_DIGEST_SENTINEL = "sha256:" + "0" * 64
 NARRATIVE_HEADINGS = (
     "## What changed and why",
     "## Read these first",
@@ -162,6 +164,13 @@ def normalize_review_target(value: object) -> str | None:
     return candidate if _REVIEW_TARGET_RE.fullmatch(candidate) is not None else None
 
 
+def normalize_request_digest(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip().lower()
+    return candidate if _REQUEST_DIGEST_RE.fullmatch(candidate) is not None else None
+
+
 def reviewer_model_matches(declared: str, configured: str) -> bool:
     """Documented identity normalization used by ingest and the configured-feedback guard."""
     left = normalize_reviewer_model(declared)
@@ -184,12 +193,13 @@ def parse_review_reply_header(body: bytes) -> dict:
     Leading blank lines and one optional Markdown fence are ignored; key case, order, and colon
     whitespace are insignificant. The block ends at its first blank/non-key line (or closing
     fence), is bounded to 32 lines/16 KiB, and is classified only if it contains ``model`` or
-    ``review-target``. Unknown keys are retained. The whole header block must be valid UTF-8;
-    duplicate fields are never guessed.
+    ``review-target``. The optional ``request-digest`` is validated as a SHA-256 digest; unknown
+    keys are retained. The whole header block must be valid UTF-8; duplicate fields are never
+    guessed.
     """
     not_detected = {
         "detected": False, "metadata": {}, "model": None, "effort": None,
-        "review_target": None, "warnings": [],
+        "review_target": None, "request_digest": None, "warnings": [],
     }
     raw_header: list[bytes] = []
     metadata: dict[str, str] = {}
@@ -258,6 +268,8 @@ def parse_review_reply_header(body: bytes) -> dict:
     effort = None if "effort" in duplicates else normalize_review_effort(metadata.get("effort"))
     target = (None if "review-target" in duplicates
               else normalize_review_target(metadata.get("review-target")))
+    request_digest = (None if "request-digest" in duplicates
+                      else normalize_request_digest(metadata.get("request-digest")))
     for key, value, invalid in (
             ("model", model, "invalid-model"),
             ("effort", effort, "invalid-effort"),
@@ -268,9 +280,14 @@ def parse_review_reply_header(body: bytes) -> dict:
             warnings.append(invalid)
         if value is None:
             metadata.pop(key, None)
+    if ("request-digest" in seen and request_digest is None
+            and "request-digest" not in duplicates):
+        warnings.append("invalid-request-digest")
+        metadata.pop("request-digest", None)
     return {
         "detected": True, "metadata": metadata, "model": model, "effort": effort,
-        "review_target": target, "warnings": list(dict.fromkeys(warnings)),
+        "review_target": target, "request_digest": request_digest,
+        "warnings": list(dict.fromkeys(warnings)),
     }
 
 
@@ -537,6 +554,35 @@ def ingest_round_binding(root: Path, round_id: str, cfg: dict) -> tuple[dict | N
         return None, f"corrupt-round-binding:{type(e).__name__}"
 
 
+def _request_binding_schema(binding: dict | None) -> object:
+    if not isinstance(binding, dict):
+        return None
+    return (binding.get("request_binding_schema")
+            or binding.get("review_binding_schema")
+            or binding.get("schema"))
+
+
+def _round_request_generation(
+        root: Path, round_id: str, cfg: dict, rendered_request_digest: str,
+) -> dict | None:
+    """Resolve an echoed digest to one immutable request sidecar generation."""
+    mode = (cfg.get("review") or {}).get("mode", "packet")
+    directory = (Path(root) / cfg["reviews_dir"] if mode == "packet"
+                 else project_state_path(root) / "review-requests")
+    matches: list[tuple[Path, dict]] = []
+    for path in sorted(directory.glob(f"{round_id}-request.binding*.json")):
+        try:
+            row = read_round_request_binding(path, expected_round_id=round_id)
+        except WorkflowError:
+            continue
+        if row.get("rendered_request_digest") == rendered_request_digest:
+            matches.append((path, row))
+    if not matches:
+        return None
+    path, row = max(matches, key=lambda item: round_request_binding_order(*item))
+    return {**row, "source": str(path)}
+
+
 def _unknown_feedback_metadata(reason: str) -> dict:
     return {
         "metadata": {}, "model": None, "effort": None, "review_target": None,
@@ -567,21 +613,28 @@ def _assess_narrative_digest(binding: dict | None, feedback_digest: str | None,
 
 
 def _assess_rendered_request_digest(
-        binding: dict | None, feedback_digest: str | None, *, feedback_digest_present: bool,
+        binding: dict | None, feedback_digest: str | None, *, coverage_present: bool,
+        receipt_reason: object,
 ) -> tuple[bool | None, str | None]:
-    """Bind a feedback receipt to the exact rendered request generation it reviewed."""
+    """Bind a feedback receipt to the exact rendered request generation it reviewed.
+
+    A stored reason never overrides comparison of a stamped echo with the current binding; it
+    preserves provenance only when ingest could not stamp a generation digest.
+    """
+    if not coverage_present:
+        return None, "request-digest-echo-unavailable"
+    if feedback_digest is None:
+        if receipt_reason == "request-digest-missing-legacy-fallback":
+            return None, receipt_reason
+        if receipt_reason in ("request-digest-missing", "request-digest-unknown"):
+            return False, receipt_reason
+        return False, "request-digest-coverage-invalid"
     if binding is None:
         return None, "round-binding-unavailable"
     binding_digest = binding.get("rendered_request_digest")
-    binding_schema = (binding.get("request_binding_schema")
-                      or binding.get("review_binding_schema")
-                      or binding.get("schema"))
-    if (binding_schema == ROUND_REQUEST_BINDING_V1_SCHEMA
-            and binding_digest is None and not feedback_digest_present):
-        return None, "legacy-pre-digest"
-    if binding_digest is not None and feedback_digest == binding_digest:
+    if feedback_digest == binding_digest:
         return True, None
-    return False, "rendered-request-digest-mismatch"
+    return False, "request-digest-stale-generation"
 
 
 def read_feedback_reply_metadata(path: Path, *, expected_round_id: str | None = None,
@@ -623,10 +676,11 @@ def read_feedback_reply_metadata(path: Path, *, expected_round_id: str | None = 
     feedback_digest = payload.get("narrative_digest")
     if not _is_sha256_digest(feedback_digest):
         feedback_digest = None
-    rendered_digest_present = "rendered_request_digest" in payload
     rendered_digest = payload.get("rendered_request_digest")
     if not _is_sha256_digest(rendered_digest):
         rendered_digest = None
+    rendered_coverage_present = "rendered_request_coverage_reason" in payload
+    rendered_receipt_reason = payload.get("rendered_request_coverage_reason")
     projected = {
         "metadata": metadata,
         "model": metadata.get("model"),
@@ -648,7 +702,8 @@ def read_feedback_reply_metadata(path: Path, *, expected_round_id: str | None = 
     narrative_matches, narrative_reason = _assess_narrative_digest(
         binding, feedback_digest, feedback_digest_present=feedback_digest_present)
     rendered_matches, rendered_reason = _assess_rendered_request_digest(
-        binding, rendered_digest, feedback_digest_present=rendered_digest_present)
+        binding, rendered_digest, coverage_present=rendered_coverage_present,
+        receipt_reason=rendered_receipt_reason)
     return {
         **projected,
         "review_target_matches": assessment["review_target_matches"],
@@ -671,7 +726,8 @@ def _packet_projection_reason(
         request_text = request.read_bytes().decode("utf-8")
     except (OSError, UnicodeDecodeError):
         return "request-unreadable"
-    if (_canonical_rendered_request_digest(request_text)
+    if (_rendered_request_digest_echo(request_text) != binding["rendered_request_digest"]
+            or _canonical_rendered_request_digest(request_text)
             != binding["rendered_request_digest"]):
         return "request-digest-mismatch"
     try:
@@ -723,9 +779,12 @@ def pending_reviews(root: Path, *, now: datetime | None = None) -> list[dict]:
         # unconfigured model still ends the wait.
         narrative_complete = (metadata["narrative_digest_matches"] is True
                               or metadata["narrative_coverage_reason"] == "legacy-pre-digest")
-        rendered_complete = (metadata["rendered_request_digest_matches"] is True
-                             or metadata["rendered_request_coverage_reason"]
-                             == "legacy-pre-digest")
+        rendered_complete = (
+            metadata["rendered_request_digest_matches"] is True
+            or (_request_binding_schema(binding) == ROUND_REQUEST_BINDING_V1_SCHEMA
+                and metadata["rendered_request_coverage_reason"]
+                == "request-digest-missing-legacy-fallback")
+        )
         if (binding is not None and projection_reason is None
                 and metadata["review_target_matches"] is True
                 and narrative_complete and rendered_complete):
@@ -739,13 +798,13 @@ def pending_reviews(root: Path, *, now: datetime | None = None) -> list[dict]:
             reason = ("feedback-review-target-mismatch"
                       if metadata["review_target_matches"] is False
                       else "matching-feedback-unavailable")
-        elif not narrative_complete:
-            reason = "feedback-" + (
-                metadata["narrative_coverage_reason"] or "narrative-digest-unavailable")
         elif not rendered_complete:
             reason = "feedback-" + (
                 metadata["rendered_request_coverage_reason"]
                 or "rendered-request-digest-unavailable")
+        elif not narrative_complete:
+            reason = "feedback-" + (
+                metadata["narrative_coverage_reason"] or "narrative-digest-unavailable")
         else:
             reason = "matching-feedback-unavailable"
 
@@ -976,8 +1035,41 @@ def _canonical_narrative_digest(narrative: str) -> str:
     return "sha256:" + hashlib.sha256(narrative.encode("utf-8")).hexdigest()
 
 
+def _rendered_request_digest_field(rendered: str) -> tuple[int, int, str] | None:
+    """Locate the self-digest value only inside the rendered response header block."""
+    sections = list(re.finditer(r"(?m)^## Response wanted\s*$", rendered))
+    if len(sections) != 1:
+        return None
+    fence_start = rendered.find("```text\n", sections[0].end())
+    if fence_start < 0:
+        return None
+    block_start = fence_start + len("```text\n")
+    block_end = rendered.find("\n```", block_start)
+    if block_end < 0:
+        return None
+    header = rendered[block_start:block_end]
+    fields = list(re.finditer(
+        r"(?mi)^\s*request-digest\s*:\s*(?P<value>[^\r\n]*?)\s*$", header))
+    if len(fields) != 1:
+        return None
+    field = fields[0]
+    start = block_start + field.start("value")
+    end = block_start + field.end("value")
+    return start, end, field.group("value")
+
+
+def _rendered_request_digest_echo(rendered: str) -> str | None:
+    field = _rendered_request_digest_field(rendered)
+    return normalize_request_digest(field[2]) if field is not None else None
+
+
 def _canonical_rendered_request_digest(rendered: str) -> str:
-    return "sha256:" + hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+    field = _rendered_request_digest_field(rendered)
+    canonical = rendered
+    if field is not None:
+        start, end, _value = field
+        canonical = rendered[:start] + _REQUEST_DIGEST_SENTINEL + rendered[end:]
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _render_review_request(round_id: str, exposure: dict, narrative: str) -> str:
@@ -998,6 +1090,7 @@ def _render_review_request(round_id: str, exposure: dict, narrative: str) -> str
         "[[NARRATIVE]]": narrative.rstrip(),
         "[[REPLY_MODEL]]": reviewers[0],
         "[[REVIEW_TARGET]]": target_sha,
+        "[[REQUEST_DIGEST]]": _REQUEST_DIGEST_SENTINEL,
     }
     found = set(_TEMPLATE_TOKEN_RE.findall(template))
     if found != set(replacements) or any(template.count(token) != 1 for token in replacements):
@@ -1022,7 +1115,19 @@ def _render_review_request(round_id: str, exposure: dict, narrative: str) -> str
     match = PACKET_REVIEWING_RE.fullmatch(candidates[0]) if len(candidates) == 1 else None
     if match is None or match.group(1) != target_sha:
         raise WorkflowError("rendered Reviewing field does not match the round exposure target")
-    return rendered if rendered.endswith("\n") else rendered + "\n"
+    if not rendered.endswith("\n"):
+        rendered += "\n"
+    field = _rendered_request_digest_field(rendered)
+    if field is None or field[2] != _REQUEST_DIGEST_SENTINEL:
+        raise WorkflowError(
+            "rendered review request must contain one canonical request-digest key")
+    digest = _canonical_rendered_request_digest(rendered)
+    start, end, _value = field
+    rendered = rendered[:start] + digest + rendered[end:]
+    if (_rendered_request_digest_echo(rendered) != digest
+            or _canonical_rendered_request_digest(rendered) != digest):
+        raise WorkflowError("rendered request self-digest is not canonical")
+    return rendered
 
 
 def prepare_review_request(root: Path, round_id: str, narrative_path: Path) -> int:
@@ -2021,6 +2126,26 @@ def ingest(root: Path, round_id: str | None, src: Path = INBOX, reviewer: str | 
             file=sys.stderr)
         return 1
     assessment = assess_review_reply(parsed_header, binding)
+    request_digest = parsed_header["request_digest"]
+    request_generation = None
+    rendered_request_digest_matches = None
+    if request_digest is not None:
+        request_generation = _round_request_generation(
+            root, round_id, cfg, request_digest)
+        if request_generation is None:
+            rendered_request_coverage_reason = "request-digest-unknown"
+            rendered_request_digest_matches = False
+        elif (binding is not None
+              and request_digest == binding.get("rendered_request_digest")):
+            rendered_request_coverage_reason = None
+            rendered_request_digest_matches = True
+        else:
+            rendered_request_coverage_reason = "request-digest-stale-generation"
+            rendered_request_digest_matches = False
+    elif _request_binding_schema(binding) == ROUND_REQUEST_BINDING_V1_SCHEMA:
+        rendered_request_coverage_reason = "request-digest-missing-legacy-fallback"
+    else:
+        rendered_request_coverage_reason = "request-digest-missing"
     if reviewer is not None:
         print("review ingest: warning: --reviewer is ignored; the reply header is authoritative",
               file=sys.stderr)
@@ -2040,6 +2165,25 @@ def ingest(root: Path, round_id: str | None, src: Path = INBOX, reviewer: str | 
             and assessment["reviewer_coverage_reason"] == "reviewer-not-configured"):
         print("review ingest: warning: declared model does not match a reviewer frozen in the "
               "round binding; reply cannot count as configured feedback", file=sys.stderr)
+    if rendered_request_coverage_reason == "request-digest-missing":
+        print(
+            "review ingest: warning: v2 reply has no valid request-digest; copy the "
+            "`request-digest` line from the request you reviewed and resubmit with "
+            "`review ingest --force`; "
+            "this receipt remains pending",
+            file=sys.stderr)
+    elif rendered_request_coverage_reason == "request-digest-missing-legacy-fallback":
+        print(
+            "review ingest: warning: reply has no request-digest; using the explicit legacy v1 "
+            "ingest-time fallback", file=sys.stderr)
+    elif rendered_request_coverage_reason == "request-digest-stale-generation":
+        print(
+            "review ingest: warning: request-digest names an older immutable request generation; "
+            "the latest generation remains pending", file=sys.stderr)
+    elif rendered_request_coverage_reason == "request-digest-unknown":
+        print(
+            "review ingest: warning: request-digest does not name any valid immutable request "
+            "generation for this round; this receipt remains pending", file=sys.stderr)
 
     findings = _parse_findings(body.decode("utf-8", "replace"))
 
@@ -2055,11 +2199,15 @@ def ingest(root: Path, round_id: str | None, src: Path = INBOX, reviewer: str | 
     triage_body = ("\n".join(lines) + "\n").encode("utf-8")
     appended = b"\n\n---\n\n" + _marked_triage(triage_body)
 
-    feedback_metadata = {"metadata": parsed_header["metadata"]}
-    if binding is not None and binding.get("narrative_digest") is not None:
-        feedback_metadata["narrative_digest"] = binding["narrative_digest"]
-    if binding is not None and binding.get("rendered_request_digest") is not None:
-        feedback_metadata["rendered_request_digest"] = binding["rendered_request_digest"]
+    feedback_metadata = {
+        "metadata": parsed_header["metadata"],
+        "rendered_request_digest_matches": rendered_request_digest_matches,
+        "rendered_request_coverage_reason": rendered_request_coverage_reason,
+    }
+    if request_generation is not None:
+        feedback_metadata["narrative_digest"] = request_generation["narrative_digest"]
+        feedback_metadata["rendered_request_digest"] = request_generation[
+            "rendered_request_digest"]
     metadata_json = json.dumps(
         feedback_metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     header = (

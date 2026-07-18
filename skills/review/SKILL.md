@@ -37,15 +37,18 @@ metadata header and consumes the drop-file:
 waystone review ingest . --round <round-id>
 ```
 
-The reply itself must begin with the request template's key/value block: `model`, `effort`, and
-`review-target` (`<target-sha>` or `<base-sha>-<target-sha>`, 12–40 hex characters each). Key
-case/order/colon whitespace and an optional Markdown fence are tolerated; extra keys are preserved.
-Missing, duplicate, invalid, or non-UTF-8 values stay unknown, and a leading key/value block with
-neither `model` nor `review-target` is ordinary prose. Ingest compares the declaration only with the
-round's publication-time sidecar; it never rebuilds a missing legacy binding from current config or
-profile. For new projects that sidecar already freezes the backend resolved from `role:reviewer` at
-publication time. A model matches an exact configured identity, or a provider-qualified identity
-matches the same bare model slug; two provider-qualified identities must match completely.
+The reply itself must begin with the request template's key/value block: `model`, `effort`,
+`review-target` (`<target-sha>` or `<base-sha>-<target-sha>`, 12–40 hex characters each), and the
+request's exact `request-digest`. Key case/order/colon whitespace and an optional Markdown fence are
+tolerated; extra keys are preserved. Missing, duplicate, invalid, or non-UTF-8 values stay unknown,
+and a leading key/value block with neither `model` nor `review-target` is ordinary prose. Ingest
+resolves an echoed digest to that round's immutable request sidecar generation; a stale or unknown
+generation remains pending. A digestless reply can use the ingest-time binding only for a genuine
+legacy v1 binding; a v2 reply must be resubmitted with the request's digest line. Ingest never
+rebuilds a missing legacy binding from current config or profile. For new projects that sidecar
+already freezes the backend resolved from `role:reviewer` at publication time. A model matches an
+exact configured identity, or a provider-qualified identity matches the same bare model slug; two
+provider-qualified identities must match completely.
 Missing/mismatched identity or target does not count as configured feedback for
 `review-skipped-closes-v1`.
 

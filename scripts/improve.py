@@ -1136,6 +1136,9 @@ def _project_review_rows(name: str, root: Path, cfg: dict) -> list[dict]:
             "reviewer_coverage_reason": "reply-metadata-unavailable",
             "narrative_digest": None, "narrative_digest_matches": None,
             "narrative_coverage_reason": None,
+            "rendered_request_digest": None,
+            "rendered_request_digest_matches": None,
+            "rendered_request_coverage_reason": None,
         }
         round_tasks = tasks_by_round.get(rid, [])
         tasks_by_id = {t["id"]: t for t in round_tasks if t.get("id")}
@@ -1206,6 +1209,11 @@ def _project_review_rows(name: str, root: Path, cfg: dict) -> list[dict]:
             "reply_narrative_digest": reply_metadata["narrative_digest"],
             "narrative_digest_matches": reply_metadata["narrative_digest_matches"],
             "narrative_coverage_reason": reply_metadata["narrative_coverage_reason"],
+            "reply_rendered_request_digest": reply_metadata["rendered_request_digest"],
+            "rendered_request_digest_matches": reply_metadata[
+                "rendered_request_digest_matches"],
+            "rendered_request_coverage_reason": reply_metadata[
+                "rendered_request_coverage_reason"],
             "reply_metadata": reply_metadata["metadata"],
             **review_binding,
             "session_id": session_id,
