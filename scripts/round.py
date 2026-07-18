@@ -26,6 +26,7 @@ import json
 import os
 import re
 import sys
+from datetime import date
 from pathlib import Path
 
 import yaml
@@ -203,6 +204,24 @@ def _validate_recorded_routes(root: Path, routes: list[dict]) -> None:
                 f"--route-note {route['role']} route does not match the current profile binding")
 
 
+def _current_date() -> date:
+    """Local calendar clock seam; tests pin it so close contracts cannot race midnight."""
+    return date.today()
+
+
+def _round_has_existing_closeout(root: Path, round_id: str, cfg: dict, review) -> bool:
+    """Recognize a previously minted round from its durable closeout surfaces."""
+    try:
+        review.read_round_closeout_exposure(root, round_id)
+        return True
+    except WorkflowError:
+        pass
+    progress = Path(root) / cfg["progress"]
+    if not progress.is_file():
+        return False
+    return re.search(rf"(?m)^## {re.escape(round_id)}\s*$", progress.read_text()) is not None
+
+
 def close(root: Path, round_id: str, done: list[str], touched: list[str], commit: str,
           routes: list[dict] | None = None) -> int:
     """Fail-closed: resolve the commit and confirm the watermark slot up front, apply edits in
@@ -217,7 +236,20 @@ def close(root: Path, round_id: str, done: list[str], touched: list[str], commit
     if not ROUND_RE.match(round_id):
         print(f"round close: --round must match YYYY-MM-DD-<slug>, got {round_id!r}", file=sys.stderr)
         return 1
+    try:
+        round_date = date.fromisoformat(round_id[:10])
+    except ValueError:
+        print(f"round close: --round has no real calendar date, got {round_id!r}",
+              file=sys.stderr)
+        return 1
     cfg = load_config(root)
+    current_date = _current_date()
+    if (round_date != current_date
+            and not _round_has_existing_closeout(root, round_id, cfg, review)):
+        print(
+            f"round close: --round date must be today ({current_date.isoformat()}), "
+            f"got {round_date.isoformat()}", file=sys.stderr)
+        return 1
     routes = list(routes or [])
     try:
         _validate_recorded_routes(root, routes)

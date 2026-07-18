@@ -949,24 +949,36 @@ def _round_session_binding(round_id: str, exposures: list[dict] | dict[str, dict
 
 def _review_binding(request_file: Path | None, round_id: str, mode: str,
                     sidecars: list[dict]) -> dict:
+    import review
+
     def result(target_sha=None, base_sha=None, provenance="unknown", reason=None, source=None,
                *, cycle=None, reviewers=None, profile_fingerprint=None,
-               narrative_digest=None) -> dict:
+               narrative_digest=None, rendered_request_digest=None,
+               binding_schema=None, request_provenance="unknown",
+               request_reason=None, request_source=None) -> dict:
         return {
             "target_sha": target_sha, "base_sha": base_sha,
             "narrative_digest": narrative_digest,
+            "rendered_request_digest": rendered_request_digest,
             "review_cycle": cycle, "reviewers": reviewers,
             "review_profile_fingerprint": profile_fingerprint,
+            "review_binding_schema": binding_schema,
             "review_binding_provenance": provenance,
             "review_binding_reason": reason, "review_binding_source": source,
+            "review_request_binding_provenance": request_provenance,
+            "review_request_binding_reason": request_reason,
+            "review_request_binding_source": request_source,
         }
 
     if mode == "pr":
-        pr_sidecars = [row for row in sidecars if row.get("mode") == "pr"]
-        if not pr_sidecars:
+        freeze_sidecars = [
+            row for row in sidecars
+            if row.get("schema") == review.PR_FREEZE_BINDING_SCHEMA
+        ]
+        if not freeze_sidecars:
             return result(reason="missing-pr-freeze-sidecar")
-        latest_cycle = max(row["cycle"] for row in pr_sidecars)
-        cycle_rows = [row for row in pr_sidecars if row["cycle"] == latest_cycle]
+        latest_cycle = max(row["cycle"] for row in freeze_sidecars)
+        cycle_rows = [row for row in freeze_sidecars if row["cycle"] == latest_cycle]
         bindings = {(
             row["target_sha"], row["base_sha"], tuple(row["reviewers"]),
             row.get("profile_fingerprint"), row["pr"],
@@ -974,14 +986,36 @@ def _review_binding(request_file: Path | None, round_id: str, mode: str,
         if len(bindings) != 1:
             return result(reason="conflicting-pr-freeze-sidecars")
         latest = max(cycle_rows, key=lambda row: (row["at"], row["_file"]))
+        request_sidecars = [
+            row for row in sidecars
+            if row.get("_binding_kind") == "request"
+        ]
+        request_kwargs = {"request_reason": "missing-pr-request-sidecar"}
+        if len(request_sidecars) > 1:
+            request_kwargs["request_reason"] = "conflicting-pr-request-sidecars"
+        elif request_sidecars:
+            request = request_sidecars[0]
+            if request.get("_binding_error") is not None:
+                request_kwargs["request_reason"] = request["_binding_error"]
+            elif (request.get("mode") != "pr"
+                    or request.get("target_sha") != latest["target_sha"]
+                    or request.get("reviewers") != latest["reviewers"]):
+                request_kwargs["request_reason"] = "pr-request-freeze-mismatch"
+            else:
+                request_kwargs = {
+                    "narrative_digest": request.get("narrative_digest"),
+                    "rendered_request_digest": request.get("rendered_request_digest"),
+                    "binding_schema": request.get("schema"),
+                    "request_provenance": "explicit",
+                    "request_reason": None,
+                    "request_source": request.get("_file"),
+                }
         return result(
             latest["target_sha"], latest["base_sha"], "explicit", None,
             "pr-freeze-sidecar", cycle=latest_cycle, reviewers=list(latest["reviewers"]),
-            profile_fingerprint=latest.get("profile_fingerprint"))
+            profile_fingerprint=latest.get("profile_fingerprint"), **request_kwargs)
     if request_file is None:
         return result(reason="missing-review-request")
-    import review
-
     packet_binding = review.parse_packet_request_binding(request_file)
     packet_sidecars = [
         row for row in sidecars
@@ -1000,7 +1034,10 @@ def _review_binding(request_file: Path | None, round_id: str, mode: str,
         return result(
             latest["target_sha"], latest.get("base_sha"), "explicit", None,
             "round-request-sidecar", reviewers=list(latest.get("reviewers") or []),
-            narrative_digest=latest.get("narrative_digest"))
+            narrative_digest=latest.get("narrative_digest"),
+            rendered_request_digest=latest.get("rendered_request_digest"),
+            binding_schema=latest.get("schema"), request_provenance="explicit",
+            request_source=latest.get("_file"))
     try:
         text = request_file.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
@@ -1026,18 +1063,26 @@ def _review_binding(request_file: Path | None, round_id: str, mode: str,
         profile_fingerprint=latest.get("profile_fingerprint"))
 
 
-def _round_review_sidecars(rdir: Path) -> dict[str, list[dict]]:
+def _round_review_sidecars(
+        rdir: Path, request_binding_dir: Path | None = None,
+) -> dict[str, list[dict]]:
     import review
 
     rows: dict[str, list[dict]] = {}
-    if not rdir.is_dir():
+    request_directories = {rdir}
+    if request_binding_dir is not None:
+        request_directories.add(request_binding_dir)
+    if not any(directory.is_dir() for directory in request_directories):
         return rows
     request_paths: dict[str, list[Path]] = {}
-    for path in sorted(rdir.glob("*-request.binding*.json")):
-        identity = review.round_request_binding_identity(path)
-        if identity is None:
+    for directory in sorted(request_directories, key=str):
+        if not directory.is_dir():
             continue
-        request_paths.setdefault(identity[0], []).append(path)
+        for path in sorted(directory.glob("*-request.binding*.json")):
+            identity = review.round_request_binding_identity(path)
+            if identity is None:
+                continue
+            request_paths.setdefault(identity[0], []).append(path)
     for round_id, paths in sorted(request_paths.items()):
         path, data = review.latest_round_request_binding(paths, expected_round_id=round_id)
         if path is None:
@@ -1048,12 +1093,14 @@ def _round_review_sidecars(rdir: Path) -> dict[str, list[dict]]:
             rows.setdefault(round_id, []).append({
                 "round_id": round_id, "_file": str(path),
                 "_binding_error": "corrupt-round-request-sidecar",
+                "_binding_kind": "request",
             })
             continue
-        if data.get("mode") != "packet":
-            continue
-        rows.setdefault(round_id, []).append({**data, "_file": str(path)})
-    for path in sorted(rdir.glob("*-freeze-*.binding*.json")):
+        rows.setdefault(round_id, []).append({
+            **data, "_file": str(path), "_binding_kind": "request",
+        })
+    freeze_paths = sorted(rdir.glob("*-freeze-*.binding*.json")) if rdir.is_dir() else []
+    for path in freeze_paths:
         try:
             data = review.read_pr_freeze_binding(path)
         except WorkflowError as e:
@@ -1072,7 +1119,8 @@ def _project_review_rows(name: str, root: Path, cfg: dict) -> list[dict]:
             request_files[p.stem[: -len("-request")]] = p
         for p in sorted(rdir.glob("*-feedback.md")):
             feedback_files[p.stem[: -len("-feedback")]] = p
-    request_sidecars = _round_review_sidecars(rdir)
+    request_sidecars = _round_review_sidecars(
+        rdir, project_state_path(root) / "review-requests")
     tasks_by_round = _finding_tasks_by_round(root)
     round_exposures, _exposures_skipped = _round_exposure_rows(root)
     latest_round_exposures = _latest_round_exposures(round_exposures)

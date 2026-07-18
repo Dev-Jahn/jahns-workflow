@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -41,6 +42,13 @@ import round  # noqa: E402
 import tasks  # noqa: E402
 import validate  # noqa: E402
 import yaml  # noqa: E402
+
+TEST_CURRENT_DATE = date(2026, 7, 19)
+TEST_CURRENT_ROUND_DATE = TEST_CURRENT_DATE.isoformat()
+TEST_CLOSE_ROUND_ID = f"{TEST_CURRENT_ROUND_DATE}-close"
+TEST_NARRATIVE_DIGEST = "sha256:" + "1" * 64
+TEST_RENDERED_REQUEST_DIGEST = "sha256:" + "2" * 64
+round._current_date = lambda: TEST_CURRENT_DATE
 
 
 def git(root, *args):
@@ -75,6 +83,25 @@ def _synthetic_codex_fingerprint(worktree: Path) -> dict:
         },
         "worktree_cache_mount": delegate._worktree_mount_identity(worktree),
     }
+
+
+def write_legacy_round_request_binding(
+        root: Path, round_id: str, target_sha: str, base_sha: str | None,
+        reviewers: list[str], *, mode: str = "packet") -> Path:
+    directory = root / "docs/reviews"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{round_id}-request.binding.json"
+    path.write_text(_json.dumps({
+        "schema": review.ROUND_REQUEST_BINDING_V1_SCHEMA,
+        "round_id": round_id,
+        "target_sha": target_sha,
+        "base_sha": base_sha,
+        "reviewers": reviewers,
+        "mode": mode,
+        "canonical_store": "local-packet" if mode == "packet" else "github-pr-comment",
+        "at": "2026-01-01T00:00:00+00:00",
+    }) + "\n")
+    return path
 
 
 class ReleaseToMainTests(unittest.TestCase):
@@ -621,7 +648,7 @@ def _pr_prepared_round(base: Path, reviewers: str, *, pre_close=None) -> tuple[P
     head = git(root, "rev-parse", "HEAD").stdout.strip()
     if pre_close is not None:
         pre_close(root)
-    rid = "2026-07-17-prfix"
+    rid = f"{TEST_CURRENT_ROUND_DATE}-prfix"
     with contextlib.redirect_stdout(io.StringIO()):
         assert round.close(root, rid, done=[], touched=[], commit="HEAD") == 0
         narrative = base / "narrative.md"
@@ -1464,7 +1491,7 @@ class RemoteTests(unittest.TestCase):
 
 
 class PacketPublicationTests(unittest.TestCase):
-    ROUND_ID = "2026-07-16-packet"
+    ROUND_ID = f"{TEST_CURRENT_ROUND_DATE}-packet"
 
     NARRATIVE = """## What changed and why
 
@@ -1550,6 +1577,79 @@ Fail-loud protocol boundaries.
             self.assertEqual(binding["target_sha"], target)
             self.assertIsNone(binding["base_sha"])
             self.assertEqual(binding["reviewers"], ["reviewer-x"])
+            self.assertEqual(binding["schema"], review.ROUND_REQUEST_BINDING_SCHEMA)
+            self.assertRegex(binding["narrative_digest"], r"^sha256:[0-9a-f]{64}$")
+            self.assertEqual(
+                binding["rendered_request_digest"],
+                review._canonical_rendered_request_digest(rendered))
+
+    def test_v2_binding_missing_or_invalid_digest_is_corrupt(self):
+        for field, value in (
+                ("narrative_digest", None),
+                ("rendered_request_digest", None),
+                ("narrative_digest", "sha256:not-a-digest"),
+                ("rendered_request_digest", "sha256:not-a-digest")):
+            with self.subTest(field=field, value=value), tempfile.TemporaryDirectory() as d:
+                root, _target, narrative = self._closed_project(Path(d))
+                self.assertEqual(review.prepare_review_request(
+                    root, self.ROUND_ID, narrative), 0)
+                binding_path = next((root / "docs/reviews").glob(
+                    f"{self.ROUND_ID}-request.binding*.json"))
+                binding = _json.loads(binding_path.read_text())
+                if value is None:
+                    binding.pop(field)
+                else:
+                    binding[field] = value
+                binding_path.write_text(_json.dumps(binding) + "\n")
+
+                with self.assertRaisesRegex(common.WorkflowError, "corrupt review binding"):
+                    review.read_round_request_binding(binding_path)
+
+    def test_v1_binding_cutoff_includes_real_2026_07_18_artifacts(self):
+        for name in (
+                "2026-07-18-carrier-lanes-request.binding.json",
+                "2026-07-18-carrier-lanes-fixes-request.binding.json"):
+            binding = review.read_round_request_binding(
+                SCRIPTS.parent / "docs/reviews" / name)
+            self.assertEqual(binding["schema"], review.ROUND_REQUEST_BINDING_V1_SCHEMA)
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            later = write_legacy_round_request_binding(
+                root, "2026-07-19-digest-era", "a" * 40, None, ["reviewer-x"])
+            with self.assertRaisesRegex(common.WorkflowError, "corrupt review binding"):
+                review.read_round_request_binding(later)
+
+    def test_v1_binding_with_digest_fields_is_not_accepted_as_legacy(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            binding_path = write_legacy_round_request_binding(
+                root, "2026-07-18-genuine-legacy", "a" * 40, None, ["reviewer-x"])
+            binding = _json.loads(binding_path.read_text())
+            binding["narrative_digest"] = TEST_NARRATIVE_DIGEST
+            binding["rendered_request_digest"] = TEST_RENDERED_REQUEST_DIGEST
+            binding_path.write_text(_json.dumps(binding) + "\n")
+
+            with self.assertRaisesRegex(common.WorkflowError, "corrupt review binding"):
+                review.read_round_request_binding(binding_path)
+
+    def test_binding_rejects_nonexistent_calendar_date(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = write_legacy_round_request_binding(
+                Path(d), "2026-99-99-impossible", "a" * 40, None, ["reviewer-x"])
+            with self.assertRaisesRegex(common.WorkflowError, "corrupt review binding"):
+                review.read_round_request_binding(path)
+
+    def test_pr_binding_paths_reject_nonexistent_calendar_date(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            path = review.write_pr_freeze_binding(
+                root, "2026-99-99-r1", 7, 1, "a" * 40, "b" * 40,
+                ["reviewer-x"], None, "docs/reviews")
+            with self.assertRaisesRegex(common.WorkflowError, "corrupt review binding"):
+                review.read_pr_freeze_binding(path)
+            with self.assertRaisesRegex(common.WorkflowError, "real YYYY-MM-DD"):
+                review._round_requires_digest_binding("2026-99-99-r1")
 
     def test_prepare_rejects_narrative_protocol_lookalikes(self):
         lookalikes = (
@@ -1672,6 +1772,8 @@ Fail-loud protocol boundaries.
             "base_sha": lambda exposure: exposure.update(base_sha="b" * 40),
             "reviewers": lambda exposure: exposure.update(reviewers=["reviewer-y"]),
             "mode": lambda exposure: exposure.update(review_mode="packet"),
+            "project": lambda exposure: exposure["project"].update(name="other-project"),
+            "branch": lambda exposure: exposure["project"].update(branch="other-branch"),
         }
         for field, mutate in mutations.items():
             with self.subTest(field=field), tempfile.TemporaryDirectory() as d:
@@ -1701,7 +1803,9 @@ Fail-loud protocol boundaries.
                 finally:
                     review.pr_context, review._gh = saved
                 self.assertEqual(posted, [])
-                self.assertIn("round exposure", err.getvalue())
+                self.assertTrue(
+                    "round exposure" in err.getvalue()
+                    or "rendered request digest" in err.getvalue())
 
     def test_pr_freeze_keeps_explicit_prepared_pair_pr_mode_check(self):
         import inspect
@@ -1735,7 +1839,9 @@ Fail-loud protocol boundaries.
             root, target, narrative = self._closed_project(Path(d))
             foreign = "a" * 40 if target != "a" * 40 else "b" * 40
             existing = review.write_round_request_binding(
-                root, self.ROUND_ID, foreign, None, ["reviewer-x"], mode="packet")
+                root, self.ROUND_ID, foreign, None, ["reviewer-x"], mode="packet",
+                narrative_digest=TEST_NARRATIVE_DIGEST,
+                rendered_request_digest=TEST_RENDERED_REQUEST_DIGEST)
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
                 self.assertEqual(review.prepare_review_request(
@@ -1816,6 +1922,41 @@ Fail-loud protocol boundaries.
             self.assertIn(f"# Review Request — {self.ROUND_ID}", body)
             self.assertIn(f"- Reviewing: {target}   (diff against (root))", body)
             self.assertEqual(body.count("## Response wanted"), 1)
+
+    def test_pr_freeze_posts_the_exact_digest_verified_request_bytes(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            root, target, narrative = self._closed_project(base, mode="pr")
+            original_template = review.REVIEW_REQUEST_TEMPLATE
+            trailing_template = base / "review-request.md"
+            trailing_template.write_text(original_template.read_text().rstrip("\n") + "   \n")
+            posted = []
+            try:
+                review.REVIEW_REQUEST_TEMPLATE = trailing_template
+                self.assertEqual(review.prepare_review_request(
+                    root, self.ROUND_ID, narrative), 0)
+                request_text = review.prepared_request_path(
+                    root, self.ROUND_ID, mode="pr").read_text()
+                cfg = common.load_config(root)
+                ctx = {
+                    "repo": "o/r", "pr": 7, "head": target, "base_sha": "b" * 40,
+                    "base": "main", "bundle": {
+                        "head": target, "base_sha": "b" * 40, "bodies": []},
+                    "policy": cfg,
+                }
+                original_context, original_gh = review.pr_context, review._gh
+                review.pr_context = lambda _root, _pr: ctx
+                review._gh = lambda _root, *args: (posted.append(args) or (0, "ok"))
+                try:
+                    self.assertEqual(review.freeze(root, 7, self.ROUND_ID), 0)
+                finally:
+                    review.pr_context, review._gh = original_context, original_gh
+            finally:
+                review.REVIEW_REQUEST_TEMPLATE = original_template
+
+            body = posted[0][posted[0].index("--body") + 1]
+            self.assertIn(request_text + "\n<!-- waystone-review-cycle:v1", body)
+            self.assertTrue(request_text.endswith("   \n"))
 
     def test_reviewing_line_is_exact_and_malformed_input_warns(self):
         import contextlib
@@ -1923,15 +2064,63 @@ Fail-loud protocol boundaries.
             latest.pop("narrative_digest")
             latest_path.write_text(_json.dumps(latest) + "\n")
 
-            feedback = root / "docs/reviews" / f"{self.ROUND_ID}-feedback.md"
-            metadata = review.read_feedback_reply_metadata(
-                feedback, expected_round_id=self.ROUND_ID,
-                binding=review.read_round_request_binding(latest_path))
-            self.assertIs(metadata["narrative_digest_matches"], False)
-            self.assertEqual(metadata["narrative_coverage_reason"],
-                             "narrative-digest-mismatch")
+            with self.assertRaisesRegex(common.WorkflowError, "corrupt review binding"):
+                review.read_round_request_binding(latest_path)
             self.assertEqual([row["round_id"] for row in review.pending_reviews(root)],
                              [self.ROUND_ID])
+
+    def test_ingest_rejects_digest_strip_and_v1_downgrade_for_digest_era_round(self):
+        import contextlib
+        import io
+
+        for downgrade in (False, True):
+            with self.subTest(downgrade=downgrade), tempfile.TemporaryDirectory() as d:
+                root = Path(d) / "repo"
+                root.mkdir()
+                init_repo(root)
+                (root / ".waystone.yml").write_text(
+                    "version: 1\nproject: demo\nreviews_dir: docs/reviews\n")
+                round_id = "2026-07-19-digest-era"
+                rdir = root / "docs/reviews"
+                rdir.mkdir(parents=True)
+                (rdir / f"{round_id}-request.md").write_text("request\n")
+                target, base_sha = "a" * 40, "b" * 40
+                binding_path = rdir / f"{round_id}-request.binding.json"
+                binding = {
+                    "schema": "waystone-round-request-binding-2",
+                    "round_id": round_id, "target_sha": target, "base_sha": base_sha,
+                    "reviewers": ["reviewer-x"], "mode": "packet",
+                    "canonical_store": "local-packet",
+                    "narrative_digest": TEST_NARRATIVE_DIGEST,
+                    "rendered_request_digest": TEST_RENDERED_REQUEST_DIGEST,
+                    "at": "2026-07-19T00:00:00+00:00",
+                }
+                binding_path.write_text(_json.dumps(binding) + "\n")
+                bare = Path(d) / "remote.git"
+                subprocess.run(
+                    ["git", "init", "-q", "--bare", "-b", "main", str(bare)], check=True)
+                git(root, "remote", "add", "origin", str(bare))
+                git(root, "add", "-A")
+                git(root, "commit", "-qm", "publish digest-bound packet")
+                git(root, "push", "-q", "-u", "origin", "main")
+                binding.pop("narrative_digest")
+                binding.pop("rendered_request_digest")
+                if downgrade:
+                    binding["schema"] = "waystone-round-request-binding-1"
+                binding_path.write_text(_json.dumps(binding) + "\n")
+                reply = Path(d) / "reply.md"
+                reply.write_text(
+                    "model: reviewer-x\neffort: high\n"
+                    f"review-target: {base_sha[:12]}-{target[:12]}\n\nreviewed\n")
+                err = io.StringIO()
+
+                with contextlib.redirect_stderr(err):
+                    self.assertEqual(review.ingest(root, round_id, src=reply), 1)
+
+                self.assertIn("corrupt", err.getvalue())
+                self.assertFalse((rdir / f"{round_id}-feedback.md").exists())
+                self.assertEqual(
+                    [row["round_id"] for row in review.pending_reviews(root)], [round_id])
 
     def test_pr_freeze_rejects_stored_narrative_digest_mismatch(self):
         import contextlib
@@ -1979,18 +2168,49 @@ Fail-loud protocol boundaries.
                 self.assertEqual(review.verify_packet_publication(root, self.ROUND_ID), 1)
             self.assertIn("does not reproduce", err.getvalue())
 
+    def test_packet_gate_rejects_live_template_change_against_stored_render_digest(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            root, _target, _narrative = self._remote_project(Path(d))
+            original_template = review.REVIEW_REQUEST_TEMPLATE
+            changed_template = Path(d) / "review-request.md"
+            changed_template.write_text(
+                original_template.read_text().replace(
+                    "# Review Request", "# Changed Review Request", 1))
+            err = io.StringIO()
+            try:
+                review.REVIEW_REQUEST_TEMPLATE = changed_template
+                with contextlib.redirect_stderr(err):
+                    self.assertEqual(
+                        review.verify_packet_publication(root, self.ROUND_ID), 1)
+            finally:
+                review.REVIEW_REQUEST_TEMPLATE = original_template
+
+            self.assertIn("rendered request digest", err.getvalue())
+
     def test_packet_gate_rejects_legacy_digestless_binding(self):
         import contextlib
         import io
 
         with tempfile.TemporaryDirectory() as d:
-            root, target, _narrative = self._closed_project(Path(d))
-            self._request(root, target)
-            review.write_round_request_binding(
-                root, self.ROUND_ID, target, None, ["reviewer-x"], mode="packet")
+            root = Path(d)
+            round_id = "2026-07-18-genuine-legacy"
+            target = "a" * 40
+            (root / ".waystone.yml").write_text(
+                "version: 1\nproject: demo\nreviews_dir: docs/reviews\n"
+                "review:\n  mode: packet\n  reviewers: [reviewer-x]\n")
+            request = root / "docs/reviews" / f"{round_id}-request.md"
+            request.parent.mkdir(parents=True)
+            request.write_text(
+                f"# Review Request — {round_id}\n\n"
+                f"- Reviewing: {target}   (diff against (root))\n")
+            write_legacy_round_request_binding(
+                root, round_id, target, None, ["reviewer-x"])
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
-                self.assertEqual(review.verify_packet_publication(root, self.ROUND_ID), 1)
+                self.assertEqual(review.verify_packet_publication(root, round_id), 1)
             self.assertIn("legacy-pre-digest", err.getvalue())
 
     def test_packet_publication_gate_uses_real_remote_and_rejects_partial_commit(self):
@@ -2205,7 +2425,9 @@ Fail-loud protocol boundaries.
                 self.ROUND_ID, exposure, narrative))
             review.write_round_request_binding(
                 root, self.ROUND_ID, target, None, ["reviewer-x"], mode="packet",
-                narrative_digest=review._canonical_narrative_digest(narrative))
+                narrative_digest=review._canonical_narrative_digest(narrative),
+                rendered_request_digest=review._canonical_rendered_request_digest(
+                    request.read_text()))
             git(root, "add", "-A")
             git(root, "commit", "-qm", "reissued packet committed locally only")
 
@@ -2318,7 +2540,9 @@ Fail-loud protocol boundaries.
             git(root, "push", "-q")
             review.write_round_request_binding(
                 root, self.ROUND_ID, exposure["head_sha"], None, ["reviewer-x"], mode="packet",
-                narrative_digest=review._canonical_narrative_digest(narrative))
+                narrative_digest=review._canonical_narrative_digest(narrative),
+                rendered_request_digest=review._canonical_rendered_request_digest(
+                    request.read_text()))
 
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
@@ -3240,6 +3464,9 @@ class LaneTests(unittest.TestCase):
 
 
 class RoundCloseTests(unittest.TestCase):
+    ROUND_ID = f"{TEST_CURRENT_ROUND_DATE}-z"
+    ROLE_ROUND_ID = f"{TEST_CURRENT_ROUND_DATE}-l2-a"
+
     def test_close_integration(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
@@ -3248,16 +3475,17 @@ class RoundCloseTests(unittest.TestCase):
                 "version: 1\nproject: x\nstate:\n  last_round_commit: null\n")
             (root / "tasks.yaml").write_text(TASKS_FIXTURE)
             git(root, "add", "-A"); git(root, "commit", "-qm", "setup")
-            rc = round.close(root, "2026-06-19-z", done=["feat/alpha"], touched=["gate/beta"], commit="HEAD")
+            rc = round.close(root, self.ROUND_ID, done=["feat/alpha"],
+                             touched=["gate/beta"], commit="HEAD")
             self.assertEqual(rc, 0)
             txt = (root / "tasks.yaml").read_text()
             # feat/a flipped to done and stamped
             a = txt.split("gate/beta")[0]
             self.assertIn("status: done", a)
-            self.assertIn("round: 2026-06-19-z", a)
+            self.assertIn(f"round: {self.ROUND_ID}", a)
             # gate/b stamped with round but NOT flipped to done
             b = "gate/beta" + txt.split("gate/beta")[1]
-            self.assertIn("round: 2026-06-19-z", b)
+            self.assertIn(f"round: {self.ROUND_ID}", b)
             self.assertIn("status: blocked", b)
             # comment preserved, ROADMAP generated, watermark advanced
             self.assertIn("# registry — comments must be preserved", txt)
@@ -3280,7 +3508,7 @@ class RoundCloseTests(unittest.TestCase):
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 rc = round.close(
-                    root, "2026-07-15-l2-a", done=["feat/alpha"], touched=[], commit="HEAD")
+                    root, self.ROLE_ROUND_ID, done=["feat/alpha"], touched=[], commit="HEAD")
             self.assertEqual(rc, 0)
             self.assertIn("review reviewers = claude:opus-4.1", out.getvalue())
             self.assertNotIn("role:reviewer", out.getvalue())
@@ -3294,7 +3522,7 @@ class RoundCloseTests(unittest.TestCase):
             _write_profile(root)
             before = (root / "tasks.yaml").read_bytes()
             self.assertEqual(round.close(
-                root, "2026-07-15-l2-a", done=["feat/alpha"], touched=[], commit="HEAD"), 1)
+                root, self.ROLE_ROUND_ID, done=["feat/alpha"], touched=[], commit="HEAD"), 1)
             self.assertEqual((root / "tasks.yaml").read_bytes(), before)
 
     def test_close_replaces_all_primary_files_atomically(self):
@@ -3311,7 +3539,8 @@ class RoundCloseTests(unittest.TestCase):
             common.os.replace = tracked_replace
             try:
                 rc = round.close(
-                    root, "2026-06-19-atomic", done=["feat/alpha"], touched=[], commit="HEAD")
+                    root, f"{TEST_CURRENT_ROUND_DATE}-atomic",
+                    done=["feat/alpha"], touched=[], commit="HEAD")
             finally:
                 common.os.replace = original_replace
             self.assertEqual(rc, 0)
@@ -3327,12 +3556,59 @@ class RoundCloseTests(unittest.TestCase):
         (root / "tasks.yaml").write_text(TASKS_FIXTURE)
         git(root, "add", "-A"); git(root, "commit", "-qm", "setup")
 
+    def test_close_rejects_backdated_and_nonexistent_round_dates_before_write(self):
+        import contextlib
+        import io
+
+        for round_id, message in (
+                ("2000-01-01-backdated", "must be today"),
+                ("2026-99-99-impossible", "real calendar date")):
+            with self.subTest(round_id=round_id), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                self._setup(
+                    root, "version: 1\nproject: x\nstate:\n  last_round_commit: null\n")
+                before = (root / "tasks.yaml").read_bytes()
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    rc = round.close(
+                        root, round_id, done=["feat/alpha"], touched=[], commit="HEAD")
+                self.assertEqual(rc, 1)
+                self.assertIn(message, err.getvalue())
+                self.assertEqual((root / "tasks.yaml").read_bytes(), before)
+
+    def test_close_allows_next_day_reclose_for_existing_exposure_or_progress(self):
+        original_clock = round._current_date
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                self._setup(
+                    root, "version: 1\nproject: x\nstate:\n  last_round_commit: null\n")
+                round_id = "2026-07-19-existing-exposure"
+                round._current_date = lambda: date(2026, 7, 19)
+                self.assertEqual(round.close(
+                    root, round_id, done=["feat/alpha"], touched=[], commit="HEAD"), 0)
+                round._current_date = lambda: date(2026, 7, 20)
+                self.assertEqual(round.close(
+                    root, round_id, done=["feat/alpha"], touched=[], commit="HEAD"), 0)
+
+            with tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                self._setup(
+                    root, "version: 1\nproject: x\nstate:\n  last_round_commit: null\n")
+                round_id = "2026-07-19-existing-progress"
+                (root / "PROGRESS.md").write_text(f"# PROGRESS\n\n## {round_id}\n\n- prior\n")
+                round._current_date = lambda: date(2026, 7, 20)
+                self.assertEqual(round.close(
+                    root, round_id, done=["feat/alpha"], touched=[], commit="HEAD"), 0)
+        finally:
+            round._current_date = original_clock
+
     def test_missing_watermark_fails_closed_no_write(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             self._setup(root, "version: 1\nproject: x\n")  # no state.last_round_commit
             before = (root / "tasks.yaml").read_text()
-            rc = round.close(root, "2026-06-19-z", done=["feat/alpha"], touched=[], commit="HEAD")
+            rc = round.close(root, self.ROUND_ID, done=["feat/alpha"], touched=[], commit="HEAD")
             self.assertEqual(rc, 1)
             self.assertEqual((root / "tasks.yaml").read_text(), before)  # nothing written
             self.assertFalse((root / "ROADMAP.md").exists())
@@ -3342,7 +3618,8 @@ class RoundCloseTests(unittest.TestCase):
             root = Path(d)
             self._setup(root, "version: 1\nproject: x\nstate:\n  last_round_commit: null\n")
             before = (root / "tasks.yaml").read_text()
-            rc = round.close(root, "2026-06-19-z", done=["feat/alpha"], touched=[], commit="nope-not-a-ref")
+            rc = round.close(root, self.ROUND_ID, done=["feat/alpha"],
+                             touched=[], commit="nope-not-a-ref")
             self.assertEqual(rc, 1)
             self.assertEqual((root / "tasks.yaml").read_text(), before)
 
@@ -3352,7 +3629,7 @@ class RoundCloseTests(unittest.TestCase):
             self._setup(root, "version: 1\nproject: x\nstate:\n  last_round_commit: null\n")
             before = (root / "tasks.yaml").read_text()
             # gate/beta depends on feat/alpha (active) — closing gate/beta as done must fail
-            rc = round.close(root, "2026-06-19-z", done=["gate/beta"], touched=[], commit="HEAD")
+            rc = round.close(root, self.ROUND_ID, done=["gate/beta"], touched=[], commit="HEAD")
             self.assertEqual(rc, 1)
             self.assertEqual((root / "tasks.yaml").read_text(), before)
 
@@ -3362,7 +3639,8 @@ class RoundCloseTests(unittest.TestCase):
             self._setup(root, "version: 1\nproject: x\nstate:\n  last_round_commit: null\n")
             # closing a dependency (feat/alpha) and its dependent (gate/beta) in ONE round is valid:
             # the dep is done in the final state
-            rc = round.close(root, "2026-06-19-z", done=["feat/alpha", "gate/beta"], touched=[], commit="HEAD")
+            rc = round.close(root, self.ROUND_ID, done=["feat/alpha", "gate/beta"],
+                             touched=[], commit="HEAD")
             self.assertEqual(rc, 0)
             self.assertEqual((root / "tasks.yaml").read_text().count("status: done"), 2)
 
@@ -3380,7 +3658,8 @@ class RoundCloseTests(unittest.TestCase):
             orig = roadmap.render
             roadmap.render = boom
             try:
-                rc = round.close(root, "2026-06-19-z", done=["feat/alpha"], touched=["gate/beta"], commit="HEAD")
+                rc = round.close(root, self.ROUND_ID, done=["feat/alpha"],
+                                 touched=["gate/beta"], commit="HEAD")
             finally:
                 roadmap.render = orig
             self.assertEqual(rc, 1)
@@ -3414,7 +3693,7 @@ class RoundCloseTests(unittest.TestCase):
             orig = ssot.regenerate
             ssot.regenerate = boom
             try:
-                rc = round.close(root, "2026-06-19-z", done=["feat/alpha"], touched=[], commit="HEAD")
+                rc = round.close(root, self.ROUND_ID, done=["feat/alpha"], touched=[], commit="HEAD")
             finally:
                 ssot.regenerate = orig
             self.assertEqual(rc, 1)
@@ -3567,7 +3846,9 @@ class IngestTests(unittest.TestCase):
     def _binding(self, root, round_id, *, target=None, base=None, reviewers=None):
         return review.write_round_request_binding(
             root, round_id, target or "a" * 40, "b" * 40 if base is None else base,
-            reviewers or ["codex:gpt-5.6-sol"], mode="packet")
+            reviewers or ["codex:gpt-5.6-sol"], mode="packet",
+            narrative_digest=TEST_NARRATIVE_DIGEST,
+            rendered_request_digest=TEST_RENDERED_REQUEST_DIGEST)
 
     def _reply(self, *, model="gpt-5.6-sol", effort="high", target=None, extra=""):
         target = target or f"{'b' * 12}-{'a' * 12}"
@@ -3743,12 +4024,14 @@ class IngestTests(unittest.TestCase):
     def test_projection_recomputes_binding_and_rejects_feedback_round_mismatch(self):
         with tempfile.TemporaryDirectory() as d:
             root = self._root(d)
-            self._binding(root, "r1")
+            round_id = "2026-07-18-r1"
+            self._binding(root, round_id)
             src = root / "reply.md"
             src.write_bytes(self._reply())
-            self.assertEqual(review.ingest(root, "r1", src=src), 0)
-            feedback = root / "docs/reviews/r1-feedback.md"
-            binding, reason = review.ingest_round_binding(root, "r1", common.load_config(root))
+            self.assertEqual(review.ingest(root, round_id, src=src), 0)
+            feedback = root / f"docs/reviews/{round_id}-feedback.md"
+            binding, reason = review.ingest_round_binding(
+                root, round_id, common.load_config(root))
             self.assertIsNone(reason)
 
             content = feedback.read_bytes()
@@ -3756,9 +4039,9 @@ class IngestTests(unittest.TestCase):
                 line.removeprefix("reply-metadata-json: ")
                 for line in content.split(review.FEEDBACK_HEADER_SEPARATOR, 1)[0]
                 .decode().splitlines() if line.startswith("reply-metadata-json: ")))
-            self.assertEqual(set(stored), {"metadata"})
+            self.assertEqual(set(stored), {"metadata", "narrative_digest"})
             projected = review.read_feedback_reply_metadata(
-                feedback, expected_round_id="r1", binding=binding)
+                feedback, expected_round_id=round_id, binding=binding)
             self.assertIs(projected["review_target_matches"], True)
             self.assertIs(projected["reviewer_configured"], True)
 
@@ -3799,19 +4082,21 @@ class IngestTests(unittest.TestCase):
         import io
         with tempfile.TemporaryDirectory() as d:
             root = self._root(d)
-            self._binding(root, "r1")
+            round_id = "2026-07-18-r1"
+            self._binding(root, round_id)
             src = root / "corrupt.md"
             src.write_bytes(
                 b"model: gpt-5.6-\xff\neffort: high\n"
                 + f"review-target: {'b' * 12}-{'a' * 12}\n".encode())
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
-                self.assertEqual(review.ingest(root, "r1", src=src), 0)
+                self.assertEqual(review.ingest(root, round_id, src=src), 0)
             self.assertIn("structured reply header not found", err.getvalue())
-            feedback = root / "docs/reviews/r1-feedback.md"
-            binding, _reason = review.ingest_round_binding(root, "r1", common.load_config(root))
+            feedback = root / f"docs/reviews/{round_id}-feedback.md"
+            binding, _reason = review.ingest_round_binding(
+                root, round_id, common.load_config(root))
             projected = review.read_feedback_reply_metadata(
-                feedback, expected_round_id="r1", binding=binding)
+                feedback, expected_round_id=round_id, binding=binding)
             self.assertIsNone(projected["model"])
             self.assertIsNone(projected["effort"])
             self.assertIsNone(projected["review_target"])
@@ -3861,14 +4146,15 @@ class IngestTests(unittest.TestCase):
     def test_triage_command_replaces_only_marked_tail_with_quoted_markers_in_reply(self):
         with tempfile.TemporaryDirectory() as d:
             root = self._root(d)
-            self._binding(root, "r1")
+            round_id = "2026-07-18-r1"
+            self._binding(root, round_id)
             src = root / "reply.md"
             body = self._reply() + (
                 b"\nQuoted protocol text:\n" + review.TRIAGE_BEGIN + b"\n"
                 + review.TRIAGE_END + b"\n")
             src.write_bytes(body)
-            self.assertEqual(review.ingest(root, "r1", src=src), 0)
-            feedback = root / "docs/reviews/r1-feedback.md"
+            self.assertEqual(review.ingest(root, round_id, src=src), 0)
+            feedback = root / f"docs/reviews/{round_id}-feedback.md"
             before = feedback.read_bytes()
             actual_begin = before.rfind(review.TRIAGE_BEGIN)
             self.assertGreater(actual_begin, before.index(body))
@@ -3879,7 +4165,7 @@ class IngestTests(unittest.TestCase):
                 b"## Findings (triage skeleton v2)\n\n"
                 b"| finding | severity | type | verdict | evidence | task id |\n"
                 b"|---|---|---|---|---|---|\n")
-            self.assertEqual(review.triage(root, "r1", replacement), 0)
+            self.assertEqual(review.triage(root, round_id, replacement), 0)
             after = feedback.read_bytes()
             self.assertEqual(after[:actual_begin], immutable_prefix)
             self.assertIn(replacement.read_bytes(), after[actual_begin:])
@@ -3916,13 +4202,14 @@ class IngestTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as d:
             root = self._root(d)
-            self._binding(root, "r1")
+            round_id = "2026-07-18-r1"
+            self._binding(root, round_id)
             src = root / "reply.md"
             body = self._reply() + (
                 b"\nQuoted protocol line:\n" + review.TRIAGE_BEGIN + b"\n")
             src.write_bytes(body)
-            self.assertEqual(review.ingest(root, "r1", src=src), 0)
-            feedback = root / "docs/reviews/r1-feedback.md"
+            self.assertEqual(review.ingest(root, round_id, src=src), 0)
+            feedback = root / f"docs/reviews/{round_id}-feedback.md"
             content = feedback.read_bytes()
             # Hand-damage ONLY the canonical BEGIN (a discipline violation); the quoted BEGIN in
             # the verbatim reply and the canonical END at EOF remain — the masking case.
@@ -3936,7 +4223,7 @@ class IngestTests(unittest.TestCase):
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
                 self.assertEqual(review.main([
-                    "triage", "--round", "r1", "--file", str(replacement), str(root),
+                    "triage", "--round", round_id, "--file", str(replacement), str(root),
                 ]), 1)
             self.assertEqual(feedback.read_bytes(), damaged)
             self.assertIn("triage marker", err.getvalue())
@@ -3949,50 +4236,52 @@ class IngestTests(unittest.TestCase):
             (common.ensure_project_state_dir(root) / "profile.yml").write_text(
                 "schema: waystone-profile-1\nbindings:\n"
                 "  reviewer: {execution: external-runner, backend: 'codex:gpt-5.6-sol'}\n")
-            self._binding(root, "r1", reviewers=["codex:gpt-5.6-sol"])
-            self._binding(root, "r2", reviewers=["codex:gpt-5.6-sol"])
+            r1, r2, r3 = "2026-07-18-r1", "2026-07-18-r2", "2026-07-18-r3"
+            self._binding(root, r1, reviewers=["codex:gpt-5.6-sol"])
+            self._binding(root, r2, reviewers=["codex:gpt-5.6-sol"])
             configured = root / "configured.md"
             configured.write_bytes(self._reply())
-            self.assertEqual(review.ingest(root, "r1", src=configured), 0)
+            self.assertEqual(review.ingest(root, r1, src=configured), 0)
             ad_hoc = root / "ad-hoc.md"
             ad_hoc.write_bytes(self._reply(model="other-model"))
-            self.assertEqual(review.ingest(root, "r2", src=ad_hoc), 0)
+            self.assertEqual(review.ingest(root, r2, src=ad_hoc), 0)
 
             events, skipped = overlay.load_review_ingests(root)
             self.assertEqual(skipped, 0)
             by_round = {event["round_id"]: event for event in events}
             # A declared bare model matches the provider-qualified backend frozen in the sidecar.
-            self.assertEqual(by_round["r1"]["reviewer"], "gpt-5.6-sol")
-            self.assertIs(by_round["r1"]["reviewer_configured"], True)
-            self.assertEqual(by_round["r1"]["reviewer_effort"], "high")
-            self.assertEqual(by_round["r2"]["reviewer"], "other-model")
-            self.assertIsNone(by_round["r2"]["reviewer_configured"])
+            self.assertEqual(by_round[r1]["reviewer"], "gpt-5.6-sol")
+            self.assertIs(by_round[r1]["reviewer_configured"], True)
+            self.assertEqual(by_round[r1]["reviewer_effort"], "high")
+            self.assertEqual(by_round[r2]["reviewer"], "other-model")
+            self.assertIsNone(by_round[r2]["reviewer_configured"])
 
             fixed_events = [
-                {**by_round["r1"], "at": "2026-07-15T01:00:00+00:00"},
-                {**by_round["r2"], "at": "2026-07-15T03:00:00+00:00"},
+                {**by_round[r1], "at": "2026-07-15T01:00:00+00:00"},
+                {**by_round[r2], "at": "2026-07-15T03:00:00+00:00"},
             ]
             rounds = [
-                {"round_id": "r1", "at": "2026-07-15T00:00:00+00:00",
+                {"round_id": r1, "at": "2026-07-15T00:00:00+00:00",
                  "review_mode": "packet"},
-                {"round_id": "r2", "at": "2026-07-15T02:00:00+00:00",
+                {"round_id": r2, "at": "2026-07-15T02:00:00+00:00",
                  "review_mode": "packet"},
-                {"round_id": "r3", "at": "2026-07-15T04:00:00+00:00",
+                {"round_id": r3, "at": "2026-07-15T04:00:00+00:00",
                  "review_mode": "packet"},
             ]
             result = overlay.evaluate_review_skipped_closes(
                 rounds, fixed_events, consecutive=2)
-            self.assertEqual(result["fires"], ["r3"])
+            self.assertEqual(result["fires"], [r3])
             self.assertIsNone(result["by_round"][-1]["feedback_observed"])
             self.assertEqual(result["unknown_reviewer_feedback"], 1)
 
     def test_overlay_projection_ignores_stored_packet_identity_assessment(self):
         with tempfile.TemporaryDirectory() as d:
             root = self._root(d)
-            self._binding(root, "r1")
+            round_id = "2026-07-18-r1"
+            self._binding(root, round_id)
             src = root / "reply.md"
             src.write_bytes(self._reply())
-            self.assertEqual(review.ingest(root, "r1", src=src), 0)
+            self.assertEqual(review.ingest(root, round_id, src=src), 0)
 
             event_path = common.ensure_project_state_dir(root) / "overlay/review-ingests.jsonl"
             stored = _json.loads(event_path.read_text())
@@ -4017,12 +4306,13 @@ class IngestTests(unittest.TestCase):
         import io
         with tempfile.TemporaryDirectory() as d:
             root = self._root(d)
-            self._binding(root, "wrong")
+            wrong_round = "2026-07-18-wrong"
+            self._binding(root, wrong_round)
             wrong = root / "wrong.md"
             wrong.write_bytes(self._reply(target=f"{'c' * 12}-{'d' * 12}"))
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
-                self.assertEqual(review.ingest(root, "wrong", src=wrong), 0)
+                self.assertEqual(review.ingest(root, wrong_round, src=wrong), 0)
             self.assertIn("review-target", err.getvalue())
 
             legacy = root / "legacy.md"
@@ -4034,8 +4324,8 @@ class IngestTests(unittest.TestCase):
             events, skipped = overlay.load_review_ingests(root)
             self.assertEqual(skipped, 0)
             by_round = {event["round_id"]: event for event in events}
-            self.assertIs(by_round["wrong"]["review_target_matches"], False)
-            self.assertIsNone(by_round["wrong"]["reviewer_configured"])
+            self.assertIs(by_round[wrong_round]["review_target_matches"], False)
+            self.assertIsNone(by_round[wrong_round]["reviewer_configured"])
             self.assertIsNone(by_round["legacy"]["review_target_matches"])
             self.assertIsNone(by_round["legacy"]["reviewer_configured"])
             self.assertEqual(by_round["legacy"]["reviewer_coverage_reason"],
@@ -4044,25 +4334,26 @@ class IngestTests(unittest.TestCase):
     def test_force_reingest_replaces_legacy_identity_event_for_round(self):
         with tempfile.TemporaryDirectory() as d:
             root = self._root(d)
-            self._binding(root, "r1")
+            round_id = "2026-07-18-r1"
+            self._binding(root, round_id)
             event_path = common.ensure_project_state_dir(root) / "overlay/review-ingests.jsonl"
             event_path.parent.mkdir(parents=True, exist_ok=True)
             event_path.write_text(_json.dumps({
                 "schema": overlay.REVIEW_FEEDBACK_SCHEMA, "event": "review-feedback",
-                "at": "2026-07-15T00:00:00+00:00", "round_id": "r1",
-                "source": "packet-ingest", "event_id": "packet:r1:reviewer:old-model",
+                "at": "2026-07-15T00:00:00+00:00", "round_id": round_id,
+                "source": "packet-ingest", "event_id": f"packet:{round_id}:reviewer:old-model",
                 "reviewer": "old-model", "reviewer_configured": True,
                 "reviewer_coverage_reason": None, "provenance": "observed",
             }) + "\n")
-            dest = root / "docs/reviews/r1-feedback.md"
+            dest = root / f"docs/reviews/{round_id}-feedback.md"
             dest.write_text("old feedback")
             src = root / "corrected.md"
             src.write_bytes(self._reply())
-            self.assertEqual(review.ingest(root, "r1", src=src, force=True), 0)
+            self.assertEqual(review.ingest(root, round_id, src=src, force=True), 0)
 
             raw_rows = [_json.loads(line) for line in event_path.read_text().splitlines()]
             self.assertEqual(len(raw_rows), 1)
-            self.assertEqual(raw_rows[0]["event_id"], "packet:r1")
+            self.assertEqual(raw_rows[0]["event_id"], f"packet:{round_id}")
             self.assertEqual(raw_rows[0]["reviewer"], "gpt-5.6-sol")
             self.assertNotIn("reviewer_configured", raw_rows[0])
             self.assertNotIn("review_target_matches", raw_rows[0])
@@ -4072,8 +4363,9 @@ class IngestTests(unittest.TestCase):
         import io
         with tempfile.TemporaryDirectory() as d:
             root = self._root(d)
-            self._binding(root, "r1")
-            dest = root / "docs/reviews/r1-feedback.md"
+            round_id = "2026-07-18-r1"
+            self._binding(root, round_id)
+            dest = root / f"docs/reviews/{round_id}-feedback.md"
             dest.write_bytes(b"old feedback")
             src = root / "corrected.md"
             src.write_bytes(self._reply())
@@ -4083,7 +4375,7 @@ class IngestTests(unittest.TestCase):
             err = io.StringIO()
             try:
                 with contextlib.redirect_stderr(err):
-                    rc = review.ingest(root, "r1", src=src, force=True)
+                    rc = review.ingest(root, round_id, src=src, force=True)
             finally:
                 overlay.record_review_ingest = original
             self.assertEqual(rc, 1)
@@ -4206,7 +4498,9 @@ class PendingReviewTests(unittest.TestCase):
         rdir = root / "docs" / "reviews"
         (rdir / f"{round_id}-request.md").write_text("request\n")
         return review.write_round_request_binding(
-            root, round_id, target, base, reviewers or ["gpt-5.6-sol"], mode="packet")
+            root, round_id, target, base, reviewers or ["gpt-5.6-sol"], mode="packet",
+            narrative_digest=TEST_NARRATIVE_DIGEST,
+            rendered_request_digest=TEST_RENDERED_REQUEST_DIGEST)
 
     def _reply(self, model: str, base: str, target: str) -> bytes:
         return (f"model: {model}\neffort: xhigh\n"
@@ -4248,7 +4542,9 @@ class PendingReviewTests(unittest.TestCase):
             self.assertEqual(review.ingest(root, round_id, src=source), 0)
 
             review.write_round_request_binding(
-                root, round_id, new_target, base, ["new-reviewer"], mode="packet")
+                root, round_id, new_target, base, ["new-reviewer"], mode="packet",
+                narrative_digest=TEST_NARRATIVE_DIGEST,
+                rendered_request_digest=TEST_RENDERED_REQUEST_DIGEST)
             pending = review.pending_reviews(root)
             self.assertEqual([(row["target_sha"], row["reviewers"]) for row in pending],
                              [(new_target, ["new-reviewer"])])
@@ -4271,7 +4567,9 @@ class PendingReviewTests(unittest.TestCase):
                 self.assertEqual(review.ingest(root, round_id, src=source), 0)
 
                 latest = review.write_round_request_binding(
-                    root, round_id, "c" * 40, base, ["new-reviewer"], mode="packet")
+                    root, round_id, "c" * 40, base, ["new-reviewer"], mode="packet",
+                    narrative_digest=TEST_NARRATIVE_DIGEST,
+                    rendered_request_digest=TEST_RENDERED_REQUEST_DIGEST)
                 latest.write_text(corrupt_content)
 
                 pending = review.pending_reviews(root)
@@ -4289,7 +4587,9 @@ class PendingReviewTests(unittest.TestCase):
             round_id = "2026-01-01-resolver-order"
             first = self._request(root, round_id, "a" * 40)
             latest = review.write_round_request_binding(
-                root, round_id, "c" * 40, "b" * 40, ["r2"], mode="packet")
+                root, round_id, "c" * 40, "b" * 40, ["r2"], mode="packet",
+                narrative_digest=TEST_NARRATIVE_DIGEST,
+                rendered_request_digest=TEST_RENDERED_REQUEST_DIGEST)
             latest.write_text('{"schema":')
 
             with mock.patch.object(
@@ -4312,7 +4612,9 @@ class PendingReviewTests(unittest.TestCase):
             binding["at"] = "2026-01-01T23:00:00+09:00"  # sorts AFTER the newer stamp as a string
             first.write_text(_json.dumps(binding) + "\n")
             second = review.write_round_request_binding(
-                root, round_id, "c" * 40, base, ["r2"], mode="packet")
+                root, round_id, "c" * 40, base, ["r2"], mode="packet",
+                narrative_digest=TEST_NARRATIVE_DIGEST,
+                rendered_request_digest=TEST_RENDERED_REQUEST_DIGEST)
             row2 = _json.loads(second.read_text())
             row2["at"] = "2026-01-01T15:00:00+00:00"  # chronologically one hour newer
             second.write_text(_json.dumps(row2) + "\n")
@@ -4392,8 +4694,9 @@ class PendingReviewTests(unittest.TestCase):
             round_id = "2026-01-01-legacy-unconfigured"
             base = "b" * 40
             target = "a" * 40
-            binding_path = self._request(
-                root, round_id, target, base=base, reviewers=["expected-reviewer"])
+            binding_path = write_legacy_round_request_binding(
+                root, round_id, target, base, ["expected-reviewer"])
+            (root / "docs/reviews" / f"{round_id}-request.md").write_text("request\n")
             source = root / "reply.md"
             source.write_bytes(self._reply("someone-else", base, target))
             self.assertEqual(review.ingest(root, round_id, src=source), 0)
@@ -4492,7 +4795,7 @@ class PendingReviewTests(unittest.TestCase):
             err = io.StringIO()
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
                 close_rc = round.close(
-                    root, "2026-01-02-close", done=["chore/close-me"], touched=[], commit="HEAD")
+                    root, TEST_CLOSE_ROUND_ID, done=["chore/close-me"], touched=[], commit="HEAD")
             self.assertEqual(close_rc, 0)
             self.assertIn(round_id, err.getvalue())
             self.assertIn("pending review", err.getvalue())
@@ -6385,7 +6688,8 @@ class ImproveReviewsTests(unittest.TestCase):
             (root / ".waystone.yml").write_text("version: 1\nproject: demo\n")
             rdir = root / "docs/reviews"
             rdir.mkdir(parents=True)
-            (rdir / "r1-request.md").write_text("# request\n")
+            round_id = "2026-07-18-r1"
+            (rdir / f"{round_id}-request.md").write_text("# request\n")
             payload = _json.dumps({
                 "metadata": {"model": "gpt-5.6-sol", "effort": "xhigh",
                              "review-target": "bbbbbbbbbbbb-aaaaaaaaaaaa", "foo": "bar"},
@@ -6393,12 +6697,14 @@ class ImproveReviewsTests(unittest.TestCase):
                 "reviewer_coverage_reason": "forged-stored-result",
             }, separators=(",", ":"))
             review.write_round_request_binding(
-                root, "r1", "a" * 40, "b" * 40,
-                ["codex:gpt-5.6-sol"], mode="packet")
-            (rdir / "r1-feedback.md").write_text(
-                "<!-- waystone feedback -->\nround: r1\n"
+                root, round_id, "a" * 40, "b" * 40,
+                ["codex:gpt-5.6-sol"], mode="packet",
+                narrative_digest=TEST_NARRATIVE_DIGEST,
+                rendered_request_digest=TEST_RENDERED_REQUEST_DIGEST)
+            (rdir / f"{round_id}-feedback.md").write_text(
+                f"<!-- waystone feedback -->\nround: {round_id}\n"
                 f"reply-metadata-json: {payload}\n\n---\n\nreply body\n")
-            (rdir / "r1-request.md").write_text(
+            (rdir / f"{round_id}-request.md").write_text(
                 f"# request\n\n- Reviewing: {'a' * 40}   (diff against {'b' * 40})\n")
             registry = base / "projects.json"
             registry.write_text(_json.dumps({
@@ -6429,12 +6735,16 @@ class ImproveReviewsTests(unittest.TestCase):
             (rdir / f"{round_id}-request.md").write_text(
                 f"# request\n\n- Reviewing: {old_target}   (diff against {base_sha})\n")
             review.write_round_request_binding(
-                root, round_id, old_target, base_sha, ["old-reviewer"], mode="packet")
+                root, round_id, old_target, base_sha, ["old-reviewer"], mode="packet",
+                narrative_digest=TEST_NARRATIVE_DIGEST,
+                rendered_request_digest=TEST_RENDERED_REQUEST_DIGEST)
             (rdir / f"{round_id}-feedback.md").write_text(
                 "model: old-reviewer\neffort: high\n"
                 f"review-target: {base_sha[:12]}-{old_target[:12]}\n\nreviewed\n")
             latest = review.write_round_request_binding(
-                root, round_id, "c" * 40, base_sha, ["new-reviewer"], mode="packet")
+                root, round_id, "c" * 40, base_sha, ["new-reviewer"], mode="packet",
+                narrative_digest=TEST_NARRATIVE_DIGEST,
+                rendered_request_digest=TEST_RENDERED_REQUEST_DIGEST)
             latest.write_text('{"schema":')
             registry = base / "projects.json"
             registry.write_text(_json.dumps({
@@ -6459,15 +6769,15 @@ class ImproveReviewsTests(unittest.TestCase):
             rdir = root / "docs/reviews"
             rdir.mkdir(parents=True)
             target, base_sha = "a" * 40, "b" * 40
-            (rdir / "r1-request.md").write_text(
+            round_id = "2026-07-18-r1"
+            (rdir / f"{round_id}-request.md").write_text(
                 f"# request\n\n- Reviewing: {target}   (diff against {base_sha})\n")
-            binding_path = review.write_round_request_binding(
-                root, "r1", target, base_sha, ["expected-reviewer"], mode="packet")
-            binding = _json.loads(binding_path.read_text())
             binding_digest = "sha256:" + "2" * 64
             reply_digest = "sha256:" + "1" * 64
-            binding["narrative_digest"] = binding_digest
-            binding_path.write_text(_json.dumps(binding) + "\n")
+            review.write_round_request_binding(
+                root, round_id, target, base_sha, ["expected-reviewer"], mode="packet",
+                narrative_digest=binding_digest,
+                rendered_request_digest=TEST_RENDERED_REQUEST_DIGEST)
             payload = _json.dumps({
                 "metadata": {
                     "model": "expected-reviewer", "effort": "high",
@@ -6475,8 +6785,8 @@ class ImproveReviewsTests(unittest.TestCase):
                 },
                 "narrative_digest": reply_digest,
             }, separators=(",", ":"))
-            (rdir / "r1-feedback.md").write_text(
-                "<!-- waystone feedback -->\nround: r1\n"
+            (rdir / f"{round_id}-feedback.md").write_text(
+                f"<!-- waystone feedback -->\nround: {round_id}\n"
                 f"reply-metadata-json: {payload}\n\n---\n\nreply body\n")
             registry = base / "projects.json"
             registry.write_text(_json.dumps({
@@ -6487,6 +6797,11 @@ class ImproveReviewsTests(unittest.TestCase):
 
             row = self._load(out)[0][0]
             self.assertEqual(row["narrative_digest"], binding_digest)
+            self.assertEqual(row["rendered_request_digest"],
+                             TEST_RENDERED_REQUEST_DIGEST)
+            self.assertEqual(row["review_binding_schema"],
+                             review.ROUND_REQUEST_BINDING_SCHEMA)
+            self.assertEqual(row["review_request_binding_provenance"], "explicit")
             self.assertEqual(row["reply_narrative_digest"], reply_digest)
             self.assertIs(row["narrative_digest_matches"], False)
             self.assertEqual(row["narrative_coverage_reason"],
@@ -6503,15 +6818,16 @@ class ImproveReviewsTests(unittest.TestCase):
             rdir = root / "docs/reviews"
             rdir.mkdir(parents=True)
             target, base_sha = "a" * 40, "b" * 40
-            (rdir / "r1-request.md").write_text(
+            round_id = "2026-07-18-r1"
+            (rdir / f"{round_id}-request.md").write_text(
                 f"# request\n\n- Reviewing: {target}   (diff against {base_sha})\n")
-            review.write_round_request_binding(
-                root, "r1", target, base_sha, ["expected-reviewer"], mode="packet")
+            write_legacy_round_request_binding(
+                root, round_id, target, base_sha, ["expected-reviewer"])
             reply = root / "reply.md"
             reply.write_text(
                 "model: someone-else\neffort: high\n"
                 f"review-target: {base_sha[:12]}-{target[:12]}\n\nreviewed\n")
-            self.assertEqual(review.ingest(root, "r1", src=reply), 0)
+            self.assertEqual(review.ingest(root, round_id, src=reply), 0)
             registry = base / "projects.json"
             registry.write_text(_json.dumps({
                 "projects": [{"name": "demo", "path": str(root)}]}))
@@ -6523,6 +6839,10 @@ class ImproveReviewsTests(unittest.TestCase):
             self.assertIs(row["review_target_matches"], True)
             self.assertEqual(row["reviewer_coverage_reason"], "reviewer-not-configured")
             self.assertEqual(row["narrative_coverage_reason"], "legacy-pre-digest")
+            self.assertEqual(row["review_binding_schema"],
+                             review.ROUND_REQUEST_BINDING_V1_SCHEMA)
+            self.assertIsNone(row["narrative_digest"])
+            self.assertIsNone(row["rendered_request_digest"])
             self.assertEqual(review.pending_reviews(root), [])
 
     def test_triage_ignores_verbatim_body(self):
@@ -12673,7 +12993,7 @@ class BoundaryWarnTests(unittest.TestCase):
             err = io.StringIO()
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
                 rc = _run_with_home(home, lambda: round.close(
-                    root, "2026-01-02-close", done=["chore/close-me"], touched=[], commit="HEAD"))
+                    root, TEST_CLOSE_ROUND_ID, done=["chore/close-me"], touched=[], commit="HEAD"))
             self.assertEqual(rc, 0)  # warn does not block close
             self.assertIn("waystone warn", err.getvalue())
             rows = _read_warnings(root, home)
@@ -12691,7 +13011,7 @@ class BoundaryWarnTests(unittest.TestCase):
             try:
                 with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
                     rc = _run_with_home(home, lambda: round.close(
-                        root, "2026-01-02-close", done=["chore/close-me"], touched=[], commit="HEAD"))
+                        root, TEST_CLOSE_ROUND_ID, done=["chore/close-me"], touched=[], commit="HEAD"))
             finally:
                 overlay.evaluate_boundary = orig
             self.assertEqual(rc, 0)
@@ -12720,7 +13040,7 @@ class BoundaryWarnTests(unittest.TestCase):
             try:
                 with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
                     rc = _run_with_home(home, lambda: round.close(
-                        root, "2026-01-02-close", done=["chore/close-me"], touched=[], commit="HEAD"))
+                        root, TEST_CLOSE_ROUND_ID, done=["chore/close-me"], touched=[], commit="HEAD"))
             finally:
                 builtins.__import__ = orig_import
             self.assertEqual(rc, 0)
@@ -12818,30 +13138,30 @@ class RoundExposureTests(unittest.TestCase):
             import io
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 rc = _run_with_home(home, lambda: round.close(
-                    root, "2026-01-02-close", done=["chore/close-me"], touched=[], commit="HEAD"))
+                    root, TEST_CLOSE_ROUND_ID, done=["chore/close-me"], touched=[], commit="HEAD"))
             self.assertEqual(rc, 0)
-            p = self._exposure_dir(root, home) / "round-2026-01-02-close.json"
+            p = self._exposure_dir(root, home) / f"round-{TEST_CLOSE_ROUND_ID}.json"
             self.assertTrue(p.exists())
             exp = _json.loads(p.read_text())
             self.assertEqual(exp["schema"], "waystone-round-exposure-1")
-            self.assertEqual(exp["round_id"], "2026-01-02-close")
+            self.assertEqual(exp["round_id"], TEST_CLOSE_ROUND_ID)
             self.assertIsNotNone(exp["profile_fingerprint"])
             self.assertEqual(exp["bindings"]["implementer"], "codex:gpt-5.4-codex")
             self.assertEqual(exp["guards"], None)
             self.assertEqual(exp["waivers"], [])
             bindings = list((root / "docs" / "reviews").glob(
-                "2026-01-02-close-request.binding*.json"))
+                f"{TEST_CLOSE_ROUND_ID}-request.binding*.json"))
             self.assertEqual(bindings, [])
 
             closeout = git(root, "rev-parse", "HEAD").stdout.strip()
             narrative = Path(d) / "narrative.md"
             narrative.write_text(PacketPublicationTests.NARRATIVE)
             self.assertEqual(review.prepare_packet_request(
-                root, "2026-01-02-close", narrative), 0)
+                root, TEST_CLOSE_ROUND_ID, narrative), 0)
             binding_path = next((root / "docs" / "reviews").glob(
-                "2026-01-02-close-request.binding*.json"))
+                f"{TEST_CLOSE_ROUND_ID}-request.binding*.json"))
             binding = _json.loads(binding_path.read_text())
-            self.assertEqual(binding["round_id"], "2026-01-02-close")
+            self.assertEqual(binding["round_id"], TEST_CLOSE_ROUND_ID)
             self.assertEqual(binding["target_sha"], closeout)
             self.assertEqual(binding["canonical_store"], "local-packet")
 
@@ -12852,8 +13172,8 @@ class RoundExposureTests(unittest.TestCase):
             import io
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 _run_with_home(home, lambda: round.close(
-                    root, "2026-01-02-close", done=["chore/close-me"], touched=[], commit="HEAD"))
-            p = self._exposure_dir(root, home) / "round-2026-01-02-close.json"
+                    root, TEST_CLOSE_ROUND_ID, done=["chore/close-me"], touched=[], commit="HEAD"))
+            p = self._exposure_dir(root, home) / f"round-{TEST_CLOSE_ROUND_ID}.json"
             exp = _json.loads(p.read_text())
             self.assertIsNone(exp["profile_fingerprint"])
             self.assertIsNone(exp["bindings"])
@@ -12866,10 +13186,10 @@ class RoundExposureTests(unittest.TestCase):
             for _ in range(2):
                 with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                     _run_with_home(home, lambda: round.close(
-                        root, "2026-01-02-close", done=["chore/close-me"], touched=[], commit="HEAD"))
+                        root, TEST_CLOSE_ROUND_ID, done=["chore/close-me"], touched=[], commit="HEAD"))
             edir = self._exposure_dir(root, home)
-            self.assertTrue((edir / "round-2026-01-02-close.json").exists())
-            self.assertTrue((edir / "round-2026-01-02-close-2.json").exists())
+            self.assertTrue((edir / f"round-{TEST_CLOSE_ROUND_ID}.json").exists())
+            self.assertTrue((edir / f"round-{TEST_CLOSE_ROUND_ID}-2.json").exists())
 
     def test_exposure_open_x_collision_never_overwrites(self):
         with tempfile.TemporaryDirectory() as d:
@@ -12906,7 +13226,7 @@ class RoundExposureTests(unittest.TestCase):
             try:
                 with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
                     rc = _run_with_home(home, lambda: round.close(
-                        root, "2026-01-02-close", done=["chore/close-me"], touched=[], commit="HEAD"))
+                        root, TEST_CLOSE_ROUND_ID, done=["chore/close-me"], touched=[], commit="HEAD"))
             finally:
                 overlay.write_round_exposure = orig
             self.assertEqual(rc, 1)
@@ -12927,13 +13247,13 @@ class RoundExposureTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": session_id}), \
                     contextlib.redirect_stdout(io.StringIO()):
                 rc = _run_with_home(home, lambda: round.close(
-                    root, "2026-01-02-close", done=["chore/close-me"],
+                    root, TEST_CLOSE_ROUND_ID, done=["chore/close-me"],
                     touched=[], commit="HEAD"))
             self.assertEqual(rc, 0)
             task = common.load_tasks(root)["tasks"][0]
             self.assertEqual(task["session_id"], session_id)
             exposure = _json.loads(
-                (self._exposure_dir(root, home) / "round-2026-01-02-close.json").read_text())
+                (self._exposure_dir(root, home) / f"round-{TEST_CLOSE_ROUND_ID}.json").read_text())
             self.assertEqual(exposure["session_id"], session_id)
 
     def test_absent_session_id_is_recorded_as_null(self):
@@ -12949,13 +13269,13 @@ class RoundExposureTests(unittest.TestCase):
                 os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
                 os.environ.pop("CODEX_THREAD_ID", None)
                 rc = _run_with_home(home, lambda: round.close(
-                    root, "2026-01-02-close", done=["chore/close-me"],
+                    root, TEST_CLOSE_ROUND_ID, done=["chore/close-me"],
                     touched=[], commit="HEAD"))
             self.assertEqual(rc, 0)
             task = common.load_tasks(root)["tasks"][0]
             self.assertIsNone(task["session_id"])
             exposure = _json.loads(
-                (self._exposure_dir(root, home) / "round-2026-01-02-close.json").read_text())
+                (self._exposure_dir(root, home) / f"round-{TEST_CLOSE_ROUND_ID}.json").read_text())
             self.assertIsNone(exposure["session_id"])
 
 
@@ -13619,7 +13939,9 @@ class ImproveL2BAdversarialTests(unittest.TestCase):
             self.assertEqual(row["review_binding_reason"], "round-mismatched-review-marker")
 
             review.write_round_request_binding(
-                root, rid, "c" * 40, "d" * 40, ["codex"], mode="packet")
+                root, rid, "c" * 40, "d" * 40, ["codex"], mode="packet",
+                narrative_digest=TEST_NARRATIVE_DIGEST,
+                rendered_request_digest=TEST_RENDERED_REQUEST_DIGEST)
             improve.run_reviews(registry, out)
             row = self._rows(out / "reviews.jsonl")[0]
             self.assertEqual(row["review_binding_reason"], "missing-structured-reviewing-line")
@@ -16590,10 +16912,11 @@ class L2CGuardTests(unittest.TestCase):
             }])
 
             err = io.StringIO()
+            round_id = f"{TEST_CURRENT_ROUND_DATE}-r1"
             with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "s-main"}), \
                     contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
                 rc = _run_with_home(home, lambda: round.close(
-                    root, "2026-07-15-r1", done=["chore/close-me"], touched=[], commit="HEAD"))
+                    root, round_id, done=["chore/close-me"], touched=[], commit="HEAD"))
             self.assertEqual(rc, 0)
             rows = _read_warnings(root, home)
             fires = {row["rule"]: row for row in rows if row["event"] == "fire"}
@@ -16602,7 +16925,7 @@ class L2CGuardTests(unittest.TestCase):
             self.assertEqual(fires["done-without-evidence-v1"]["context"]["task_ids"],
                              ["chore/close-me"])
             self.assertEqual(fires["env-manifest-mutation-v1"]["context"]["round_id"],
-                             "2026-07-15-r1")
+                             round_id)
 
             for delta_id in ("env_unpreparedness/manifest", "verification_debt/done"):
                 report = _run_with_home(home, lambda did=delta_id: overlay.replay(root, did))
@@ -16794,32 +17117,34 @@ class L2CAdversarialFixTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as d:
             root, home = _round_review_project(d)
+            round_id = f"{TEST_CURRENT_ROUND_DATE}-invalid-scope"
             tasks = (root / "tasks.yaml").read_text().replace(
                 "    deps: []\n", "    deps: []\n    scope: [../outside]\n", 1)
             (root / "tasks.yaml").write_text(tasks)
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 rc = _run_with_home(home, lambda: round.close(
-                    root, "2026-07-15-invalid-scope", done=["chore/close-me"],
+                    root, round_id, done=["chore/close-me"],
                     touched=[], commit="HEAD"))
             self.assertEqual(rc, 0)
             exposure = _json.loads((overlay._exposure_dir(root) /
-                                    "round-2026-07-15-invalid-scope.json").read_text())
+                                    f"round-{round_id}.json").read_text())
             self.assertIs(exposure["round_evidence"]["evaluable"], False)
             self.assertEqual(exposure["round_evidence"]["coverage_reason"],
                              "task-scope-invalid")
 
         with tempfile.TemporaryDirectory() as d:
             root, home = _round_review_project(d)
+            round_id = f"{TEST_CURRENT_ROUND_DATE}-snapshot-error"
             with mock.patch.object(
                     overlay, "_capture_round_evidence", side_effect=RuntimeError("snapshot")), \
                     contextlib.redirect_stdout(io.StringIO()), \
                     contextlib.redirect_stderr(io.StringIO()):
                 rc = _run_with_home(home, lambda: round.close(
-                    root, "2026-07-15-snapshot-error", done=["chore/close-me"],
+                    root, round_id, done=["chore/close-me"],
                     touched=[], commit="HEAD"))
             self.assertEqual(rc, 0)
             exposure = _json.loads((overlay._exposure_dir(root) /
-                                    "round-2026-07-15-snapshot-error.json").read_text())
+                                    f"round-{round_id}.json").read_text())
             evidence = exposure["round_evidence"]
             self.assertEqual(
                 {key: evidence[key] for key in ("evaluable", "fired", "coverage_reason")},
@@ -17089,6 +17414,7 @@ class L2CAdversarialFixTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as d:
             root, home = _round_review_project(d)
+            round_id = f"{TEST_CURRENT_ROUND_DATE}-one-scan"
             tasks = (root / "tasks.yaml").read_text().replace(
                 "  - id: fix/finding-a", "  - id: chore/second\n    title: a second task close\n"
                 "    status: active\n    deps: []\n  - id: fix/finding-a")
@@ -17099,7 +17425,7 @@ class L2CAdversarialFixTests(unittest.TestCase):
                                       wraps=overlay._capture_round_evidence) as capture, \
                     contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 rc = _run_with_home(home, lambda: round.close(
-                    root, "2026-07-15-one-scan", done=["chore/close-me", "chore/second"],
+                    root, round_id, done=["chore/close-me", "chore/second"],
                     touched=[], commit="HEAD"))
             self.assertEqual(rc, 0)
             self.assertEqual(index.call_count, 1)
@@ -17497,13 +17823,13 @@ class L2DPolicyMachineTests(unittest.TestCase):
             _run_with_home(home, lambda: overlay.add_delta(
                 root, "review_association/local", rule="round-close-open-findings-v1", summary="s"))
             _run_with_home(home, lambda: overlay.set_round_override(
-                root, "2026-01-02-close", "round-close-open-findings-v1", "observing", "temporary"))
+                root, TEST_CLOSE_ROUND_ID, "round-close-open-findings-v1", "observing", "temporary"))
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 rc = _run_with_home(home, lambda: round.close(
-                    root, "2026-01-02-close", done=["chore/close-me"], touched=[], commit="HEAD"))
+                    root, TEST_CLOSE_ROUND_ID, done=["chore/close-me"], touched=[], commit="HEAD"))
             self.assertEqual(rc, 0)
             exposure = _json.loads((overlay._exposure_dir(root) /
-                                    "round-2026-01-02-close.json").read_text())
+                                    f"round-{TEST_CLOSE_ROUND_ID}.json").read_text())
             effective = next(row for row in exposure["policy_composition"]["effective"]
                              if row["rule"] == "round-close-open-findings-v1")
             self.assertEqual(effective["layer"], "round")
@@ -18423,6 +18749,41 @@ class L3GapClosureAcceptanceTests(unittest.TestCase):
             self.assertEqual(row["reviewers"], ["macro-reviewer"])
             self.assertEqual(row["review_profile_fingerprint"], "sha256:profile")
             self.assertEqual(row["review_binding_provenance"], "explicit")
+
+    def test_pr_improve_joins_freeze_with_v2_request_digest_provenance(self):
+        from unittest import mock
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            root, target, round_id = _pr_prepared_round(base, "macro-reviewer")
+            cfg = common.load_config(root)
+            context = {
+                "repo": "owner/repo", "pr": 9,
+                "bundle": {"head": target, "base_sha": "b" * 40, "bodies": []},
+                "head": target, "base_sha": "b" * 40, "base": "main",
+                "policy": cfg,
+            }
+            with mock.patch.object(review, "pr_context", return_value=context), \
+                    mock.patch.object(review, "_gh", return_value=(0, "ok")), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(review.freeze(root, 9, round_id), 0)
+
+            row = next(item for item in improve._project_review_rows("demo", root, cfg)
+                       if item["round_id"] == round_id)
+            request_binding = review.read_round_request_binding(next(
+                (common.project_state_path(root) / "review-requests").glob(
+                    f"{round_id}-request.binding*.json")))
+            self.assertEqual(row["review_binding_provenance"], "explicit")
+            self.assertEqual(row["review_binding_source"], "pr-freeze-sidecar")
+            self.assertEqual(row["review_request_binding_provenance"], "explicit")
+            self.assertEqual(row["review_binding_schema"],
+                             review.ROUND_REQUEST_BINDING_SCHEMA)
+            self.assertEqual(row["narrative_digest"],
+                             request_binding["narrative_digest"])
+            self.assertEqual(row["rendered_request_digest"],
+                             request_binding["rendered_request_digest"])
 
     def test_conflicting_same_cycle_pr_freeze_sidecars_fail_closed(self):
         with tempfile.TemporaryDirectory() as d:

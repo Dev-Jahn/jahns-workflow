@@ -44,7 +44,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -58,7 +58,14 @@ from common import (
 
 CODEX_BOT = "chatgpt-codex-connector[bot]"  # REST `user.login` form
 INBOX = Path("/tmp/review.md")  # fixed drop-file: user saves the reviewer reply here, byte-exact
-ROUND_REQUEST_BINDING_SCHEMA = "waystone-round-request-binding-1"
+ROUND_REQUEST_BINDING_V1_SCHEMA = "waystone-round-request-binding-1"
+ROUND_REQUEST_BINDING_SCHEMA = "waystone-round-request-binding-2"
+# 0.10.0 emitted genuine v1 bindings on this date. Only later rounds are digest-capable.
+# This leaves a finite downgrade window for round ids on/before the cutoff: their v2 sidecars can
+# still be rewritten as v1 because same-day genuine v1 evidence is indistinguishable. Settling
+# those historical rounds is explicitly owned by chore/pre-header-feedback-settlement; widening
+# the cutoff or guessing provenance here would retroactively corrupt authentic 0.10.0 artifacts.
+DIGEST_BINDING_ROUND_CUTOFF = date(2026, 7, 18)
 PR_FREEZE_BINDING_SCHEMA = "waystone-pr-freeze-binding-1"
 _ROUND_REQUEST_BINDING_FILE_RE = re.compile(
     r"^(?P<round_id>.+)-request\.binding(?:-(?P<sequence>\d+))?\.json$")
@@ -310,7 +317,8 @@ def assess_review_reply(parsed: dict, binding: dict | None) -> dict:
 
 def write_round_request_binding(root: Path, round_id: str, target_sha: str, base_sha: str | None,
                                 reviewers: list[str], *, mode: str,
-                                narrative_digest: str | None = None,
+                                narrative_digest: str,
+                                rendered_request_digest: str,
                                 directory: Path | None = None) -> Path:
     """Append an immutable round-bound sidecar for packet request projection.
 
@@ -319,10 +327,14 @@ def write_round_request_binding(root: Path, round_id: str, target_sha: str, base
     """
     if not _is_sha(target_sha) or (base_sha is not None and not _is_sha(base_sha)):
         raise WorkflowError("round request binding requires full target/base commit SHAs")
+    if _round_request_binding_date(round_id) is None:
+        raise WorkflowError("round request binding requires a real YYYY-MM-DD-<slug> round id")
     if mode not in ("packet", "pr") or not _is_strlist(reviewers):
         raise WorkflowError("round request binding requires packet|pr mode and literal reviewers")
-    if narrative_digest is not None and not _is_sha256_digest(narrative_digest):
-        raise WorkflowError("round request binding requires a canonical narrative digest")
+    if (not _is_sha256_digest(narrative_digest)
+            or not _is_sha256_digest(rendered_request_digest)):
+        raise WorkflowError(
+            "round request binding requires canonical narrative and rendered request digests")
     if directory is None:
         cfg = load_config(root)
         directory = Path(root) / cfg["reviews_dir"]
@@ -333,10 +345,10 @@ def write_round_request_binding(root: Path, round_id: str, target_sha: str, base
         "schema": ROUND_REQUEST_BINDING_SCHEMA, "round_id": round_id,
         "target_sha": target_sha, "base_sha": base_sha, "reviewers": reviewers,
         "mode": mode, "canonical_store": "github-pr-comment" if mode == "pr" else "local-packet",
+        "narrative_digest": narrative_digest,
+        "rendered_request_digest": rendered_request_digest,
         "at": datetime.now().astimezone().isoformat(),
     }
-    if narrative_digest is not None:
-        row["narrative_digest"] = narrative_digest
     contract = {key: value for key, value in row.items() if key != "at"}
     base = directory / f"{round_id}-request.binding.json"
     prior: list[tuple[Path, dict]] = []
@@ -371,19 +383,56 @@ def write_round_request_binding(root: Path, round_id: str, target_sha: str, base
         temporary.unlink(missing_ok=True)
 
 
+def _round_request_binding_date(round_id: object) -> date | None:
+    if (not isinstance(round_id, str)
+            or re.fullmatch(r"\d{4}-\d{2}-\d{2}-[a-z0-9][a-z0-9-]*", round_id) is None):
+        return None
+    try:
+        return date.fromisoformat(round_id[:10])
+    except ValueError:
+        return None
+
+
+def _round_requires_digest_binding(round_id: object) -> bool:
+    """Anchor digest capability outside the mutable sidecar payload.
+
+    The round id is repeated in the filename, request, feedback, and closeout exposure. Rewriting
+    that whole artifact set is outside this boundary's threat model; changing only schema and
+    digest fields must not turn a digest-capable binding into legacy evidence.
+    """
+    round_date = _round_request_binding_date(round_id)
+    if round_date is None:
+        raise WorkflowError("digest binding requires a real YYYY-MM-DD-<slug> round id")
+    return round_date > DIGEST_BINDING_ROUND_CUTOFF
+
+
 def read_round_request_binding(path: Path, *, expected_round_id: str | None = None) -> dict:
     """Load one request sidecar without silently accepting damaged projection evidence."""
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
         raise WorkflowError(f"corrupt review binding {path}: {type(e).__name__}") from e
-    if (not isinstance(data, dict) or data.get("schema") != ROUND_REQUEST_BINDING_SCHEMA
+    schema = data.get("schema") if isinstance(data, dict) else None
+    round_id = data.get("round_id") if isinstance(data, dict) else None
+    round_date = _round_request_binding_date(round_id)
+    v1_digests_valid = (
+        schema == ROUND_REQUEST_BINDING_V1_SCHEMA
+        and "narrative_digest" not in data
+        and "rendered_request_digest" not in data
+        and round_date is not None
+        and not _round_requires_digest_binding(round_id)
+    )
+    v2_digests_valid = (
+        schema == ROUND_REQUEST_BINDING_SCHEMA
+        and _is_sha256_digest(data.get("narrative_digest"))
+        and _is_sha256_digest(data.get("rendered_request_digest"))
+    )
+    if (not isinstance(data, dict) or round_date is None
+            or not (v1_digests_valid or v2_digests_valid)
             or not isinstance(data.get("round_id"), str) or not data["round_id"]
             or not _is_sha(data.get("target_sha"))
             or (data.get("base_sha") is not None and not _is_sha(data.get("base_sha")))
             or not _is_strlist(data.get("reviewers"))
-            or ("narrative_digest" in data
-                and not _is_sha256_digest(data.get("narrative_digest")))
             or data.get("mode") not in ("packet", "pr")
             or data.get("canonical_store") != (
                 "local-packet" if data.get("mode") == "packet" else "github-pr-comment")
@@ -462,7 +511,28 @@ def ingest_round_binding(root: Path, round_id: str, cfg: dict) -> tuple[dict | N
         if len(contracts) != 1:
             return None, "conflicting-pr-freeze-sidecars"
         path, row = max(latest, key=lambda item: (item[1]["at"], str(item[0])))
-        return {**row, "source": str(path)}, None
+        request_directory = project_state_path(root) / "review-requests"
+        request_paths = sorted(request_directory.glob(f"{round_id}-request.binding*.json"))
+        if not request_paths:
+            if _round_requires_digest_binding(round_id):
+                return None, "corrupt-round-binding:missing-pr-request-sidecar"
+            return {**row, "source": str(path)}, None
+        request_path, request_row = latest_round_request_binding(
+            request_paths, expected_round_id=round_id)
+        if request_path is None or request_row is None:
+            return None, "corrupt-round-binding:WorkflowError"
+        if (request_row["mode"] != "pr"
+                or request_row["target_sha"] != row["target_sha"]
+                or request_row["reviewers"] != row["reviewers"]):
+            return None, "corrupt-round-binding:pr-request-freeze-mismatch"
+        return {
+            **row,
+            "request_binding_schema": request_row["schema"],
+            "narrative_digest": request_row.get("narrative_digest"),
+            "rendered_request_digest": request_row.get("rendered_request_digest"),
+            "source": str(path),
+            "request_binding_source": str(request_path),
+        }, None
     except (OSError, WorkflowError) as e:
         return None, f"corrupt-round-binding:{type(e).__name__}"
 
@@ -483,7 +553,11 @@ def _assess_narrative_digest(binding: dict | None, feedback_digest: str | None,
     if binding is None:
         return None, "round-binding-unavailable"
     binding_digest = binding.get("narrative_digest")
-    if binding_digest is None and not feedback_digest_present:
+    binding_schema = (binding.get("request_binding_schema")
+                      or binding.get("review_binding_schema")
+                      or binding.get("schema"))
+    if (binding_schema == ROUND_REQUEST_BINDING_V1_SCHEMA
+            and binding_digest is None and not feedback_digest_present):
         return None, "legacy-pre-digest"
     if binding_digest is not None and feedback_digest == binding_digest:
         return True, None
@@ -636,6 +710,7 @@ def read_pr_freeze_binding(path: Path, *, expected_round_id: str | None = None,
         raise WorkflowError(f"corrupt review binding {path}: {type(e).__name__}") from e
     if (not isinstance(data, dict) or data.get("schema") != PR_FREEZE_BINDING_SCHEMA
             or not isinstance(data.get("round_id"), str) or not data["round_id"]
+            or _round_request_binding_date(data.get("round_id")) is None
             or type(data.get("pr")) is not int or data["pr"] < 1
             or not _is_cycle(data.get("cycle"))
             or not _is_sha(data.get("target_sha")) or not _is_sha(data.get("base_sha"))
@@ -823,6 +898,10 @@ def _canonical_narrative_digest(narrative: str) -> str:
     return "sha256:" + hashlib.sha256(narrative.encode("utf-8")).hexdigest()
 
 
+def _canonical_rendered_request_digest(rendered: str) -> str:
+    return "sha256:" + hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+
+
 def _render_review_request(round_id: str, exposure: dict, narrative: str) -> str:
     try:
         template = REVIEW_REQUEST_TEMPLATE.read_text(encoding="utf-8")
@@ -886,10 +965,13 @@ def prepare_review_request(root: Path, round_id: str, narrative_path: Path) -> i
         request = prepared_request_path(root, round_id, mode=mode)
         narrative = _read_review_narrative(narrative_path)
         narrative_digest = _canonical_narrative_digest(narrative)
+        rendered = _render_review_request(round_id, exposure, narrative)
+        rendered_request_digest = _canonical_rendered_request_digest(rendered)
         expected = {
             "target_sha": exposure["head_sha"], "base_sha": exposure.get("base_sha"),
             "reviewers": exposure["reviewers"], "mode": mode,
             "narrative_digest": narrative_digest,
+            "rendered_request_digest": rendered_request_digest,
         }
         existing_paths = sorted(request.parent.glob(f"{round_id}-request.binding*.json"))
         for path in existing_paths:
@@ -899,7 +981,6 @@ def prepare_review_request(root: Path, round_id: str, narrative_path: Path) -> i
                 raise WorkflowError(
                     f"existing request sidecar {path} disagrees with the round exposure; "
                     "reclose and prepare with a new round id instead of superseding immutable evidence")
-        rendered = _render_review_request(round_id, exposure, narrative)
         request.parent.mkdir(parents=True, exist_ok=True)
         write_bytes_atomic(request, rendered.encode("utf-8"))
         narrative_store = stored_narrative_path(root, round_id)
@@ -908,6 +989,7 @@ def prepare_review_request(root: Path, round_id: str, narrative_path: Path) -> i
         binding_path = write_round_request_binding(
             root, round_id, expected["target_sha"], expected["base_sha"],
             expected["reviewers"], mode=mode, narrative_digest=narrative_digest,
+            rendered_request_digest=rendered_request_digest,
             directory=request.parent)
     except (OSError, WorkflowError, ValueError) as e:
         print(f"review prepare: {e}", file=sys.stderr)
@@ -989,7 +1071,7 @@ def verify_packet_publication(root: Path, round_id: str) -> int:
             f"remote: packet request and latest binding disagree for round {round_id}",
             file=sys.stderr)
         return 1
-    if binding.get("narrative_digest") is None:
+    if binding["schema"] == ROUND_REQUEST_BINDING_V1_SCHEMA:
         print(
             f"remote: latest packet binding for round {round_id} is legacy-pre-digest; "
             "re-run review prepare before publication",
@@ -1003,7 +1085,11 @@ def verify_packet_publication(root: Path, round_id: str) -> int:
         if exposure["review_mode"] != "packet" or not _binding_matches_exposure(
                 binding, exposure):
             raise WorkflowError("round exposure does not match the latest binding")
-        reproduced = _render_review_request(round_id, exposure, narrative).encode("utf-8")
+        reproduced_text = _render_review_request(round_id, exposure, narrative)
+        if (_canonical_rendered_request_digest(reproduced_text)
+                != binding["rendered_request_digest"]):
+            raise WorkflowError("rendered request digest does not match the latest binding")
+        reproduced = reproduced_text.encode("utf-8")
     except (OSError, UnicodeDecodeError, WorkflowError) as e:
         print(f"remote: packet request is not reproducible from bound inputs: {e}",
               file=sys.stderr)
@@ -1616,12 +1702,11 @@ def freeze(root: Path, pr: int, round_id: str | None) -> int:
                 sidecar_paths, expected_round_id=round_id)
             if _binding_path is None or request_sidecar is None:
                 raise WorkflowError("latest request binding is corrupt")
-            # The published carrier is RE-RENDERED from the same inputs prepare used (round
-            # exposure + stored narrative) — the on-disk request file is never re-trusted, so
-            # a post-prepare edit cannot reach the PR comment. Re-rendering IS the integrity.
+            # The published carrier is re-rendered from prepare's inputs, checked against the
+            # digest prepare stored, and appended without transforming those verified bytes.
             _exposure_path, exposure = read_round_closeout_exposure(root, round_id)
             narrative = _read_review_narrative(stored_narrative_path(root, round_id))
-            if request_sidecar.get("narrative_digest") is None:
+            if request_sidecar["schema"] == ROUND_REQUEST_BINDING_V1_SCHEMA:
                 raise WorkflowError("latest request binding is legacy-pre-digest")
             if (_canonical_narrative_digest(narrative)
                     != request_sidecar["narrative_digest"]):
@@ -1631,6 +1716,10 @@ def freeze(root: Path, pr: int, round_id: str | None) -> int:
                 raise WorkflowError(
                     "round exposure does not match the latest request binding")
             request_text = _render_review_request(round_id, exposure, narrative)
+            if (_canonical_rendered_request_digest(request_text)
+                    != request_sidecar["rendered_request_digest"]):
+                raise WorkflowError(
+                    "rendered request digest does not match the latest request binding")
         except (OSError, UnicodeDecodeError, WorkflowError) as e:
             print(
                 f"review freeze: prepared PR request is not reproducible ({e}); re-run "
@@ -1661,7 +1750,7 @@ def freeze(root: Path, pr: int, round_id: str | None) -> int:
             + (f"Macro reviewer(s) — {', '.join(macro)}: review at the SHA above; end your reply with "
                f"a `waystone-review-result` footer carrying `reviewed_sha: {head}` and `review_cycle: {n}`.\n\n"
                if macro else "")
-            + ((request_text.rstrip() + "\n\n") if request_text is not None else "")
+            + ((request_text + "\n") if request_text is not None else "")
             + marker + "\n")
     rc, out = _gh(root, "pr", "comment", str(pr), "--body", body)
     if rc != 0:
@@ -1844,6 +1933,12 @@ def ingest(root: Path, round_id: str | None, src: Path = INBOX, reviewer: str | 
 
     parsed_header = parse_review_reply_header(body)
     binding, binding_reason = ingest_round_binding(root, round_id, cfg)
+    if (binding is None and binding_reason is not None
+            and binding_reason.startswith("corrupt-round-binding:")):
+        print(
+            f"review ingest: round binding is corrupt ({binding_reason}); refusing feedback ingest",
+            file=sys.stderr)
+        return 1
     assessment = assess_review_reply(parsed_header, binding)
     if reviewer is not None:
         print("review ingest: warning: --reviewer is ignored; the reply header is authoritative",
