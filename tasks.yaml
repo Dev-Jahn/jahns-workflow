@@ -560,6 +560,7 @@ tasks:
     severity: "major"
     origin: "review-2026-07-18-generation-binding"
   - id: fix/pr-cycle-generation-binding
+    accept: ["PR freeze의 cycle 증거가 request generation을 명명한다 — waystone-review-cycle marker와 freeze sidecar 양쪽에 rendered_request_digest가 포함되고, 같은 cycle의 conflict 판정에도 digest가 참여한다", "improve와 ingest_round_binding의 PR 경로는 latest request가 아니라 cycle 증거가 명명한 digest의 불변 sidecar를 조회한다 — freeze되지 않은 B generation이 cycle-A의 provenance로 출력될 수 없다 (RED: freeze(A) 후 같은 target 재-prepare(B) → 투영이 A generation을 유지)", "로컬 freeze sidecar가 없어도 GitHub cycle marker 단독으로 exact generation을 복구할 수 있다 — marker의 digest로 sidecar를 resolve하고 부재 시 정직한 unknown", "legacy(digest 없는) cycle marker/freeze sidecar는 정직하게 구분된다 — 조용한 동등 취급 없이 pre-digest provenance로 라벨", "전체 테스트 스위트 green + ruff F401,F841 clean — freeze·merge gate·receipt 계약 무회귀"]
     scope: ["scripts/review.py", "scripts/improve.py", "scripts/tests/run_tests.py"]
     title: "PR review cycle에 request generation 결속 — waystone-review-cycle marker·freeze sidecar·cycle conflict 판정에 rendered_request_digest 포함, improve·ingest_round_binding은 latest request가 아니라 marker가 명명한 digest의 sidecar를 조회 (cycle-A에 B provenance 귀속 차단; GitHub marker 단독으로 exact generation 복구 가능) (JW-GPT-008)"
     status: "pending"
