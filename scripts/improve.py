@@ -981,13 +981,18 @@ def _review_binding(request_file: Path | None, round_id: str, mode: str,
             return result(reason="corrupt-pr-freeze-demotion-sidecar")
         freeze_sidecars = [
             row for row in sidecars
-            if row.get("schema") in (
-                review.PR_FREEZE_BINDING_V1_SCHEMA, review.PR_FREEZE_BINDING_SCHEMA)
+            if (row.get("_binding_kind") == "freeze"
+                or row.get("schema") in (
+                    review.PR_FREEZE_BINDING_V1_SCHEMA, review.PR_FREEZE_BINDING_SCHEMA))
         ]
         if not freeze_sidecars:
             return result(reason="missing-pr-freeze-sidecar")
+        if any(row.get("cycle") is None for row in freeze_sidecars):
+            return result(reason="corrupt-pr-freeze-sidecar")
         latest_cycle = max(row["cycle"] for row in freeze_sidecars)
         cycle_rows = [row for row in freeze_sidecars if row["cycle"] == latest_cycle]
+        if any(row.get("_binding_error") is not None for row in cycle_rows):
+            return result(reason="corrupt-pr-freeze-sidecar")
         core_bindings = {(
             row["target_sha"], row["base_sha"], tuple(row["reviewers"]),
             row.get("profile_fingerprint"), row["pr"],
@@ -1158,12 +1163,38 @@ def _round_review_sidecars(
             })
     freeze_paths = sorted(rdir.glob("*-freeze-*.binding*.json")) if rdir.is_dir() else []
     for path in freeze_paths:
-        try:
-            data = review.read_pr_freeze_binding(path)
-        except WorkflowError as e:
-            print(f"improve: warning: {e}; excluded from projection", file=sys.stderr)
+        identity = review.pr_freeze_binding_identity(path)
+        if identity is None:
+            round_id, separator, tail = path.name.rpartition("-freeze-")
+            if (not separator or re.fullmatch(r".+\.binding.*\.json", tail) is None
+                    or review._round_request_binding_date(round_id) is None):
+                round_id = None
+            print(
+                f"improve: warning: corrupt review binding {path}: invalid freeze filename; "
+                "quarantined as unknown",
+                file=sys.stderr,
+            )
+            if round_id is not None:
+                rows.setdefault(round_id, []).append({
+                    "round_id": round_id, "cycle": None, "_file": str(path),
+                    "_binding_error": "corrupt-pr-freeze-sidecar",
+                    "_binding_kind": "freeze",
+                })
             continue
-        rows.setdefault(data["round_id"], []).append({**data, "_file": str(path)})
+        try:
+            data = review.read_pr_freeze_binding(
+                path, expected_round_id=identity[0], expected_cycle=identity[1])
+        except WorkflowError as e:
+            print(f"improve: warning: {e}; quarantined as unknown", file=sys.stderr)
+            rows.setdefault(identity[0], []).append({
+                "round_id": identity[0], "cycle": identity[1], "_file": str(path),
+                "_binding_error": "corrupt-pr-freeze-sidecar",
+                "_binding_kind": "freeze",
+            })
+            continue
+        rows.setdefault(data["round_id"], []).append({
+            **data, "_file": str(path), "_binding_kind": "freeze",
+        })
     demotion_paths = sorted(
         rdir.glob("*-freeze-*.demotion*.json")) if rdir.is_dir() else []
     for path in demotion_paths:

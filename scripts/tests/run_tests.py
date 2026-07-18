@@ -20874,6 +20874,185 @@ class L3GapClosureAcceptanceTests(unittest.TestCase):
             self.assertEqual(row["review_binding_reason"],
                              "corrupt-pr-freeze-demotion-sidecar")
 
+    def test_cross_round_freeze_prefix_collisions_are_excluded_across_projections(self):
+        for kind in ("freeze", "demotion"):
+            for foreign_corrupt in (False, True):
+                with self.subTest(kind=kind, foreign_corrupt=foreign_corrupt), \
+                        tempfile.TemporaryDirectory() as d:
+                    root = Path(d)
+                    (root / ".waystone.yml").write_text(
+                        "version: 1\nproject: demo\nreviews_dir: docs/reviews\n"
+                        "review:\n  mode: pr\n")
+                    round_id = "2026-07-19-a"
+                    foreign_round_id = f"{round_id}-freeze-b"
+                    target, foreign_target = "a" * 40, "c" * 40
+                    review.write_pr_freeze_binding(
+                        root, round_id, 7, 1, target, "b" * 40,
+                        ["macro-reviewer"], None, "docs/reviews",
+                        rendered_request_digest=TEST_RENDERED_REQUEST_DIGEST)
+                    if kind == "freeze":
+                        foreign = review.write_pr_freeze_binding(
+                            root, foreign_round_id, 8, 3, foreign_target, "d" * 40,
+                            ["macro-reviewer"], None, "docs/reviews",
+                            rendered_request_digest=TEST_RENDERED_REQUEST_DIGEST)
+                    else:
+                        foreign = review.write_pr_freeze_demotion(
+                            root, foreign_round_id, 8, 3, foreign_target, "d" * 40,
+                            ["macro-reviewer"], None, "docs/reviews",
+                            rendered_request_digest=TEST_RENDERED_REQUEST_DIGEST,
+                            superseding_cycle=3,
+                            superseding_marker_at="2026-07-19T00:01:00Z")
+                    if foreign_corrupt:
+                        foreign.write_text("{corrupt")
+
+                    sidecars = improve._round_review_sidecars(root / "docs/reviews")
+                    projected = improve._review_binding(
+                        None, round_id, "pr", sidecars[round_id])
+                    self.assertEqual(projected["target_sha"], target)
+                    self.assertEqual(projected["review_cycle"], 1)
+                    self.assertEqual(projected["review_binding_provenance"], "explicit")
+                    self.assertNotIn(
+                        foreign, [Path(row["_file"]) for row in sidecars[round_id]])
+
+                    binding, reason = review.ingest_round_binding(
+                        root, round_id, common.load_config(root))
+                    self.assertIsNotNone(binding, reason)
+                    self.assertEqual(binding["target_sha"], projected["target_sha"])
+                    self.assertEqual(binding["cycle"], projected["review_cycle"])
+                    self.assertEqual(
+                        binding["request_binding_provenance"],
+                        projected["review_request_binding_provenance"])
+                    self.assertEqual(reason, projected["review_request_binding_reason"])
+
+    def test_corrupt_latest_pr_freeze_sidecar_blocks_stale_cycle_across_projections(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / ".waystone.yml").write_text(
+                "version: 1\nproject: demo\nreviews_dir: docs/reviews\n"
+                "review:\n  mode: pr\n")
+            round_id = "2026-07-19-corrupt-latest-freeze"
+            review.write_pr_freeze_binding(
+                root, round_id, 7, 1, "a" * 40, "b" * 40,
+                ["macro-reviewer"], None, "docs/reviews",
+                rendered_request_digest=TEST_RENDERED_REQUEST_DIGEST)
+            corrupt = (root / "docs/reviews" /
+                       f"{round_id}-freeze-2.binding.json")
+            corrupt.write_text('{"schema":')
+
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                sidecars = improve._round_review_sidecars(
+                    root / "docs/reviews")[round_id]
+            projected = improve._review_binding(None, round_id, "pr", sidecars)
+
+            self.assertIsNone(projected["target_sha"])
+            self.assertEqual(projected["review_binding_provenance"], "unknown")
+            self.assertEqual(projected["review_binding_reason"],
+                             "corrupt-pr-freeze-sidecar")
+            sentinels = [
+                row for row in sidecars
+                if row.get("_binding_error") == "corrupt-pr-freeze-sidecar"
+            ]
+            self.assertEqual(len(sentinels), 1)
+            self.assertEqual(sentinels[0]["round_id"], round_id)
+            self.assertEqual(sentinels[0]["cycle"], 2)
+            self.assertEqual(sentinels[0]["_binding_kind"], "freeze")
+            self.assertIn(str(corrupt), err.getvalue())
+            self.assertIn("quarantined as unknown", err.getvalue())
+
+            binding, reason = review.ingest_round_binding(
+                root, round_id, common.load_config(root))
+            self.assertIsNone(binding)
+            self.assertEqual(reason, "corrupt-round-binding:WorkflowError")
+
+    def test_pr_freeze_binding_reader_enforces_filename_round_and_cycle_identity(self):
+        for field, value in (
+                ("round_id", "2026-07-19-other-round"), ("cycle", 3)):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                path = review.write_pr_freeze_binding(
+                    root, "2026-07-19-r1", 7, 2, "a" * 40, "b" * 40,
+                    ["macro-reviewer"], None, "docs/reviews",
+                    rendered_request_digest=TEST_RENDERED_REQUEST_DIGEST)
+                row = _json.loads(path.read_text())
+                row[field] = value
+                path.write_text(_json.dumps(row) + "\n")
+
+                with self.assertRaisesRegex(common.WorkflowError, "filename identity"):
+                    review.read_pr_freeze_binding(path)
+
+    def test_unparseable_pr_freeze_filename_quarantines_only_its_round(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / ".waystone.yml").write_text(
+                "version: 1\nproject: demo\nreviews_dir: docs/reviews\n"
+                "review:\n  mode: pr\n")
+            damaged_round = "2026-07-19-invalid-freeze-name"
+            healthy_round = "2026-07-19-healthy-freeze"
+            for round_id, cycle, target in (
+                    (damaged_round, 1, "a" * 40),
+                    (healthy_round, 3, "c" * 40)):
+                review.write_pr_freeze_binding(
+                    root, round_id, 7, cycle, target, "b" * 40,
+                    ["macro-reviewer"], None, "docs/reviews",
+                    rendered_request_digest=TEST_RENDERED_REQUEST_DIGEST)
+            invalid = (root / "docs/reviews" /
+                       f"{damaged_round}-freeze-latest.binding.json")
+            invalid.write_text("{corrupt")
+
+            sidecars = improve._round_review_sidecars(root / "docs/reviews")
+            damaged = improve._review_binding(
+                None, damaged_round, "pr", sidecars[damaged_round])
+            healthy = improve._review_binding(
+                None, healthy_round, "pr", sidecars[healthy_round])
+
+            self.assertIsNone(damaged["target_sha"])
+            self.assertEqual(damaged["review_binding_reason"],
+                             "corrupt-pr-freeze-sidecar")
+            sentinel = next(
+                row for row in sidecars[damaged_round]
+                if row.get("_binding_error") == "corrupt-pr-freeze-sidecar")
+            self.assertIsNone(sentinel["cycle"])
+            self.assertEqual(sentinel["_file"], str(invalid))
+            self.assertEqual(healthy["target_sha"], "c" * 40)
+            self.assertEqual(healthy["review_cycle"], 3)
+            self.assertEqual(healthy["review_binding_provenance"], "explicit")
+
+            binding, reason = review.ingest_round_binding(
+                root, damaged_round, common.load_config(root))
+            self.assertIsNone(binding)
+            self.assertEqual(reason, "corrupt-round-binding:WorkflowError")
+
+    def test_older_corrupt_pr_freeze_does_not_override_newer_valid_cycle(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / ".waystone.yml").write_text(
+                "version: 1\nproject: demo\nreviews_dir: docs/reviews\n"
+                "review:\n  mode: pr\n")
+            round_id = "2026-07-19-newer-valid-freeze"
+            directory = root / "docs/reviews"
+            directory.mkdir(parents=True)
+            (directory / f"{round_id}-freeze-1.binding.json").write_text("{corrupt")
+            review.write_pr_freeze_binding(
+                root, round_id, 7, 2, "c" * 40, "b" * 40,
+                ["macro-reviewer"], None, "docs/reviews",
+                rendered_request_digest=TEST_RENDERED_REQUEST_DIGEST)
+
+            sidecars = improve._round_review_sidecars(directory)[round_id]
+            projected = improve._review_binding(None, round_id, "pr", sidecars)
+            self.assertEqual(projected["target_sha"], "c" * 40)
+            self.assertEqual(projected["review_cycle"], 2)
+            self.assertEqual(projected["review_binding_provenance"], "explicit")
+
+            binding, reason = review.ingest_round_binding(
+                root, round_id, common.load_config(root))
+            self.assertEqual(binding["target_sha"], "c" * 40)
+            self.assertEqual(binding["cycle"], 2)
+            self.assertEqual(reason, "missing-pr-request-generation")
+
     def test_unparseable_mixed_version_timestamp_fails_closed(self):
         head = "a" * 40
         rows = [

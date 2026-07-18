@@ -74,6 +74,9 @@ CYCLE_VERSION_TIE_REASON = "v1-v2-timestamp-tie"
 CYCLE_DIGEST_ERA_V1_REASON = "digest-era-v1-freeze"
 _ROUND_REQUEST_BINDING_FILE_RE = re.compile(
     r"^(?P<round_id>.+)-request\.binding(?:-(?P<sequence>\d+))?\.json$")
+_PR_FREEZE_BINDING_FILE_RE = re.compile(
+    r"^(?P<round_id>.+)-freeze-(?P<cycle>[1-9]\d*)\.binding"
+    r"(?:-(?P<sequence>[1-9]\d*))?\.json$")
 _PR_FREEZE_DEMOTION_FILE_RE = re.compile(
     r"^(?P<round_id>.+)-freeze-(?P<cycle>[1-9]\d*)\.demotion"
     r"(?:-(?P<sequence>[1-9]\d*))?\.json$")
@@ -587,15 +590,35 @@ def ingest_round_binding(root: Path, round_id: str, cfg: dict) -> tuple[dict | N
         paths = sorted(directory.glob(f"{round_id}-freeze-*.binding*.json"))
         if not paths:
             return None, "missing-pr-freeze-sidecar"
-        rows = [(path, read_pr_freeze_binding(path, expected_round_id=round_id))
-                for path in paths]
+        candidates: list[tuple[Path, int, dict | None]] = []
+        for path in paths:
+            identity = pr_freeze_binding_identity(path)
+            if identity is None:
+                return None, "corrupt-round-binding:WorkflowError"
+            if identity[0] != round_id:
+                continue
+            try:
+                row = read_pr_freeze_binding(
+                    path, expected_round_id=identity[0], expected_cycle=identity[1])
+            except WorkflowError:
+                row = None
+            candidates.append((path, identity[1], row))
+        if not candidates:
+            return None, "missing-pr-freeze-sidecar"
+        latest_cycle = max(cycle for _path, cycle, _row in candidates)
+        if any(row is None for _path, cycle, row in candidates
+               if cycle == latest_cycle):
+            return None, "corrupt-round-binding:WorkflowError"
+        rows = [(path, row) for path, _cycle, row in candidates if row is not None]
         demotion_paths = sorted(directory.glob(
             f"{round_id}-freeze-*.demotion*.json"))
-        demotions = [
-            (path, read_pr_freeze_demotion(path, expected_round_id=round_id))
-            for path in demotion_paths
-        ]
-        latest_cycle = max(row["cycle"] for _path, row in rows)
+        demotions = []
+        for path in demotion_paths:
+            identity = pr_freeze_demotion_identity(path)
+            if identity is not None and identity[0] != round_id:
+                continue
+            demotions.append((
+                path, read_pr_freeze_demotion(path, expected_round_id=round_id)))
         latest = [(path, row) for path, row in rows if row["cycle"] == latest_cycle]
         core_contracts = {(
             row["target_sha"], row["base_sha"], tuple(row["reviewers"]),
@@ -1080,9 +1103,23 @@ def format_pending_review(row: dict) -> str:
             f"reviewers {reviewers} | reason {row.get('reason') or 'unknown'}")
 
 
+def pr_freeze_binding_identity(path: Path) -> tuple[str, int, int] | None:
+    """Return the immutable round/cycle/sequence identity encoded by a freeze filename."""
+    match = _PR_FREEZE_BINDING_FILE_RE.fullmatch(Path(path).name)
+    if match is None:
+        return None
+    return (
+        match.group("round_id"), int(match.group("cycle")),
+        int(match.group("sequence") or 1),
+    )
+
+
 def read_pr_freeze_binding(path: Path, *, expected_round_id: str | None = None,
                            expected_cycle: int | None = None) -> dict:
     """Load a PR freeze sidecar strictly so a damaged predecessor cannot be hidden by a suffix."""
+    identity = pr_freeze_binding_identity(path)
+    if identity is None:
+        raise WorkflowError(f"corrupt review binding {path}: invalid freeze filename")
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
@@ -1107,6 +1144,15 @@ def read_pr_freeze_binding(path: Path, *, expected_round_id: str | None = None,
             or data.get("canonical_store") != "local-freeze-evidence"
             or parse_iso_timestamp(data.get("at")) is None):
         raise WorkflowError(f"corrupt review binding {path}: invalid schema or fields")
+    filename_round, filename_cycle, _sequence = identity
+    if data["round_id"] != filename_round:
+        raise WorkflowError(
+            f"corrupt review binding {path}: round_id {data['round_id']!r} does not match "
+            f"filename identity {filename_round!r}")
+    if data["cycle"] != filename_cycle:
+        raise WorkflowError(
+            f"corrupt review binding {path}: cycle {data['cycle']!r} does not match "
+            f"filename identity {filename_cycle!r}")
     if expected_round_id is not None and data["round_id"] != expected_round_id:
         raise WorkflowError(
             f"corrupt review binding {path}: round_id {data['round_id']!r} does not match "
