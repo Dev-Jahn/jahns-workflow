@@ -544,6 +544,8 @@ def _unknown_feedback_metadata(reason: str) -> dict:
         "reviewer_coverage_reason": reason,
         "narrative_digest": None, "narrative_digest_matches": None,
         "narrative_coverage_reason": None,
+        "rendered_request_digest": None, "rendered_request_digest_matches": None,
+        "rendered_request_coverage_reason": None,
     }
 
 
@@ -562,6 +564,24 @@ def _assess_narrative_digest(binding: dict | None, feedback_digest: str | None,
     if binding_digest is not None and feedback_digest == binding_digest:
         return True, None
     return False, "narrative-digest-mismatch"
+
+
+def _assess_rendered_request_digest(
+        binding: dict | None, feedback_digest: str | None, *, feedback_digest_present: bool,
+) -> tuple[bool | None, str | None]:
+    """Bind a feedback receipt to the exact rendered request generation it reviewed."""
+    if binding is None:
+        return None, "round-binding-unavailable"
+    binding_digest = binding.get("rendered_request_digest")
+    binding_schema = (binding.get("request_binding_schema")
+                      or binding.get("review_binding_schema")
+                      or binding.get("schema"))
+    if (binding_schema == ROUND_REQUEST_BINDING_V1_SCHEMA
+            and binding_digest is None and not feedback_digest_present):
+        return None, "legacy-pre-digest"
+    if binding_digest is not None and feedback_digest == binding_digest:
+        return True, None
+    return False, "rendered-request-digest-mismatch"
 
 
 def read_feedback_reply_metadata(path: Path, *, expected_round_id: str | None = None,
@@ -603,12 +623,17 @@ def read_feedback_reply_metadata(path: Path, *, expected_round_id: str | None = 
     feedback_digest = payload.get("narrative_digest")
     if not _is_sha256_digest(feedback_digest):
         feedback_digest = None
+    rendered_digest_present = "rendered_request_digest" in payload
+    rendered_digest = payload.get("rendered_request_digest")
+    if not _is_sha256_digest(rendered_digest):
+        rendered_digest = None
     projected = {
         "metadata": metadata,
         "model": metadata.get("model"),
         "effort": metadata.get("effort"),
         "review_target": metadata.get("review-target"),
         "narrative_digest": feedback_digest,
+        "rendered_request_digest": rendered_digest,
     }
     if expected_round_id is not None and rounds[0] != expected_round_id:
         return {
@@ -616,10 +641,14 @@ def read_feedback_reply_metadata(path: Path, *, expected_round_id: str | None = 
             "reviewer_coverage_reason": "feedback-round-mismatch",
             "narrative_digest_matches": None,
             "narrative_coverage_reason": "feedback-round-mismatch",
+            "rendered_request_digest_matches": None,
+            "rendered_request_coverage_reason": "feedback-round-mismatch",
         }
     assessment = assess_review_reply(projected, binding)
     narrative_matches, narrative_reason = _assess_narrative_digest(
         binding, feedback_digest, feedback_digest_present=feedback_digest_present)
+    rendered_matches, rendered_reason = _assess_rendered_request_digest(
+        binding, rendered_digest, feedback_digest_present=rendered_digest_present)
     return {
         **projected,
         "review_target_matches": assessment["review_target_matches"],
@@ -627,7 +656,31 @@ def read_feedback_reply_metadata(path: Path, *, expected_round_id: str | None = 
         "reviewer_coverage_reason": assessment["reviewer_coverage_reason"],
         "narrative_digest_matches": narrative_matches,
         "narrative_coverage_reason": narrative_reason,
+        "rendered_request_digest_matches": rendered_matches,
+        "rendered_request_coverage_reason": rendered_reason,
     }
+
+
+def _packet_projection_reason(
+        root: Path, round_id: str, request: Path, binding: dict | None,
+) -> str | None:
+    """Explain why on-disk v2 projections do not match their latest immutable binding."""
+    if binding is None or binding["schema"] == ROUND_REQUEST_BINDING_V1_SCHEMA:
+        return None
+    try:
+        request_text = request.read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return "request-unreadable"
+    if (_canonical_rendered_request_digest(request_text)
+            != binding["rendered_request_digest"]):
+        return "request-digest-mismatch"
+    try:
+        narrative = _read_review_narrative(stored_narrative_path(root, round_id))
+    except WorkflowError:
+        return "stored-narrative-unreadable"
+    if _canonical_narrative_digest(narrative) != binding["narrative_digest"]:
+        return "stored-narrative-digest-mismatch"
+    return None
 
 
 def pending_reviews(root: Path, *, now: datetime | None = None) -> list[dict]:
@@ -661,16 +714,40 @@ def pending_reviews(root: Path, *, now: datetime | None = None) -> list[dict]:
         feedback = directory / f"{round_id}-feedback.md"
         metadata = read_feedback_reply_metadata(
             feedback, expected_round_id=round_id, binding=binding)
+        projection_reason = _packet_projection_reason(root, round_id, request, binding)
         # Complete = an ingested reply whose declared review-target matches the LATEST binding
-        # and whose stamped narrative digest matches. Pre-digest history retains only the old
-        # target contract, labeled explicitly rather than misrepresented as a digest match.
+        # and whose two generation digests match, with both on-disk projections reproduced from
+        # that binding. Pre-digest history retains only the old target contract, labeled explicitly
+        # rather than misrepresented as a digest match.
         # Reviewer-identity configuration is coverage reporting, not receipt — a reply from an
         # unconfigured model still ends the wait.
         narrative_complete = (metadata["narrative_digest_matches"] is True
                               or metadata["narrative_coverage_reason"] == "legacy-pre-digest")
-        if (binding is not None and metadata["review_target_matches"] is True
-                and narrative_complete):
+        rendered_complete = (metadata["rendered_request_digest_matches"] is True
+                             or metadata["rendered_request_coverage_reason"]
+                             == "legacy-pre-digest")
+        if (binding is not None and projection_reason is None
+                and metadata["review_target_matches"] is True
+                and narrative_complete and rendered_complete):
             continue
+
+        if binding is None:
+            reason = "binding-unavailable"
+        elif projection_reason is not None:
+            reason = projection_reason
+        elif metadata["review_target_matches"] is not True:
+            reason = ("feedback-review-target-mismatch"
+                      if metadata["review_target_matches"] is False
+                      else "matching-feedback-unavailable")
+        elif not narrative_complete:
+            reason = "feedback-" + (
+                metadata["narrative_coverage_reason"] or "narrative-digest-unavailable")
+        elif not rendered_complete:
+            reason = "feedback-" + (
+                metadata["rendered_request_coverage_reason"]
+                or "rendered-request-digest-unavailable")
+        else:
+            reason = "matching-feedback-unavailable"
 
         requested_date = None
         if binding is not None:
@@ -689,6 +766,7 @@ def pending_reviews(root: Path, *, now: datetime | None = None) -> list[dict]:
                          if requested_date is not None else None),
             "target_sha": binding["target_sha"] if binding is not None else None,
             "reviewers": list(binding["reviewers"]) if binding is not None else [],
+            "reason": reason,
         })
     return pending
 
@@ -698,7 +776,7 @@ def format_pending_review(row: dict) -> str:
     target = row.get("target_sha") or "(binding unavailable)"
     reviewers = ", ".join(row.get("reviewers") or []) or "(binding unavailable)"
     return (f"round {row['round_id']} | age {age} | target {target} | "
-            f"reviewers {reviewers}")
+            f"reviewers {reviewers} | reason {row.get('reason') or 'unknown'}")
 
 
 def read_pr_freeze_binding(path: Path, *, expected_round_id: str | None = None,
@@ -981,16 +1059,19 @@ def prepare_review_request(root: Path, round_id: str, narrative_path: Path) -> i
                 raise WorkflowError(
                     f"existing request sidecar {path} disagrees with the round exposure; "
                     "reclose and prepare with a new round id instead of superseding immutable evidence")
-        request.parent.mkdir(parents=True, exist_ok=True)
-        write_bytes_atomic(request, rendered.encode("utf-8"))
-        narrative_store = stored_narrative_path(root, round_id)
-        narrative_store.parent.mkdir(parents=True, exist_ok=True)
-        write_bytes_atomic(narrative_store, narrative.encode("utf-8"))
+        # Publish the immutable generation first. Any interruption after this point leaves old
+        # feedback bound to an older digest pair, while pending reports whichever projection has
+        # not yet caught up instead of preserving a false completed state.
         binding_path = write_round_request_binding(
             root, round_id, expected["target_sha"], expected["base_sha"],
             expected["reviewers"], mode=mode, narrative_digest=narrative_digest,
             rendered_request_digest=rendered_request_digest,
             directory=request.parent)
+        request.parent.mkdir(parents=True, exist_ok=True)
+        write_bytes_atomic(request, rendered.encode("utf-8"))
+        narrative_store = stored_narrative_path(root, round_id)
+        narrative_store.parent.mkdir(parents=True, exist_ok=True)
+        write_bytes_atomic(narrative_store, narrative.encode("utf-8"))
     except (OSError, WorkflowError, ValueError) as e:
         print(f"review prepare: {e}", file=sys.stderr)
         return 1
@@ -1977,6 +2058,8 @@ def ingest(root: Path, round_id: str | None, src: Path = INBOX, reviewer: str | 
     feedback_metadata = {"metadata": parsed_header["metadata"]}
     if binding is not None and binding.get("narrative_digest") is not None:
         feedback_metadata["narrative_digest"] = binding["narrative_digest"]
+    if binding is not None and binding.get("rendered_request_digest") is not None:
+        feedback_metadata["rendered_request_digest"] = binding["rendered_request_digest"]
     metadata_json = json.dumps(
         feedback_metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     header = (

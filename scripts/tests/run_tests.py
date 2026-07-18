@@ -2040,6 +2040,112 @@ Fail-loud protocol boundaries.
                 [(self.ROUND_ID, target)],
             )
 
+    def test_reprepare_crash_after_each_projection_write_stays_pending(self):
+        from unittest import mock
+
+        class SimulatedCrash(BaseException):
+            pass
+
+        for stop_after in (1, 2):
+            with self.subTest(stop_after=stop_after), tempfile.TemporaryDirectory() as d:
+                root, target, narrative = self._closed_project(Path(d))
+                self.assertEqual(review.prepare_review_request(
+                    root, self.ROUND_ID, narrative), 0)
+                request = root / "docs/reviews" / f"{self.ROUND_ID}-request.md"
+                stored_narrative = review.stored_narrative_path(root, self.ROUND_ID)
+                old_request = request.read_bytes()
+                old_narrative = stored_narrative.read_bytes()
+                reply = Path(d) / "reply.md"
+                reply.write_text(
+                    "model: reviewer-x\neffort: high\n"
+                    f"review-target: {target}\n\nreviewed\n")
+                self.assertEqual(review.ingest(root, self.ROUND_ID, src=reply), 0)
+                self.assertEqual(review.pending_reviews(root), [])
+
+                narrative.write_text(self.NARRATIVE.replace(
+                    "Fail-loud protocol boundaries.",
+                    "Fail-loud protocol boundaries after interrupted reprepare."))
+                new_narrative = review._read_review_narrative(narrative)
+                original_write = review.write_bytes_atomic
+                writes = []
+
+                def interrupt_after_write(path, content):
+                    original_write(path, content)
+                    writes.append(Path(path))
+                    if len(writes) == stop_after:
+                        raise SimulatedCrash
+
+                with mock.patch.object(
+                        review, "write_bytes_atomic", side_effect=interrupt_after_write):
+                    with self.assertRaises(SimulatedCrash):
+                        review.prepare_review_request(root, self.ROUND_ID, narrative)
+
+                self.assertNotEqual(request.read_bytes(), old_request)
+                self.assertEqual(
+                    stored_narrative.read_bytes() != old_narrative, stop_after == 2)
+                latest_path, latest = review.latest_round_request_binding(
+                    list(request.parent.glob(f"{self.ROUND_ID}-request.binding*.json")),
+                    expected_round_id=self.ROUND_ID)
+                self.assertIsNotNone(latest_path)
+                self.assertIsNotNone(latest)
+                self.assertEqual(
+                    latest["narrative_digest"],
+                    review._canonical_narrative_digest(new_narrative))
+                pending = review.pending_reviews(root)
+                self.assertEqual([row["round_id"] for row in pending], [self.ROUND_ID])
+
+    def test_pending_exposes_latest_binding_projection_mismatches(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, target, narrative = self._closed_project(Path(d))
+            self.assertEqual(review.prepare_review_request(
+                root, self.ROUND_ID, narrative), 0)
+            reply = Path(d) / "reply.md"
+            reply.write_text(
+                "model: reviewer-x\neffort: high\n"
+                f"review-target: {target}\n\nreviewed\n")
+            self.assertEqual(review.ingest(root, self.ROUND_ID, src=reply), 0)
+            self.assertEqual(review.pending_reviews(root), [])
+
+            request = root / "docs/reviews" / f"{self.ROUND_ID}-request.md"
+            original_request = request.read_bytes()
+            request.write_bytes(original_request + b"mutated request\n")
+            pending = review.pending_reviews(root)
+            self.assertEqual(pending[0]["reason"], "request-digest-mismatch")
+            self.assertIn("request-digest-mismatch", review.format_pending_review(pending[0]))
+
+            request.write_bytes(original_request)
+            stored_narrative = review.stored_narrative_path(root, self.ROUND_ID)
+            stored_narrative.write_bytes(stored_narrative.read_bytes() + b"mutated narrative\n")
+            pending = review.pending_reviews(root)
+            self.assertEqual(pending[0]["reason"], "stored-narrative-digest-mismatch")
+
+    def test_render_only_reprepare_invalidates_old_feedback(self):
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as d:
+            root, target, narrative = self._closed_project(Path(d))
+            self.assertEqual(review.prepare_review_request(
+                root, self.ROUND_ID, narrative), 0)
+            reply = Path(d) / "reply.md"
+            reply.write_text(
+                "model: reviewer-x\neffort: high\n"
+                f"review-target: {target}\n\nreviewed\n")
+            self.assertEqual(review.ingest(root, self.ROUND_ID, src=reply), 0)
+            self.assertEqual(review.pending_reviews(root), [])
+
+            revised_template = Path(d) / "review-request.md"
+            revised_template.write_text(
+                review.REVIEW_REQUEST_TEMPLATE.read_text().replace(
+                    "This is a domain/code review", "This is a revised domain/code review"))
+            with mock.patch.object(review, "REVIEW_REQUEST_TEMPLATE", revised_template):
+                self.assertEqual(review.prepare_review_request(
+                    root, self.ROUND_ID, narrative), 0)
+                pending = review.pending_reviews(root)
+
+            self.assertEqual([row["round_id"] for row in pending], [self.ROUND_ID])
+            self.assertEqual(
+                pending[0]["reason"], "feedback-rendered-request-digest-mismatch")
+
     def test_stamped_feedback_blocks_legacy_fallback_if_latest_digest_is_stripped(self):
         with tempfile.TemporaryDirectory() as d:
             root, target, narrative = self._closed_project(Path(d))
@@ -4039,7 +4145,9 @@ class IngestTests(unittest.TestCase):
                 line.removeprefix("reply-metadata-json: ")
                 for line in content.split(review.FEEDBACK_HEADER_SEPARATOR, 1)[0]
                 .decode().splitlines() if line.startswith("reply-metadata-json: ")))
-            self.assertEqual(set(stored), {"metadata", "narrative_digest"})
+            self.assertEqual(
+                set(stored),
+                {"metadata", "narrative_digest", "rendered_request_digest"})
             projected = review.read_feedback_reply_metadata(
                 feedback, expected_round_id=round_id, binding=binding)
             self.assertIs(projected["review_target_matches"], True)
@@ -4478,6 +4586,10 @@ class IngestTests(unittest.TestCase):
 
 
 class PendingReviewTests(unittest.TestCase):
+    REQUEST = "request\n"
+    NARRATIVE = "\n\n".join(
+        f"{heading}\n\ncontent" for heading in review.NARRATIVE_HEADINGS) + "\n"
+
     def _root(self, d: str) -> Path:
         root = Path(d) / "repo"
         root.mkdir()
@@ -4496,11 +4608,19 @@ class PendingReviewTests(unittest.TestCase):
     def _request(self, root: Path, round_id: str, target: str, *, base: str = "b" * 40,
                  reviewers: list[str] | None = None) -> Path:
         rdir = root / "docs" / "reviews"
-        (rdir / f"{round_id}-request.md").write_text("request\n")
+        (rdir / f"{round_id}-request.md").write_text(self.REQUEST)
+        narrative = review.stored_narrative_path(root, round_id)
+        narrative.parent.mkdir(parents=True, exist_ok=True)
+        narrative.write_text(self.NARRATIVE)
         return review.write_round_request_binding(
             root, round_id, target, base, reviewers or ["gpt-5.6-sol"], mode="packet",
-            narrative_digest=TEST_NARRATIVE_DIGEST,
-            rendered_request_digest=TEST_RENDERED_REQUEST_DIGEST)
+            **self._projection_digests())
+
+    def _projection_digests(self) -> dict[str, str]:
+        return {
+            "narrative_digest": review._canonical_narrative_digest(self.NARRATIVE),
+            "rendered_request_digest": review._canonical_rendered_request_digest(self.REQUEST),
+        }
 
     def _reply(self, model: str, base: str, target: str) -> bytes:
         return (f"model: {model}\neffort: xhigh\n"
@@ -4543,8 +4663,7 @@ class PendingReviewTests(unittest.TestCase):
 
             review.write_round_request_binding(
                 root, round_id, new_target, base, ["new-reviewer"], mode="packet",
-                narrative_digest=TEST_NARRATIVE_DIGEST,
-                rendered_request_digest=TEST_RENDERED_REQUEST_DIGEST)
+                **self._projection_digests())
             pending = review.pending_reviews(root)
             self.assertEqual([(row["target_sha"], row["reviewers"]) for row in pending],
                              [(new_target, ["new-reviewer"])])
@@ -4568,8 +4687,7 @@ class PendingReviewTests(unittest.TestCase):
 
                 latest = review.write_round_request_binding(
                     root, round_id, "c" * 40, base, ["new-reviewer"], mode="packet",
-                    narrative_digest=TEST_NARRATIVE_DIGEST,
-                    rendered_request_digest=TEST_RENDERED_REQUEST_DIGEST)
+                    **self._projection_digests())
                 latest.write_text(corrupt_content)
 
                 pending = review.pending_reviews(root)
@@ -4588,8 +4706,7 @@ class PendingReviewTests(unittest.TestCase):
             first = self._request(root, round_id, "a" * 40)
             latest = review.write_round_request_binding(
                 root, round_id, "c" * 40, "b" * 40, ["r2"], mode="packet",
-                narrative_digest=TEST_NARRATIVE_DIGEST,
-                rendered_request_digest=TEST_RENDERED_REQUEST_DIGEST)
+                **self._projection_digests())
             latest.write_text('{"schema":')
 
             with mock.patch.object(
@@ -4613,8 +4730,7 @@ class PendingReviewTests(unittest.TestCase):
             first.write_text(_json.dumps(binding) + "\n")
             second = review.write_round_request_binding(
                 root, round_id, "c" * 40, base, ["r2"], mode="packet",
-                narrative_digest=TEST_NARRATIVE_DIGEST,
-                rendered_request_digest=TEST_RENDERED_REQUEST_DIGEST)
+                **self._projection_digests())
             row2 = _json.loads(second.read_text())
             row2["at"] = "2026-01-01T15:00:00+00:00"  # chronologically one hour newer
             second.write_text(_json.dumps(row2) + "\n")
