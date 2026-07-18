@@ -473,6 +473,8 @@ tasks:
     severity: "minor"
     origin: "review-2026-07-18-carrier-lanes"
   - id: fix/reply-narrative-echo
+    scope: ["scripts/review.py", "scripts/tests/run_tests.py", "templates", "skills/round"]
+    accept: ["request 렌더가 rendered_request_digest를 리뷰어가 복사 가능한 형태로 노출한다 — 회신 헤더 안내 블록(model/effort/review-target)에 request-digest 키가 추가된다", "reply 구조화 헤더 파서가 request-digest를 인식하고, ingest는 에코된 digest를 최신 binding의 rendered_request_digest와 대조해 도장한다 — 에코 존재 시 그것이 도장 근거(현재-binding 재도장 race 차단), 불일치는 완료 불인정 + 정직한 사유", "RED-first: prepare A → A의 digest를 에코한 회신 → 같은 target reprepare B → 회신 ingest → round가 pending을 유지한다(B 완료 오판 없음 — JW-GPT-004 메커니즘 A의 재현이 닫힘)", "에코 부재 회신(구 형식)은 기존 ingest-time 도장 경로로 폴백하되 커버리지 사유에 에코 부재가 명시된다 — 조용한 동등 취급 금지", "전체 테스트 스위트 green + ruff F401,F841 clean — reply 파서·digest·publication 계약 무회귀"]
     notes: "JW-GPT-004 메커니즘 A (재리뷰에서 재확인 — 리뷰어 최소 조건 1). 회신 헤더에 request-digest 에코 추가: request 렌더에 rendered_request_digest 노출(schema v2가 도입) + reply 구조화 헤더에 request-digest 키 + ingest가 에코를 최신 binding의 rendered digest와 대조(불일치·부재는 완료 불인정). 리뷰어 자신이 요구한 계약이라 채택 마찰 없음 — 사용자 ruling은 확인 성격. deps: binding-schema-v2-digests(에코 대상 digest 필드 선행)."
     title: "리뷰 회신이 검토한 narrative를 자기증언하지 않아 ingest가 현재 binding digest를 도장 — prepare(A)→리뷰 중 prepare(B)→A회신 ingest 시 B 완료 오판. request 렌더에 digest 노출 + reply 구조화 헤더에 request-digest 에코 + ingest 대조 (reply 계약 변경 — 사용자 ruling 필요)"
     status: "pending"
