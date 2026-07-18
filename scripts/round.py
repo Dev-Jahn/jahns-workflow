@@ -209,17 +209,13 @@ def _current_date() -> date:
     return date.today()
 
 
-def _round_has_existing_closeout(root: Path, round_id: str, cfg: dict, review) -> bool:
-    """Recognize a previously minted round from its durable closeout surfaces."""
+def _round_has_existing_closeout(root: Path, round_id: str, review) -> bool:
+    """Recognize a previously minted round from its validated immutable exposure."""
     try:
         review.read_round_closeout_exposure(root, round_id)
         return True
     except WorkflowError:
-        pass
-    progress = Path(root) / cfg["progress"]
-    if not progress.is_file():
         return False
-    return re.search(rf"(?m)^## {re.escape(round_id)}\s*$", progress.read_text()) is not None
 
 
 def close(root: Path, round_id: str, done: list[str], touched: list[str], commit: str,
@@ -245,7 +241,7 @@ def close(root: Path, round_id: str, done: list[str], touched: list[str], commit
     cfg = load_config(root)
     current_date = _current_date()
     if (round_date != current_date
-            and not _round_has_existing_closeout(root, round_id, cfg, review)):
+            and not _round_has_existing_closeout(root, round_id, review)):
         print(
             f"round close: --round date must be today ({current_date.isoformat()}), "
             f"got {round_date.isoformat()}", file=sys.stderr)

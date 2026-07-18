@@ -3895,7 +3895,7 @@ class RoundCloseTests(unittest.TestCase):
                 self.assertIn(message, err.getvalue())
                 self.assertEqual((root / "tasks.yaml").read_bytes(), before)
 
-    def test_close_allows_next_day_reclose_for_existing_exposure_or_progress(self):
+    def test_close_allows_next_day_reclose_for_existing_exposure(self):
         original_clock = round._current_date
         try:
             with tempfile.TemporaryDirectory() as d:
@@ -3909,7 +3909,15 @@ class RoundCloseTests(unittest.TestCase):
                 round._current_date = lambda: date(2026, 7, 20)
                 self.assertEqual(round.close(
                     root, round_id, done=["feat/alpha"], touched=[], commit="HEAD"), 0)
+        finally:
+            round._current_date = original_clock
 
+    def test_close_rejects_backdated_round_with_only_progress_heading(self):
+        import contextlib
+        import io
+
+        original_clock = round._current_date
+        try:
             with tempfile.TemporaryDirectory() as d:
                 root = Path(d)
                 self._setup(
@@ -3917,8 +3925,14 @@ class RoundCloseTests(unittest.TestCase):
                 round_id = "2026-07-19-existing-progress"
                 (root / "PROGRESS.md").write_text(f"# PROGRESS\n\n## {round_id}\n\n- prior\n")
                 round._current_date = lambda: date(2026, 7, 20)
-                self.assertEqual(round.close(
-                    root, round_id, done=["feat/alpha"], touched=[], commit="HEAD"), 0)
+                before = (root / "tasks.yaml").read_bytes()
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    rc = round.close(
+                        root, round_id, done=["feat/alpha"], touched=[], commit="HEAD")
+                self.assertEqual(rc, 1)
+                self.assertIn("must be today", err.getvalue())
+                self.assertEqual((root / "tasks.yaml").read_bytes(), before)
         finally:
             round._current_date = original_clock
 
