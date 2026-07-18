@@ -2,6 +2,20 @@
 
 round 단위 작업 이력이 이 파일에 축적된다. 활성 task와 의존성은 `tasks.yaml`(CLI: `waystone task`)과 생성 파일 `ROADMAP.md` 참조.
 
+## 2026-07-19-evidence-authority-fixes
+
+- **Goal**: 4차 리뷰(codex 대체, REAL major 3: JW-GPT-011~013) 전량 해소 — 0.11.1 hotfix 라인. 부수 목표: 0.11.0 probe 자기-churn 실사고(delegate run 전면 불가) 해소.
+- **운영 특기**: 0.11.0 하네스의 probe 결함(013과 동일 근원)으로 `delegate run` 발사가 불가 → 전 lane을 **raw codex exec 우회**(사용자 규칙: 하네스 버그는 raw 우회 + finding 기록). 검증은 lane별 게이트 주관측 재실측 + RED 독립 재현 + codex 적대 리뷰(xhigh)로 delegation 파이프라인과 동등 규율 유지.
+- **Shipped** (전부 raw codex gpt-5.6-sol xhigh; 순차 병합 013→011→012):
+  - fix/probe-config-content-binding (013) — fingerprint를 config.toml 내용 digest에 결속(디렉터리 stat은 진단 강등), absent 상태 동등·읽기 실패 fail-toward-probe·digest-only 저장. probe 자기-churn 실사고 해소 포함 (attempt-1 인수 @ 1cbff2a; 적대 리뷰 ACCEPT-WITH-NOTES major 0)
+  - fix/pr-cycle-v1-supersession-honesty (011) — same-cycle later-v1이 v2 digest 권위를 강등(3면 동일 규칙·tie/미파싱 fail-closed), completion·merge gate가 skew 사유 소비, mixed-host demotion sidecar 영속화, freeze `--round` 필수화(신형 CLI v1 발행 금지·capability 탐지 제거), post-cutoff v1은 digest-era 차단 (attempt-3 인수 @ ae2e8e3; 적대 회전 REJECT2→REJECT1→ACCEPT-WITH-NOTES0)
+  - fix/freeze-sidecar-corruption-isolation (012) — corrupt freeze sidecar를 sentinel 보존(filename↔content identity 대조), 최신 cycle 손상 시 round honest-unknown(이전 cycle explicit 승격 금지), cross-round prefix 충돌 foreign-skip(improve/ingest 판정 일치) (attempt-2 인수 @ fc70ce1; REJECT1→기계 델타 main 직접 검증 — 비례성 규칙 기록)
+- **Gates**: live 807→828 green(매 attempt·매 병합 주관측 재실측, rc 직접 캡처) + ruff clean. RED 전 attempt 독립 재현.
+- **수용 residual(비차단)**: digest-era-v1-freeze 사유의 demotion 미영속(감사 parity, gate 무영향) · demotion 쓰기 동시 writer TOCTOU(단일 사용자 모델) · crafted demotion fail-closed DoS · unreadable rename 위조(filename=identity 계약) — 뒤 둘은 decision/trust-threat-model-boundary 범위.
+- **부수 사고 기록**: ① registry 조작 1회가 잔류 cwd로 worktree에서 실행돼 worktree tasks.yaml 오염+pre-0.9 profile seed — 즉시 원복, "registry 조작은 main repo에서만" 성문화. ② 0.10.0 dedup 버그의 중복 binding sidecar 재발행 2회 수동 제거(0.11.1 후 재발 여부가 dogfooding 검증 포인트).
+- **SSOT**: unchanged.
+- **Next**: 5차 재검토 요청 게시 → 0.11.1 릴리스(`release-to-main.sh`) → `/plugin update` → delegate run 복구 확인 → 구식 pending 표기(historic 5건+evidence-authority binding-unavailable) 0.11.1 판독으로 재확인. 0.12 refactor plan r2는 사용자 리뷰 대기.
+
 ## 2026-07-19-evidence-authority
 
 - **Goal**: generation-binding 3차 리뷰(CHANGES REQUESTED — major 4: JW-GPT-007~010)를 전량 해소 — "완료" 판정을 지탱하는 증거의 권위를 가변 로컬 상태에서 불변·재파생 가능한 원천으로 이전.
