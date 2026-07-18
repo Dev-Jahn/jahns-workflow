@@ -2,6 +2,22 @@
 
 round 단위 작업 이력이 이 파일에 축적된다. 활성 task와 의존성은 `tasks.yaml`(CLI: `waystone task`)과 생성 파일 `ROADMAP.md` 참조.
 
+## 2026-07-19-evidence-authority
+
+- **Goal**: generation-binding 3차 리뷰(CHANGES REQUESTED — major 4: JW-GPT-007~010)를 전량 해소 — "완료" 판정을 지탱하는 증거의 권위를 가변 로컬 상태에서 불변·재파생 가능한 원천으로 이전.
+- **Shipped** (전부 implementer=external-runner/codex:gpt-5.6-sol xhigh; 매 attempt 실측, 설계 회전 적대 리뷰(xhigh)·재량 0 델타는 main 직접 검증 — 근거는 verdict artifacts):
+  - fix/receipt-read-time-rederive (007) — receipt 권위를 reply-metadata cache → verbatim body 읽기 시점 재파생으로 이전(cache는 진단 전용, legacy 경로 포함 cache 단독 신뢰 0). 손상 격리(한 receipt가 pending/improve/overlay를 중단 불가), 사유 taxonomy 구분(envelope/불일치/sidecar 부재), bounded 리더 복원(CRLF 정확 산술), overlay 패리티 (attempt-3 인수 @ 4af545d; 적대 2회전이 major 6·minor 7 적출)
+  - fix/pr-cycle-generation-binding (008) — cycle marker·freeze sidecar를 digest 필수 v2 schema로 승격, 투영은 cycle 증거가 명명한 generation만 조회(latest 채택 금지), marker 단독 복구, v1/v2 혼재는 위양성 conflict가 아닌 정직한 skew, cycle 번호는 신뢰 operator만 계상 (attempt-2 인수 @ a2ff310)
+  - fix/round-mint-anchor-immutable (009) — round 기존성 앵커에서 mutable PROGRESS heading 제거(검증된 immutable exposure 단독) — 문서 한 줄 편집으로 과거-dated round를 mint해 v1 legacy 창을 여는 경로 폐쇄, 익일 확장 무회귀 (attempt-1 인수 @ b3354c8)
+  - fix/probe-proof-principal-binding (010) — fingerprint에 실행 principal(euid/gid/groups)·codex config root·Linux best-effort process context 축 추가(공유 checkout의 타 사용자 적중 차단), not-observed는 상태 동등 대조(macOS probe-once 유지, 비대칭 전이만 재프로브) (attempt-2 인수 @ 69036c1)
+- **리뷰 finding 처분**: 007~010 전량 폐쇄. 컨테이너/namespace 심층 축·로컬 단일-파일 변조의 강한 변형(append-only/원격 store)은 decision/trust-threat-model-boundary로 위양(사용자 ruling 대기, 비차단).
+- **Gates**: live 777→804 green(lane별 병합 후 재실측; P-lane은 codex 부재 이중 게이트) + ruff clean.
+- **SSOT**: unchanged.
+- **Decisions pending**: decision/trust-threat-model-boundary(위협모델 경계) · chore/pre-header-feedback-settlement(역사 정착).
+- **Review**: requested (docs/reviews/2026-07-19-evidence-authority-request.md) — 4차 검토.
+- **Adaptive rules**: unevaluable (활성 overlay 규칙 0개).
+- **Next**: 4차 리뷰 통과 시 릴리스 0.11 → /plugin update → verifier binding 복원 → carrier 라이브 검증 → migration-sunset. minor 큐 별도.
+
 ## 2026-07-18-generation-binding
 
 - **Goal**: carrier-lanes-fixes 재리뷰(gpt-5.6-pro/xhigh, CHANGES REQUESTED — major 4)를 전량 해소: request generation 정체성 결속과 프로브 증명의 runtime 결속.
