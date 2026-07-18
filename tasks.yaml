@@ -550,3 +550,32 @@ tasks:
     status: done
     severity: "major"
     origin: "review-2026-07-18-carrier-lanes-fixes"
+  - id: fix/receipt-read-time-rederive
+    scope: ["scripts/review.py", "scripts/improve.py", "scripts/tests/run_tests.py"]
+    title: "feedback receipt 권위를 가변 metadata cache에서 verbatim body 재파생으로 이전 — 읽기 경로가 body의 request-digest를 재파싱해 불변 sidecar generation에 resolve하고 stored metadata와 불일치 시 corrupt/pending 처리 (reply-metadata-json은 cache/진단 전용; 한 줄 편집 재귀속 차단) (JW-GPT-007)"
+    status: "pending"
+    severity: "major"
+    origin: "review-2026-07-18-generation-binding"
+  - id: fix/pr-cycle-generation-binding
+    scope: ["scripts/review.py", "scripts/improve.py", "scripts/tests/run_tests.py"]
+    title: "PR review cycle에 request generation 결속 — waystone-review-cycle marker·freeze sidecar·cycle conflict 판정에 rendered_request_digest 포함, improve·ingest_round_binding은 latest request가 아니라 marker가 명명한 digest의 sidecar를 조회 (cycle-A에 B provenance 귀속 차단; GitHub marker 단독으로 exact generation 복구 가능) (JW-GPT-008)"
+    status: "pending"
+    severity: "major"
+    origin: "review-2026-07-18-generation-binding"
+  - id: fix/round-mint-anchor-immutable
+    scope: ["scripts/round.py", "scripts/tests/run_tests.py"]
+    title: "round 기존성 판정에서 mutable PROGRESS.md heading 제거 — 유효한 immutable round exposure만 기존 round로 인정(또는 migration 시점 고정 allowlist), 임의 과거-dated round의 신규 mint로 v1 legacy 창을 여는 경로 차단 — '유한 전환일 잔여' 전제 복원 (JW-GPT-009)"
+    status: "pending"
+    severity: "major"
+    origin: "review-2026-07-18-generation-binding"
+  - id: fix/probe-proof-principal-binding
+    scope: ["scripts/delegate.py", "scripts/tests/run_tests.py"]
+    title: "probe fingerprint에 실행 principal·process context 결속 — effective UID/GID/groups, codex config root 정체성(CODEX_HOME/~/.codex resolve+stat), Linux best-effort process context(/proc/self/status의 Seccomp·NoNewPrivs·CapEff, /proc/self/attr/current) — 공유 checkout의 타 사용자/컨테이너 marker 적중 차단, 관측 불가 환경은 fail-toward-probe (JW-GPT-010)"
+    status: "pending"
+    severity: "major"
+    origin: "review-2026-07-18-generation-binding"
+  - id: decision/trust-threat-model-boundary
+    title: "신뢰 기계의 위협모델 경계 ruling — 리뷰가 3회전 연속 로컬-적대·다중사용자·프로세스 컨텍스트로 위협모델을 확장 중. SSOT §3(솔로 개발자·다중 머신)에 비춰 어디까지 하드닝이 비례적인가: 로컬 단일-파일 변조(007의 append-only/원격 store 변형), 컨테이너/namespace 축(010 심층), 이후 라운드의 수용 기준을 성문화"
+    status: "pending"
+    severity: "major"
+    origin: "review-2026-07-18-generation-binding"
