@@ -727,27 +727,48 @@ tasks:
     severity: "major"
     origin: "plan-0.12-M0B"
   - id: feat/run-spec-readiness-contract
+    session_id: "513d1802-24e4-4adf-8ffb-a86b15e0f41d"
+    round: 2026-07-19-m0-contract-gaps
+    result: "ADR-0010-run-spec-readiness @ dev d092fe0 — 구조화 acceptance + 결정론 검사 + 독립 contract critic(typed concern만 반환, 자동 재작성 금지) + retry/수렴 hard ceiling(counter 초기화로 회피 불가) + risk-gated reviewer requirement"
+    accept: ["docs/adr/ADR-0010-run-spec-readiness.md 작성 — 권위 원천은 git-tracked 문서만: docs/reviews/2026-07-19-m0-contracts-feedback.md(해당 finding의 '실패 메커니즘'과 '필수 수정' 절), docs/adr/ADR-0002~0008, docs/invariants.md. dev_docs/는 이 트리에 없으므로 참조 금지. JW-GPT-016의 필수 수정 3부를 하나의 run-spec readiness contract로 확정", "① Acceptance contract readiness — 자유 문장을 금지하지 않되 coordinator가 합성한 criterion은 최소 구조(claim/property · source pointer · subject scope · observable evidence kind · negative/failure case · explicit method constraint 여부)를 갖는다. dispatch 전 두 층: 결정론 검사(source 존재·scope 지정·evidence adapter 존재·중복/빈 criterion·참조 대상 유효성)와 독립 contract critic(unachievable·unbounded·unverified-reference·scope-ambiguous·implementation-prescriptive를 typed concern으로 반환). **critic은 criterion을 자동 재작성하거나 구현법을 지시하지 않는다** — coordinator가 concern을 해소해 새 frozen run spec을 발행한다. owner가 직접 쓴 criterion에는 선택, autonomous mode의 합성 criterion에는 필수", "② Retry와 수렴 한계 — attempt/budget hard ceiling을 계약으로 둔다(정교한 trajectory heuristic은 0.13+로 명시 이월). 한계 도달은 실패가 아니라 typed 정지 상태로 표면화하며, 자율 실행 중에도 사람 개입 없이 무한 재시도가 불가능해야 한다", "③ Risk-gated reviewer requirement — 모든 run에 적대 리뷰를 강제하지 않되, 어떤 변경이 리뷰를 필수로 요구하는지를 계약으로 정한다(예: 신뢰 표면 touch). 판정 근거와 면제 조건을 명시", "ADR에 이 계약이 왜 필요한지의 실측 근거를 기록 — 2026-07-19 round-6에서 기각 12건 중 3건의 근본 원인이 coordinator가 작성한 조항이었고(미검증 기준 채택·달성 불가능한 요구·범위 미기재로 과잉 demotion 유발), 두 lane이 각 4회전 발산했으며, 기각된 attempt는 전부 게이트 green이었고 결함은 적대 리뷰만 잡았다", "기존 ADR 컨벤션 준수, 한국어 본문, 코드 식별자 영문. 전체 스위트 green + ruff clean"]
+    scope: ["docs/adr"]
     title: "coordinator가 합성한 acceptance criterion의 dispatch 전 readiness 계약 — 구조화 필드(claim/source/scope/evidence kind/negative case) + 결정론 검사 + 독립 contract critic(unachievable·unbounded·unverified-reference·scope-ambiguous·implementation-prescriptive typed concern), retry ceiling·수렴 한계, risk-gated reviewer requirement (JW-GPT-016)"
-    status: "pending"
+    status: done
     severity: "major"
     origin: "review-2026-07-19-m0-contracts"
   - id: feat/canonical-project-identity
+    session_id: "513d1802-24e4-4adf-8ffb-a86b15e0f41d"
+    round: 2026-07-19-m0-contract-gaps
+    result: "ADR-0011-project-context @ dev d092fe0 — ProjectContext(project_id·canonical_root·active_worktree_root·git_common_dir·checkout_identity), intent 변경 명령은 noncanonical linked worktree에서 거부"
+    accept: ["docs/adr/ADR-0011-project-context.md 작성 — 권위 원천은 git-tracked 문서만: docs/reviews/2026-07-19-m0-contracts-feedback.md(해당 finding의 '실패 메커니즘'과 '필수 수정' 절), docs/adr/ADR-0002~0008, docs/invariants.md. dev_docs/는 이 트리에 없으므로 참조 금지. JW-GPT-017의 필수 수정대로 ProjectContext 도메인 객체(project_id·canonical_root·active_worktree_root·git_common_dir·checkout_identity) 확정. 규칙: project_id와 runtime DB 위치는 등록된 canonical project에 결속 / linked worktree는 별개 project가 아니라 같은 project의 checkout context / read-only status·inspect는 linked worktree에서도 canonical DB로 정규화 / task·config·consent처럼 project intent를 변경하는 command는 noncanonical linked worktree에서 기본 거부 / linked worktree를 run input으로 의도할 때만 --from-worktree 같은 명시적 selector 요구", "ADR-0007(SQLite 운영)의 DB 위치 규칙과 정합하게 서술한다 — ADR-0007을 뒤집지 않고, resolved root가 canonical project인지의 판정을 어느 지점에서 하는지 명시. 실측 근거 기록: 2026-07-19에 잔류 cwd로 registry 변경이 linked worktree에 기록되고 pre-0.9 migration까지 유발한 사고 2회, 그리고 0.12에서는 runtime 상태 전체가 다른 DB에 쌓이는 형태로 악화된다는 점", "docs/adr/ADR-0012-verification-capability-preflight.md 작성 — JW-GPT-019의 필수 수정: verification plan과 capability preflight를 dispatch precondition으로 둔다. worker 환경이 요구된 검증 명령을 실행할 수 있는지 사전 확인하고 불가하면 typed refusal한다. 독립 검증(E-07)이 조용히 조정자 단독 검증으로 퇴화하는 경로를 차단한다. 실측 근거: 2026-07-19 위임 8회 전부에서 러너가 worktree-local uv 캐시에 pyyaml·ruff 부재로 전체 스위트·lint를 실행하지 못했고 한 건은 RED 단계조차 실행 실패했다", "ADR-0012는 검증을 worker에서 떼어 engine으로 옮길지, worker 환경을 보장할지의 선택지를 비교하고 하나를 채택한다 — 채택안이 '독립 검증'의 독립성을 약화시키지 않음을 논증한다", "두 ADR 모두 컨벤션 준수, 한국어 본문, 코드 식별자 영문. 전체 스위트 green + ruff clean"]
+    scope: ["docs/adr"]
     title: "ProjectContext 도메인 객체 도입 — project_id·canonical_root·active_worktree_root·git_common_dir·checkout_identity 분리. runtime DB는 canonical project에 결속, linked worktree는 별개 project가 아닌 checkout context, intent 변경 명령은 noncanonical worktree에서 기본 거부 (JW-GPT-017)"
-    status: "pending"
+    status: done
     severity: "major"
     origin: "review-2026-07-19-m0-contracts"
   - id: feat/review-artifact-addressing
+    session_id: "513d1802-24e4-4adf-8ffb-a86b15e0f41d"
+    round: 2026-07-19-m0-contract-gaps
+    result: "ADR-0009-review-artifact-addressing @ dev d092fe0 — UUID owner directory, filename 분해 owner 추론 금지, legacy adapter로 구 flat 파일 판독(bulk migration 없음)"
+    accept: ["docs/adr/ADR-0009-review-artifact-addressing.md 작성 — 권위 원천은 git-tracked 문서만 사용한다: docs/reviews/2026-07-19-m0-contracts-feedback.md(해당 finding의 '실패 메커니즘'과 '필수 수정' 절), docs/adr/ADR-0002~0008, docs/invariants.md, docs/known-issues.md. dev_docs/는 이 트리에 존재하지 않으므로 참조하지 말 것. JW-GPT-018의 필수 수정을 확정: 신규 run의 리뷰 artifact는 UUID owner directory(docs/reviews/runs/<run-uuid>/request.md·request.binding.json·feedback.md·pr-freeze/<cycle>.json·pr-demotion/<observation-id>.json)로 발행하고, directory segment의 UUID grammar와 payload의 run_id가 일치해야 한다. filename을 delimiter로 분해해 owner를 추측하는 규칙을 금지한다. 기존 flat 파일은 bulk migration 없이 legacy adapter가 판독하며 writer는 새 layout만 발행한다(strangler)", "같은 ADR에서 **E-09와의 충돌을 함께 해소**한다 — 현행 E-09(docs/invariants.md)는 '판정 근거는 파일 내용·파일명·git-tracked 사실에서만 나온다'로 **파일명을 정당한 근거로 명시**하는데, 이는 위 '파일명 분해로 owner 추측 금지'와 정면 충돌한다. 두 문서를 함께 개정해 모순을 남기지 않는다", "docs/invariants.md의 E-09를 JW-GPT-020의 필수 수정대로 개정 — durable identity(대상이 변하지 않으면 변하지 않는 값)와 scoped ambient observation(관측 시점의 환경값으로, 신원이 아니라 관측 맥락으로만 사용)을 구분한다. 현행 문구는 파일시스템 메타데이터에 한정돼 hostname 사례(probe의 machine 축이 Mac.local이라 네트워크 이동 시 증명 무효화)를 못 잡는다. 개정 후에도 ADR-0003이 쓰는 boot id·pid 같은 정당한 ambient 사용이 위반이 되지 않아야 하며, 정당/부당을 가르는 기준을 문구에 담는다", "E-09 개정은 다른 불변조건(E-01~E-08, I-01~I-12)의 문구를 건드리지 않는다", "기존 ADR 컨벤션 준수(헤더 + Context/Decision/Consequences/Alternatives considered), 한국어 본문, 코드 식별자 영문. 전체 스위트 green + ruff F401,F841 clean"]
+    scope: ["docs/adr", "docs/invariants.md"]
     title: "리뷰 artifact addressing을 UUID owner directory로 이전(docs/reviews/runs/<run-uuid>/...) — filename delimiter 분해로 owner를 추측하지 않음. 기존 flat 파일은 legacy adapter 판독(bulk migration 없음). 미채택 시 계획서·known-issues의 '015 부류 구조적 소멸' 주장 제거 필수 (JW-GPT-018)"
-    status: "pending"
+    status: done
     severity: "major"
     origin: "review-2026-07-19-m0-contracts"
   - id: feat/verification-capability-preflight
+    session_id: "513d1802-24e4-4adf-8ffb-a86b15e0f41d"
+    round: 2026-07-19-m0-contract-gaps
+    result: "ADR-0012-verification-capability-preflight @ dev d092fe0 — frozen VerificationPlan, required check의 authoritative_executor=engine, capability preflight 불가 시 typed refusal. 독립성 논거: 독립은 실행 위치가 아니라 승인 권한 분리에서 온다"
     title: "verification plan + capability preflight를 dispatch precondition으로 — worker 환경이 요구된 검증 명령을 실행할 수 있는지 사전 확인하고 불가하면 typed refusal. 독립 검증이 조용히 조정자 단독 검증으로 퇴화하는 경로 차단 (JW-GPT-019)"
-    status: "pending"
+    status: done
     severity: "major"
     origin: "review-2026-07-19-m0-contracts"
   - id: docs/e09-durable-identity-scope
+    session_id: "513d1802-24e4-4adf-8ffb-a86b15e0f41d"
+    round: 2026-07-19-m0-contract-gaps
+    result: "E-09 개정 @ dev d092fe0 — durable identity(intrinsic identifier)와 scoped ambient observation(boot id·pid·monotonic, scope·lifetime 선언 시 locator/freshness로만) 구분. hostname·cwd·파일시스템 메타데이터를 identity에서 배제, filename 분해 owner 추론 금지(legacy adapter 예외), git path는 검증된 intrinsic identity의 주소로는 허용. 검증: invariants.md의 E-09 행만 변경, ADR-0003의 boot id/pid 사용은 개정 조건을 이미 충족"
     title: "E-09 개정 — durable identity와 scoped ambient observation을 구분. 현행 문구는 파일시스템 메타데이터에 한정돼 hostname 사례를 못 잡고, 동시에 '파일명'을 정당한 판정 근거로 명시해 JW-GPT-018의 요구와 충돌 (JW-GPT-020)"
-    status: "pending"
+    status: done
     severity: "major"
     origin: "review-2026-07-19-m0-contracts"

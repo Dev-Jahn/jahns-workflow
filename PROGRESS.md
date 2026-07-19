@@ -2,6 +2,24 @@
 
 round 단위 작업 이력이 이 파일에 축적된다. 활성 task와 의존성은 `tasks.yaml`(CLI: `waystone task`)과 생성 파일 `ROADMAP.md` 참조.
 
+## 2026-07-19-m0-contract-gaps
+
+- **Goal**: 설계공백 리뷰(chatgpt:gpt-5.6-pro, CHANGES REQUESTED · major 5, JW-GPT-016~020)가 지적한 **M0-B 계약의 빈칸**을 폐쇄. 리뷰어가 `gate/characterization-baseline` exit를 이 5건 반영 전에는 통과시키지 말라고 게이팅했으므로 M0-C 착수 전 필수.
+- **리뷰 성격**: 코드 리뷰가 아니라 설계 공백 리뷰였다 — "이번 세션의 실패·실수 중 0.12가 설계대로 전부 구현돼도 남는 것은 무엇인가"(R-1~R-8 + 메타 질문). 내 자기 진단 8건 중 **7건이 '남음'으로 확인**됐고 R-2만 부분 해결로 갈렸다. **receipt 결속 성공**(model/target/request-digest 전부 일치 — 하네스 생성 요청서를 손대지 않고 사용, 직전 라운드의 미결속 사고와 대조).
+- **Shipped** (implementer=external-runner/codex:gpt-5.6-sol xhigh, 3 lane 병렬 → 순차 병합 @ d092fe0):
+  - **ADR-0010 run-spec readiness** (016 = R-1·R-4·R-5를 하나로 묶음) — 구조화 acceptance criterion(claim/source/scope/evidence kind/negative case) + 결정론 검사 + **독립 contract critic**(unachievable·unbounded·unverified-reference·scope-ambiguous·implementation-prescriptive를 typed concern으로만 반환, **자동 재작성 금지**) + **retry/수렴 hard ceiling**(counter 초기화로 회피 불가) + risk-gated reviewer requirement.
+  - **ADR-0011 project context** (017) — ProjectContext(project_id·canonical_root·active_worktree_root·git_common_dir·checkout_identity). runtime DB는 canonical project 결속, linked worktree는 checkout context, intent 변경 명령은 noncanonical worktree에서 기본 거부.
+  - **ADR-0012 verification capability preflight** (019) — frozen VerificationPlan, required check의 `authoritative_executor=engine`, capability preflight 불가 시 typed refusal. **독립성 논거**: 독립은 "다른 디렉터리에서 실행했다"가 아니라 **구현 actor가 자기 결과를 최종 승인하지 못하는 데서** 온다 → engine 실행이 E-07을 약화하지 않고 강화. `worker_execution_required`로 worker의 RED·self-check는 유지.
+  - **ADR-0009 review artifact addressing** (018) — 신규 run은 `docs/reviews/runs/<run-uuid>/...` UUID owner directory, **filename 분해 owner 추론 금지**, 구 flat 파일은 legacy adapter 판독(bulk migration 없음, strangler).
+  - **E-09 개정** (020) — durable identity(intrinsic identifier)와 scoped ambient observation(boot id·pid·monotonic time을 **scope·lifetime 선언 하에 locator/freshness로만**) 구분. hostname·cwd·파일시스템 메타데이터를 identity에서 배제. git path는 검증된 intrinsic identity의 **주소**로는 허용하되 이름 분해로 owner 추론 불가.
+- **Gates**: 828 green + ruff clean — 통합 lane 1회 + 병합 후 1회, 전부 main 주관측. **코드 변경 0건**(ADR·불변조건 문서만).
+- **병합 전 교차 검증 2건**: ⑴ `docs/invariants.md`는 **E-09 행 하나만 변경**(다른 불변조건 문구 손상 0, 기계 대조) ⑵ **ADR-0003 ↔ 개정 E-09 충돌 없음** — ADR-0003이 `host_boot_identity`를 "재부팅 전후 PID·monotonic 영역 구분"이라는 scope로, `process_start_token`을 "같은 boot 내 PID 재사용 구분"이라는 lifetime으로 이미 명시해 개정 E-09의 허용 조건을 충족.
+- **main이 추가로 발견한 것 (리뷰어 미지적)**: 초판 E-09가 *"판정 근거는 파일 내용·**파일명**·git-tracked 사실에서만"*으로 파일명을 정당한 근거로 명시해, JW-GPT-018의 "파일명 분해 owner 추론 금지" 요구와 **정면 충돌**. 018·020을 **같은 lane에 묶어 동시 개정**해 해소했다 — 따로 고쳤으면 두 계약이 서로를 위반했을 것.
+- **위임 메커니즘 결함 발견**: `dev_docs/`는 gitignore라 **위임 worktree에 존재하지 않는다.** 즉 ADR-0002~0008은 계획서를 한 번도 보지 못한 채 acceptance 조항만으로 작성됐다(결과는 main 대조로 확인했으나 메커니즘은 깨져 있었음). 내 조항의 *"계획서 §3-4를 권위 원천으로"*는 **작업자가 검증할 수 없는 참조** — JW-GPT-016이 명명한 `unverified-reference`의 실사례를 finding 등록 직후 자체 발견. 이번 lane부터 권위 원천을 git-tracked 문서로 전면 교체(리뷰 feedback 파일 + ADR + invariants).
+- **각 ADR에 실측 근거 결속**: 016↔round-6 조항 결함 3건·발산·green 게이트가 결함 미탐지, 017↔registry 오배선 2회, 019↔위임 8회 전부 게이트 실행 실패, 020↔probe hostname·cwd·파일명 분해. 추상 원칙이 아니라 실제 실패에 묶여 있다.
+- **SSOT**: unchanged.
+- **Next**: **M0-C 착수 가능**(리뷰어 게이팅 해소). characterization + porting ledger(등급 배정) + runtime-state 처분 감사 → M0 exit review → M1-A 승인. 미착수 하네스 결함 3건은 각각 019·017·020 계약의 0.11 대응물.
+
 ## 2026-07-19-m0-contracts
 
 - **Goal**: 0.12 M0-A 마감(baseline 동결)과 M0-B 산출물 전량 착지 — ruling 6건 확정 + ADR 7종 + 불변조건 확정본.
