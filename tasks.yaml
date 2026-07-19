@@ -679,3 +679,9 @@ tasks:
     status: "done"
     severity: "major"
     origin: "plan-0.12-M0A"
+  - id: decision/delivery-automation-default
+    ruling: "기본 delivery_policy=commit / review_policy=off (사용자 결정 2026-07-19, 권고안 manual에서 상향). automation level은 프로젝트 설정으로 조정 가능하되 init은 이를 묻지 않는다 — 합리적 기본값 + config override, 대화형 질문 0. 설계 귀결: commit이 기본이므로 사용자 승인 없이 커밋이 발생 → live-tree drift 3분기(계획 §6 M2-4)와 delivery 직전 dirty-tree snapshot 재검증이 안전의 핵심 계약이 된다. push와 review publication은 기본 비활성(저장소 밖으로 나가는 행위는 명시적 상향 시에만)."
+    title: "delivery 기본값 = commit, review publication = off, automation level은 설정 조정 가능하되 init이 묻지 않음 (사용자 결정 2026-07-19)"
+    status: "done"
+    severity: "major"
+    origin: "plan-0.12-M0B"
