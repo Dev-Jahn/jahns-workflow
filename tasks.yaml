@@ -726,3 +726,28 @@ tasks:
     status: done
     severity: "major"
     origin: "plan-0.12-M0B"
+  - id: feat/run-spec-readiness-contract
+    title: "coordinator가 합성한 acceptance criterion의 dispatch 전 readiness 계약 — 구조화 필드(claim/source/scope/evidence kind/negative case) + 결정론 검사 + 독립 contract critic(unachievable·unbounded·unverified-reference·scope-ambiguous·implementation-prescriptive typed concern), retry ceiling·수렴 한계, risk-gated reviewer requirement (JW-GPT-016)"
+    status: "pending"
+    severity: "major"
+    origin: "review-2026-07-19-m0-contracts"
+  - id: feat/canonical-project-identity
+    title: "ProjectContext 도메인 객체 도입 — project_id·canonical_root·active_worktree_root·git_common_dir·checkout_identity 분리. runtime DB는 canonical project에 결속, linked worktree는 별개 project가 아닌 checkout context, intent 변경 명령은 noncanonical worktree에서 기본 거부 (JW-GPT-017)"
+    status: "pending"
+    severity: "major"
+    origin: "review-2026-07-19-m0-contracts"
+  - id: feat/review-artifact-addressing
+    title: "리뷰 artifact addressing을 UUID owner directory로 이전(docs/reviews/runs/<run-uuid>/...) — filename delimiter 분해로 owner를 추측하지 않음. 기존 flat 파일은 legacy adapter 판독(bulk migration 없음). 미채택 시 계획서·known-issues의 '015 부류 구조적 소멸' 주장 제거 필수 (JW-GPT-018)"
+    status: "pending"
+    severity: "major"
+    origin: "review-2026-07-19-m0-contracts"
+  - id: feat/verification-capability-preflight
+    title: "verification plan + capability preflight를 dispatch precondition으로 — worker 환경이 요구된 검증 명령을 실행할 수 있는지 사전 확인하고 불가하면 typed refusal. 독립 검증이 조용히 조정자 단독 검증으로 퇴화하는 경로 차단 (JW-GPT-019)"
+    status: "pending"
+    severity: "major"
+    origin: "review-2026-07-19-m0-contracts"
+  - id: docs/e09-durable-identity-scope
+    title: "E-09 개정 — durable identity와 scoped ambient observation을 구분. 현행 문구는 파일시스템 메타데이터에 한정돼 hostname 사례를 못 잡고, 동시에 '파일명'을 정당한 판정 근거로 명시해 JW-GPT-018의 요구와 충돌 (JW-GPT-020)"
+    status: "pending"
+    severity: "major"
+    origin: "review-2026-07-19-m0-contracts"

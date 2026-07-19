@@ -83,7 +83,11 @@ foreign-skip 분기에 도달하기 전에 반환하기 때문이다(`scripts/re
 재현 불가함을 fixture로 증명한다:
 
 - **014 부류** — 분류 경로가 하나뿐(단일 chokepoint)이라 "관측했으나 기록하지 않음"이 성립 불가
-- **015 부류** — 신원이 파일명이 아니라 store 키라 귀속 다의성이 성립 불가
+- **015 부류** — ⚠ **정정(2026-07-19, JW-GPT-018)**: 초판은 "신원이 store 키라 다의성이 성립 불가"라고
+  적었으나 **사실과 다르다.** 리뷰 증거는 git-tracked 파일로 유지되므로(계획 §2-1) store 키가 신원을
+  대체하는 것은 runtime record뿐이다. 이 부류의 해소는 `feat/review-artifact-addressing`(UUID owner
+  directory + legacy adapter)에 달려 있으며, 0.12에 넣지 않으면 **legacy PR-mode residual**로 남는다.
+  정상 round id 간 prefix 충돌은 crafted filename이 아니므로 확정된 위협모델 안에서도 보호 대상이다
 
 패치 수준의 재시도는 하지 않는다. round-6이 그 접근의 발산을 실측했다(계획서 §6 M0-A).
 
