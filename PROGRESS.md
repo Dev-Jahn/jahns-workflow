@@ -2,6 +2,24 @@
 
 round 단위 작업 이력이 이 파일에 축적된다. 활성 task와 의존성은 `tasks.yaml`(CLI: `waystone task`)과 생성 파일 `ROADMAP.md` 참조.
 
+## 2026-07-19-supersession-attribution-attempts
+
+- **Goal**: 5차 리뷰의 REAL major 2건(JW-GPT-014 merge 관측-기록 불일치 / JW-GPT-015 foreign malformed sidecar가 healthy round ingest 차단) 해소.
+- **결과: 미착지 — 두 lane 모두 4회전 후 중단, 병합 0건. dev는 03ba429 그대로.** 라운드 산출물은 수리가 아니라 (a) ruling 1건 확정, (b) 하네스 결함 2건 발굴, (c) 0.12 구조 교체 필요성의 실측 증거다.
+- **회전 궤적** (전부 implementer=external-runner/codex:gpt-5.6-sol xhigh, 매 attempt main이 게이트 재실측 + RED 독립 재현 + codex 적대 리뷰):
+  - **014**: a1 major2(cycle_conflict 조기반환·비권위 로컬정책으로 영구 증거 기록) → a2 major2(approve 우회·순차 fan-out 부분상태) → a3 major3(freeze 우회·과잉 demotion·보상삭제 비원자) → **a4 major4** — a4는 구조적으로 옳은 방향(단일 chokepoint `classify_remote_review` + 원자적 단일 관측 레코드)이었으나 신규 결함 3건 유입. **결정적**: `marker_valid`는 v2의 base_sha/reviewers를 선택 필드로 허용(review.py:2007-2010)하는데 `_validated_demotion_target`은 필수 요구(1350-1352) → 정상 축약형 v2가 supersede되면 **모든 online 명령이 차단되는 위양성**. 병합 시 원 결함보다 악화. 변경 규모 149→908줄, 폐쇄율 < 유입율.
+  - **015**: a1 major2 → a2 major3(phantom owner 세탁·fan-out 오염·**단조성 위반**: 새 라운드의 평범한 artifact 추가만으로 기존 corruption이 사라짐) → a3 **main 직접 기각**(단조성을 `st_mtime_ns` 순서에 결속 — git clone/checkout이 mtime을 재작성하므로 다중 머신에서 보장 소멸; round-5 JW-GPT-013 교훈 재발) → a4 major3. a4 진전: `unattributable` 1급 상태 도입, 공용 resolver로 improve 99줄 순감, E-09 준수 + mtime 불변 테스트. 미해결: unattributable 행을 최단 prefix bucket에 배정해 무관 round 오염·실제 owner의 stale 승격, 이중 glob 매칭 파일이 두 round 귀속, 외부 review-requests 상충 generation에서 ingest/improve 판정 분기.
+- **구조 진단**: 014 = 관측 지점을 열거해도 다음 게 나옴(status→merge→approve→freeze→base-policy 분기) — 필요한 건 분류 경로가 하나뿐인 구조. 015 = round id가 `-freeze-`를 포함 가능한 한 파일명 귀속은 원리적으로 다의적. 둘 다 **fact당 authority가 하나여야 한다**는 0.12 M1 명제의 실증 사례.
+- **dev 잔존 위험(정직한 기술)**: merge gate는 여전히 skew를 차단하므로 **게이트 우회 경로 없음**. 실제 피해는 offline 증거 투영(`improve` 리포트·offline ingest)이 online 판정과 어긋나 무효화된 리뷰 세대를 explicit으로 표시할 수 있는 것 — 오해 유발, 게이트 무영향. 두 task는 status=blocked, notes에 시도 이력·진단 기록.
+- **Gates**: 각 attempt lane에서 전체 스위트 green 재실측(014 a4: 840 OK / 015 a4: 832 OK, 양쪽 ruff clean) — 게이트는 통과했으나 적대 리뷰가 잡은 결함은 테스트 없는 동작이었다. 병합하지 않았으므로 dev 스위트는 828 불변.
+- **Ruling 확정**: decision/trust-threat-model-boundary — **우발적 손상만 방어**(크래시·부분 쓰기·도구 버그·정상 운영 중 이름 충돌). 의도적 로컬 파일 조작·adversarial filename·다중 사용자 권한 경계는 **명시적 비보호**. 근거: 로컬 쓰기 권한자는 scripts/*.py 직접 수정이라는 더 쉬운 경로가 있음. 적용: crafted filename 전제 finding은 REAL이어도 수용된 잔여로 분류하고 재론하지 않음. M4 SECURITY.md에 사용자용 명시.
+- **신규 하네스 결함(리뷰 아닌 dogfooding 산출)**: fix/delegate-env-prep-uv-cache(major — 위임 러너 worktree 캐시에 pyyaml·ruff 부재로 러너가 자기 게이트·RED를 못 돌림; 이번 8회전 전부에서 재현) · fix/registry-worktree-misroute-guard(major — 잔류 cwd로 registry 변경이 linked worktree에 기록되고 pre-0.9 migration 유발, 2회 발생).
+- **0.12 plan r3→r4**: 사용자 지시로 **실행 관측 설계 1급 편입**(§3-8 liveness/progress/current 3분리 + honest-unknown, **E-08** 침묵은 종료의 증거가 아님, `run watch`, budget 3행) — 근거는 이 라운드의 실사고(네트워크 전환 시 main session이 러너 생사를 판정 못해 살아있는 delegation을 discard 시도, record lock이 저지). 추가로 **E-09**(신뢰·귀속 판정을 파일시스템 메타데이터에 결속 금지) 신설 — 같은 실수 2회 재발(round-5 디렉터리 stat, round-6 mtime)로 개인 규율에서 불변조건으로 승격.
+- **조정자(main) 자기 결함 3건**: acceptance 조항이 기각 사유를 직접 유발 — ① "improve와 동일 규칙으로 일원화"(그 규칙의 안전성 미검증) ② "explicit 되살아나는 경로 없음"(디렉터리 전체 unwritable에서 원리적 불가) ③ "**모든** 식별 가능한 v2 contract를 demote"(cycle 범위 누락 → 과잉 demotion 결함 유발). 조항을 구현 지시에서 **성질(property) 기술**로 바꾼 회전에서 양 lane 모두 구조적 해법으로 전환 — 다음 라운드부터 성질 기술을 기본으로.
+- **5차 리뷰 receipt**: **UNBOUND(pending)** — raw 리뷰 프롬프트가 회신 헤더를 손으로 작성하며 full SHA 오기 + request-digest 누락. 하네스가 E-01대로 거부(설계대로 동작). finding은 리뷰어 attestation이 아닌 main의 독립 코드 검증으로 채택. 레시피 교정은 메모리 기록.
+- **SSOT**: unchanged.
+- **Next**: 0.12 M0로 이동 — M0-A 잔여(baseline tag·feature freeze) → M0-B(ruling 6건 중 ②확정, 나머지 5건 + ADR 세트) → M0-C. 014/015는 M1에서 구조적으로 재검토. 0.11.2는 내지 않으며 0.11.1이 현행 릴리스.
+
 ## 2026-07-19-evidence-authority-fixes
 
 - **Goal**: 4차 리뷰(codex 대체, REAL major 3: JW-GPT-011~013) 전량 해소 — 0.11.1 hotfix 라인. 부수 목표: 0.11.0 probe 자기-churn 실사고(delegate run 전면 불가) 해소.
