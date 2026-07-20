@@ -400,6 +400,9 @@ def write_round_request_binding(root: Path, round_id: str, target_sha: str, base
     base = directory / f"{round_id}-request.binding.json"
     prior: list[tuple[Path, dict]] = []
     for existing in sorted(directory.glob(f"{round_id}-request.binding*.json")):
+        if round_request_binding_identity(existing) is None:
+            raise WorkflowError(
+                f"corrupt review binding {existing}: invalid request filename")
         previous = read_round_request_binding(existing, expected_round_id=round_id)
         prior.append((existing, previous))
     if prior:
@@ -864,6 +867,8 @@ def _request_generation_in_directory(
         return None
     matches: list[tuple[Path, dict]] = []
     for path in paths:
+        if round_request_binding_identity(path) is None:
+            continue
         try:
             row = read_round_request_binding(path, expected_round_id=round_id)
         except WorkflowError:
@@ -894,6 +899,8 @@ def _round_has_legacy_request_generation(directory: Path, round_id: str) -> bool
     except (OSError, NotImplementedError):
         return False
     for path in paths:
+        if round_request_binding_identity(path) is None:
+            continue
         try:
             row = read_round_request_binding(path, expected_round_id=round_id)
         except WorkflowError:

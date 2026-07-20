@@ -2561,6 +2561,31 @@ Fail-loud protocol boundaries.
             self.assertFalse((root / "docs" / "reviews" /
                               f"{self.ROUND_ID}-request.md").exists())
 
+    def test_prepare_rejects_noncanonical_binding_instead_of_reporting_success(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            root, _target, narrative = self._closed_project(Path(d))
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(review.prepare_review_request(
+                    root, self.ROUND_ID, narrative), 0)
+            directory = root / "docs/reviews"
+            canonical = next(directory.glob(
+                f"{self.ROUND_ID}-request.binding*.json"))
+            alias = canonical.with_name(
+                f"{self.ROUND_ID}-request.binding-02.json")
+            canonical.rename(alias)
+
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = review.prepare_review_request(root, self.ROUND_ID, narrative)
+
+            self.assertEqual(rc, 1)
+            self.assertIn(str(alias), err.getvalue())
+            self.assertNotIn("prepared review request binding", out.getvalue())
+            self.assertFalse(canonical.exists())
+
     def test_prepare_supports_pr_mode_without_unrendered_placeholders(self):
         with tempfile.TemporaryDirectory() as d:
             root, target, narrative = self._closed_project(Path(d), mode="pr")
@@ -5805,6 +5830,43 @@ class PendingReviewTests(unittest.TestCase):
                 self.assertIn(round_id, rendered)
                 self.assertIn("reason binding-generation-collision", rendered)
             self.assertIsNone(review.round_request_binding_identity(alias))
+
+    def test_binding_writer_rejects_renamed_noncanonical_generation(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root(d)
+            round_id = "2026-01-01-binding-writer-alias"
+            canonical = self._request(root, round_id, "a" * 40)
+            alias = canonical.with_name(f"{round_id}-request.binding-02.json")
+            canonical.rename(alias)
+
+            with self.assertRaises(review.WorkflowError) as raised:
+                review.write_round_request_binding(
+                    root, round_id, "a" * 40, "b" * 40, ["gpt-5.6-sol"],
+                    mode="packet", **self._projection_digests())
+
+            self.assertIn(str(alias), str(raised.exception))
+            self.assertFalse(canonical.exists())
+
+    def test_generation_lookups_ignore_noncanonical_binding_names(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root(d)
+            directory = root / "docs/reviews"
+            round_id = "2026-01-01-digest-alias"
+            canonical = self._request(root, round_id, "a" * 40)
+            alias = canonical.with_name(f"{round_id}-request.binding-02.json")
+            canonical.rename(alias)
+
+            self.assertIsNone(review._request_generation_in_directory(
+                directory, round_id,
+                self._projection_digests()["rendered_request_digest"]))
+
+            legacy_round_id = "2026-01-01-legacy-alias"
+            legacy = write_legacy_round_request_binding(
+                root, legacy_round_id, "a" * 40, "b" * 40, ["gpt-5.6-sol"])
+            legacy.rename(legacy.with_name(
+                f"{legacy_round_id}-request.binding-02.json"))
+            self.assertFalse(review._round_has_legacy_request_generation(
+                directory, legacy_round_id))
 
     def test_canonical_reingest_supersedes_stale_settlement(self):
         with tempfile.TemporaryDirectory() as d:
