@@ -2,6 +2,24 @@
 
 round 단위 작업 이력이 이 파일에 축적된다. 활성 task와 의존성은 `tasks.yaml`(CLI: `waystone task`)과 생성 파일 `ROADMAP.md` 참조.
 
+## 2026-07-20-m0-characterization
+
+- **Goal**: M0-C 완주 — runtime-state 처분 감사 실물 확정, porting ledger 개시(828건), traceability matrix 골격. 리뷰어가 걸었던 `characterization-baseline` 게이팅이 M0-B 계약 5건 폐쇄로 해소되어 착수 가능해진 상태였다.
+- **Shipped** (implementer=external-runner/codex:gpt-5.6-sol xhigh, 2 lane 병렬 @ 19938d9):
+  - **`docs/runtime-state-audit.md`** — §5-1 원칙("권위는 git에 있거나 재파생 가능")을 실물에 적용해 **위반 6건** 적출. 판정 기준의 정확성이 좋았다: '재파생 가능'을 "비슷하게 다시 쓸 수 있다"가 아니라 **"named authority channel에서 결정적으로 복구"**로 적용해 projection·cache·OS lock을 finding에서 제외했고, 어제 착지한 ADR-0011의 ProjectContext로 canonical root를 확정한 뒤 감사했다.
+  - **`docs/porting-ledger.md`** — 828건 전수 분류(port 818 / rewrite 10 / **drop 0**) + M1-A 출력 등급(machine JSON 406 / diagnostic 264 / canonical artifact 134 / human CLI 14 / time·path 10) + 불변조건 매핑. baseline 원본 SHA-256으로 대상 고정.
+  - **`docs/traceability-matrix.md`** — 불변조건 × 테스트 4층 골격. §3-9 취소·quiescence 안전 계약은 E 번호가 없으므로 독립 행.
+- **핵심 결과 — 내 우려가 틀렸다**: M0-C 내내 경계한 것은 "828 green인데 결함이 있었으니 결함을 정상으로 고정한 테스트가 있을 것"이었다. **결함 보존 테스트 0건.** JW-GPT-014·015에 대해 기존 테스트는 오히려 **반대 계약을 단언**하고 있었고(표본 검증: `test_latest_v1_supersession_requires_new_cycle_v2_refreeze`가 `assertFalse(ok)`+merge gate 차단), 결함은 **테스트가 닿지 않는 진입 경로**에 존재했다. 되돌릴 화석이 없으므로 M1-B는 **빈 fixture 2개를 채우는 작업**이며 ledger가 그 빈칸을 명시했다.
+- **부수 성과 — 요청하지 않은 축의 적출 2건**: 어제 확정한 계약과 충돌하는 기존 테스트를 `needs-ruling`으로 올렸고 둘 다 main이 판정했다.
+  - `test_claim_only_crash_remnant_is_discardable` → **ruling**: 'exposure.json 부재'는 effect 부재의 증거가 아니라 기록 부재일 뿐이며 effect 개시 후 기록 실패와 구분되지 않는다. fencing epoch 미진행 + action id 각인 산출물(worktree·ref·process·artifact) 부재를 **관측**했을 때만 폐기, 관측 채널 없으면 unknown-effect 보존 (ADR-0003 §3-9·ADR-0002·E-08 정합).
+  - `test_fixed_stdout_shim_replacement_reprobes_via_executable_stat_identity` → **ruling**: size/mtime 단독 판정 금지, content digest 결속. round-5 JW-GPT-013(디렉터리 stat→내용 digest)과 **동일한 실수의 반복**이며 개정 E-09가 금지하는 형태다.
+- **감사 finding 처분** (6건→3건 통합): F-01 profile.yml이 project 라우팅 의도와 machine 능력을 혼재 → **M3 이월**(동작 변경이라 feature freeze 대상, 계획서가 이미 profile v2를 M3에 배치) · F-06 machine-tier state 처분 부재 → **계획서 §5-1에 machine-tier 층 신설**(projects.json은 machine-local 권위, doctor typed 보고, 재등록은 명시적 owner 행위) + **원칙을 2조건에서 3조건으로 개정**(git 존재 / 재파생 가능 / **machine-local 명시+한계 문서화**) · F-02~F-05 → **수용된 잔여 ruling**(사용자 결정).
+- **수용된 잔여의 조건**: delegation 101건·exposure 12건·consent 4건은 machine-local이며 유실 시 복구 불가임을 명시하되, 동반 규율 3개를 함께 확정 — ⑴ 완료 판정·인수 근거를 이 기록에만 의존해 기술하지 않는다 ⑵ 머신 교체 시 함께 사라짐을 전제로 운영 ⑶ 타 머신 위임 기록은 그 머신에만 남는다(정상 동작, ruling #6과 정합). 백업 기계를 만들지 않은 이유는 그것이 두 번째 권위 표면이 되기 때문이며 ADR-0006이 manifest에 verdict를 이식하지 않기로 한 것과 같은 논리다.
+- **Gates**: 828 green + ruff clean — lane 1회 + 병합 후 1회 주관측. **코드 변경 0건**(문서만).
+- **운영 정리**: delegation record 8건이 `needs-review`로 남아 worktree를 붙들고 있던 것을 인수 커밋과 함께 사후 정리했다 — 오늘 8회 전부 `delegate apply`가 아니라 수동 `git apply`+squash merge로 처리해 엔진 레코드가 병합 사실을 몰랐다. **리뷰 패킷 R-2("엔진 밖 수동 조작")의 실사례**이며, 다음부터 apply 경로 사용 또는 즉시 정리를 규율로 삼는다.
+- **SSOT**: unchanged.
+- **Next**: **M0 exit review → M1-A 승인**. M0-A/B/C 산출물 전량 착지 완료. M1-A는 기계적 구조 분할(동작·저장 형식 변경 0)이며 ledger의 출력 등급표가 그 exit 기준이다.
+
 ## 2026-07-19-m0-contract-gaps
 
 - **Goal**: 설계공백 리뷰(chatgpt:gpt-5.6-pro, CHANGES REQUESTED · major 5, JW-GPT-016~020)가 지적한 **M0-B 계약의 빈칸**을 폐쇄. 리뷰어가 `gate/characterization-baseline` exit를 이 5건 반영 전에는 통과시키지 말라고 게이팅했으므로 M0-C 착수 전 필수.

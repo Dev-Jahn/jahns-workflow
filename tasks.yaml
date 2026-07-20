@@ -773,46 +773,62 @@ tasks:
     severity: "major"
     origin: "review-2026-07-19-m0-contracts"
   - id: chore/runtime-state-disposition-audit
+    session_id: "513d1802-24e4-4adf-8ffb-a86b15e0f41d"
+    round: 2026-07-20-m0-characterization
+    result: "docs/runtime-state-audit.md @ dev 19938d9 — 실물 대조로 §5-1 원칙 위반 6건 적출. main이 3건으로 통합 처분(F-01→M3 이월·F-06→§5-1 machine-tier 신설·F-02~F-05→수용된 잔여 ruling). 판정 기준의 정확성: '재파생 가능'을 '비슷하게 다시 쓸 수 있다'가 아니라 'named authority channel에서 결정적으로 복구'로 적용해 projection·cache·lock을 finding에서 제외"
     accept: ["docs/runtime-state-audit.md 작성 — 권위 원천(전부 이 트리에 존재): dev_docs/0.12.0-refactor-plan.md(§2-5 porting ledger·traceability matrix, §4 불변조건, §5-1 처분 감사, §6 M0-C/M1-A 출력 등급표), docs/invariants.md, docs/adr/ADR-0002~0012, docs/known-issues.md. 이 저장소의 실제 .waystone/ 트리(및 ~/.waystone/)를 열거해 계획서 §5-1 처분표의 각 행을 실물과 대조한다. 표에 없는 항목이 발견되면 추가하고, 표에 있으나 실물이 없는 항목도 명시한다. 각 항목에 대해: 현재 권위 여부 / git-tracked인가 / 재파생 가능한가 / 0.12 처분(git 유지·DB 이관·read-only archive·발행 중지·역할 분리) / 근거", "계획서 §5-1의 원칙 '권위 있는 것은 git에 있거나 재파생 가능해야 한다. 어느 쪽도 아닌 항목은 M0 finding'을 실제로 적용해, 위반 항목을 **finding으로 명시 열거**한다(없으면 없다고 단언). 발견된 finding은 문서에 심각도와 함께 기록하되 task 등록은 하지 않는다(main이 판단)", "read-only 감사다 — .waystone/ 아래 어떤 파일도 생성·수정·삭제하지 않는다. 산출물은 docs/runtime-state-audit.md 하나뿐", "전체 스위트 green + ruff F401,F841 clean"]
     scope: ["docs"]
     title: "M0-C: .waystone/ 아래 runtime state 항목의 실물 감사 — 계획서 §5-1 처분표를 실제 파일·디렉터리와 대조해 확정하고, '권위 있는데 git에도 없고 재파생도 불가'인 항목을 finding으로 적출"
-    status: "pending"
+    status: done
     severity: "major"
     origin: "plan-0.12-M0C"
   - id: chore/porting-ledger-bootstrap
+    session_id: "513d1802-24e4-4adf-8ffb-a86b15e0f41d"
+    round: 2026-07-20-m0-characterization
+    result: "docs/porting-ledger.md + docs/traceability-matrix.md @ dev 19938d9 — 828건 전수 분류(port 818 / rewrite 10 / drop 0), 출력 등급 배정(machine JSON 406 / diagnostic 264 / canonical artifact 134 / human CLI 14 / time·path 10), 불변조건 매핑. **핵심 결과: 알려진 결함(014·015)을 보존하는 테스트 0건** — 결함은 테스트가 닿지 않는 진입 경로에 존재했고, 기존 테스트는 오히려 반대 계약을 단언. M1-B는 화석 제거가 아니라 빈 fixture 2개를 채우는 작업. 부수 성과: 오늘 확정한 계약과 충돌하는 기존 테스트 2건을 needs-ruling으로 적출(둘 다 main ruling 완료)"
     accept: ["docs/porting-ledger.md 작성 — 권위 원천(전부 이 트리에 존재): dev_docs/0.12.0-refactor-plan.md(§2-5 ledger·matrix, §6 M1-A 출력 등급표, §4 불변조건), docs/invariants.md(I-01~12·E-01~09), docs/adr/ADR-0002~0012, docs/known-issues.md. scripts/tests/run_tests.py의 전 테스트를 열거해(테스트 클래스 단위로 묶어도 되나 828건 전부가 어느 행에든 귀속되어야 하며 총계가 맞아야 한다) 각 항목에 ⑴ 처분(port=이관 / rewrite=재작성 / drop=폐기+사유) ⑵ M1-A 출력 등급(canonical artifact=byte-identical / machine JSON=schema·value 동일 / human CLI=의미·필수 field 호환 / diagnostic path·traceback=변경 허용·typed code 동일 / time·path-bearing=normalized 비교) ⑶ 어떤 불변조건(I-nn·E-nn)을 지키는지(해당 없으면 none) 를 배정한다", "**알려진 결함을 '보존할 동작'으로 고정하지 않는다** — docs/known-issues.md의 JW-GPT-014·015가 기술하는 동작을 계약으로 태깅하는 테스트가 있으면 처분을 rewrite로 하고 사유에 'known defect, must not be preserved'를 명시한다. 이 판정을 문서의 별도 절에 목록으로 모은다(계획서 §2-1: characterization이 알려진 결함을 보존 대상으로 고정하면 안 된다)", "docs/traceability-matrix.md 골격 작성 — 불변조건 ID(I-01~12, E-01~09) × 4열(characterization test / 새 kernel test / fault-injection test / 상태). 현재 존재하는 테스트만 채우고 없는 칸은 'TODO(M1)'로 남긴다. **ADR-0003의 §3-9 취소·quiescence 안전 계약은 E 번호가 없으므로 독립 행을 둔다**(계획서 §2-5 r5 단서)", "분류는 기계적 열거 + 근거 기반이어야 한다 — 테스트 이름만 보고 추측하지 말고 각 테스트가 무엇을 단언하는지 확인한 뒤 등급을 배정한다. 판단이 갈리는 항목은 'needs-ruling'으로 표시하고 사유를 적는다(임의 결정 금지)", "전체 스위트 green + ruff F401,F841 clean. 테스트 파일 자체는 수정하지 않는다 — 산출물은 문서 2개뿐"]
     scope: ["docs"]
     title: "M0-C: 테스트 828건의 porting ledger 개시 — 각 테스트를 이관/재작성/폐기로 분류하고 M1-A 출력 등급(canonical artifact·machine JSON·human CLI·diagnostic·time/path-bearing)을 배정. silent test drop = silent contract drop 방지"
-    status: "pending"
+    status: done
     severity: "major"
     origin: "plan-0.12-M0C"
   - id: fix/profile-intent-vs-capability-split
+    session_id: "513d1802-24e4-4adf-8ffb-a86b15e0f41d"
+    round: 2026-07-20-m0-characterization
     notes: "feature freeze(baseline/0.12-refactor)에 걸리므로 0.11 라인에서 고치지 않는다 — 동작 변경이며 계획서 §5-1이 이미 profile v2 공개를 M3에 배치. M3의 profile v2 설계에 '프로젝트 라우팅 의도는 git-tracked, machine 능력·해석은 local'이라는 분리를 수용 기준으로 편입한다. 감사 F-01 근거: 실물 profile.yml의 binding(어려운 설계=fable, 구현=codex xhigh 등)은 이 프로젝트를 어떻게 일할지의 정책이며 다른 머신에서도 동일해야 하는데, 현재 그 의도의 유일한 권위가 untracked local file이다"
     title: "profile.yml이 project 라우팅 의도(어느 역할을 어떤 성격의 백엔드에)와 machine 능력(그 백엔드가 이 머신에 있는가)을 한 파일에 섞어, 프로젝트 정책이 untracked local file에만 존재 — 의도는 git-tracked로, 능력·해석은 machine-local로 분리 (감사 F-01)"
     status: "pending"
     severity: "major"
     origin: "audit-2026-07-19"
   - id: docs/machine-tier-state-disposition
+    session_id: "513d1802-24e4-4adf-8ffb-a86b15e0f41d"
+    round: 2026-07-20-m0-characterization
     result: "계획서 §5-1에 machine-tier 층 신설(projects.json=machine-local 권위·doctor typed 보고·재등록은 명시적 owner 행위 / cache worktrees=순수 cache / pre-0.9 seed=legacy). 원칙을 2조건에서 3조건으로 개정 — git 존재 · 재파생 가능 · **machine-local 명시+한계 문서화**. 세 번째가 감사 F-02~F-06이 속하는 층이며 docs/runtime-state-audit.md의 '수용된 잔여' 절이 그 문서화"
     title: "계획서 §5-1이 project-local .waystone/만 다루고 machine-tier(~/.waystone/, 특히 ADR-0011이 오늘 신설한 projects.json canonical mapping)의 처분을 정의하지 않음 — §5-1에 machine-tier 층 추가 (감사 F-06)"
-    status: "done"
+    status: done
     severity: "major"
     origin: "audit-2026-07-19"
   - id: decision/local-audit-recoverability
+    session_id: "513d1802-24e4-4adf-8ffb-a86b15e0f41d"
+    round: 2026-07-20-m0-characterization
     ruling: "수용된 잔여로 명시한다 (사용자 결정 2026-07-20, 옵션 a). 대상: delegation record 101건 · round exposure 12건 · consent event 4건 · review-ingest provenance. 이들은 machine-local이며 git에서 재파생 불가하고 유실 시 복구되지 않는다. 근거: ⑴ 백업·요약 기계를 만들면 그 자체가 두 번째 권위 표면이 되어 '원본과 요약 중 무엇이 맞나'를 낳는다 — ADR-0006이 closeout manifest에 verifier verdict를 이식하지 않기로 한 것과 동일 논리 ⑵ 67MB 대부분이 러너 로그이며 git 편입 시 저장소가 매 라운드 부풀고 프롬프트 원문·모델 출력이 공개 히스토리에 박힌다 ⑶ 정확성이 걸린 판정(무엇이 인수됐고 왜)은 이미 전부 git에 있다 — 사라지는 것은 과정의 세부다. 동반 규율: ① 완료 판정·인수 근거를 이 기록에만 의존해 기술하지 않는다(결론과 근거는 PROGRESS·task result에) ② 머신 교체·초기화 시 함께 사라짐을 전제로 운영한다 ③ 다른 머신의 위임 기록은 그 머신에만 남는다(정상 동작)"
     title: "역사적 local-only 감사 기록(delegation archive 101건·round exposure 12건·consent 4건·review-ingest provenance 8행)의 복구 가능성 계약 — git에서 재파생 불가함을 수용된 잔여로 명시할지, export/backup 경로를 제공할지 (감사 F-02~F-05 통합)"
-    status: "done"
+    status: done
     severity: "major"
     origin: "audit-2026-07-19"
   - id: decision/claim-only-remnant-discard-proof
+    session_id: "513d1802-24e4-4adf-8ffb-a86b15e0f41d"
+    round: 2026-07-20-m0-characterization
     ruling: "폐기는 effect 미개시의 **적극 증명**이 있을 때만 허용한다 (main ruling 2026-07-19). 'exposure.json이 없다'는 effect가 없었다는 증거가 아니라 기록이 없다는 사실일 뿐이며, effect 개시 후 기록 쓰기 실패와 구분되지 않는다 — ADR-0002가 이미 '긍정적으로 미생성임을 확인한 경우에만 동일 action으로 생성'으로 같은 규율을 세웠고, E-08은 침묵을 종료 증거로 쓰지 못하게 한다. 따라서 claim-only 잔여물은 ⑴ fencing epoch 미진행 ⑵ 해당 action id가 각인된 worktree·ref·process·artifact의 부재를 **관측**했을 때만 폐기 가능하며, 관측 채널이 없으면 unknown-effect로 보존한다. M1 reconcile 경계 확정 시 이 조건으로 테스트를 재작성한다"
     title: "claim-only crash 잔여물의 폐기 조건 — 현행 테스트는 effect 부재의 적극 증명 없이 폐기 가능하다고 단언하나 ADR-0003 §3-9는 destructive cleanup에 긍정적 quiescence 관측을 요구 (ledger needs-ruling #473)"
-    status: "done"
+    status: done
     severity: "major"
     origin: "ledger-2026-07-19"
   - id: decision/shim-replacement-identity-basis
+    session_id: "513d1802-24e4-4adf-8ffb-a86b15e0f41d"
+    round: 2026-07-20-m0-characterization
     ruling: "교체 판정은 **content digest**에 결속한다 (main ruling 2026-07-19). size/mtime은 값싼 사전 필터로 유지할 수 있으나 단독 판정 근거가 될 수 없다 — 같은 크기·시각으로 교체되면 탐지에 실패하고, 이는 round-5 JW-GPT-013(디렉터리 stat→config 내용 digest)과 동일한 실수의 반복이다. 개정 E-09의 허용 조항(ambient 값은 scope·lifetime 선언 하에 locator/freshness로만)에 비추어도 stat은 locator일 뿐 identity가 아니다. E-03의 probe proof 재사용 축과 정합하게 executable content digest를 신뢰 축으로 삼아 재작성한다"
     title: "stdout shim 교체 감지의 신원 축 — 현행은 executable size/mtime 단독 판정이나 개정 E-09는 incidental 파일시스템 메타데이터를 durable authority로 금지 (ledger needs-ruling #486)"
-    status: "done"
+    status: done
     severity: "major"
     origin: "ledger-2026-07-19"

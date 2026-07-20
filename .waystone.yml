@@ -17,4 +17,4 @@ delegation:
   enabled: true
   env_prep: null
 state:
-  last_round_commit: d092fe052b321fa49de223bbbab47801f9acd97b
+  last_round_commit: f0f6f23add0c71adad2d2cb64d8bd6149db08e14
