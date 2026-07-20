@@ -1438,6 +1438,8 @@ class MarkerTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
+            home = root / "home"
+            home.mkdir()
             (root / ".waystone.yml").write_text("version: 1\nproject: x\n")
             (root / "tasks.yaml").write_text("version: 1\nproject: x\ntasks: []\n")
             state = common.ensure_project_state_dir(root)
@@ -1457,8 +1459,8 @@ class MarkerTests(unittest.TestCase):
             err = io.StringIO()
             try:
                 with contextlib.redirect_stderr(err):
-                    rc = review.main([
-                        "freeze", "--pr", "3", "--round", "2026-07-19-review", str(root)])
+                    rc = _run_with_home(home, lambda: review.main([
+                        "freeze", "--pr", "3", "--round", "2026-07-19-review", str(root)]))
             finally:
                 review.pr_context = original
             self.assertEqual(rc, 1)
@@ -17966,6 +17968,85 @@ class MigrationSunsetTests(unittest.TestCase):
             self.assertIn(str(marker), str(raised.exception))
             self.assertIn("does not migrate or repair", str(raised.exception))
             self.assertEqual(marker.read_bytes(), b"/legacy/worktree/did-pending")
+
+    def test_symlinked_marker_container_is_refused_without_repair(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = self._project(Path(d))
+            marker_dir = (home / ".waystone" / "cache" / "worktrees" /
+                          common._project_slug(root))
+            target = Path(d) / "external-markers"
+            target.mkdir()
+            marker = target / "did-pending.migrating"
+            marker.write_bytes(b"/legacy/worktree/did-pending")
+            marker_dir.parent.mkdir(parents=True)
+            marker_dir.symlink_to(target, target_is_directory=True)
+
+            with self.assertRaises(common.Pre09StateError) as raised:
+                _run_with_home(home, lambda: common.migrate_project_state(root))
+
+            self.assertEqual(raised.exception.paths, (marker_dir,))
+            self.assertTrue(marker_dir.is_symlink())
+            self.assertEqual(marker.read_bytes(), b"/legacy/worktree/did-pending")
+            self.assertFalse((root / ".waystone").exists())
+
+    def test_regular_file_marker_container_is_refused_without_repair(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = self._project(Path(d))
+            marker_dir = (home / ".waystone" / "cache" / "worktrees" /
+                          common._project_slug(root))
+            marker_dir.parent.mkdir(parents=True)
+            marker_dir.write_bytes(b"not-a-marker-directory")
+
+            with self.assertRaises(common.Pre09StateError) as raised:
+                _run_with_home(home, lambda: common.migrate_project_state(root))
+
+            self.assertEqual(raised.exception.paths, (marker_dir,))
+            self.assertEqual(marker_dir.read_bytes(), b"not-a-marker-directory")
+            self.assertFalse((root / ".waystone").exists())
+
+    def test_divergent_preserved_profiles_are_refused_without_repair(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = self._project(Path(d))
+            profiles = {
+                home / ".claude" / "waystone.pre-0.9" / "profile.yml":
+                    b"schema: waystone-profile-1\nbindings: {}\n",
+                home / ".codex" / "waystone.pre-0.9" / "profile.yml":
+                    b"schema: waystone-profile-1\nbindings:\n  reviewer: gpt-other\n",
+            }
+            for path, body in profiles.items():
+                path.parent.mkdir(parents=True)
+                path.write_bytes(body)
+
+            with self.assertRaises(common.Pre09StateError) as raised:
+                _run_with_home(home, lambda: common.migrate_project_state(root))
+
+            self.assertEqual(set(raised.exception.paths), set(profiles))
+            for path, body in profiles.items():
+                self.assertEqual(path.read_bytes(), body)
+            self.assertFalse((root / ".waystone" / "profile.yml").exists())
+
+    def test_preserved_profile_mismatching_live_is_refused_without_repair(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, home = self._project(Path(d))
+            preserved_body = b"schema: waystone-profile-1\nbindings: {}\n"
+            live_body = b"schema: waystone-profile-1\nbindings:\n  reviewer: live-other\n"
+            profiles = []
+            for host in (".claude", ".codex"):
+                profile = home / host / "waystone.pre-0.9" / "profile.yml"
+                profile.parent.mkdir(parents=True)
+                profile.write_bytes(preserved_body)
+                profiles.append(profile)
+            live = root / ".waystone" / "profile.yml"
+            live.parent.mkdir()
+            live.write_bytes(live_body)
+
+            with self.assertRaises(common.Pre09StateError) as raised:
+                _run_with_home(home, lambda: common.migrate_project_state(root))
+
+            self.assertEqual(set(raised.exception.paths), {*profiles, live.resolve()})
+            for profile in profiles:
+                self.assertEqual(profile.read_bytes(), preserved_body)
+            self.assertEqual(live.read_bytes(), live_body)
 
     def test_completed_0_11_seed_and_empty_scaffolding_are_accepted(self):
         with tempfile.TemporaryDirectory() as d:

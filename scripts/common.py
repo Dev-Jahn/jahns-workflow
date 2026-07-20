@@ -409,9 +409,55 @@ def _append_children(path: Path, offenders: list[Path]) -> None:
     offenders.extend(entries)
 
 
+def _append_preserved_profile_conflicts(
+        root: Path, home: Path | None, offenders: list[Path]) -> None:
+    profiles: list[Path] = []
+    for plain in _pre_0_9_host_roots(home):
+        preserved = _preserved_pre_0_9_root(plain)
+        preserved_info = _checked_lstat(preserved)
+        if preserved_info is None:
+            continue
+        if stat.S_ISLNK(preserved_info.st_mode) or not stat.S_ISDIR(preserved_info.st_mode):
+            offenders.append(preserved)
+            continue
+        profile = preserved / "profile.yml"
+        info = _checked_lstat(profile)
+        if info is None:
+            continue
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            offenders.append(profile)
+            continue
+        profiles.append(profile)
+    if not profiles:
+        return
+
+    state = root / ".waystone"
+    state_info = _checked_lstat(state)
+    if state_info is not None and (
+            stat.S_ISLNK(state_info.st_mode) or not stat.S_ISDIR(state_info.st_mode)):
+        offenders.append(state)
+        return
+    live = state / "profile.yml"
+    live_info = _checked_lstat(live)
+    if live_info is not None:
+        if stat.S_ISLNK(live_info.st_mode) or not stat.S_ISREG(live_info.st_mode):
+            offenders.append(live)
+            return
+        profiles.append(live)
+
+    try:
+        bodies = {profile.read_bytes() for profile in profiles}
+    except OSError as e:
+        raise WorkflowError(
+            f"pre_0_9_layout_check_failed: cannot read legacy profile: {e}") from e
+    if len(bodies) > 1:
+        offenders.extend(profiles)
+
+
 def _unresolved_pre_0_9_project_paths(
         root: Path, home: Path | None = None) -> list[Path]:
     offenders = _unresolved_pre_0_9_machine_paths(home)
+    _append_preserved_profile_conflicts(root, home, offenders)
     slug = _project_slug(root)
     sources = [
         source
@@ -436,7 +482,10 @@ def _unresolved_pre_0_9_project_paths(
     marker_entries = _checked_entries(marker_dir)
     if marker_entries is not None:
         marker_info = _checked_lstat(marker_dir)
-        if marker_info is not None and stat.S_ISDIR(marker_info.st_mode):
+        if marker_info is not None and (
+                stat.S_ISLNK(marker_info.st_mode) or not stat.S_ISDIR(marker_info.st_mode)):
+            offenders.append(marker_dir)
+        else:
             offenders.extend(path for path in marker_entries if path.name.endswith(".migrating"))
     return offenders
 
