@@ -787,13 +787,15 @@ tasks:
     severity: "major"
     origin: "plan-0.12-M0C"
   - id: fix/profile-intent-vs-capability-split
+    notes: "feature freeze(baseline/0.12-refactor)에 걸리므로 0.11 라인에서 고치지 않는다 — 동작 변경이며 계획서 §5-1이 이미 profile v2 공개를 M3에 배치. M3의 profile v2 설계에 '프로젝트 라우팅 의도는 git-tracked, machine 능력·해석은 local'이라는 분리를 수용 기준으로 편입한다. 감사 F-01 근거: 실물 profile.yml의 binding(어려운 설계=fable, 구현=codex xhigh 등)은 이 프로젝트를 어떻게 일할지의 정책이며 다른 머신에서도 동일해야 하는데, 현재 그 의도의 유일한 권위가 untracked local file이다"
     title: "profile.yml이 project 라우팅 의도(어느 역할을 어떤 성격의 백엔드에)와 machine 능력(그 백엔드가 이 머신에 있는가)을 한 파일에 섞어, 프로젝트 정책이 untracked local file에만 존재 — 의도는 git-tracked로, 능력·해석은 machine-local로 분리 (감사 F-01)"
     status: "pending"
     severity: "major"
     origin: "audit-2026-07-19"
   - id: docs/machine-tier-state-disposition
+    result: "계획서 §5-1에 machine-tier 층 신설(projects.json=machine-local 권위·doctor typed 보고·재등록은 명시적 owner 행위 / cache worktrees=순수 cache / pre-0.9 seed=legacy). 원칙을 2조건에서 3조건으로 개정 — git 존재 · 재파생 가능 · **machine-local 명시+한계 문서화**. 세 번째가 감사 F-02~F-06이 속하는 층이며 docs/runtime-state-audit.md의 '수용된 잔여' 절이 그 문서화"
     title: "계획서 §5-1이 project-local .waystone/만 다루고 machine-tier(~/.waystone/, 특히 ADR-0011이 오늘 신설한 projects.json canonical mapping)의 처분을 정의하지 않음 — §5-1에 machine-tier 층 추가 (감사 F-06)"
-    status: "pending"
+    status: "done"
     severity: "major"
     origin: "audit-2026-07-19"
   - id: decision/local-audit-recoverability
