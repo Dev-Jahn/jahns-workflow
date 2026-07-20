@@ -1,11 +1,12 @@
-# 0.12 승격 계약 목록 — main 인수용 초안
+# 0.12 승격 계약 목록 (confirmed v1)
 
 - Status: **confirmed v1** — main 인수 2026-07-20 (PC-01~PC-30 전량; 행 단위 조정은 사용자 override로 가능)
 - Basis: ADR-0014
 - Inventory reviewed: `docs/porting-ledger.md` 85 classes / 828 methods
 
-이 문서는 main이 인수·확정할 계약 후보 목록이다. 아직 확정 gate가 아니며, 각 행은 legacy test
-자체나 출력 등급이 아니라 새 시스템에 남길 **의미 계약** 하나를 제안한다. 원 테스트 클래스는
+이 문서는 main이 2026-07-20 인수·확정한 계약 목록이다(v1 — 확정 기록은 ADR-0014 Amendment).
+각 행은 legacy test 자체나 출력 등급이 아니라 새 시스템에 남길 **의미 계약** 하나를 확정한다.
+각 계약 테스트 의무가 귀속되는 마일스톤은 ADR-0014 Amendment의 단계별 gate 원칙을 따른다. 원 테스트 클래스는
 채굴 anchor일 뿐 port 지시가 아니다. 같은 클래스에서 아래 행이 명명하지 않은 assertion은
 자동으로 승격되지 않는다.
 
@@ -76,7 +77,7 @@
 - E-06 잔여: artifact-reference 판독 복구와 content digest 재검증
 - E-08: positive liveness/exit evidence, 사유 있는 `unknown`, unknown에서 destructive resolution 금지
 - E-09 잔여: hostname·cwd·mtime/inode·열거 순서와 filename 분해를 durable authority로 쓰지 않음
-- ADR-0003 §3-9: cancellation·quiescence·cleanup의 독립 fault 계약
+- ADR-0003 '취소, quiescence, cleanup 안전 계약' 절(계획 §3-9 유래): cancellation·quiescence·cleanup의 독립 fault 계약
 
 `docs/traceability-matrix.md`가 I-10의 근접 증거로 언급한
 `ImproveL2BAdversarialTests.test_f12_scope_is_structured_and_packet_text_is_never_mined`는 characterization
@@ -113,7 +114,7 @@ coverage가 아니므로 승격 근거로 세지 않는다.
 - **unsafe discard·cleanup characterization:** `DelegateApplyTests`의 running/orphan discard,
   `DelegateCorruptRecordTests`의 corrupt-record discard, `DelegateRunTests`의 claim-only discard 경로는
   positive quiescence/effect reconciliation을 증명하지 않으므로 승격하지 않는다. E-08과
-  ADR-0003 §3-9의 새 fault test로 대체한다.
+  ADR-0003 '취소, quiescence, cleanup 안전 계약' 절의 새 fault test로 대체한다.
 - **host-local round exposure payload:** `RoundExposureTests`의 path/JSON과 session·policy/profile
   payload는 portability 계약으로 승격하지 않는다. PC-08의 non-overwrite·tracked rollback 의미만
   남기고 cross-machine authority는 신규 E-04 계약에서 직접 검증한다.
