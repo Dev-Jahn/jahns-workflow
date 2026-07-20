@@ -2276,6 +2276,22 @@ Fail-loud protocol boundaries.
                 with self.assertRaisesRegex(common.WorkflowError, "corrupt review binding"):
                     review.read_round_request_binding(binding_path)
 
+    def test_round_request_binding_rejects_duplicate_json_fields(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, _target, narrative = self._closed_project(Path(d))
+            self.assertEqual(review.prepare_review_request(
+                root, self.ROUND_ID, narrative), 0)
+            binding_path = next((root / "docs/reviews").glob(
+                f"{self.ROUND_ID}-request.binding*.json"))
+            shadow_target = "f" * 40
+            binding_path.write_text(binding_path.read_text().replace(
+                '"target_sha":',
+                f'"target_sha": "{shadow_target}", "target_sha":', 1))
+
+            with self.assertRaisesRegex(common.WorkflowError, "corrupt review binding"):
+                review.read_round_request_binding(
+                    binding_path, expected_round_id=self.ROUND_ID)
+
     def test_v1_binding_cutoff_includes_real_2026_07_18_artifacts(self):
         for name in (
                 "2026-07-18-carrier-lanes-request.binding.json",
@@ -5743,6 +5759,51 @@ class PendingReviewTests(unittest.TestCase):
                 self.assertEqual([row["round_id"] for row in pending], [round_id])
                 self.assertEqual(review.archived_unverifiable_reviews(root), [])
 
+    def test_binding_generation_alias_collision_demotes_settlement_to_pending_unknown(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root(d)
+            round_id = "2026-01-01-binding-alias"
+            self._request(root, round_id, "a" * 40)
+            canonical = review.write_round_request_binding(
+                root, round_id, "c" * 40, "b" * 40, ["r2"], mode="packet",
+                **self._projection_digests())
+            self.assertEqual(
+                canonical.name, f"{round_id}-request.binding-2.json")
+            self._legacy_feedback(root, round_id)
+            marker = self._settlement(root, round_id)
+            self.assertEqual(
+                _json.loads(marker.read_text())["binding_sha256"],
+                "sha256:" + hashlib.sha256(canonical.read_bytes()).hexdigest())
+            alias = canonical.with_name(f"{round_id}-request.binding-02.json")
+            alias_row = _json.loads(canonical.read_text())
+            alias_row["target_sha"] = "d" * 40
+            alias.write_text(_json.dumps(alias_row, sort_keys=True) + "\n")
+
+            dispositions = review.packet_review_dispositions(root)
+            self.assertEqual([
+                (row["round_id"], row["target_sha"], row["reviewers"], row["reason"])
+                for row in dispositions["actionable"]
+            ], [(round_id, None, [], "binding-generation-collision")])
+            self.assertEqual(dispositions["archived_unverifiable"], [])
+
+            pending_out, status_out = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(pending_out):
+                self.assertEqual(review.pending(root), 0)
+            with contextlib.redirect_stdout(status_out):
+                self.assertEqual(review.status(root, None), 0)
+            self.assertIn(
+                "1 actionable, 0 archived-unverifiable", pending_out.getvalue())
+            self.assertIn(
+                "1 actionable awaiting feedback, 0 archived-unverifiable",
+                status_out.getvalue())
+            for rendered in (pending_out.getvalue(), status_out.getvalue()):
+                self.assertIn(round_id, rendered)
+                self.assertIn("reason binding-generation-collision", rendered)
+            self.assertIsNone(review.round_request_binding_identity(alias))
+
     def test_canonical_reingest_supersedes_stale_settlement(self):
         with tempfile.TemporaryDirectory() as d:
             root = self._root(d)
@@ -5905,6 +5966,41 @@ class PendingReviewTests(unittest.TestCase):
             self.assertEqual(path, latest)
             self.assertIsNone(row)
             read.assert_called_once_with(latest, expected_round_id=round_id)
+
+    def test_latest_binding_resolver_rejects_ambiguous_candidate_names(self):
+        for suffix in ("-1", "-02", "-draft"):
+            with self.subTest(suffix=suffix), tempfile.TemporaryDirectory() as d:
+                root = self._root(d)
+                round_id = "2026-01-01-ambiguous-binding"
+                first = self._request(root, round_id, "a" * 40)
+                candidate = first.with_name(
+                    f"{round_id}-request.binding{suffix}.json")
+                candidate.write_bytes(first.read_bytes())
+
+                path, row = review.latest_round_request_binding(
+                    sorted(first.parent.glob(f"{round_id}-request.binding*.json")),
+                    expected_round_id=round_id)
+
+                self.assertIsNone(path)
+                self.assertIsNone(row)
+
+    def test_latest_binding_resolver_rejects_collision_in_stale_generation(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root(d)
+            round_id = "2026-01-01-stale-binding-collision"
+            first = self._request(root, round_id, "a" * 40)
+            review.write_round_request_binding(
+                root, round_id, "c" * 40, "b" * 40, ["r2"], mode="packet",
+                **self._projection_digests())
+            first.with_name(f"{round_id}-request.binding-1.json").write_bytes(
+                first.read_bytes())
+
+            path, row = review.latest_round_request_binding(
+                sorted(first.parent.glob(f"{round_id}-request.binding*.json")),
+                expected_round_id=round_id)
+
+            self.assertIsNone(path)
+            self.assertIsNone(row)
 
     def test_binding_sequence_outranks_raw_timestamp_strings_across_offsets(self):
         with tempfile.TemporaryDirectory() as d:

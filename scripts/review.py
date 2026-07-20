@@ -76,7 +76,7 @@ CYCLE_V1_SUPERSESSION_REASON = "latest-v1-supersedes-v2"
 CYCLE_VERSION_TIE_REASON = "v1-v2-timestamp-tie"
 CYCLE_DIGEST_ERA_V1_REASON = "digest-era-v1-freeze"
 _ROUND_REQUEST_BINDING_FILE_RE = re.compile(
-    r"^(?P<round_id>.+)-request\.binding(?:-(?P<sequence>\d+))?\.json$")
+    r"^(?P<round_id>.+)-request\.binding(?:-(?P<sequence>[1-9]\d*))?\.json$")
 _LEGACY_REVIEW_SETTLEMENT_FILE_RE = re.compile(
     r"^(?P<round_id>\d{4}-\d{2}-\d{2}-[a-z0-9][a-z0-9-]*)"
     r"(?:\.(?P<sequence>[1-9]\d*))?\.json$")
@@ -456,8 +456,8 @@ def _round_requires_digest_binding(round_id: object) -> bool:
 def read_round_request_binding(path: Path, *, expected_round_id: str | None = None) -> dict:
     """Load one request sidecar without silently accepting damaged projection evidence."""
     try:
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        data = _read_json_without_duplicate_fields(path)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as e:
         raise WorkflowError(f"corrupt review binding {path}: {type(e).__name__}") from e
     schema = data.get("schema") if isinstance(data, dict) else None
     round_id = data.get("round_id") if isinstance(data, dict) else None
@@ -515,16 +515,25 @@ def round_request_binding_identity(path: Path) -> tuple[str, int] | None:
 def latest_round_request_binding(
         paths: list[Path], *, expected_round_id: str | None = None,
 ) -> tuple[Path | None, dict | None]:
-    """Resolve the newest filename candidate first, then parse only that candidate.
+    """Resolve one unambiguous newest filename candidate, then parse only that candidate.
 
-    A corrupt newest sidecar is returned as ``(path, None)``. Older parseable bindings never
-    replace it, so callers can preserve honest-unknown state without failing unrelated rounds.
+    Every glob-visible candidate must have a canonical identity, and each logical generation must
+    have exactly one candidate. Ambiguity is returned as ``(None, None)``. A corrupt newest sidecar
+    is returned as ``(path, None)``. Older parseable bindings never replace it, so callers can
+    preserve honest-unknown state without failing unrelated rounds.
     """
     candidates = [Path(path) for path in paths]
     if not candidates:
         return None, None
-    latest = max(candidates, key=lambda path: (
-        (round_request_binding_identity(path) or ("", 1))[1], str(path)))
+    generations: dict[tuple[str, int], Path] = {}
+    for path in candidates:
+        identity = round_request_binding_identity(path)
+        if (identity is None
+                or (expected_round_id is not None and identity[0] != expected_round_id)
+                or identity in generations):
+            return None, None
+        generations[identity] = path
+    latest = max(generations.items(), key=lambda item: (item[0][1], str(item[1])))[1]
     try:
         row = read_round_request_binding(latest, expected_round_id=expected_round_id)
     except WorkflowError:
@@ -1147,11 +1156,14 @@ def packet_review_dispositions(
         binding_paths = sorted(directory.glob(f"{round_id}-request.binding*.json"))
         binding = None
         binding_path = None
+        binding_resolution_reason = None
         if binding_paths:
             # One damaged sidecar must not abort every other round's derivation — the damaged
             # round itself stays listed as pending with honest-unknown fields (binding None).
             binding_path, binding = latest_round_request_binding(
                 binding_paths, expected_round_id=round_id)
+            if binding_path is None:
+                binding_resolution_reason = "binding-generation-collision"
             if binding is not None:
                 if binding["mode"] != "packet":
                     # PR-mode rounds are completion-tracked by the PR machinery, not this
@@ -1185,7 +1197,7 @@ def packet_review_dispositions(
             continue
 
         if binding is None:
-            reason = "binding-unavailable"
+            reason = binding_resolution_reason or "binding-unavailable"
         elif projection_reason is not None:
             reason = projection_reason
         elif metadata["reviewer_coverage_reason"] in (
