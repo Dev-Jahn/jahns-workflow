@@ -6844,6 +6844,64 @@ class TaskCliTests(unittest.TestCase):
             self.assertIn("nested canonical checkout only", out.getvalue())
             self.assertFalse((linked_project / ".waystone").exists())
 
+    def test_linked_read_refuses_uninitialized_explicit_selector_before_canonical_redirect(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            repo = base / "repo"
+            linked_worktree = base / "linked"
+            canonical_project = repo / "nested-project"
+            linked_project = linked_worktree / "nested-project"
+            home = base / "home"
+            repo.mkdir()
+            home.mkdir()
+            init_repo(repo)
+            canonical_project.mkdir()
+            (canonical_project / ".waystone.yml").write_text(
+                "version: 1\nproject: canonical-decoy\n")
+            canonical = yaml.safe_load(TASKS_FIXTURE)
+            canonical_task = "canonical decoy only"
+            canonical["tasks"][0]["title"] = canonical_task
+            (canonical_project / "tasks.yaml").write_text(
+                yaml.safe_dump(canonical, sort_keys=False, allow_unicode=True))
+            self.assertEqual(git(repo, "add", "nested-project").returncode, 0)
+            self.assertEqual(git(repo, "commit", "-qm", "add canonical project").returncode, 0)
+
+            self.assertEqual(
+                git(repo, "checkout", "-q", "--orphan", "selector").returncode, 0)
+            self.assertEqual(git(repo, "rm", "-qrf", ".").returncode, 0)
+            (repo / "selector.txt").write_text("selector branch has no project config\n")
+            self.assertEqual(git(repo, "add", "selector.txt").returncode, 0)
+            self.assertEqual(git(repo, "commit", "-qm", "add selector branch").returncode, 0)
+            self.assertEqual(git(repo, "checkout", "-q", "main").returncode, 0)
+            added = git(repo, "worktree", "add", "-q", str(linked_worktree), "selector")
+            self.assertEqual(added.returncode, 0, added.stderr)
+            linked_project.mkdir()
+
+            canonical_state = canonical_project / ".waystone"
+            linked_state = linked_project / ".waystone"
+            self.assertFalse(canonical_state.exists())
+            self.assertFalse(linked_state.exists())
+
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = _run_with_home(
+                    home, lambda: tasks.main(["list", str(linked_project)]))
+
+            observed = (
+                rc,
+                canonical_task in out.getvalue(),
+                "not an initialized waystone project" in err.getvalue(),
+                linked_state.exists(),
+                (canonical_state / "lock").exists(),
+            )
+            self.assertEqual(observed, (1, False, True, False, False))
+            self.assertEqual(out.getvalue(), "")
+            self.assertFalse(canonical_state.exists())
+            self.assertFalse(linked_state.exists())
+
     def test_linked_read_refuses_unprovable_canonical_root_before_state_creation(self):
         import contextlib
         import io

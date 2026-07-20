@@ -37,7 +37,7 @@ import round  # noqa: E402  — reuse the AST-bounded text-surgery helpers
 import validate  # noqa: E402
 from common import (
     WorkflowError, canonical_scope_prefixes, find_project_root, hold_project_lock, load_tasks,
-    migrate_project_state, normalize_scope_prefix, write_text_atomic,
+    migrate_project_state, normalize_scope_prefix, require_initialized_root, write_text_atomic,
 )  # noqa: E402
 
 ARCHIVE_NAME = "tasks.archive.yaml"
@@ -465,6 +465,7 @@ def _git_checkout_context(root: Path, action: str) -> tuple[Path, Path, Path] | 
 
 def _canonical_read_root(root: Path) -> Path:
     """Normalize a linked checkout read to a proven canonical checkout before any lock write."""
+    require_initialized_root(root)
     context = _git_checkout_context(root, "task registry read")
     if context is None:
         return root
