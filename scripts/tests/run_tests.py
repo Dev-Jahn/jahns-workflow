@@ -98,6 +98,9 @@ from test_project import (
 from test_release import (
     ReleaseToMainTests,
 )
+from test_run_domain import (
+    RunDomainTests,
+)
 from test_review_protocol import (
     LockPrimitiveTests,
     LockWiringTests,
@@ -190,6 +193,7 @@ _TEST_CLASSES = (
     LaneTests,
     RoundCloseTests,
     ReleaseToMainTests,
+    RunDomainTests,
     LockPrimitiveTests,
     LockWiringTests,
     MarkerTests,
