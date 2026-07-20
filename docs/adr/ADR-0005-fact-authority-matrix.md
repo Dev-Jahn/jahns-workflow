@@ -38,6 +38,13 @@ Authority가 서로 충돌하면 최신 timestamp를 고르는 것이 아니라 
 - Git publication 계층은 같은 `run_id`에 manifest가 이미 있는지 add-only CAS로 검사한다. 같은 `run_id`와 다른 manifest digest가 관측되면 cross-machine identity conflict로 typed refusal하며 timestamp 우선이나 merge로 해소하지 않는다.
 - 따라서 generator는 전역 collision resistance, SQLite는 로컬 uniqueness, Git publication은 머신 간 충돌 검출을 맡는다. 어느 한 계층도 다른 계층의 책임을 대신했다고 주장하지 않는다.
 
+**Deviation note (2026-07-20).** 이 ADR은 권위 원천으로 적은 계획서 §5-2가 참조하는 §3-3의
+`<UTC compact timestamp>-<slug>-<6자 random>` 문법과 의도적으로 다르며 그 문법을 대체한다.
+E-09의 durable identity 원칙과 이 절의 ambient 값 조합 금지 계약에 따라 ambient 값(host
+timestamp·PID·task id)과 사람이 붙인 label(slug)의 ad hoc 조합을 identity로 삼지 않고 RFC 9562
+UUIDv7 canonical lowercase hyphenated string을 `run_id`로 삼는다. UUIDv7의 timestamp field는 정렬
+편의일 뿐 ordering·authority 근거가 아니다.
+
 ## Consequences
 
 - checkout이나 fetch 뒤 DB cache가 오래됐더라도 Git fact는 Git에서 재파생할 수 있다.
