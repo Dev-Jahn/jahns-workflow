@@ -320,6 +320,6 @@ resolved rather than guessed.
 - **Committed/project-managed files.** `docs/waystone-policy.yaml` is ordinary Git content and is
   protected by repository backup. Managed agents/hooks are created uncommitted; review and commit
   them explicitly or remove them before cleanup. Neither consent nor install performs a commit.
-- **Migration seeds — `.pre-0.9`.** Preserve legacy `.pre-0.9` roots. They remain the source for
-  lazy project-state migration and profile seeding; cleanup is intentionally outside the 0.9
-  migration.
+- **Unsupported pre-0.9 state — `.pre-0.9`.** Waystone 0.12 does not migrate or repair unresolved
+  pre-0.9 layouts. If a state check refuses one, run a released Waystone 0.11.x once on that machine
+  and project, then retry; otherwise migrate the named paths manually.

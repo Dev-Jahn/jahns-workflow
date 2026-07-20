@@ -53,7 +53,7 @@ _STATUS_DIM = "\033[38;5;245m"
 
 
 def _statusline_project_root(start: Path) -> Path | None:
-    """Find only the current config; legacy discovery would trigger rename migration on load."""
+    """Find only the current config without inspecting unsupported legacy state."""
     current = start.resolve()
     for candidate in (current, *current.parents):
         if (candidate / common.CONFIG_NAME).is_file():
@@ -87,7 +87,7 @@ def _statusline_render(data: dict, pending_count: int) -> str:
 
 
 def _statusline_main(argv: list[str]) -> int:
-    """Render without migrations, locks, state writes, subprocesses, or model calls."""
+    """Render without legacy checks, locks, state writes, subprocesses, or model calls."""
     try:
         root = _statusline_project_root(Path.cwd())
     except (OSError, RuntimeError):
@@ -584,8 +584,8 @@ def _project_main(argv: list[str]) -> int:
         return 2
 
 
-def _migrate_command_project(argv: list[str]) -> None:
-    """Run lazy Phase 2 for the project addressed by this CLI invocation, including explicit paths."""
+def _check_command_project_state(argv: list[str]) -> None:
+    """Refuse unsupported state for the project addressed by this CLI invocation."""
     candidates = [Path.cwd()]
     group, rest = argv[0], argv[1:]
     if group == "improve" and "--user-wide" in rest:
@@ -615,11 +615,11 @@ def _migrate_command_project(argv: list[str]) -> None:
             continue
         seen.add(root)
         with common.hold_project_lock(root):
-            common.migrate_project_state(root)
+            common.require_supported_project_state(root)
 
 
-def _module_handles_phase2(argv: list[str]) -> bool:
-    """Whitelist modules whose direct CLI entry point performs its own one-time lazy migration."""
+def _module_checks_project_state(argv: list[str]) -> bool:
+    """Whitelist modules whose direct CLI entry point performs its own project-state check."""
     if not argv:
         return False
     if argv[0] in {"task", "review", "delegate", "overlay", "check", "roadmap"}:
@@ -629,8 +629,8 @@ def _module_handles_phase2(argv: list[str]) -> bool:
 
 def main(argv: list[str]) -> int:
     group = argv[0] if argv else None
-    # The prompt renderer is a strict read-only fast path. It must bypass both migration phases,
-    # their locks, and machine registry parsing so legacy/outside projects remain untouched.
+    # The prompt renderer is a strict read-only fast path. It bypasses legacy state checks, their
+    # locks, and machine registry parsing so unsupported/outside projects remain untouched.
     if group == "statusline":
         try:
             return _statusline_main(argv[1:])
@@ -639,22 +639,21 @@ def main(argv: list[str]) -> int:
             return 0
     try:
         # Lock acquisition order is registry -> project -> record. Project registry verbs keep the
-        # registry lock across Phase 1, their optional Phase 2 migration, and the registry RMW so a
-        # single CLI entry acquires this lock exactly once.
+        # registry lock across state checks and registry RMW so one CLI entry acquires it once.
         if group == "project":
             with common.hold_lock(common.registry_lock_path()):
-                common.migrate_home_data()
-                _migrate_command_project(argv)
+                common.require_supported_machine_state()
+                _check_command_project_state(argv)
                 return _project_main(argv[1:])
         with common.hold_lock(common.registry_lock_path()):
-            common.migrate_home_data()
-        if argv and not _module_handles_phase2(argv):
-            _migrate_command_project(argv)
+            common.require_supported_machine_state()
+        if argv and not _module_checks_project_state(argv):
+            _check_command_project_state(argv)
     except common.WorkflowError as e:
-        print(f"waystone migration: {e}", file=sys.stderr)
+        print(f"waystone state check: {e}", file=sys.stderr)
         return 1
     except OSError as e:
-        print(f"waystone migration: filesystem failure: {e}", file=sys.stderr)
+        print(f"waystone state check: filesystem failure: {e}", file=sys.stderr)
         return 2
     if not argv:
         print(__doc__, file=sys.stderr)

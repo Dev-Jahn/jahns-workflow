@@ -3817,7 +3817,7 @@ class WaystoneStorageCliTests(unittest.TestCase):
             self.assertIn(f"project_state: {state}", human)
             self.assertEqual({p.name for p in state.iterdir()}, {".gitignore", "lock"})
 
-    def test_dispatcher_runs_lazy_migration_for_explicit_project_root(self):
+    def test_dispatcher_refuses_pre_0_9_state_for_explicit_project_root(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d) / "repo"
             outside = Path(d) / "outside"
@@ -3829,13 +3829,15 @@ class WaystoneStorageCliTests(unittest.TestCase):
             slug = common._project_slug(root)
             source = home / ".claude" / "waystone.pre-0.9" / "start_here" / f"{slug}.md"
             source.parent.mkdir(parents=True)
-            source.write_text("CLI-EXPLICIT-FRONTIER")
-            rc, _out, err = self._capture(
+            source.write_bytes(b"CLI-EXPLICIT-FRONTIER")
+            rc, out, err = self._capture(
                 home, outside, ["paths", "--root", str(root)])
-            self.assertEqual((rc, err), (0, ""))
-            self.assertEqual(
-                (root / ".waystone" / "start-here.md").read_text(), "CLI-EXPLICIT-FRONTIER")
-            self.assertFalse(source.exists())
+            self.assertEqual((rc, out), (1, ""))
+            self.assertIn("unsupported_pre_0_9_layout", err)
+            self.assertIn("0.11.x", err)
+            self.assertNotIn("Traceback", err)
+            self.assertEqual(source.read_bytes(), b"CLI-EXPLICIT-FRONTIER")
+            self.assertFalse((root / ".waystone" / "start-here.md").exists())
 
     def test_empty_state_readers_create_only_persistent_lock_state(self):
         import contextlib
@@ -6589,7 +6591,7 @@ class TaskCliTests(unittest.TestCase):
             self.assertIn("not an initialized waystone project", err.getvalue())
             self.assertFalse((plain / ".waystone").exists())
 
-    def test_mutations_refuse_linked_worktree_before_migration_but_allow_canonical_checkout(self):
+    def test_mutations_refuse_linked_worktree_before_state_check_but_allow_canonical_checkout(self):
         import contextlib
         import io
         from unittest import mock
@@ -6635,7 +6637,7 @@ class TaskCliTests(unittest.TestCase):
                     "GIT_COMMON_DIR": str(root / ".git"),
                 }),
             ]
-            with mock.patch.object(tasks, "migrate_project_state") as migrate:
+            with mock.patch.object(tasks, "migrate_project_state") as state_check:
                 for label, argv, cwd, git_env in attempts:
                     with self.subTest(label=label), mock.patch.dict(os.environ, git_env):
                         rc, _out, err = invoke(argv, cwd)
@@ -6645,7 +6647,7 @@ class TaskCliTests(unittest.TestCase):
                         self.assertEqual((linked / "tasks.yaml").read_text(), before)
                         self.assertEqual((root / "tasks.yaml").read_text(), before)
                         self.assertFalse((linked / ".waystone").exists())
-            migrate.assert_not_called()
+            state_check.assert_not_called()
 
             rc, _out, err = invoke(["set", "feat/alpha", "status", "done"], root)
             self.assertEqual(rc, 0, err)
@@ -6885,28 +6887,6 @@ class UninitializedRootGateTests(unittest.TestCase):
                 self.assertEqual(git(
                     root, "check-ignore", "--quiet",
                     ".waystone/codex-runner-verified").returncode, 0)
-
-    def test_migration_raw_state_uses_atomic_helper_without_following_ignore_symlink(self):
-        from unittest import mock
-
-        with tempfile.TemporaryDirectory() as d:
-            root = Path(d) / "repo"
-            state = root / ".waystone"
-            state.mkdir(parents=True)
-            external = Path(d) / "external-ignore"
-            external.write_text("external\n")
-            ignore = state / ".gitignore"
-            ignore.symlink_to(external)
-
-            with mock.patch.object(
-                    common, "_ensure_project_self_ignore",
-                    wraps=common._ensure_project_self_ignore) as ensure_ignore:
-                self.assertEqual(common._ensure_project_state_raw(root), state)
-
-            ensure_ignore.assert_called_once_with(state)
-            self.assertEqual(external.read_text(), "external\n")
-            self.assertFalse(ignore.is_symlink())
-            self.assertEqual(ignore.read_text(), "*\n")
 
     def test_delegate_entry_point_is_gated_via_the_same_chokepoint(self):
         import contextlib
@@ -17804,261 +17784,7 @@ class ContractInjectTests(unittest.TestCase):
             self.assertLessEqual(len("\n".join(block)), 1300)
 
 
-class MigrationV2Phase1Tests(unittest.TestCase):
-    def _run(self, home: Path, fn, *, codex_home: Path | None = None,
-             waystone_home: Path | None = None, host: str | None = None):
-        import os
-
-        updates = {
-            "CODEX_HOME": str(codex_home) if codex_home is not None else None,
-            "WAYSTONE_HOME": str(waystone_home) if waystone_home is not None else None,
-            "WAYSTONE_HOST": host,
-        }
-        before = {name: os.environ.get(name) for name in updates}
-        try:
-            for name, value in updates.items():
-                if value is None:
-                    os.environ.pop(name, None)
-                else:
-                    os.environ[name] = value
-            return _run_with_home(home, fn, isolate_storage=False)
-        finally:
-            for name, value in before.items():
-                if value is None:
-                    os.environ.pop(name, None)
-                else:
-                    os.environ[name] = value
-
-    def test_registry_union_reports_every_entry_and_codex_host_runs_it(self):
-        import contextlib
-        import io
-        import waystone
-
-        with tempfile.TemporaryDirectory() as d:
-            d = Path(d)
-            home = d / "home"
-            codex_home = d / "codex-home"
-            machine = d / "machine"
-            claude = home / ".claude" / "waystone"
-            codex = codex_home / "waystone"
-            claude.mkdir(parents=True)
-            codex.mkdir(parents=True)
-            local = str(d / "local")
-            (claude / "projects.json").write_text(_json.dumps({"projects": [
-                {"name": "local-primary", "path": local},
-                {"name": "remote-primary", "repo": "org/primary"},
-            ]}))
-            (codex / "projects.json").write_text(_json.dumps({"projects": [
-                {"name": "local-secondary", "path": local},
-                {"name": "remote-secondary", "repo": "org/secondary"},
-            ]}))
-            err = io.StringIO()
-            with contextlib.redirect_stderr(err):
-                rc = self._run(
-                    home, lambda: waystone.main([]), codex_home=codex_home,
-                    waystone_home=machine, host="codex")
-            self.assertEqual(rc, 1)
-            self.assertEqual(_json.loads((machine / "projects.json").read_text())["projects"], [
-                {"name": "local-primary", "path": local},
-                {"name": "remote-primary", "repo": "org/primary"},
-                {"name": "remote-secondary", "repo": "org/secondary"},
-            ])
-            report = err.getvalue()
-            for label in ("local-primary", "remote-primary", "local-secondary", "remote-secondary"):
-                self.assertIn(label, report)
-            self.assertTrue((home / ".claude" / "waystone.pre-0.9" / "projects.json").is_file())
-            self.assertTrue((codex_home / "waystone.pre-0.9" / "projects.json").is_file())
-
-    def test_registry_migration_union_rejects_canonical_alias_collision(self):
-        with tempfile.TemporaryDirectory() as d:
-            d = Path(d)
-            home = d / "home"
-            codex_home = d / "codex-home"
-            claude = home / ".claude" / "waystone"
-            codex = codex_home / "waystone"
-            claude.mkdir(parents=True)
-            codex.mkdir(parents=True)
-            first = (d / "first").resolve()
-            collision = (d / "collision").resolve()
-            (claude / "projects.json").write_text(_json.dumps({"projects": [{
-                "name": "first", "path": str(first), "aliases": [str(collision)],
-            }]}))
-            (codex / "projects.json").write_text(_json.dumps({"projects": [{
-                "name": "second", "path": str(collision),
-            }]}))
-
-            with self.assertRaisesRegex(common.WorkflowError, "already belongs to"):
-                self._run(
-                    home, lambda: common.migrate_home_data(home), codex_home=codex_home)
-
-            self.assertFalse((home / ".waystone" / "projects.json").exists())
-            self.assertTrue((claude / "projects.json").is_file())
-            self.assertTrue((codex / "projects.json").is_file())
-
-    def test_decisions_concat_is_timestamp_sorted_and_codex_projection_is_preserved(self):
-        import contextlib
-        import io
-
-        with tempfile.TemporaryDirectory() as d:
-            d = Path(d)
-            home = d / "home"
-            codex_home = d / "codex-home"
-            claude_improve = home / ".claude" / "waystone" / "improve"
-            codex_improve = codex_home / "waystone" / "improve"
-            claude_improve.mkdir(parents=True)
-            codex_improve.mkdir(parents=True)
-            _write_jsonl(claude_improve / "decisions.jsonl", [
-                {"rec_id": "later", "at": "2026-07-15T02:00:00Z"},
-            ])
-            _write_jsonl(codex_improve / "decisions.jsonl", [
-                {"rec_id": "earlier", "at": "2026-07-15T01:00:00Z"},
-            ])
-            (claude_improve / "sessions.jsonl").write_text("claude projection\n")
-            (codex_improve / "sessions.jsonl").write_text("codex projection\n")
-            err = io.StringIO()
-            with contextlib.redirect_stderr(err):
-                self._run(home, lambda: common.migrate_home_data(home), codex_home=codex_home)
-            rows = [
-                _json.loads(line)
-                for line in (home / ".waystone" / "improve" / "decisions.jsonl")
-                .read_text().splitlines()
-            ]
-            self.assertEqual([row["rec_id"] for row in rows], ["earlier", "later"])
-            self.assertEqual(
-                (home / ".waystone" / "improve" / "sessions.jsonl").read_text(),
-                "claude projection\n")
-            self.assertEqual(
-                (codex_home / "waystone.pre-0.9" / "improve" / "sessions.jsonl").read_text(),
-                "codex projection\n")
-            self.assertIn("2 decision row", err.getvalue())
-            self.assertIn("waystone improve trace --host codex", err.getvalue())
-
-    def test_decisions_merge_marker_prevents_duplicate_rows_after_interruption(self):
-        with tempfile.TemporaryDirectory() as d:
-            d = Path(d)
-            home = d / "home"
-            source = home / ".claude" / "waystone" / "improve" / "decisions.jsonl"
-            source.parent.mkdir(parents=True)
-            _write_jsonl(source, [{"rec_id": "one", "at": "2026-07-15T01:00:00Z"}])
-            original = common._preserve_phase1_root
-            common._preserve_phase1_root = lambda _root: (_ for _ in ()).throw(
-                RuntimeError("injected after decisions merge"))
-            try:
-                with self.assertRaisesRegex(RuntimeError, "injected"):
-                    self._run(home, lambda: common.migrate_home_data(home))
-            finally:
-                common._preserve_phase1_root = original
-
-            destination = home / ".waystone" / "improve"
-            self.assertEqual(len(list(destination.glob(".merged-*"))), 1)
-            self._run(home, lambda: common.migrate_home_data(home))
-            rows = (destination / "decisions.jsonl").read_text().splitlines()
-            self.assertEqual(len(rows), 1)
-            self.assertEqual(_json.loads(rows[0])["rec_id"], "one")
-
-    def test_decisions_merge_preserves_legitimate_duplicate_rows(self):
-        with tempfile.TemporaryDirectory() as d:
-            d = Path(d)
-            home = d / "home"
-            row = {"rec_id": "same", "at": "2026-07-15T01:00:00Z"}
-            for host in (".claude", ".codex"):
-                source = home / host / "waystone" / "improve" / "decisions.jsonl"
-                source.parent.mkdir(parents=True)
-                _write_jsonl(source, [row])
-
-            self._run(home, lambda: common.migrate_home_data(home))
-
-            lines = (home / ".waystone" / "improve" / "decisions.jsonl").read_text().splitlines()
-            self.assertEqual([_json.loads(line) for line in lines], [row, row])
-
-    def test_profile_stays_preserved_worktrees_stay_at_original_path_and_orphans_report(self):
-        import contextlib
-        import io
-
-        with tempfile.TemporaryDirectory() as d:
-            d = Path(d)
-            home = d / "home"
-            root = d / "repo"
-            root.mkdir()
-            init_repo(root)
-            legacy = home / ".claude" / "waystone"
-            slug = common._project_slug(root)
-            (legacy / "delegations" / slug / "did-known").mkdir(parents=True)
-            (legacy / "delegations" / "unmapped-slug" / "did-orphan").mkdir(parents=True)
-            old_worktree = legacy / "worktrees" / slug / "did-known"
-            old_worktree.parent.mkdir(parents=True)
-            self.assertEqual(
-                git(root, "worktree", "add", "--detach", str(old_worktree), "HEAD").returncode, 0)
-            profile = "bindings:\n  verifier: {execution: external-runner, backend: 'codex:gpt-test'}\n"
-            (legacy / "profile.yml").write_text(profile)
-            (legacy / "projects.json").write_text(_json.dumps({"projects": [
-                {"name": "demo", "path": str(root)},
-            ]}))
-            err = io.StringIO()
-            with contextlib.redirect_stderr(err):
-                self._run(home, lambda: common.migrate_home_data(home))
-            preserved = home / ".claude" / "waystone.pre-0.9"
-            self.assertEqual((preserved / "profile.yml").read_text(), profile)
-            self.assertFalse((home / ".waystone" / "profile.yml").exists())
-            self.assertTrue(old_worktree.is_dir())
-            self.assertEqual(git(old_worktree, "status", "--porcelain").returncode, 0)
-            self.assertTrue(legacy.is_dir())
-            self.assertEqual([p.name for p in legacy.iterdir()], ["worktrees"])
-            self.assertIn("unmapped-slug", err.getvalue())
-            second = io.StringIO()
-            with contextlib.redirect_stderr(second):
-                self._run(home, lambda: common.migrate_home_data(home))
-            self.assertEqual(second.getvalue(), "")
-            self.assertEqual(git(old_worktree, "status", "--porcelain").returncode, 0)
-
-    def test_symlinked_legacy_root_is_rejected_without_touching_target(self):
-        with tempfile.TemporaryDirectory() as d:
-            d = Path(d)
-            home = d / "home"
-            external = d / "external"
-            external.mkdir()
-            projects = external / "projects.json"
-            projects.write_text(_json.dumps({"projects": [{"repo": "org/external"}]}))
-            legacy = home / ".claude" / "waystone"
-            legacy.parent.mkdir(parents=True)
-            legacy.symlink_to(external, target_is_directory=True)
-
-            with self.assertRaises(common.WorkflowError) as cm:
-                self._run(home, lambda: common.migrate_home_data(home))
-
-            self.assertIn("symlink", str(cm.exception).lower())
-            self.assertTrue(legacy.is_symlink())
-            self.assertEqual(projects.read_text(), _json.dumps({"projects": [{"repo": "org/external"}]}))
-            self.assertFalse((home / ".waystone" / "projects.json").exists())
-
-    def test_plain_legacy_root_is_rechecked_for_version_skew(self):
-        with tempfile.TemporaryDirectory() as d:
-            d = Path(d)
-            home = d / "home"
-            first = home / ".claude" / "waystone"
-            first.mkdir(parents=True)
-            (first / "projects.json").write_text(_json.dumps({"projects": [
-                {"name": "first", "repo": "org/first"},
-            ]}))
-            self._run(home, lambda: common.migrate_home_data(home))
-            second = home / ".claude" / "waystone"
-            second.mkdir(parents=True, exist_ok=True)
-            (second / "projects.json").write_text(_json.dumps({"projects": [
-                {"name": "second", "repo": "org/second"},
-            ]}))
-            self._run(home, lambda: common.migrate_home_data(home))
-            projects = _json.loads((home / ".waystone" / "projects.json").read_text())["projects"]
-            self.assertEqual([entry["name"] for entry in projects], ["first", "second"])
-            self.assertFalse(second.exists())
-
-
-class MigrationV2Phase2Tests(unittest.TestCase):
-    PROFILE = (
-        "schema: waystone-profile-1\nbindings:\n"
-        "  implementer: {execution: external-runner, backend: 'codex:gpt-test'}\n"
-        "  verifier: {execution: external-runner, backend: 'codex:gpt-test'}\n"
-    )
-
+class MigrationSunsetTests(unittest.TestCase):
     def _project(self, d: Path) -> tuple[Path, Path]:
         root = d / "repo"
         root.mkdir()
@@ -18069,496 +17795,73 @@ class MigrationV2Phase2Tests(unittest.TestCase):
         home.mkdir()
         return root, home
 
-    def _source(self, home: Path, host: str, *, plain: bool = False) -> Path:
-        base = home / (".claude" if host == "claude" else ".codex")
-        return base / ("waystone" if plain else "waystone.pre-0.9")
-
-    def test_profile_seeds_without_consuming_or_removing_execution(self):
-        import contextlib
-        import io
-
+    def test_pre_0_9_layout_is_refused_with_0_11_x_guidance(self):
         with tempfile.TemporaryDirectory() as d:
             root, home = self._project(Path(d))
-            for host in ("claude", "codex"):
-                source = self._source(home, host)
-                source.mkdir(parents=True)
-                (source / "profile.yml").write_text(self.PROFILE)
-            err = io.StringIO()
-            with contextlib.redirect_stderr(err):
+            source = (home / ".claude" / "waystone.pre-0.9" / "start_here" /
+                      f"{common._project_slug(root)}.md")
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"LEGACY-FRONTIER")
+
+            with self.assertRaises(common.Pre09StateError) as raised:
                 _run_with_home(home, lambda: common.migrate_project_state(root))
-            self.assertEqual((root / ".waystone" / "profile.yml").read_text(), self.PROFILE)
-            self.assertIn("execution: external-runner", (root / ".waystone" / "profile.yml").read_text())
-            for host in ("claude", "codex"):
-                self.assertEqual((self._source(home, host) / "profile.yml").read_text(), self.PROFILE)
-            self.assertIn("seeded", err.getvalue())
 
-    def test_profile_seed_recovers_after_atomic_replace_commits_then_raises(self):
+            message = str(raised.exception)
+            self.assertIn("unsupported_pre_0_9_layout", message)
+            self.assertIn("pre-0.9", message)
+            self.assertIn("0.11.x", message)
+            self.assertIn(str(source), message)
+            self.assertEqual(source.read_bytes(), b"LEGACY-FRONTIER")
+            self.assertFalse((root / ".waystone").exists())
+
+    def test_plain_machine_state_is_refused_without_registry_merge(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d) / "home"
+            source = home / ".codex" / "waystone" / "projects.json"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b'{"projects": [{"repo": "org/legacy"}]}')
+
+            with self.assertRaises(common.Pre09StateError) as raised:
+                _run_with_home(home, common.migrate_home_data)
+
+            self.assertIn("0.11.x", str(raised.exception))
+            self.assertIn(str(source), str(raised.exception))
+            self.assertEqual(source.read_bytes(), b'{"projects": [{"repo": "org/legacy"}]}')
+            self.assertFalse((home / ".waystone" / "projects.json").exists())
+
+    def test_pending_worktree_marker_is_refused_without_repair(self):
         with tempfile.TemporaryDirectory() as d:
             root, home = self._project(Path(d))
-            source = self._source(home, "claude")
-            source.mkdir(parents=True)
-            profile = source / "profile.yml"
-            profile.write_text(self.PROFILE)
-            live = (root / ".waystone" / "profile.yml").resolve()
-            original = common.os.replace
+            marker = (home / ".waystone" / "cache" / "worktrees" /
+                      common._project_slug(root) / "did-pending.migrating")
+            marker.parent.mkdir(parents=True)
+            marker.write_bytes(b"/legacy/worktree/did-pending")
 
-            def replace_then_raise(old, new):
-                original(old, new)
-                if Path(new) == live:
-                    raise RuntimeError("injected after profile replace")
-
-            common.os.replace = replace_then_raise
-            try:
-                with self.assertRaisesRegex(RuntimeError, "injected"):
-                    _run_with_home(home, lambda: common.migrate_project_state(root))
-            finally:
-                common.os.replace = original
-
-            self.assertEqual(live.read_text(), self.PROFILE)
-            self.assertEqual(profile.read_text(), self.PROFILE)
-            _run_with_home(home, lambda: common.migrate_project_state(root))
-            self.assertEqual(live.read_text(), self.PROFILE)
-            self.assertEqual(profile.read_text(), self.PROFILE)
-
-    def test_different_host_profiles_fail_loud_without_writing(self):
-        with tempfile.TemporaryDirectory() as d:
-            root, home = self._project(Path(d))
-            claude = self._source(home, "claude")
-            codex = self._source(home, "codex")
-            claude.mkdir(parents=True)
-            codex.mkdir(parents=True)
-            (claude / "profile.yml").write_text(self.PROFILE)
-            (codex / "profile.yml").write_text(self.PROFILE.replace("gpt-test", "gpt-other"))
-            with self.assertRaises(common.WorkflowError) as cm:
+            with self.assertRaises(common.Pre09StateError) as raised:
                 _run_with_home(home, lambda: common.migrate_project_state(root))
-            self.assertIn("profile", str(cm.exception))
-            self.assertIn(str(claude / "profile.yml"), str(cm.exception))
-            self.assertIn(str(codex / "profile.yml"), str(cm.exception))
-            self.assertFalse((root / ".waystone" / "profile.yml").exists())
 
-    def test_staged_legacy_profile_conflict_fails_even_when_live_exists(self):
+            self.assertIn(str(marker), str(raised.exception))
+            self.assertIn("does not migrate or repair", str(raised.exception))
+            self.assertEqual(marker.read_bytes(), b"/legacy/worktree/did-pending")
+
+    def test_completed_0_11_seed_and_empty_scaffolding_are_accepted(self):
         with tempfile.TemporaryDirectory() as d:
             root, home = self._project(Path(d))
-            first = self._source(home, "claude")
-            first.mkdir(parents=True)
-            (first / "profile.yml").write_text(self.PROFILE)
-            _run_with_home(home, lambda: common.migrate_project_state(root))
+            profile = b"schema: waystone-profile-1\nbindings: {}\n"
             live = root / ".waystone" / "profile.yml"
-            self.assertEqual(live.read_text(), self.PROFILE)
-
-            reentry = self._source(home, "codex", plain=True)
-            reentry.mkdir(parents=True)
-            conflicting = self.PROFILE.replace("gpt-test", "gpt-other")
-            incoming = reentry / "profile.yml"
-            incoming.write_text(conflicting)
-
-            with self.assertRaises(common.WorkflowError) as cm:
-                _run_with_home(home, lambda: common.migrate_project_state(root))
-
-            self.assertIn("profile", str(cm.exception))
-            self.assertEqual(live.read_text(), self.PROFILE)
-            self.assertEqual(incoming.read_text(), conflicting)
-
-    def test_symlinked_project_state_is_rejected_without_external_write(self):
-        with tempfile.TemporaryDirectory() as d:
-            root, home = self._project(Path(d))
+            live.parent.mkdir()
+            live.write_bytes(profile)
             slug = common._project_slug(root)
-            source = self._source(home, "claude") / "start_here" / f"{slug}.md"
-            source.parent.mkdir(parents=True)
-            source.write_text("keep")
-            external = Path(d) / "external-state"
-            external.mkdir()
-            (root / ".waystone").symlink_to(external, target_is_directory=True)
+            for host in (".claude", ".codex"):
+                preserved = home / host / "waystone.pre-0.9"
+                preserved.mkdir(parents=True)
+                (preserved / "profile.yml").write_bytes(profile)
+                (preserved / "projects.json").write_text('{"projects": []}')
+            (home / ".claude" / "waystone" / "worktrees" / slug).mkdir(parents=True)
 
-            with self.assertRaises(common.WorkflowError) as cm:
-                _run_with_home(home, lambda: common.migrate_project_state(root))
-
-            self.assertIn("symlink", str(cm.exception).lower())
-            self.assertEqual(source.read_text(), "keep")
-            self.assertEqual(list(external.iterdir()), [])
-
-    def test_symlinked_legacy_slug_and_delegation_record_are_rejected(self):
-        for target_kind in ("slug", "record"):
-            with self.subTest(target_kind=target_kind), tempfile.TemporaryDirectory() as d:
-                root, home = self._project(Path(d))
-                slug = common._project_slug(root)
-                external = Path(d) / "external"
-                external.mkdir()
-                sentinel = external / "sentinel.json"
-                sentinel.write_text("keep")
-                source = self._source(home, "claude")
-                if target_kind == "slug":
-                    link = source / "overlay" / slug
-                else:
-                    link = source / "delegations" / slug / "did-link"
-                link.parent.mkdir(parents=True)
-                link.symlink_to(external, target_is_directory=True)
-
-                with self.assertRaises(common.WorkflowError) as cm:
-                    _run_with_home(home, lambda: common.migrate_project_state(root))
-
-                self.assertIn("symlink", str(cm.exception).lower())
-                self.assertTrue(link.is_symlink())
-                self.assertEqual(sentinel.read_text(), "keep")
-                self.assertFalse((root / ".waystone").exists())
-
-    def test_unique_path_treats_dangling_symlink_as_occupied(self):
-        with tempfile.TemporaryDirectory() as d:
-            target = Path(d) / "conflict.json"
-            target.symlink_to(Path(d) / "missing.json")
-            self.assertEqual(common._unique_path(target), Path(d) / "conflict.2.json")
-
-    def test_same_overlay_rule_across_hosts_fails_before_moving(self):
-        with tempfile.TemporaryDirectory() as d:
-            root, home = self._project(Path(d))
-            slug = common._project_slug(root)
-            paths = []
-            for host, delta_id in (("claude", "alpha"), ("codex", "beta")):
-                path = self._source(home, host) / "overlay" / slug / "deltas" / f"{delta_id}.json"
-                path.parent.mkdir(parents=True)
-                path.write_text(_json.dumps({"id": delta_id, "rule": "same-rule"}))
-                paths.append(path)
-            with self.assertRaises(common.WorkflowError) as cm:
-                _run_with_home(home, lambda: common.migrate_project_state(root))
-            self.assertIn("same-rule", str(cm.exception))
-            self.assertTrue(all(path.is_file() for path in paths))
-            self.assertFalse((root / ".waystone" / "overlay").exists())
-
-    def test_staged_overlay_rule_conflict_with_live_fails_and_preserves_source(self):
-        with tempfile.TemporaryDirectory() as d:
-            root, home = self._project(Path(d))
-            slug = common._project_slug(root)
-            first = self._source(home, "claude") / "overlay" / slug / "deltas" / "alpha.json"
-            first.parent.mkdir(parents=True)
-            first.write_text(_json.dumps({"id": "alpha", "rule": "same-rule", "state": "warning"}))
-            _run_with_home(home, lambda: common.migrate_project_state(root))
-            live = root / ".waystone" / "overlay" / "deltas" / "alpha.json"
-            live_body = live.read_bytes()
-
-            incoming = (self._source(home, "codex", plain=True) / "overlay" / slug /
-                        "deltas" / "beta.json")
-            incoming.parent.mkdir(parents=True)
-            incoming.write_text(
-                _json.dumps({"id": "beta", "rule": "same-rule", "state": "suspended"}))
-
-            with self.assertRaises(common.WorkflowError) as cm:
-                _run_with_home(home, lambda: common.migrate_project_state(root))
-
-            self.assertIn("same-rule", str(cm.exception))
-            self.assertEqual(live.read_bytes(), live_body)
-            self.assertTrue(incoming.is_file())
-            self.assertFalse((live.parent / "beta.json").exists())
-
-    def test_staged_byte_identical_overlay_rule_cleans_incoming_source(self):
-        with tempfile.TemporaryDirectory() as d:
-            root, home = self._project(Path(d))
-            slug = common._project_slug(root)
-            first = self._source(home, "claude") / "overlay" / slug / "deltas" / "alpha.json"
-            first.parent.mkdir(parents=True)
-            first.write_text(_json.dumps({"id": "alpha", "rule": "same-rule"}))
-            _run_with_home(home, lambda: common.migrate_project_state(root))
-            live = root / ".waystone" / "overlay" / "deltas" / "alpha.json"
-            live_body = live.read_bytes()
-
-            incoming = (self._source(home, "codex", plain=True) / "overlay" / slug /
-                        "deltas" / "copy.json")
-            incoming.parent.mkdir(parents=True)
-            incoming.write_bytes(live.read_bytes())
-            _run_with_home(home, lambda: common.migrate_project_state(root))
-
-            self.assertFalse(incoming.exists())
-            self.assertFalse((live.parent / "copy.json").exists())
-            self.assertEqual(live.read_bytes(), live_body)
-
-    def test_newer_general_conflict_wins_and_loser_is_quarantined(self):
-        import contextlib
-        import io
-        import os
-
-        with tempfile.TemporaryDirectory() as d:
-            root, home = self._project(Path(d))
-            slug = common._project_slug(root)
-            older = self._source(home, "claude") / "start_here" / f"{slug}.md"
-            newer = self._source(home, "codex", plain=True) / "start_here" / f"{slug}.md"
-            older.parent.mkdir(parents=True)
-            newer.parent.mkdir(parents=True)
-            older.write_text("older")
-            newer.write_text("newer")
-            os.utime(older, ns=(1_000_000_000, 1_000_000_000))
-            os.utime(newer, ns=(2_000_000_000, 2_000_000_000))
-            err = io.StringIO()
-            with contextlib.redirect_stderr(err):
-                _run_with_home(home, lambda: common.migrate_project_state(root))
-            self.assertEqual((root / ".waystone" / "start-here.md").read_text(), "newer")
-            quarantined = list((root / ".waystone" / "migration-conflicts" / "claude").rglob("*"))
-            self.assertTrue(any(path.is_file() and path.read_text() == "older" for path in quarantined))
-            self.assertFalse(older.exists())
-            self.assertFalse(newer.exists())
-            self.assertIn("conflict", err.getvalue().lower())
-
-    def test_file_move_recovers_after_atomic_replace_commits_then_raises(self):
-        with tempfile.TemporaryDirectory() as d:
-            root, home = self._project(Path(d))
-            slug = common._project_slug(root)
-            source = self._source(home, "claude") / "start_here" / f"{slug}.md"
-            source.parent.mkdir(parents=True)
-            source.write_text("frontier")
-            live = (root / ".waystone" / "start-here.md").resolve()
-            original = common.os.replace
-
-            def replace_then_raise(old, new):
-                original(old, new)
-                if Path(new) == live:
-                    raise RuntimeError("injected after file replace")
-
-            common.os.replace = replace_then_raise
-            try:
-                with self.assertRaisesRegex(RuntimeError, "injected"):
-                    _run_with_home(home, lambda: common.migrate_project_state(root))
-            finally:
-                common.os.replace = original
-
-            self.assertEqual(live.read_text(), "frontier")
-            self.assertEqual(source.read_text(), "frontier")
-            _run_with_home(home, lambda: common.migrate_project_state(root))
-            self.assertEqual(live.read_text(), "frontier")
-            self.assertFalse(source.exists())
-            conflicts = root / ".waystone" / "migration-conflicts"
-            self.assertFalse(conflicts.exists() and any(
-                path.is_file() and path.read_text() == "frontier"
-                for path in conflicts.rglob("*")))
-
-    def test_phase2_is_self_extinguishing_and_second_run_changes_nothing(self):
-        with tempfile.TemporaryDirectory() as d:
-            root, home = self._project(Path(d))
-            slug = common._project_slug(root)
-            source = self._source(home, "claude")
-            start = source / "start_here" / f"{slug}.md"
-            start.parent.mkdir(parents=True)
-            start.write_text("frontier")
-            source.mkdir(parents=True, exist_ok=True)
-            (source / "profile.yml").write_text(self.PROFILE)
-            _run_with_home(home, lambda: common.migrate_project_state(root))
-
-            def snapshot():
-                return {
-                    str(path.relative_to(root)): (path.read_bytes(), path.stat().st_mtime_ns)
-                    for path in root.rglob("*") if path.is_file()
-                }
-
-            first = snapshot()
-            _run_with_home(home, lambda: common.migrate_project_state(root))
-            self.assertEqual(snapshot(), first)
-            self.assertFalse(start.exists())
-            self.assertTrue((source / "profile.yml").is_file())
-
-    def test_delegation_slug_is_removed_and_cross_host_did_collision_is_skipped(self):
-        import contextlib
-        import io
-
-        with tempfile.TemporaryDirectory() as d:
-            root, home = self._project(Path(d))
-            slug = common._project_slug(root)
-            unique = self._source(home, "claude") / "delegations" / slug / "did-unique"
-            unique.mkdir(parents=True)
-            (unique / "exposure.json").write_text(_json.dumps({"task_id": "feat/unique"}))
-            collisions = []
-            for host in ("claude", "codex"):
-                record = self._source(home, host) / "delegations" / slug / "did-collision"
-                record.mkdir(parents=True)
-                (record / "exposure.json").write_text(_json.dumps({"task_id": f"feat/{host}"}))
-                collisions.append(record)
-            err = io.StringIO()
-            with contextlib.redirect_stderr(err):
-                _run_with_home(home, lambda: common.migrate_project_state(root))
-            self.assertTrue((root / ".waystone" / "delegations" / "did-unique" /
-                             "exposure.json").is_file())
-            self.assertFalse(unique.exists())
-            self.assertFalse((root / ".waystone" / "delegations" / "did-collision").exists())
-            self.assertTrue(all(record.is_dir() for record in collisions))
-            self.assertIn("did-collision", err.getvalue())
-            self.assertIn("skipped", err.getvalue())
-
-    def test_staged_different_live_did_skips_and_preserves_whole_record(self):
-        import contextlib
-        import io
-
-        with tempfile.TemporaryDirectory() as d:
-            root, home = self._project(Path(d))
-            slug = common._project_slug(root)
-            first = self._source(home, "claude") / "delegations" / slug / "did-staged"
-            first.mkdir(parents=True)
-            (first / "exposure.json").write_text(_json.dumps({"task_id": "feat/demo"}))
-            (first / "status.json").write_text(_json.dumps({"state": "needs-review"}))
-            _run_with_home(home, lambda: common.migrate_project_state(root))
-            live = root / ".waystone" / "delegations" / "did-staged"
-            before = {
-                path.relative_to(live): path.read_bytes()
-                for path in live.rglob("*") if path.is_file()
-            }
-
-            incoming = (self._source(home, "codex", plain=True) / "delegations" / slug /
-                        "did-staged")
-            incoming.mkdir(parents=True)
-            (incoming / "exposure.json").write_text(_json.dumps({"task_id": "feat/demo"}))
-            (incoming / "status.json").write_text(_json.dumps({"state": "failed"}))
-            (incoming / "incoming-only.json").write_text(_json.dumps({"keep": True}))
-            err = io.StringIO()
-            with contextlib.redirect_stderr(err):
-                _run_with_home(home, lambda: common.migrate_project_state(root))
-
-            after = {
-                path.relative_to(live): path.read_bytes()
-                for path in live.rglob("*") if path.is_file()
-            }
-            self.assertEqual(after, before)
-            self.assertTrue((incoming / "exposure.json").is_file())
-            self.assertTrue((incoming / "status.json").is_file())
-            self.assertTrue((incoming / "incoming-only.json").is_file())
-            self.assertIn("did-staged", err.getvalue())
-            self.assertIn("skipped", err.getvalue())
-
-    def test_staged_byte_identical_live_did_removes_source_as_one_record(self):
-        with tempfile.TemporaryDirectory() as d:
-            root, home = self._project(Path(d))
-            slug = common._project_slug(root)
-            first = self._source(home, "claude") / "delegations" / slug / "did-identical"
-            first.mkdir(parents=True)
-            (first / "exposure.json").write_text(_json.dumps({"task_id": "feat/demo"}))
-            (first / "status.json").write_text(_json.dumps({"state": "needs-review"}))
-            _run_with_home(home, lambda: common.migrate_project_state(root))
-            live = root / ".waystone" / "delegations" / "did-identical"
-
-            incoming = (self._source(home, "codex", plain=True) / "delegations" / slug /
-                        "did-identical")
-            incoming.mkdir(parents=True)
-            for path in live.iterdir():
-                if path.is_file():
-                    (incoming / path.name).write_bytes(path.read_bytes())
-            _run_with_home(home, lambda: common.migrate_project_state(root))
-
-            self.assertFalse(incoming.exists())
-            empty_copy = (root / ".waystone" / "migration-conflicts" / "codex" /
-                          "empty-sources" / "delegations" / "did-identical")
-            self.assertFalse(empty_copy.exists())
-
-    def _legacy_record_and_worktree(self, root: Path, home: Path, did: str):
-        slug = common._project_slug(root)
-        record = self._source(home, "claude") / "delegations" / slug / did
-        record.mkdir(parents=True)
-        (record / "exposure.json").write_text(_json.dumps({"task_id": "feat/demo"}))
-        (record / "status.json").write_text(_json.dumps({"state": "needs-review"}))
-        worktree = self._source(home, "claude", plain=True) / "worktrees" / slug / did
-        return slug, record, worktree
-
-    def test_worktree_uses_git_move_first(self):
-        with tempfile.TemporaryDirectory() as d:
-            root, home = self._project(Path(d))
-            slug, _record, old = self._legacy_record_and_worktree(root, home, "did-move")
-            old.parent.mkdir(parents=True, exist_ok=True)
-            self.assertEqual(git(root, "worktree", "add", "--detach", str(old), "HEAD").returncode, 0)
-            _run_with_home(home, lambda: common.migrate_project_state(root))
-            new = home / ".waystone" / "cache" / "worktrees" / slug / "did-move"
-            self.assertTrue(new.is_dir())
-            self.assertFalse(old.exists())
-            self.assertEqual(git(new, "status", "--porcelain").returncode, 0)
-            listing = git(root, "worktree", "list", "--porcelain").stdout
-            self.assertIn(str(new), listing)
-            self.assertNotIn(str(old), listing)
-
-    def test_worktree_move_failure_uses_filesystem_move_then_real_repair(self):
-        with tempfile.TemporaryDirectory() as d:
-            root, home = self._project(Path(d))
-            slug, _record, old = self._legacy_record_and_worktree(root, home, "did-repair")
-            old.parent.mkdir(parents=True, exist_ok=True)
-            self.assertEqual(git(root, "worktree", "add", "--detach", str(old), "HEAD").returncode, 0)
-            original = common.git_rc
-
-            def fake_git_rc(project, *args):
-                if args[:2] == ("worktree", "move"):
-                    return 1, "", "move failed"
-                return original(project, *args)
-
-            common.git_rc = fake_git_rc
-            try:
-                _run_with_home(home, lambda: common.migrate_project_state(root))
-            finally:
-                common.git_rc = original
-            new = home / ".waystone" / "cache" / "worktrees" / slug / "did-repair"
-            self.assertEqual(git(new, "rev-parse", "--git-dir").returncode, 0)
-            listing = git(root, "worktree", "list", "--porcelain").stdout
-            self.assertIn(str(new), listing)
-            self.assertNotIn(str(old), listing)
-            self.assertFalse(new.with_name(f"{new.name}.migrating").exists())
-
-    def test_worktree_fallback_resumes_after_move_commits_then_raises(self):
-        with tempfile.TemporaryDirectory() as d:
-            root, home = self._project(Path(d))
-            slug, _record, old = self._legacy_record_and_worktree(root, home, "did-resume")
-            old.parent.mkdir(parents=True, exist_ok=True)
-            self.assertEqual(git(root, "worktree", "add", "--detach", str(old), "HEAD").returncode, 0)
-            new = home / ".waystone" / "cache" / "worktrees" / slug / "did-resume"
-            marker = new.with_name(f"{new.name}.migrating")
-            original_git_rc = common.git_rc
-            original_move = common.shutil.move
-
-            def fail_native_move(project, *args):
-                if args[:2] == ("worktree", "move"):
-                    return 1, "", "move failed"
-                return original_git_rc(project, *args)
-
-            def move_then_raise(source, destination):
-                result = original_move(source, destination)
-                if Path(source) == old and Path(destination) == new:
-                    raise RuntimeError("injected after worktree move")
-                return result
-
-            common.git_rc = fail_native_move
-            common.shutil.move = move_then_raise
-            try:
-                with self.assertRaisesRegex(RuntimeError, "injected"):
-                    _run_with_home(home, lambda: common.migrate_project_state(root))
-            finally:
-                common.shutil.move = original_move
-
-            self.assertEqual(marker.read_text(), str(old))
-            self.assertTrue(new.is_dir())
-            self.assertFalse(old.exists())
-            try:
-                _run_with_home(home, lambda: common.migrate_project_state(root))
-            finally:
-                common.git_rc = original_git_rc
-
-            self.assertFalse(marker.exists())
-            self.assertEqual(git(new, "rev-parse", "--git-dir").returncode, 0)
-            listing = git(root, "worktree", "list", "--porcelain").stdout
-            self.assertIn(str(new), listing)
-            self.assertNotIn(str(old), listing)
-
-    def test_worktree_repair_failure_marks_record_discard_only_and_warns(self):
-        import contextlib
-        import io
-
-        with tempfile.TemporaryDirectory() as d:
-            root, home = self._project(Path(d))
-            slug, _record, old = self._legacy_record_and_worktree(root, home, "did-degrade")
-            old.mkdir(parents=True)
-            original = common.git_rc
-            common.git_rc = lambda _root, *_args: (1, "", "git failed")
-            err = io.StringIO()
-            try:
-                with contextlib.redirect_stderr(err):
-                    _run_with_home(home, lambda: common.migrate_project_state(root))
-            finally:
-                common.git_rc = original
-            live = root / ".waystone" / "delegations" / "did-degrade" / "status.json"
-            status = _json.loads(live.read_text())
-            self.assertEqual(status["state"], "migration-worktree-failed")
-            self.assertEqual(status["migration"]["disposition"], "discard-only")
-            self.assertTrue((home / ".waystone" / "cache" / "worktrees" / slug / "did-degrade").is_dir())
-            self.assertIn("WARNING", err.getvalue())
-            self.assertIn("DISCARD-ONLY", err.getvalue())
-
+            self.assertFalse(_run_with_home(
+                home, lambda: common.migrate_project_state(root)))
+            self.assertEqual(live.read_bytes(), profile)
 
 class MigrationV2HookTests(unittest.TestCase):
     def _module(self):
@@ -18590,18 +17893,23 @@ class MigrationV2HookTests(unittest.TestCase):
             sys.argv = old_argv
         return rc, _json.loads(out.getvalue()), err.getvalue()
 
-    def test_hook_migrates_plain_legacy_source_before_phase1(self):
+    def test_hook_warns_and_preserves_unsupported_legacy_source(self):
         module = self._module()
         with tempfile.TemporaryDirectory() as d:
             root, home = self._project(Path(d))
             slug = common._project_slug(root)
             source = home / ".claude" / "waystone" / "start_here" / f"{slug}.md"
             source.parent.mkdir(parents=True)
-            source.write_text("HOOK-PLAINTEXT-FRONTIER")
+            source.write_bytes(b"HOOK-PLAINTEXT-FRONTIER")
             rc, payload, err = self._run_context(module, root, home)
-            self.assertEqual((rc, err), (0, ""))
-            self.assertIn("HOOK-PLAINTEXT-FRONTIER", payload["hookSpecificOutput"]["additionalContext"])
-            self.assertFalse(source.exists())
+            self.assertEqual(rc, 0)
+            self.assertEqual(payload["hookSpecificOutput"]["hookEventName"], "SessionStart")
+            self.assertNotIn(
+                "HOOK-PLAINTEXT-FRONTIER",
+                payload["hookSpecificOutput"]["additionalContext"])
+            self.assertIn("unsupported_pre_0_9_layout", err)
+            self.assertIn("0.11.x", err)
+            self.assertEqual(source.read_bytes(), b"HOOK-PLAINTEXT-FRONTIER")
 
     def test_hook_migration_failure_warns_but_always_emits_json_context(self):
         module = self._module()
