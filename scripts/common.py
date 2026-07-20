@@ -125,7 +125,13 @@ from waystone.adapters.git import (  # noqa: E402, F401
 )
 
 class _CommonShim(type(sys)):
-    """Keep legacy module-level monkeypatches bound to moved helpers' owner globals."""
+    """Keep legacy module-level monkeypatches bound to moved helpers' owner globals.
+
+    Legacy monkeypatch forwarding supports only setattr/delattr. Direct module
+    ``__dict__`` mutation (for example, ``mock.patch.dict``) is not forwarded
+    because the module dict cannot be replaced with an intercepting mapping.
+    This non-conventional surface has no current consumers.
+    """
 
     _routes = {
         name: tuple(

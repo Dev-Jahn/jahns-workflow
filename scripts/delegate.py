@@ -24,7 +24,13 @@ __doc__ = _delegate_owner.__doc__
 
 
 class _DelegateShim(type(sys)):
-    """Keep legacy module-level monkeypatches bound to the moved runtime's globals."""
+    """Keep legacy module-level monkeypatches bound to the moved runtime's globals.
+
+    Legacy monkeypatch forwarding supports only setattr/delattr. Direct module
+    ``__dict__`` mutation (for example, ``mock.patch.dict``) is not forwarded
+    because the module dict cannot be replaced with an intercepting mapping.
+    This non-conventional surface has no current consumers.
+    """
 
     _routes = {
         name: (_delegate_owner,)

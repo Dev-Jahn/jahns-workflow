@@ -9,7 +9,11 @@ Run: uv run scripts/tests/run_tests.py [Class[.method] ...]
 """
 from __future__ import annotations
 
+import sys
 import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from test_delegate_cli import (
     DelegateFanoutPlanTests,

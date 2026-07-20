@@ -67,7 +67,13 @@ from waystone.project.tasks_cli import (  # noqa: E402, F401
 
 
 class _TasksShim(type(sys)):
-    """Keep legacy module-level monkeypatches bound to the moved module's globals."""
+    """Keep legacy module-level monkeypatches bound to the moved module's globals.
+
+    Legacy monkeypatch forwarding supports only setattr/delattr. Direct module
+    ``__dict__`` mutation (for example, ``mock.patch.dict``) is not forwarded
+    because the module dict cannot be replaced with an intercepting mapping.
+    This non-conventional surface has no current consumers.
+    """
 
     _routes = {
         name: (_tasks_owner,)
