@@ -10,6 +10,7 @@ import errno
 import fcntl
 import os
 import sqlite3
+import stat
 import sys
 import tempfile
 import threading
@@ -40,6 +41,7 @@ try:
         EntityKind,
         FilesystemInfo,
         RunStore,
+        StatePathSymlinkError,
         TransitionReason,
     )
 finally:
@@ -428,6 +430,71 @@ class RunLeaseTests(unittest.TestCase):
                 with self.manager.advisory_lock(lock_path, principal):
                     self.fail("unknown lock entered")
         self.assertEqual(unknown.exception.code, "lock_principal_unknown")
+
+    def test_advisory_lock_creation_is_0600_and_nofollow(self):
+        action = self.action()
+        principal = self.manager.claim(
+            action.entity_id, expected_entity_version=0, ttl_seconds=30)
+        lock_path = self.root / ".waystone" / "permission.lock"
+        real_open = os.open
+        observations: list[tuple[int, int, int]] = []
+
+        def inspect_open(path, flags, mode=0o777, *, dir_fd=None):
+            descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+            if Path(path).name == lock_path.name and flags & os.O_CREAT:
+                observations.append((
+                    flags,
+                    mode,
+                    stat.S_IMODE(os.fstat(descriptor).st_mode),
+                ))
+            return descriptor
+
+        previous_umask = os.umask(0)
+        try:
+            with mock.patch.object(
+                    lease_module.os, "open", side_effect=inspect_open):
+                with self.manager.advisory_lock(lock_path, principal) as handle:
+                    self.assertEqual(stat.S_IMODE(os.fstat(handle.fileno()).st_mode), 0o600)
+        finally:
+            os.umask(previous_umask)
+
+        self.assertEqual(stat.S_IMODE(lock_path.lstat().st_mode), 0o600)
+        self.assertEqual(len(observations), 1)
+        flags, requested_mode, created_mode = observations[0]
+        self.assertTrue(flags & os.O_NOFOLLOW)
+        self.assertEqual(requested_mode, 0o600)
+        self.assertEqual(created_mode, 0o600)
+
+    def test_advisory_lock_symlink_is_refused_at_open_before_flock(self):
+        action = self.action()
+        principal = self.manager.claim(
+            action.entity_id, expected_entity_version=0, ttl_seconds=30)
+        target = self.root / "regular-lock-target"
+        target.write_bytes(b"target remains unchanged")
+        target.chmod(0o600)
+        lock_path = self.root / ".waystone" / "symlink.lock"
+        lock_path.symlink_to(target)
+        real_open = os.open
+        observed_flags: list[int] = []
+
+        def inspect_open(path, flags, mode=0o777, *, dir_fd=None):
+            if Path(path).name == lock_path.name:
+                observed_flags.append(flags)
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        with mock.patch.object(
+                lease_module.os, "open", side_effect=inspect_open), \
+                mock.patch.object(lease_module.fcntl, "flock") as flock:
+            with self.assertRaises(StatePathSymlinkError) as raised:
+                with self.manager.advisory_lock(lock_path, principal):
+                    self.fail("symlinked lock entered")
+
+        self.assertEqual(raised.exception.code, "state_path_symlink")
+        self.assertTrue(observed_flags)
+        self.assertTrue(all(flags & os.O_NOFOLLOW for flags in observed_flags))
+        flock.assert_not_called()
+        self.assertTrue(lock_path.is_symlink())
+        self.assertEqual(target.read_bytes(), b"target remains unchanged")
 
     def test_reclaim_requires_fresh_positive_quiescence_and_effect_absence(self):
         action = self.action()

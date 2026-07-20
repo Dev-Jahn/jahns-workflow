@@ -11,6 +11,7 @@ import inspect
 import os
 import re
 import sqlite3
+import stat
 import sys
 import tempfile
 import threading
@@ -42,8 +43,10 @@ try:
         EntityVersionConflict,
         FilesystemInfo,
         RunStore,
+        StatePathSymlinkError,
         TransitionReason,
         UninitializedProjectError,
+        UnsafeStatePermissionsError,
         UnsupportedSchemaVersionError,
         UnsupportedStateFilesystemError,
     )
@@ -700,8 +703,246 @@ class RunStoreTests(_StoreFixture):
                 Path("/uninitialized"), Path(":memory:"), connection,
                 FilesystemInfo("nfs", Path("/network")), 1)
 
+    def test_new_runtime_objects_have_exact_modes_and_nofollow(self):
+        root = self.project()
+        real_open = os.open
+        observed_flags: dict[str, list[int]] = {}
+
+        def inspect_open(path, flags, mode=0o777, *, dir_fd=None):
+            descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+            name = Path(path).name
+            if name in {"state.db", "state.db-wal", "state.db-shm"}:
+                observed_flags.setdefault(name, []).append(flags)
+            return descriptor
+
+        previous_umask = os.umask(0)
+        try:
+            with self.supported_filesystem(), mock.patch.object(
+                    store_module.os, "open", side_effect=inspect_open):
+                store = RunStore.open(root)
+        finally:
+            os.umask(previous_umask)
+        self.addCleanup(store.close)
+
+        state = root.resolve() / ".waystone"
+        paths = {
+            "state.db": state / "state.db",
+            "state.db-wal": state / "state.db-wal",
+            "state.db-shm": state / "state.db-shm",
+        }
+        self.assertEqual(stat.S_IMODE(state.lstat().st_mode), 0o700)
+        for name, path in paths.items():
+            with self.subTest(path=name):
+                self.assertEqual(stat.S_IMODE(path.lstat().st_mode), 0o600)
+                self.assertTrue(observed_flags.get(name))
+                self.assertTrue(all(
+                    flags & os.O_NOFOLLOW for flags in observed_flags[name]))
+
+    def test_existing_sidecar_unsafe_mode_or_foreign_owner_refuses_before_connect(self):
+        for suffix in ("-wal", "-shm"):
+            with self.subTest(suffix=suffix, fault="non-owner-write"):
+                root = self.project(f"unsafe-{suffix[1:]}")
+                store = self.open_store(root)
+                sidecar = Path(f"{store.database_path}{suffix}")
+                sidecar.chmod(0o666)
+                with self.supported_filesystem(), mock.patch.object(
+                        store_module, "_connect",
+                        side_effect=AssertionError("unsafe sidecar reached sqlite connect")):
+                    with self.assertRaises(UnsafeStatePermissionsError) as raised:
+                        RunStore.open(root)
+                self.assertEqual(raised.exception.code, "unsafe_state_permissions")
+                self.assertEqual(raised.exception.path, sidecar)
+                self.assertEqual(stat.S_IMODE(sidecar.lstat().st_mode), 0o666)
+                sidecar.chmod(0o600)
+
+        root = self.project("foreign-owner")
+        store = self.open_store(root)
+        sidecar = Path(f"{store.database_path}-wal")
+        effective_uid = os.geteuid()
+
+        def selective_euid(path: Path) -> int:
+            return effective_uid + 1 if Path(path) == sidecar else effective_uid
+
+        with self.supported_filesystem(), mock.patch.object(
+                store_module, "_effective_uid", side_effect=selective_euid), \
+                mock.patch.object(
+                    store_module, "_connect",
+                    side_effect=AssertionError("foreign-owner sidecar reached sqlite connect")):
+            with self.assertRaises(UnsafeStatePermissionsError) as raised:
+                RunStore.open(root)
+        self.assertEqual(raised.exception.code, "unsafe_state_permissions")
+        self.assertEqual(raised.exception.path, sidecar)
+        self.assertEqual(stat.S_IMODE(sidecar.lstat().st_mode), 0o600)
+
+    def test_unsafe_existing_state_directory_refuses_without_repair_or_write(self):
+        root = self.project("unsafe-state-directory")
+        state = root / ".waystone"
+        state.mkdir(mode=0o700)
+        state.chmod(0o777)
+
+        with self.supported_filesystem(), mock.patch.object(
+                store_module, "_connect",
+                side_effect=AssertionError("unsafe state directory reached sqlite connect")):
+            with self.assertRaises(UnsafeStatePermissionsError) as raised:
+                RunStore.open(root)
+
+        self.assertEqual(raised.exception.code, "unsafe_state_permissions")
+        self.assertEqual(raised.exception.path, root.resolve() / ".waystone")
+        self.assertEqual(stat.S_IMODE(state.lstat().st_mode), 0o777)
+        self.assertEqual(list(state.iterdir()), [])
+
+    def test_state_database_symlink_is_refused_at_nofollow_open(self):
+        root = self.project("state-symlink")
+        state = root / ".waystone"
+        state.mkdir(mode=0o700)
+        target = self.base / "outside-state-target"
+        target.write_bytes(b"outside remains unchanged")
+        target.chmod(0o600)
+        database = state / "state.db"
+        database.symlink_to(target)
+        real_open = os.open
+        observed_flags: list[int] = []
+
+        def inspect_open(path, flags, mode=0o777, *, dir_fd=None):
+            if Path(path).name == "state.db":
+                observed_flags.append(flags)
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        with self.supported_filesystem(), mock.patch.object(
+                store_module.os, "open", side_effect=inspect_open), \
+                mock.patch.object(
+                    store_module, "_connect",
+                    side_effect=AssertionError("symlinked state DB reached sqlite connect")):
+            with self.assertRaises(StatePathSymlinkError) as raised:
+                RunStore.open(root)
+
+        self.assertEqual(raised.exception.code, "state_path_symlink")
+        self.assertTrue(observed_flags)
+        self.assertTrue(all(flags & os.O_NOFOLLOW for flags in observed_flags))
+        self.assertTrue(database.is_symlink())
+        self.assertEqual(target.read_bytes(), b"outside remains unchanged")
+        self.assertFalse((state / ".gitignore").exists())
+
 
 class ArtifactStoreTests(_StoreFixture):
+    def _tamper_artifact_bytes(self, path: Path, content: bytes) -> None:
+        """Overwrite a published artifact's bytes as a deliberate external-tamper simulation.
+
+        ADR-0013 publishes the final content-addressed artifact as immutable (0400), so a
+        plain write is refused. A real out-of-band tamperer would relax the mode, corrupt
+        the bytes, and restore 0400; this reproduces exactly that dance, test-only.
+        """
+        os.chmod(path, 0o600)
+        path.write_bytes(content)
+        os.chmod(path, 0o400)
+
+    @contextmanager
+    def _artifact_descriptor_read_fails(self, error: OSError):
+        """Fail the artifact byte-read at the descriptor seam the store actually reads through.
+
+        Post-ADR-0013 reads go through a no-follow ``os.open`` descriptor wrapped by
+        ``os.fdopen``, so the pre-hardening ``Path.read_bytes`` injection point no longer
+        executes. Failing the stream read on that descriptor re-exercises the store's
+        'bytes are unreadable' integrity branch.
+        """
+        real_fdopen = artifacts_module.os.fdopen
+
+        class _FailingReader:
+            def __init__(self, descriptor: int):
+                self._descriptor = descriptor
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc_info):
+                os.close(self._descriptor)
+                return False
+
+            def read(self, *args, **kwargs):
+                raise error
+
+        def fake_fdopen(descriptor, *args, **kwargs):
+            mode = args[0] if args else kwargs.get("mode", "")
+            if "r" in mode:
+                return _FailingReader(descriptor)
+            return real_fdopen(descriptor, *args, **kwargs)
+
+        with mock.patch.object(artifacts_module.os, "fdopen", side_effect=fake_fdopen):
+            yield
+
+    def test_artifact_staging_creation_and_atomic_publish_have_exact_modes(self):
+        root = self.project()
+        artifacts = ArtifactStore(root)
+        real_open = os.open
+        real_replace = os.replace
+        staging_observations: list[tuple[int, int, int]] = []
+        publish_source_modes: list[int] = []
+
+        def inspect_open(path, flags, mode=0o777, *, dir_fd=None):
+            descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+            if Path(path).name.startswith(".artifact-") and flags & os.O_CREAT:
+                staging_observations.append((
+                    flags,
+                    mode,
+                    stat.S_IMODE(os.fstat(descriptor).st_mode),
+                ))
+            return descriptor
+
+        def inspect_replace(source, destination):
+            if Path(destination).parent == artifacts.directory:
+                publish_source_modes.append(stat.S_IMODE(Path(source).lstat().st_mode))
+            return real_replace(source, destination)
+
+        previous_umask = os.umask(0)
+        try:
+            with mock.patch.object(
+                    artifacts_module.os, "open", side_effect=inspect_open), \
+                    mock.patch.object(
+                        artifacts_module.os, "replace", side_effect=inspect_replace):
+                stored = artifacts.write(b"permission contract")
+        finally:
+            os.umask(previous_umask)
+
+        state = root.resolve() / ".waystone"
+        self.assertEqual(stat.S_IMODE(state.lstat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(artifacts.directory.lstat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(stored.path.lstat().st_mode), 0o400)
+        self.assertEqual(publish_source_modes, [0o400])
+        self.assertEqual(len(staging_observations), 1)
+        flags, requested_mode, created_mode = staging_observations[0]
+        self.assertTrue(flags & os.O_NOFOLLOW)
+        self.assertEqual(requested_mode, 0o600)
+        self.assertEqual(created_mode, 0o600)
+
+    def test_artifact_root_and_leaf_symlinks_are_typed_without_following(self):
+        root = self.project("artifact-root-symlink")
+        state = root / ".waystone"
+        state.mkdir(mode=0o700)
+        outside_directory = self.base / "outside-artifacts"
+        outside_directory.mkdir()
+        (state / "artifacts").symlink_to(outside_directory, target_is_directory=True)
+
+        with self.assertRaises(ArtifactIntegrityError) as root_error:
+            ArtifactStore(root).write(b"must not escape")
+        self.assertEqual(root_error.exception.code, "artifact_root_symlink")
+        self.assertEqual(list(outside_directory.iterdir()), [])
+
+        root = self.project("artifact-leaf-symlink")
+        artifacts = ArtifactStore(root)
+        artifacts.write(b"directory seed")
+        content = b"outside artifact bytes"
+        digest = _sha256(content)
+        outside_file = self.base / "outside-artifact-file"
+        outside_file.write_bytes(content)
+        leaf = artifacts.path_for(digest)
+        leaf.symlink_to(outside_file)
+
+        with self.assertRaises(ArtifactIntegrityError) as leaf_error:
+            artifacts.read(digest)
+        self.assertEqual(leaf_error.exception.code, "artifact_path_symlink")
+        self.assertTrue(leaf.is_symlink())
+        self.assertEqual(outside_file.read_bytes(), content)
+
     def test_concurrent_first_artifact_write_is_idempotent_and_self_ignored(self):
         root = self.project()
         first = ArtifactStore(root)
@@ -717,6 +958,21 @@ class ArtifactStoreTests(_StoreFixture):
         self.assertEqual(results[0].digest, results[1].digest)
         self.assertEqual(first.read(results[0].digest), b"same immutable bytes")
         self.assertEqual((root / ".waystone" / ".gitignore").read_bytes(), b"*\n")
+
+    def test_concurrent_artifact_publish_survives_verified_inode_churn(self):
+        for round_number in range(40):
+            root = self.project(f"concurrent-publish-{round_number}")
+            stores = [ArtifactStore(root) for _ in range(8)]
+            barrier = threading.Barrier(len(stores))
+
+            def write_together(store: ArtifactStore):
+                barrier.wait()
+                return store.write(b"same concurrent bytes")
+
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                results = list(executor.map(write_together, stores))
+            self.assertEqual(len({result.digest for result in results}), 1)
+            self.assertEqual(stat.S_IMODE(results[0].path.lstat().st_mode), 0o400)
 
     def test_artifact_write_uses_same_directory_temp_atomic_rename_and_post_write_rehash(self):
         root = self.project()
@@ -760,19 +1016,22 @@ class ArtifactStoreTests(_StoreFixture):
         root = self.project()
         artifacts = ArtifactStore(root)
         stored = artifacts.write(b"trusted")
-        stored.path.write_bytes(b"tampered")
+        # Deliberate external tamper of the now-immutable (0400) artifact bytes.
+        self._tamper_artifact_bytes(stored.path, b"tampered")
 
         with self.assertRaises(ArtifactIntegrityError) as mismatch:
             artifacts.read(stored.digest)
         self.assertEqual(mismatch.exception.code, "artifact_integrity_error")
 
-        stored.path.write_bytes(b"trusted")
-        with mock.patch.object(Path, "read_bytes", side_effect=PermissionError("denied")):
+        self._tamper_artifact_bytes(stored.path, b"trusted")
+        # The store reads bytes through a no-follow descriptor, not Path.read_bytes, so
+        # inject the unreadable/vanished fault at that real descriptor-read seam.
+        with self._artifact_descriptor_read_fails(PermissionError("denied")):
             with self.assertRaises(ArtifactIntegrityError) as unreadable:
                 artifacts.read(stored.digest)
         self.assertEqual(unreadable.exception.code, "artifact_integrity_error")
 
-        with mock.patch.object(Path, "read_bytes", side_effect=FileNotFoundError("vanished")):
+        with self._artifact_descriptor_read_fails(FileNotFoundError("vanished")):
             with self.assertRaises(ArtifactIntegrityError) as disappeared:
                 artifacts.read(stored.digest)
         self.assertEqual(disappeared.exception.code, "artifact_integrity_error")
@@ -781,7 +1040,8 @@ class ArtifactStoreTests(_StoreFixture):
         root = self.project()
         artifacts = ArtifactStore(root)
         stored = artifacts.write(b"original")
-        stored.path.write_bytes(b"corrupt")
+        # Deliberate external tamper of the now-immutable (0400) artifact bytes.
+        self._tamper_artifact_bytes(stored.path, b"corrupt")
 
         with self.assertRaises(ArtifactIntegrityError):
             artifacts.write(b"original")

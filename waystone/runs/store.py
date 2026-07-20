@@ -1,6 +1,7 @@
 """Transactional runtime state for one initialized Waystone project."""
 from __future__ import annotations
 
+import errno
 import json
 import os
 import platform
@@ -38,6 +39,8 @@ _SUPPORTED_LOCAL_FILESYSTEMS = frozenset({
 _REQUIRED_FILESYSTEM_PROPERTIES = (
     "process locking", "atomic replace", "sync/durability", "WAL journal mode",
 )
+_STATE_DIRECTORY_MODE = 0o700
+_MUTABLE_STATE_FILE_MODE = 0o600
 
 
 class StoreError(WorkflowError):
@@ -83,6 +86,60 @@ class InvalidStatePathError(StoreError):
     """A state parent or database path is not a real directory/regular file."""
 
     code = "invalid_state_path"
+
+    def __init__(self, path: Path, detail: str):
+        self.path = Path(path)
+        self.detail = detail
+        super().__init__(f"{path}: {detail}")
+
+
+class UnsafeStatePermissionsError(StoreError):
+    """An engine-owned state object has unsafe or unprovable owner/mode."""
+
+    code = "unsafe_state_permissions"
+
+    def __init__(self, path: Path, detail: str):
+        self.path = Path(path)
+        self.detail = detail
+        super().__init__(f"{path}: {detail}")
+
+
+class StatePathSymlinkError(StoreError):
+    """An engine-owned state path is a symlink."""
+
+    code = "state_path_symlink"
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        super().__init__(f"{path} must not be a symlink")
+
+
+class StatePathEscapeError(StoreError):
+    """An engine-owned state path is outside its confirmed runtime root."""
+
+    code = "state_path_escape"
+
+    def __init__(self, path: Path, root: Path):
+        self.path = Path(path)
+        self.root = Path(root)
+        super().__init__(f"{path} is outside confirmed state root {root}")
+
+
+class StatePathTypeMismatchError(StoreError):
+    """An engine-owned state path has a different filesystem kind."""
+
+    code = "state_path_type_mismatch"
+
+    def __init__(self, path: Path, expected: str):
+        self.path = Path(path)
+        self.expected = expected
+        super().__init__(f"{path} must be a {expected}")
+
+
+class EngineOwnedPathUnverifiableError(StoreError):
+    """The platform cannot prove no-follow state-path handling."""
+
+    code = "engine_owned_path_unverifiable"
 
     def __init__(self, path: Path, detail: str):
         self.path = Path(path)
@@ -313,6 +370,181 @@ def _contains_path(mount_point: Path, path: Path) -> bool:
         return False
 
 
+def _require_contained_state_path(path: Path, root: Path) -> None:
+    try:
+        path.relative_to(root)
+    except ValueError as error:
+        raise StatePathEscapeError(path, root) from error
+
+
+def _nofollow_flag(path: Path) -> int:
+    flag = getattr(os, "O_NOFOLLOW", None)
+    if not isinstance(flag, int):
+        raise EngineOwnedPathUnverifiableError(
+            path, "platform does not expose O_NOFOLLOW")
+    return flag
+
+
+def _effective_uid(path: Path) -> int:
+    getter = getattr(os, "geteuid", None)
+    if not callable(getter):
+        raise UnsafeStatePermissionsError(
+            path, "platform does not expose an effective POSIX owner")
+    return int(getter())
+
+
+def _validate_state_owner(path: Path, info: os.stat_result) -> None:
+    observed_owner = getattr(info, "st_uid", None)
+    if not isinstance(observed_owner, int):
+        raise UnsafeStatePermissionsError(path, "filesystem owner is not observable")
+    expected_owner = _effective_uid(path)
+    if observed_owner != expected_owner:
+        raise UnsafeStatePermissionsError(
+            path, f"owner uid {observed_owner} does not match effective uid {expected_owner}")
+
+
+def _validate_state_directory_mode(
+        path: Path, info: os.stat_result, *, newly_created: bool) -> None:
+    _validate_state_owner(path, info)
+    mode = stat.S_IMODE(info.st_mode)
+    if newly_created and mode != _STATE_DIRECTORY_MODE:
+        raise UnsafeStatePermissionsError(
+            path, f"new state directory mode {mode:#05o} is not 0700")
+    required = stat.S_IWUSR | stat.S_IXUSR
+    if mode & required != required or mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise UnsafeStatePermissionsError(
+            path, f"state directory mode {mode:#05o} lacks owner write/search "
+            "or grants non-owner write")
+
+
+def _validate_mutable_state_file_mode(
+        path: Path, info: os.stat_result, *, newly_created: bool) -> None:
+    _validate_state_owner(path, info)
+    mode = stat.S_IMODE(info.st_mode)
+    if newly_created and mode != _MUTABLE_STATE_FILE_MODE:
+        raise UnsafeStatePermissionsError(
+            path, f"new mutable state file mode {mode:#05o} is not 0600")
+    required = stat.S_IRUSR | stat.S_IWUSR
+    if mode & required != required or mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise UnsafeStatePermissionsError(
+            path, f"mutable state file mode {mode:#05o} lacks owner read/write "
+            "or grants non-owner write")
+
+
+def _verify_state_directory(path: Path, root: Path, *, newly_created: bool) -> None:
+    _require_contained_state_path(path, root)
+    try:
+        path_info = path.lstat()
+    except FileNotFoundError as error:
+        raise EngineOwnedPathUnverifiableError(
+            path, "state directory disappeared during verification") from error
+    except OSError as error:
+        raise EngineOwnedPathUnverifiableError(
+            path, f"cannot inspect state directory: {error}") from error
+    if stat.S_ISLNK(path_info.st_mode):
+        raise StatePathSymlinkError(path)
+    if not stat.S_ISDIR(path_info.st_mode):
+        raise StatePathTypeMismatchError(path, "directory")
+    _validate_state_directory_mode(path, path_info, newly_created=newly_created)
+    directory_flag = getattr(os, "O_DIRECTORY", None)
+    if not isinstance(directory_flag, int):
+        raise EngineOwnedPathUnverifiableError(
+            path, "platform does not expose O_DIRECTORY")
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, os.O_RDONLY | directory_flag | _nofollow_flag(path))
+        handle_info = os.fstat(descriptor)
+    except OSError as error:
+        if error.errno == getattr(errno, "ELOOP", None):
+            raise StatePathSymlinkError(path) from error
+        if error.errno == getattr(errno, "ENOTDIR", None):
+            raise StatePathTypeMismatchError(path, "directory") from error
+        raise EngineOwnedPathUnverifiableError(
+            path, f"cannot open state directory without following links: {error}") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if not stat.S_ISDIR(handle_info.st_mode):
+        raise StatePathTypeMismatchError(path, "directory")
+    if (path_info.st_dev, path_info.st_ino) != (handle_info.st_dev, handle_info.st_ino):
+        raise EngineOwnedPathUnverifiableError(
+            path, "state directory identity changed during verification")
+    _validate_state_directory_mode(path, handle_info, newly_created=newly_created)
+
+
+def _open_mutable_state_file(path: Path, state_root: Path, *, create: bool) -> int:
+    _require_contained_state_path(path, state_root)
+    nofollow = _nofollow_flag(path)
+    for _ in range(2):
+        try:
+            path_info = path.lstat()
+        except FileNotFoundError:
+            path_info = None
+        except OSError as error:
+            raise EngineOwnedPathUnverifiableError(
+                path, f"cannot inspect state file: {error}") from error
+        if path_info is not None:
+            if stat.S_ISLNK(path_info.st_mode):
+                try:
+                    descriptor = os.open(
+                        path, os.O_RDWR | nofollow | (os.O_CREAT if create else 0),
+                        _MUTABLE_STATE_FILE_MODE,
+                    )
+                except OSError as error:
+                    raise StatePathSymlinkError(path) from error
+                os.close(descriptor)
+                raise EngineOwnedPathUnverifiableError(
+                    path, "O_NOFOLLOW unexpectedly opened a symlinked state file")
+            if not stat.S_ISREG(path_info.st_mode):
+                raise StatePathTypeMismatchError(path, "regular file")
+            _validate_mutable_state_file_mode(path, path_info, newly_created=False)
+        elif not create:
+            raise EngineOwnedPathUnverifiableError(
+                path, "state file disappeared during verification")
+
+        flags = os.O_RDWR | nofollow
+        if path_info is None:
+            flags |= os.O_CREAT | os.O_EXCL
+        try:
+            descriptor = os.open(path, flags, _MUTABLE_STATE_FILE_MODE)
+        except FileExistsError:
+            continue
+        except OSError as error:
+            if error.errno == getattr(errno, "ELOOP", None):
+                raise StatePathSymlinkError(path) from error
+            if error.errno in {getattr(errno, "EISDIR", None), getattr(errno, "ENOTDIR", None)}:
+                raise StatePathTypeMismatchError(path, "regular file") from error
+            raise EngineOwnedPathUnverifiableError(
+                path, f"cannot open state file without following links: {error}") from error
+        try:
+            handle_info = os.fstat(descriptor)
+            if not stat.S_ISREG(handle_info.st_mode):
+                raise StatePathTypeMismatchError(path, "regular file")
+            if path_info is not None and (
+                    path_info.st_dev, path_info.st_ino) != (
+                        handle_info.st_dev, handle_info.st_ino):
+                raise EngineOwnedPathUnverifiableError(
+                    path, "state file identity changed during no-follow open")
+            _validate_mutable_state_file_mode(
+                path, handle_info, newly_created=path_info is None)
+        except BaseException:
+            os.close(descriptor)
+            raise
+        return descriptor
+    raise EngineOwnedPathUnverifiableError(
+        path, "state file kept changing during exclusive creation")
+
+
+def _verify_existing_state_file(path: Path, state_root: Path) -> None:
+    descriptor = _open_mutable_state_file(path, state_root, create=False)
+    os.close(descriptor)
+
+
+def _ensure_mutable_state_file(path: Path, state_root: Path) -> None:
+    descriptor = _open_mutable_state_file(path, state_root, create=True)
+    os.close(descriptor)
+
+
 def _linux_mounts() -> list[FilesystemInfo]:
     try:
         lines = Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines()
@@ -424,10 +656,11 @@ def _probe_state_filesystem(existing_parent: Path) -> FilesystemInfo:
 
 def _connect(database_path: Path) -> sqlite3.Connection:
     return sqlite3.connect(
-        database_path,
+        f"{database_path.as_uri()}?mode=rw",
         timeout=_BUSY_TIMEOUT_MS / 1_000,
         isolation_level=None,
         check_same_thread=False,
+        uri=True,
     )
 
 
@@ -830,16 +1063,18 @@ class RunStore:
             raise UninitializedProjectError(supplied_root) from error
 
         state_directory = resolved_root / ".waystone"
+        _require_contained_state_path(state_directory, resolved_root)
         try:
             state_info = state_directory.lstat()
         except FileNotFoundError:
             probe_parent = resolved_root
             state_info = None
         except OSError as error:
-            raise InvalidStatePathError(state_directory, f"cannot inspect state directory: {error}") from error
+            raise EngineOwnedPathUnverifiableError(
+                state_directory, f"cannot inspect state directory: {error}") from error
         else:
-            if stat.S_ISLNK(state_info.st_mode) or not stat.S_ISDIR(state_info.st_mode):
-                raise InvalidStatePathError(state_directory, "state directory must be a real directory")
+            _verify_state_directory(
+                state_directory, resolved_root, newly_created=False)
             probe_parent = state_directory
 
         filesystem = _probe_state_filesystem(probe_parent)
@@ -856,36 +1091,43 @@ class RunStore:
             raise UnsupportedStateFilesystemError(
                 state_directory, filesystem.filesystem, reason)
 
+        state_directory_created = False
         if state_info is None:
             try:
-                state_directory.mkdir(exist_ok=True)
+                os.mkdir(state_directory, _STATE_DIRECTORY_MODE)
+                state_directory_created = True
+            except FileExistsError:
+                pass
             except OSError as error:
-                raise InvalidStatePathError(
+                raise EngineOwnedPathUnverifiableError(
                     state_directory, f"cannot create state directory: {error}") from error
-        try:
-            state_info = state_directory.lstat()
-        except OSError as error:
-            raise InvalidStatePathError(
-                state_directory, f"cannot verify state directory: {error}") from error
-        if stat.S_ISLNK(state_info.st_mode) or not stat.S_ISDIR(state_info.st_mode):
-            raise InvalidStatePathError(state_directory, "state directory must be a real directory")
+        _verify_state_directory(
+            state_directory, resolved_root, newly_created=state_directory_created)
+
+        database_path = state_directory / "state.db"
+        sidecar_paths = (
+            Path(f"{database_path}-wal"),
+            Path(f"{database_path}-shm"),
+        )
+        missing_state_files: list[Path] = []
+        for path in (database_path, *sidecar_paths):
+            try:
+                path.lstat()
+            except FileNotFoundError:
+                missing_state_files.append(path)
+            except OSError as error:
+                raise EngineOwnedPathUnverifiableError(
+                    path, f"cannot inspect state file: {error}") from error
+            else:
+                _verify_existing_state_file(path, state_directory)
         try:
             _ensure_project_self_ignore(state_directory)
         except (OSError, WorkflowError) as error:
             raise InvalidStatePathError(
                 state_directory / ".gitignore",
                 f"cannot establish project-state self-ignore: {error}") from error
-
-        database_path = state_directory / "state.db"
-        try:
-            database_info = database_path.lstat()
-        except FileNotFoundError:
-            database_info = None
-        except OSError as error:
-            raise InvalidStatePathError(database_path, f"cannot inspect database: {error}") from error
-        if database_info is not None and (
-                stat.S_ISLNK(database_info.st_mode) or not stat.S_ISREG(database_info.st_mode)):
-            raise InvalidStatePathError(database_path, "database must be a regular non-symlink file")
+        for path in missing_state_files:
+            _ensure_mutable_state_file(path, state_directory)
 
         connection: sqlite3.Connection | None = None
         try:
@@ -904,6 +1146,8 @@ class RunStore:
             _negotiate_wal(connection, state_directory, filesystem)
             version = _migrate(connection)
             _validate_schema(connection)
+            for path in (database_path, *sidecar_paths):
+                _verify_existing_state_file(path, state_directory)
             connection.set_authorizer(_store_authorizer)
             return cls(
                 resolved_root, database_path, connection, filesystem, version,

@@ -17,7 +17,17 @@ from pathlib import Path
 from typing import Callable, Iterator, TypeVar
 
 from waystone.core import WorkflowError
-from waystone.runs.store import EntityKind, RunStore, StoreError
+from waystone.runs.store import (
+    EngineOwnedPathUnverifiableError,
+    EntityKind,
+    RunStore,
+    StatePathSymlinkError,
+    StatePathTypeMismatchError,
+    StoreError,
+    _open_mutable_state_file,
+    _require_contained_state_path,
+    _verify_state_directory,
+)
 
 
 _MAX_FENCING_EPOCH = (1 << 63) - 1
@@ -561,14 +571,52 @@ class LeaseManager:
             self, path: Path, principal: LeasePrincipal, *,
             blocking: bool = True) -> Iterator[AdvisoryLockHandle]:
         """Hold a real fcntl handle, then recheck the DB tuple before entry."""
-        lock_path = Path(path)
+        supplied_lock_path = Path(path)
+        state_directory = self._store.database_path.parent
+        current_parent = supplied_lock_path.parent
+        while True:
+            try:
+                parent_info = current_parent.lstat()
+            except OSError as error:
+                raise EngineOwnedPathUnverifiableError(
+                    supplied_lock_path,
+                    f"cannot inspect lock directory traversal: {error}") from error
+            if stat.S_ISLNK(parent_info.st_mode):
+                raise StatePathSymlinkError(current_parent)
+            if not stat.S_ISDIR(parent_info.st_mode):
+                raise StatePathTypeMismatchError(current_parent, "directory")
+            try:
+                if os.path.samefile(current_parent, state_directory):
+                    break
+            except OSError as error:
+                raise EngineOwnedPathUnverifiableError(
+                    supplied_lock_path,
+                    f"cannot establish lock directory containment: {error}") from error
+            parent = current_parent.parent
+            if parent == current_parent:
+                _require_contained_state_path(supplied_lock_path, state_directory)
+            current_parent = parent
+        try:
+            canonical_parent = supplied_lock_path.parent.resolve(strict=True)
+        except OSError as error:
+            raise EngineOwnedPathUnverifiableError(
+                supplied_lock_path, f"cannot resolve lock parent: {error}") from error
+        lock_path = canonical_parent / supplied_lock_path.name
+        _require_contained_state_path(lock_path, state_directory)
+        _verify_state_directory(
+            state_directory, self._store.project_root, newly_created=False)
+        relative_lock = lock_path.relative_to(state_directory)
+        current_directory = state_directory
+        for component in relative_lock.parts[:-1]:
+            current_directory /= component
+            _verify_state_directory(
+                current_directory, state_directory, newly_created=False)
+
         descriptor: int | None = None
         acquired = False
         try:
-            try:
-                descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-            except OSError as error:
-                raise LockPrincipalUnknown(lock_path, f"cannot open lock handle: {error}") from error
+            descriptor = _open_mutable_state_file(
+                lock_path, state_directory, create=True)
             operation = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
             try:
                 fcntl.flock(descriptor, operation)
@@ -577,12 +625,6 @@ class LeaseManager:
                     raise LockBusy(lock_path) from error
                 raise LockPrincipalUnknown(lock_path, str(error)) from error
             acquired = True
-            try:
-                handle_stat = os.fstat(descriptor)
-            except OSError as error:
-                raise LockPrincipalUnknown(lock_path, f"cannot inspect acquired handle: {error}") from error
-            if not stat.S_ISREG(handle_stat.st_mode):
-                raise LockPrincipalUnknown(lock_path, "acquired handle is not a regular file")
 
             self._guard_operation(principal, "os-lock-entry", lambda: None)
             yield AdvisoryLockHandle(lock_path, descriptor)
