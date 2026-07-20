@@ -539,3 +539,16 @@ tasks:
     title: "ADR-0013 'DB·artifact permission과 symlink' 절의 store 적용: .waystone/ state 디렉터리·state.db·sidecar·staging·최종 artifact의 mode 고정(0700/0600/0400)·WAL/SHM owner-mode 검증·no-follow 강제 — m1b-store 보고 ④11이 확인한 분해 누락 귀속 공백의 폐쇄 (symlink 거부는 커널에 이미 구현, mode 계약이 잔여)"
     status: "pending"
     deps: ["feat/run-store-kernel"]
+  - id: feat/review-pr-canonical-publication
+    title: "PR-mode freeze/demotion publisher의 ADR-0009 canonical owner 연결: m1b-review-uuid는 packet-mode wiring으로 한정(브리핑 계약)했고 PR-mode live publication은 flat 유지 — ADR-0009 '신규 artifact는 canonical에만' 전면 적용은 review transport 재구축 마일스톤(PC-13 소유)에서, main ruling 2026-07-21: packet 한정 wiring 수용·전면 적용은 이 task로 분할 (m1b-review-uuid 보고 ④4)"
+    status: "pending"
+  - id: fix/review-status-owner-isolation
+    title: "review status의 전역 packet round scan에 per-owner 격리 적용: 한 owner의 canonical/flat identity conflict가 healthy owner의 status 출력을 중단시킬 수 있음 — JW-GPT-015 격리 의미를 status reader까지 확대 (m1b-review-uuid 보고 ④7, 브리핑의 명시 reader 목록 밖이라 미수정)"
+    status: "pending"
+    severity: "minor"
+    deps: ["feat/review-runs-uuid-owner-directory"]
+  - id: fix/review-legacy-label-coverage
+    title: "legacy-read 진단 라벨 2종(request-digest-stale-generation·round-binding-unavailable)의 테스트 커버리지 복원: 삭제된 legacy 테스트에 묶여 있던 라벨 단언이 canonical 전환에서 함께 소실 — 방출 로직은 live·무변경이므로 직접 작성한 다중-generation/무-binding 역사 flat fixture 테스트 1-2건으로 재커버 (m1b-review-uuid opus 검증 결함 1·2)"
+    status: "pending"
+    severity: "minor"
+    deps: ["feat/review-runs-uuid-owner-directory"]

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from support import *  # noqa: F401,F403
+from waystone.features import review_layout
 
 
 class LockPrimitiveTests(unittest.TestCase):
@@ -1168,6 +1169,26 @@ Fail-loud protocol boundaries.
         narrative.write_text(self.NARRATIVE)
         return root, target, narrative
 
+    def _packet_artifacts(self, root: Path) -> dict:
+        return review.packet_review_artifacts(root, self.ROUND_ID)
+
+    def _write_legacy_packet_generation(self, root: Path, narrative_path: Path) -> Path:
+        _path, exposure = review.read_round_closeout_exposure(root, self.ROUND_ID)
+        narrative = review._read_review_narrative(narrative_path)
+        rendered = review._render_review_request(self.ROUND_ID, exposure, narrative)
+        request = root / "docs/reviews" / f"{self.ROUND_ID}-request.md"
+        request.parent.mkdir(parents=True, exist_ok=True)
+        request.write_text(rendered)
+        stored = review.stored_narrative_path(root, self.ROUND_ID)
+        stored.parent.mkdir(parents=True, exist_ok=True)
+        stored.write_text(narrative)
+        return review.write_round_request_binding(
+            root, self.ROUND_ID, exposure["head_sha"], exposure.get("base_sha"),
+            exposure["reviewers"], mode="packet",
+            narrative_digest=review._canonical_narrative_digest(narrative),
+            rendered_request_digest=review._canonical_rendered_request_digest(rendered),
+            directory=request.parent)
+
     def test_prepare_renders_template_from_round_exposure_and_narrative(self):
         import re
 
@@ -1176,7 +1197,8 @@ Fail-loud protocol boundaries.
             self.assertEqual(review.prepare_review_request(
                 root, self.ROUND_ID, narrative), 0)
 
-            request = root / "docs" / "reviews" / f"{self.ROUND_ID}-request.md"
+            artifacts = self._packet_artifacts(root)
+            request = artifacts["request"]
             rendered = request.read_text()
             for line in (
                     "- Project: demo", "- Branch: main", "- Reviewer: reviewer-x",
@@ -1193,9 +1215,7 @@ Fail-loud protocol boundaries.
                     "{40-lowercase-hex-closeout-sha}"):
                 self.assertNotIn(old_placeholder, rendered)
 
-            binding = review.read_round_request_binding(next(
-                (root / "docs" / "reviews").glob(
-                    f"{self.ROUND_ID}-request.binding*.json")))
+            binding = review.read_round_request_binding(artifacts["binding_path"])
             self.assertEqual(binding["target_sha"], target)
             self.assertIsNone(binding["base_sha"])
             self.assertEqual(binding["reviewers"], ["reviewer-x"])
@@ -1214,10 +1234,10 @@ Fail-loud protocol boundaries.
             self.assertEqual(review.prepare_review_request(
                 root, self.ROUND_ID, narrative), 0)
 
-            request = root / "docs/reviews" / f"{self.ROUND_ID}-request.md"
+            artifacts = self._packet_artifacts(root)
+            request = artifacts["request"]
             rendered = request.read_text()
-            binding = review.read_round_request_binding(next(
-                request.parent.glob(f"{self.ROUND_ID}-request.binding*.json")))
+            binding = review.read_round_request_binding(artifacts["binding_path"])
             self.assertIn(
                 f"request-digest: {binding['rendered_request_digest']}", rendered)
             self.assertIn(
@@ -1236,18 +1256,16 @@ Fail-loud protocol boundaries.
                 review._canonical_rendered_request_digest(displayed_changed),
                 binding["rendered_request_digest"])
 
-    def test_delayed_echo_stamps_named_generation_and_stays_pending_after_reprepare(self):
+    def test_delayed_echo_remains_bound_after_canonical_reprepare_refusal(self):
         with tempfile.TemporaryDirectory() as d:
             base = Path(d)
             root, target, narrative = self._closed_project(base)
             self.assertEqual(review.prepare_review_request(
                 root, self.ROUND_ID, narrative), 0)
-            rdir = root / "docs/reviews"
-            first_path, first = review.latest_round_request_binding(
-                list(rdir.glob(f"{self.ROUND_ID}-request.binding*.json")),
-                expected_round_id=self.ROUND_ID)
-            self.assertIsNotNone(first_path)
-            self.assertIsNotNone(first)
+            artifacts = self._packet_artifacts(root)
+            first = artifacts["binding"]
+            request_before = artifacts["request"].read_bytes()
+            binding_before = artifacts["binding_path"].read_bytes()
 
             reply = base / "reply.md"
             reply.write_text(
@@ -1257,57 +1275,28 @@ Fail-loud protocol boundaries.
             narrative.write_text(self.NARRATIVE.replace(
                 "Fail-loud protocol boundaries.", "A newer narrative generation."))
             self.assertEqual(review.prepare_review_request(
-                root, self.ROUND_ID, narrative), 0)
-            _latest_path, latest = review.latest_round_request_binding(
-                list(rdir.glob(f"{self.ROUND_ID}-request.binding*.json")),
-                expected_round_id=self.ROUND_ID)
-            self.assertIsNotNone(latest)
-            self.assertNotEqual(
-                first["rendered_request_digest"], latest["rendered_request_digest"])
+                root, self.ROUND_ID, narrative), 1)
+            latest = self._packet_artifacts(root)
+            self.assertEqual(latest["run_id"], artifacts["run_id"])
+            self.assertEqual(latest["request"].read_bytes(), request_before)
+            self.assertEqual(latest["binding_path"].read_bytes(), binding_before)
 
             self.assertEqual(review.ingest(root, self.ROUND_ID, src=reply), 0)
-            pending = review.pending_reviews(root)
-            self.assertEqual([row["round_id"] for row in pending], [self.ROUND_ID])
-            self.assertEqual(
-                pending[0]["reason"], "feedback-request-digest-stale-generation")
+            self.assertEqual(review.pending_reviews(root), [])
 
-            feedback = rdir / f"{self.ROUND_ID}-feedback.md"
+            feedback = latest["feedback"]
             metadata = review.read_feedback_reply_metadata(
-                feedback, expected_round_id=self.ROUND_ID, binding=latest)
+                feedback, expected_round_id=self.ROUND_ID, binding=first)
             self.assertEqual(metadata["narrative_digest"], first["narrative_digest"])
             self.assertEqual(
                 metadata["rendered_request_digest"], first["rendered_request_digest"])
-            self.assertIs(metadata["rendered_request_digest_matches"], False)
-            self.assertEqual(
-                metadata["rendered_request_coverage_reason"],
-                "request-digest-stale-generation")
+            self.assertIs(metadata["rendered_request_digest_matches"], True)
+            self.assertIsNone(metadata["rendered_request_coverage_reason"])
 
             events, skipped = overlay.load_review_ingests(root)
             self.assertEqual(skipped, 0)
-            self.assertIs(events[0]["narrative_digest_matches"], False)
-            self.assertEqual(
-                events[0]["rendered_request_coverage_reason"],
-                "request-digest-stale-generation")
-            projected_guard = overlay.evaluate_review_skipped_closes(
-                [{"round_id": self.ROUND_ID,
-                  "at": "2099-01-01T00:00:00+00:00",
-                  "review_mode": "packet"}],
-                [{**events[0], "at": "2098-01-01T00:00:00+00:00"}],
-                consecutive=1)
-            self.assertEqual(projected_guard["fires"], [self.ROUND_ID])
-            self.assertIsNone(projected_guard["by_round"][0]["feedback_observed"])
-
-            out = base / "out"
-            improve.run_reviews(base / "unused-registry.json", out, project_root=root)
-            row = next(row for row in (
-                _json.loads(line) for line in (out / "reviews.jsonl").read_text().splitlines()
-            ) if row["round_id"] == self.ROUND_ID)
-            self.assertEqual(
-                row["reply_rendered_request_digest"], first["rendered_request_digest"])
-            self.assertIs(row["rendered_request_digest_matches"], False)
-            self.assertEqual(
-                row["rendered_request_coverage_reason"],
-                "request-digest-stale-generation")
+            self.assertIs(events[0]["narrative_digest_matches"], True)
+            self.assertIs(events[0]["rendered_request_digest_matches"], True)
 
     def test_feedback_cache_digest_edit_cannot_reassign_verbatim_reply(self):
         with tempfile.TemporaryDirectory() as d:
@@ -1315,11 +1304,8 @@ Fail-loud protocol boundaries.
             root, target, narrative = self._closed_project(base)
             self.assertEqual(review.prepare_review_request(
                 root, self.ROUND_ID, narrative), 0)
-            rdir = root / "docs/reviews"
-            _first_path, first = review.latest_round_request_binding(
-                list(rdir.glob(f"{self.ROUND_ID}-request.binding*.json")),
-                expected_round_id=self.ROUND_ID)
-            self.assertIsNotNone(first)
+            artifacts = self._packet_artifacts(root)
+            first = artifacts["binding"]
 
             reply = base / "reply.md"
             reply.write_text(
@@ -1328,18 +1314,10 @@ Fail-loud protocol boundaries.
                 f"request-digest: {first['rendered_request_digest']}\n\nreviewed\n")
             self.assertEqual(review.ingest(root, self.ROUND_ID, src=reply), 0)
 
-            narrative.write_text(self.NARRATIVE.replace(
-                "Fail-loud protocol boundaries.", "A newer narrative generation."))
-            self.assertEqual(review.prepare_review_request(
-                root, self.ROUND_ID, narrative), 0)
-            _latest_path, latest = review.latest_round_request_binding(
-                list(rdir.glob(f"{self.ROUND_ID}-request.binding*.json")),
-                expected_round_id=self.ROUND_ID)
-            self.assertIsNotNone(latest)
-            self.assertNotEqual(
-                first["rendered_request_digest"], latest["rendered_request_digest"])
+            forged_narrative_digest = "sha256:" + "e" * 64
+            forged_request_digest = "sha256:" + "f" * 64
 
-            feedback = rdir / f"{self.ROUND_ID}-feedback.md"
+            feedback = artifacts["feedback"]
             content = feedback.read_bytes()
             header, tail = content.split(review.FEEDBACK_HEADER_SEPARATOR, 1)
             lines = header.decode().splitlines()
@@ -1348,8 +1326,8 @@ Fail-loud protocol boundaries.
                 if line.startswith("reply-metadata-json: "))
             payload = _json.loads(lines[metadata_index].removeprefix(
                 "reply-metadata-json: "))
-            payload["narrative_digest"] = latest["narrative_digest"]
-            payload["rendered_request_digest"] = latest["rendered_request_digest"]
+            payload["narrative_digest"] = forged_narrative_digest
+            payload["rendered_request_digest"] = forged_request_digest
             lines[metadata_index] = "reply-metadata-json: " + _json.dumps(
                 payload, sort_keys=True, separators=(",", ":"))
             feedback.write_bytes(
@@ -1359,20 +1337,11 @@ Fail-loud protocol boundaries.
             self.assertEqual([row["round_id"] for row in pending], [self.ROUND_ID])
             self.assertEqual(pending[0]["reason"], "feedback-cache-body-mismatch")
             projected = review.read_feedback_reply_metadata(
-                feedback, expected_round_id=self.ROUND_ID, binding=latest)
+                feedback, expected_round_id=self.ROUND_ID, binding=first)
             self.assertIsNone(projected["rendered_request_digest_matches"])
             self.assertEqual(
                 projected["rendered_request_coverage_reason"],
                 "feedback-cache-body-mismatch")
-
-            out = base / "out"
-            improve.run_reviews(base / "unused-registry.json", out, project_root=root)
-            row = next(row for row in (
-                _json.loads(line) for line in (out / "reviews.jsonl").read_text().splitlines()
-            ) if row["round_id"] == self.ROUND_ID)
-            self.assertIsNone(row["rendered_request_digest_matches"])
-            self.assertEqual(
-                row["rendered_request_coverage_reason"], "feedback-cache-body-mismatch")
 
     def test_feedback_cache_coverage_edit_cannot_enable_legacy_fallback(self):
         with tempfile.TemporaryDirectory() as d:
@@ -1386,8 +1355,8 @@ Fail-loud protocol boundaries.
                 f"review-target: {target}\n\nreviewed\n")
             self.assertEqual(review.ingest(root, self.ROUND_ID, src=reply), 0)
 
-            rdir = root / "docs/reviews"
-            feedback = rdir / f"{self.ROUND_ID}-feedback.md"
+            artifacts = self._packet_artifacts(root)
+            feedback = artifacts["feedback"]
             header, tail = feedback.read_bytes().split(
                 review.FEEDBACK_HEADER_SEPARATOR, 1)
             lines = header.decode().splitlines()
@@ -1403,9 +1372,7 @@ Fail-loud protocol boundaries.
             feedback.write_bytes(
                 "\n".join(lines).encode() + review.FEEDBACK_HEADER_SEPARATOR + tail)
 
-            _binding_path, binding = review.latest_round_request_binding(
-                list(rdir.glob(f"{self.ROUND_ID}-request.binding*.json")),
-                expected_round_id=self.ROUND_ID)
+            binding = artifacts["binding"]
             projected = review.read_feedback_reply_metadata(
                 feedback, expected_round_id=self.ROUND_ID, binding=binding)
             self.assertIs(projected["rendered_request_digest_matches"], False)
@@ -1415,19 +1382,16 @@ Fail-loud protocol boundaries.
                 review.pending_reviews(root)[0]["reason"],
                 "feedback-request-digest-missing")
 
-    def test_missing_or_corrupt_named_generation_is_unknown_not_receipt_corrupt(self):
-        for mutation in ("missing", "corrupt"):
+    def test_missing_or_replaced_canonical_generation_is_unknown_not_receipt_corrupt(self):
+        for mutation in ("missing", "replaced"):
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as d:
                 base = Path(d)
                 root, target, narrative = self._closed_project(base)
                 self.assertEqual(review.prepare_review_request(
                     root, self.ROUND_ID, narrative), 0)
-                rdir = root / "docs/reviews"
-                first_path, first = review.latest_round_request_binding(
-                    list(rdir.glob(f"{self.ROUND_ID}-request.binding*.json")),
-                    expected_round_id=self.ROUND_ID)
-                self.assertIsNotNone(first_path)
-                self.assertIsNotNone(first)
+                artifacts = self._packet_artifacts(root)
+                first_path = artifacts["binding_path"]
+                first = artifacts["binding"]
                 reply = base / "reply.md"
                 reply.write_text(
                     "model: reviewer-x\neffort: high\n"
@@ -1435,22 +1399,18 @@ Fail-loud protocol boundaries.
                     f"request-digest: {first['rendered_request_digest']}\n\nreviewed\n")
                 self.assertEqual(review.ingest(root, self.ROUND_ID, src=reply), 0)
 
-                narrative.write_text(self.NARRATIVE.replace(
-                    "Fail-loud protocol boundaries.", "A newer narrative generation."))
-                self.assertEqual(review.prepare_review_request(
-                    root, self.ROUND_ID, narrative), 0)
-                _latest_path, latest = review.latest_round_request_binding(
-                    list(rdir.glob(f"{self.ROUND_ID}-request.binding*.json")),
-                    expected_round_id=self.ROUND_ID)
-                self.assertIsNotNone(latest)
                 if mutation == "missing":
                     first_path.unlink()
                 else:
-                    first_path.write_text("{}\n")
+                    replacement = _json.loads(first_path.read_text())
+                    replacement["narrative_digest"] = "sha256:" + "e" * 64
+                    replacement["rendered_request_digest"] = "sha256:" + "f" * 64
+                    first_path.write_text(_json.dumps(replacement) + "\n")
 
-                feedback = rdir / f"{self.ROUND_ID}-feedback.md"
+                feedback = artifacts["feedback"]
                 projected = review.read_feedback_reply_metadata(
-                    feedback, expected_round_id=self.ROUND_ID, binding=latest)
+                    feedback, expected_round_id=self.ROUND_ID, binding=first,
+                    request_generation_dir=artifacts["directory"])
                 self.assertIsNone(projected["narrative_digest_matches"])
                 self.assertEqual(
                     projected["narrative_coverage_reason"], "request-digest-unknown")
@@ -1458,23 +1418,9 @@ Fail-loud protocol boundaries.
                 self.assertEqual(
                     projected["rendered_request_coverage_reason"],
                     "request-digest-unknown")
-                events, skipped = overlay.load_review_ingests(root)
-                self.assertEqual(skipped, 0)
-                self.assertIsNone(events[0]["narrative_digest_matches"])
-                self.assertEqual(
-                    events[0]["rendered_request_coverage_reason"],
-                    "request-digest-unknown")
-                projected_guard = overlay.evaluate_review_skipped_closes(
-                    [{"round_id": self.ROUND_ID,
-                      "at": "2099-01-01T00:00:00+00:00",
-                      "review_mode": "packet"}],
-                    [{**events[0], "at": "2098-01-01T00:00:00+00:00"}],
-                    consecutive=1)
-                self.assertEqual(projected_guard["fires"], [self.ROUND_ID])
-                self.assertIsNone(projected_guard["by_round"][0]["feedback_observed"])
-                self.assertEqual(
-                    review.pending_reviews(root)[0]["reason"],
-                    "feedback-request-digest-unknown")
+                canonical_feedback = review_layout.read_canonical_artifact(
+                    root / "docs/reviews", feedback)
+                self.assertEqual(canonical_feedback["run_id"], artifacts["run_id"])
 
     def test_invalid_stored_round_is_isolated_before_generation_lookup(self):
         from unittest import mock
@@ -1484,10 +1430,8 @@ Fail-loud protocol boundaries.
             root, target, narrative = self._closed_project(base)
             self.assertEqual(review.prepare_review_request(
                 root, self.ROUND_ID, narrative), 0)
-            rdir = root / "docs/reviews"
-            _binding_path, binding = review.latest_round_request_binding(
-                list(rdir.glob(f"{self.ROUND_ID}-request.binding*.json")),
-                expected_round_id=self.ROUND_ID)
+            artifacts = self._packet_artifacts(root)
+            binding = artifacts["binding"]
             reply = base / "reply.md"
             reply.write_text(
                 "model: reviewer-x\neffort: high\n"
@@ -1495,7 +1439,7 @@ Fail-loud protocol boundaries.
                 f"request-digest: {binding['rendered_request_digest']}\n\nreviewed\n")
             self.assertEqual(review.ingest(root, self.ROUND_ID, src=reply), 0)
 
-            feedback = rdir / f"{self.ROUND_ID}-feedback.md"
+            feedback = artifacts["feedback"]
             pristine = feedback.read_bytes()
             header, tail = pristine.split(
                 review.FEEDBACK_HEADER_SEPARATOR, 1)
@@ -1535,63 +1479,42 @@ Fail-loud protocol boundaries.
             self.assertEqual(
                 review.pending_reviews(root)[0]["reason"], "feedback-receipt-corrupt")
 
-            out = base / "out"
-            improve.run_reviews(base / "unused-registry.json", out, project_root=root)
-            row = next(row for row in (
-                _json.loads(line) for line in (out / "reviews.jsonl").read_text().splitlines()
-            ) if row["round_id"] == self.ROUND_ID)
-            self.assertEqual(
-                row["rendered_request_coverage_reason"], "feedback-receipt-corrupt")
-
     def test_stale_echo_recovers_when_its_generation_becomes_latest_again(self):
         with tempfile.TemporaryDirectory() as d:
             base = Path(d)
             root, target, narrative = self._closed_project(base)
             self.assertEqual(review.prepare_review_request(
                 root, self.ROUND_ID, narrative), 0)
-            rdir = root / "docs/reviews"
-            _first_path, first = review.latest_round_request_binding(
-                list(rdir.glob(f"{self.ROUND_ID}-request.binding*.json")),
-                expected_round_id=self.ROUND_ID)
-            self.assertIsNotNone(first)
+            artifacts = self._packet_artifacts(root)
+            first = artifacts["binding"]
+            original_binding = artifacts["binding_path"].read_bytes()
 
             reply = base / "reply.md"
             reply.write_text(
                 "model: reviewer-x\neffort: high\n"
                 f"review-target: {target}\n"
                 f"request-digest: {first['rendered_request_digest']}\n\nreviewed\n")
-            narrative.write_text(self.NARRATIVE.replace(
-                "Fail-loud protocol boundaries.", "A newer narrative generation."))
-            self.assertEqual(review.prepare_review_request(
-                root, self.ROUND_ID, narrative), 0)
             self.assertEqual(review.ingest(root, self.ROUND_ID, src=reply), 0)
+
+            replacement = _json.loads(original_binding)
+            replacement["narrative_digest"] = "sha256:" + "e" * 64
+            replacement["rendered_request_digest"] = "sha256:" + "f" * 64
+            artifacts["binding_path"].write_text(_json.dumps(replacement) + "\n")
             self.assertEqual(
                 review.pending_reviews(root)[0]["reason"],
-                "feedback-request-digest-stale-generation")
+                "request-digest-mismatch")
 
-            narrative.write_text(self.NARRATIVE)
-            self.assertEqual(review.prepare_review_request(
-                root, self.ROUND_ID, narrative), 0)
-            _latest_path, latest = review.latest_round_request_binding(
-                list(rdir.glob(f"{self.ROUND_ID}-request.binding*.json")),
-                expected_round_id=self.ROUND_ID)
-            self.assertEqual(
-                latest["rendered_request_digest"], first["rendered_request_digest"])
+            artifacts["binding_path"].write_bytes(original_binding)
+            latest = self._packet_artifacts(root)["binding"]
+            self.assertEqual(latest, first)
             self.assertEqual(review.pending_reviews(root), [])
 
-            feedback = rdir / f"{self.ROUND_ID}-feedback.md"
+            feedback = artifacts["feedback"]
             receipt = review.read_feedback_reply_metadata(
-                feedback, expected_round_id=self.ROUND_ID, binding=latest)
+                feedback, expected_round_id=self.ROUND_ID, binding=latest,
+                request_generation_dir=artifacts["directory"])
             self.assertIs(receipt["rendered_request_digest_matches"], True)
             self.assertIsNone(receipt["rendered_request_coverage_reason"])
-
-            out = base / "out"
-            improve.run_reviews(base / "unused-registry.json", out, project_root=root)
-            row = next(row for row in (
-                _json.loads(line) for line in (out / "reviews.jsonl").read_text().splitlines()
-            ) if row["round_id"] == self.ROUND_ID)
-            self.assertIs(row["rendered_request_digest_matches"], True)
-            self.assertIsNone(row["rendered_request_coverage_reason"])
 
     def test_v2_reply_without_digest_stays_pending_with_resubmission_guidance(self):
         import contextlib
@@ -1622,7 +1545,7 @@ Fail-loud protocol boundaries.
             self.assertEqual(pending[0]["reason"], "feedback-request-digest-missing")
 
             metadata = review.read_feedback_reply_metadata(
-                root / "docs/reviews" / f"{self.ROUND_ID}-feedback.md",
+                self._packet_artifacts(root)["feedback"],
                 expected_round_id=self.ROUND_ID, binding=binding)
             self.assertIsNone(metadata["rendered_request_digest"])
             self.assertEqual(
@@ -1646,7 +1569,7 @@ Fail-loud protocol boundaries.
                 root, self.ROUND_ID, common.load_config(root))
             self.assertIsNone(reason)
             receipt = review.read_feedback_reply_metadata(
-                root / "docs/reviews" / f"{self.ROUND_ID}-feedback.md",
+                self._packet_artifacts(root)["feedback"],
                 expected_round_id=self.ROUND_ID, binding=binding)
             self.assertIsNone(receipt["rendered_request_digest"])
             self.assertEqual(
@@ -1662,8 +1585,7 @@ Fail-loud protocol boundaries.
                 root, _target, narrative = self._closed_project(Path(d))
                 self.assertEqual(review.prepare_review_request(
                     root, self.ROUND_ID, narrative), 0)
-                binding_path = next((root / "docs/reviews").glob(
-                    f"{self.ROUND_ID}-request.binding*.json"))
+                binding_path = self._packet_artifacts(root)["binding_path"]
                 binding = _json.loads(binding_path.read_text())
                 if value is None:
                     binding.pop(field)
@@ -1679,8 +1601,7 @@ Fail-loud protocol boundaries.
             root, _target, narrative = self._closed_project(Path(d))
             self.assertEqual(review.prepare_review_request(
                 root, self.ROUND_ID, narrative), 0)
-            binding_path = next((root / "docs/reviews").glob(
-                f"{self.ROUND_ID}-request.binding*.json"))
+            binding_path = self._packet_artifacts(root)["binding_path"]
             shadow_target = "f" * 40
             binding_path.write_text(binding_path.read_text().replace(
                 '"target_sha":',
@@ -1966,21 +1887,19 @@ Fail-loud protocol boundaries.
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(review.prepare_review_request(
                     root, self.ROUND_ID, narrative), 0)
-            directory = root / "docs/reviews"
-            canonical = next(directory.glob(
-                f"{self.ROUND_ID}-request.binding*.json"))
-            alias = canonical.with_name(
-                f"{self.ROUND_ID}-request.binding-02.json")
-            canonical.rename(alias)
+            canonical = self._packet_artifacts(root)["binding_path"]
+            payload = _json.loads(canonical.read_text())
+            payload["run_id"] = review_layout.new_run_id()
+            canonical.write_text(_json.dumps(payload) + "\n")
 
             out, err = io.StringIO(), io.StringIO()
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                 rc = review.prepare_review_request(root, self.ROUND_ID, narrative)
 
             self.assertEqual(rc, 1)
-            self.assertIn(str(alias), err.getvalue())
+            self.assertIn(str(canonical), err.getvalue())
             self.assertNotIn("prepared review request binding", out.getvalue())
-            self.assertFalse(canonical.exists())
+            self.assertTrue(canonical.exists())
 
     def test_prepare_supports_pr_mode_without_unrendered_placeholders(self):
         with tempfile.TemporaryDirectory() as d:
@@ -2122,13 +2041,15 @@ Fail-loud protocol boundaries.
 
             self.assertEqual(review.prepare_packet_request(
                 root, self.ROUND_ID, narrative), 0)
-            bindings = list((root / "docs" / "reviews").glob(
-                f"{self.ROUND_ID}-request.binding*.json"))
-            self.assertEqual(len(bindings), 1)
+            first = self._packet_artifacts(root)
             self.assertEqual(review.prepare_packet_request(
                 root, self.ROUND_ID, narrative), 0)
-            self.assertEqual(list((root / "docs" / "reviews").glob(
-                f"{self.ROUND_ID}-request.binding*.json")), bindings)
+            second = self._packet_artifacts(root)
+            self.assertEqual(second["run_id"], first["run_id"])
+            self.assertEqual(second["binding_path"], first["binding_path"])
+            self.assertEqual(
+                list((root / "docs/reviews").glob(
+                    f"{self.ROUND_ID}-request.binding*.json")), [])
 
             (root / "advance.txt").write_text(head)
             git(root, "add", "-A")
@@ -2136,14 +2057,17 @@ Fail-loud protocol boundaries.
             self.assertEqual(review.prepare_packet_request(
                 root, self.ROUND_ID, narrative), 1)
 
-    def test_narrative_only_reprepare_reissues_binding_and_reopens_pending(self):
+    def test_narrative_only_reprepare_refuses_fixed_canonical_leaf(self):
+        import contextlib
+        import io
+
         with tempfile.TemporaryDirectory() as d:
             root, target, narrative = self._closed_project(Path(d))
             self.assertEqual(review.prepare_review_request(
                 root, self.ROUND_ID, narrative), 0)
-            first_path = next((root / "docs/reviews").glob(
-                f"{self.ROUND_ID}-request.binding*.json"))
-            first = review.read_round_request_binding(first_path)
+            artifacts = self._packet_artifacts(root)
+            first_path = artifacts["binding_path"]
+            first = artifacts["binding"]
             self.assertRegex(first["narrative_digest"], r"^sha256:[0-9a-f]{64}$")
 
             reply = Path(d) / "reply.md"
@@ -2157,82 +2081,53 @@ Fail-loud protocol boundaries.
             narrative.write_text(self.NARRATIVE.replace(
                 "Fail-loud protocol boundaries.",
                 "Fail-loud protocol boundaries after a narrative correction."))
+            before = first_path.read_bytes()
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(review.prepare_review_request(
+                    root, self.ROUND_ID, narrative), 1)
+            self.assertIn("new round id", err.getvalue())
+            self.assertEqual(first_path.read_bytes(), before)
+            self.assertEqual(review.pending_reviews(root), [])
+
+    def test_reprepare_conflict_leaves_canonical_projections_byte_exact(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, target, narrative = self._closed_project(Path(d))
             self.assertEqual(review.prepare_review_request(
                 root, self.ROUND_ID, narrative), 0)
-            paths = sorted((root / "docs/reviews").glob(
-                f"{self.ROUND_ID}-request.binding*.json"))
-            self.assertEqual(len(paths), 2)
-            _latest_path, latest = review.latest_round_request_binding(
-                paths, expected_round_id=self.ROUND_ID)
-            self.assertIsNotNone(latest)
-            self.assertNotEqual(first["narrative_digest"], latest["narrative_digest"])
-            self.assertEqual(
-                [(row["round_id"], row["target_sha"]) for row in review.pending_reviews(root)],
-                [(self.ROUND_ID, target)],
-            )
+            artifacts = self._packet_artifacts(root)
+            stored_narrative = review.stored_narrative_path(root, self.ROUND_ID)
+            before = {
+                "request": artifacts["request"].read_bytes(),
+                "binding": artifacts["binding_path"].read_bytes(),
+                "narrative": stored_narrative.read_bytes(),
+            }
+            reply = Path(d) / "reply.md"
+            reply.write_text(
+                "model: reviewer-x\neffort: high\n"
+                f"review-target: {target}\n"
+                f"request-digest: {artifacts['binding']['rendered_request_digest']}\n\n"
+                "reviewed\n")
+            self.assertEqual(review.ingest(root, self.ROUND_ID, src=reply), 0)
+            self.assertEqual(review.pending_reviews(root), [])
 
-    def test_reprepare_crash_after_each_projection_write_stays_pending(self):
-        from unittest import mock
+            narrative.write_text(self.NARRATIVE.replace(
+                "Fail-loud protocol boundaries.",
+                "Fail-loud protocol boundaries after rejected reprepare."))
+            self.assertEqual(review.prepare_review_request(
+                root, self.ROUND_ID, narrative), 1)
 
-        class SimulatedCrash(BaseException):
-            pass
-
-        for stop_after in (1, 2):
-            with self.subTest(stop_after=stop_after), tempfile.TemporaryDirectory() as d:
-                root, target, narrative = self._closed_project(Path(d))
-                self.assertEqual(review.prepare_review_request(
-                    root, self.ROUND_ID, narrative), 0)
-                request = root / "docs/reviews" / f"{self.ROUND_ID}-request.md"
-                stored_narrative = review.stored_narrative_path(root, self.ROUND_ID)
-                old_request = request.read_bytes()
-                old_narrative = stored_narrative.read_bytes()
-                request_digest = review._rendered_request_digest_echo(request.read_text())
-                reply = Path(d) / "reply.md"
-                reply.write_text(
-                    "model: reviewer-x\neffort: high\n"
-                    f"review-target: {target}\n"
-                    f"request-digest: {request_digest}\n\nreviewed\n")
-                self.assertEqual(review.ingest(root, self.ROUND_ID, src=reply), 0)
-                self.assertEqual(review.pending_reviews(root), [])
-
-                narrative.write_text(self.NARRATIVE.replace(
-                    "Fail-loud protocol boundaries.",
-                    "Fail-loud protocol boundaries after interrupted reprepare."))
-                new_narrative = review._read_review_narrative(narrative)
-                original_write = review.write_bytes_atomic
-                writes = []
-
-                def interrupt_after_write(path, content):
-                    original_write(path, content)
-                    writes.append(Path(path))
-                    if len(writes) == stop_after:
-                        raise SimulatedCrash
-
-                with mock.patch.object(
-                        review, "write_bytes_atomic", side_effect=interrupt_after_write):
-                    with self.assertRaises(SimulatedCrash):
-                        review.prepare_review_request(root, self.ROUND_ID, narrative)
-
-                self.assertNotEqual(request.read_bytes(), old_request)
-                self.assertEqual(
-                    stored_narrative.read_bytes() != old_narrative, stop_after == 2)
-                latest_path, latest = review.latest_round_request_binding(
-                    list(request.parent.glob(f"{self.ROUND_ID}-request.binding*.json")),
-                    expected_round_id=self.ROUND_ID)
-                self.assertIsNotNone(latest_path)
-                self.assertIsNotNone(latest)
-                self.assertEqual(
-                    latest["narrative_digest"],
-                    review._canonical_narrative_digest(new_narrative))
-                pending = review.pending_reviews(root)
-                self.assertEqual([row["round_id"] for row in pending], [self.ROUND_ID])
+            self.assertEqual(artifacts["request"].read_bytes(), before["request"])
+            self.assertEqual(artifacts["binding_path"].read_bytes(), before["binding"])
+            self.assertEqual(stored_narrative.read_bytes(), before["narrative"])
+            self.assertEqual(review.pending_reviews(root), [])
 
     def test_pending_exposes_latest_binding_projection_mismatches(self):
         with tempfile.TemporaryDirectory() as d:
             root, target, narrative = self._closed_project(Path(d))
             self.assertEqual(review.prepare_review_request(
                 root, self.ROUND_ID, narrative), 0)
-            request = root / "docs/reviews" / f"{self.ROUND_ID}-request.md"
+            request = self._packet_artifacts(root)["request"]
             request_digest = review._rendered_request_digest_echo(request.read_text())
             reply = Path(d) / "reply.md"
             reply.write_text(
@@ -2261,14 +2156,15 @@ Fail-loud protocol boundaries.
             pending = review.pending_reviews(root)
             self.assertEqual(pending[0]["reason"], "stored-narrative-digest-mismatch")
 
-    def test_render_only_reprepare_invalidates_old_feedback(self):
+    def test_render_only_reprepare_refuses_fixed_canonical_leaf(self):
         from unittest import mock
 
         with tempfile.TemporaryDirectory() as d:
             root, target, narrative = self._closed_project(Path(d))
             self.assertEqual(review.prepare_review_request(
                 root, self.ROUND_ID, narrative), 0)
-            request = root / "docs/reviews" / f"{self.ROUND_ID}-request.md"
+            artifacts = self._packet_artifacts(root)
+            request = artifacts["request"]
             request_digest = review._rendered_request_digest_echo(request.read_text())
             reply = Path(d) / "reply.md"
             reply.write_text(
@@ -2282,14 +2178,15 @@ Fail-loud protocol boundaries.
             revised_template.write_text(
                 review.REVIEW_REQUEST_TEMPLATE.read_text().replace(
                     "This is a domain/code review", "This is a revised domain/code review"))
+            before_request = request.read_bytes()
+            before_binding = artifacts["binding_path"].read_bytes()
             with mock.patch.object(review, "REVIEW_REQUEST_TEMPLATE", revised_template):
                 self.assertEqual(review.prepare_review_request(
-                    root, self.ROUND_ID, narrative), 0)
-                pending = review.pending_reviews(root)
+                    root, self.ROUND_ID, narrative), 1)
 
-            self.assertEqual([row["round_id"] for row in pending], [self.ROUND_ID])
-            self.assertEqual(
-                pending[0]["reason"], "feedback-request-digest-stale-generation")
+            self.assertEqual(request.read_bytes(), before_request)
+            self.assertEqual(artifacts["binding_path"].read_bytes(), before_binding)
+            self.assertEqual(review.pending_reviews(root), [])
 
     def test_stamped_feedback_blocks_legacy_fallback_if_latest_digest_is_stripped(self):
         with tempfile.TemporaryDirectory() as d:
@@ -2302,28 +2199,23 @@ Fail-loud protocol boundaries.
                 f"review-target: {target}\n\nreviewed\n")
             self.assertEqual(review.ingest(root, self.ROUND_ID, src=reply), 0)
 
-            narrative.write_text(self.NARRATIVE.replace(
-                "Fail-loud protocol boundaries.", "A second valid narrative."))
-            self.assertEqual(review.prepare_review_request(
-                root, self.ROUND_ID, narrative), 0)
-            latest_path, _latest = review.latest_round_request_binding(
-                list((root / "docs/reviews").glob(
-                    f"{self.ROUND_ID}-request.binding*.json")),
-                expected_round_id=self.ROUND_ID)
-            self.assertIsNotNone(latest_path)
+            artifacts = self._packet_artifacts(root)
+            latest_path = artifacts["binding_path"]
             latest = _json.loads(latest_path.read_text())
             latest.pop("narrative_digest")
             latest_path.write_text(_json.dumps(latest) + "\n")
 
             with self.assertRaisesRegex(common.WorkflowError, "corrupt review binding"):
                 review.read_round_request_binding(latest_path)
-            self.assertEqual([row["round_id"] for row in review.pending_reviews(root)],
-                             [self.ROUND_ID])
+            with self.assertRaisesRegex(
+                    review_layout.IdentityConflict, "prevents flat fallback"):
+                review.packet_review_artifacts(root, self.ROUND_ID)
+            pending = review.pending_reviews(root)
+            self.assertEqual([row["round_id"] for row in pending], [self.ROUND_ID])
+            self.assertEqual(
+                pending[0]["reason"], "canonical-artifact-identity-conflict")
 
     def test_ingest_rejects_digest_strip_and_v1_downgrade_for_digest_era_round(self):
-        import contextlib
-        import io
-
         for downgrade in (False, True):
             with self.subTest(downgrade=downgrade), tempfile.TemporaryDirectory() as d:
                 root = Path(d) / "repo"
@@ -2333,10 +2225,10 @@ Fail-loud protocol boundaries.
                     "version: 1\nproject: demo\nreviews_dir: docs/reviews\n")
                 round_id = "2026-07-19-digest-era"
                 rdir = root / "docs/reviews"
-                rdir.mkdir(parents=True)
-                (rdir / f"{round_id}-request.md").write_text("request\n")
+                run_id = review_layout.new_run_id()
+                review_layout.publish_markdown(
+                    rdir, run_id, review_layout.REQUEST, b"request\n")
                 target, base_sha = "a" * 40, "b" * 40
-                binding_path = rdir / f"{round_id}-request.binding.json"
                 binding = {
                     "schema": "waystone-round-request-binding-2",
                     "round_id": round_id, "target_sha": target, "base_sha": base_sha,
@@ -2346,7 +2238,8 @@ Fail-loud protocol boundaries.
                     "rendered_request_digest": TEST_RENDERED_REQUEST_DIGEST,
                     "at": "2026-07-19T00:00:00+00:00",
                 }
-                binding_path.write_text(_json.dumps(binding) + "\n")
+                binding_path = review_layout.publish_json(
+                    rdir, run_id, review_layout.REQUEST_BINDING, binding)
                 bare = Path(d) / "remote.git"
                 subprocess.run(
                     ["git", "init", "-q", "--bare", "-b", "main", str(bare)], check=True)
@@ -2354,22 +2247,25 @@ Fail-loud protocol boundaries.
                 git(root, "add", "-A")
                 git(root, "commit", "-qm", "publish digest-bound packet")
                 git(root, "push", "-q", "-u", "origin", "main")
-                binding.pop("narrative_digest")
-                binding.pop("rendered_request_digest")
+                damaged = _json.loads(binding_path.read_text())
+                damaged.pop("narrative_digest")
+                damaged.pop("rendered_request_digest")
                 if downgrade:
-                    binding["schema"] = "waystone-round-request-binding-1"
-                binding_path.write_text(_json.dumps(binding) + "\n")
+                    damaged["schema"] = "waystone-round-request-binding-1"
+                binding_path.write_text(_json.dumps(damaged) + "\n")
                 reply = Path(d) / "reply.md"
                 reply.write_text(
                     "model: reviewer-x\neffort: high\n"
                     f"review-target: {base_sha[:12]}-{target[:12]}\n\nreviewed\n")
-                err = io.StringIO()
 
-                with contextlib.redirect_stderr(err):
-                    self.assertEqual(review.ingest(root, round_id, src=reply), 1)
+                with self.assertRaisesRegex(
+                        review_layout.IdentityConflict, "prevents flat fallback"):
+                    review.ingest(root, round_id, src=reply)
 
-                self.assertIn("corrupt", err.getvalue())
-                self.assertFalse((rdir / f"{round_id}-feedback.md").exists())
+                feedback = review_layout.canonical_artifact_path(
+                    rdir, run_id, review_layout.FEEDBACK)
+                self.assertFalse(feedback.exists())
+                self.assertTrue(reply.exists())
                 self.assertEqual(
                     [row["round_id"] for row in review.pending_reviews(root)], [round_id])
 
@@ -2410,7 +2306,7 @@ Fail-loud protocol boundaries.
 
         with tempfile.TemporaryDirectory() as d:
             root, _target, _narrative = self._remote_project(Path(d))
-            request = root / "docs/reviews" / f"{self.ROUND_ID}-request.md"
+            request = self._packet_artifacts(root)["request"]
             request.write_text(request.read_text().replace(
                 "The round made packet rendering deterministic.",
                 "The packet narrative was altered after prepare."))
@@ -2499,9 +2395,9 @@ Fail-loud protocol boundaries.
                 "review", "prepare", "--round", self.ROUND_ID,
                 "--narrative", str(narrative), str(root))
             self.assertEqual(prepared.returncode, 0, prepared.stderr)
-            request = root / "docs" / "reviews" / f"{self.ROUND_ID}-request.md"
-            binding = next((root / "docs" / "reviews").glob(
-                f"{self.ROUND_ID}-request.binding*.json"))
+            artifacts = self._packet_artifacts(root)
+            request = artifacts["request"]
+            binding = artifacts["binding_path"]
 
             untracked = cli("remote", "verify", str(root), "--round", self.ROUND_ID)
             self.assertNotEqual(untracked.returncode, 0)
@@ -2521,14 +2417,19 @@ Fail-loud protocol boundaries.
             self.assertEqual(published.returncode, 0, published.stderr)
             self.assertIn("request and binding", published.stdout)
 
-    def _remote_project(self, base: Path) -> tuple[Path, str, Path]:
+    def _remote_project(
+            self, base: Path, *, legacy: bool = False) -> tuple[Path, str, Path]:
         bare = base / "remote.git"
         subprocess.run(
             ["git", "init", "-q", "--bare", "-b", "main", str(bare)], check=True)
         root, target, narrative = self._closed_project(base)
         git(root, "remote", "add", "origin", str(bare))
         git(root, "push", "-q", "-u", "origin", "main")
-        self.assertEqual(review.prepare_review_request(root, self.ROUND_ID, narrative), 0)
+        if legacy:
+            self._write_legacy_packet_generation(root, narrative)
+        else:
+            self.assertEqual(review.prepare_review_request(
+                root, self.ROUND_ID, narrative), 0)
         return root, target, narrative
 
     def _publish_remote_packet(self, base: Path) -> tuple[Path, Path, str]:
@@ -2699,8 +2600,7 @@ Fail-loud protocol boundaries.
             subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
             root, target, narrative_path = self._closed_project(base)
             git(root, "remote", "add", "origin", str(bare))
-            self.assertEqual(review.prepare_review_request(
-                root, self.ROUND_ID, narrative_path), 0)
+            self._write_legacy_packet_generation(root, narrative_path)
             git(root, "add", "-A")
             git(root, "commit", "-qm", "publish first packet")
             git(root, "push", "-q", "-u", "origin", "main")
@@ -2741,15 +2641,15 @@ Fail-loud protocol boundaries.
             git(root, "add", "-A")
             git(root, "commit", "-qm", "publish packet")
             git(root, "push", "-q")
-            request = root / "docs" / "reviews" / f"{self.ROUND_ID}-request.md"
-            real = root / "docs" / "reviews" / "elsewhere.md"
+            request = self._packet_artifacts(root)["request"]
+            real = request.parent / "elsewhere.md"
             request.rename(real)
             request.symlink_to(real.name)
 
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
                 self.assertEqual(review.verify_packet_publication(root, self.ROUND_ID), 1)
-            self.assertIn("regular file", err.getvalue())
+            self.assertRegex(err.getvalue(), r"regular file|contains a symlink")
 
     def test_gate_source_has_no_ancestry_topology_checks(self):
         import inspect
@@ -2809,7 +2709,7 @@ Fail-loud protocol boundaries.
         import io
 
         with tempfile.TemporaryDirectory() as d:
-            root, _target, _narrative = self._remote_project(Path(d))
+            root, _target, _narrative = self._remote_project(Path(d), legacy=True)
             git(root, "add", "-A")
             git(root, "commit", "-qm", "publish first packet")
             git(root, "push", "-q")
@@ -2900,8 +2800,8 @@ class RoundExposureTests(unittest.TestCase):
             narrative.write_text(PacketPublicationTests.NARRATIVE)
             self.assertEqual(review.prepare_packet_request(
                 root, TEST_CLOSE_ROUND_ID, narrative), 0)
-            binding_path = next((root / "docs" / "reviews").glob(
-                f"{TEST_CLOSE_ROUND_ID}-request.binding*.json"))
+            binding_path = review.packet_review_artifacts(
+                root, TEST_CLOSE_ROUND_ID)["binding_path"]
             binding = _json.loads(binding_path.read_text())
             self.assertEqual(binding["round_id"], TEST_CLOSE_ROUND_ID)
             self.assertEqual(binding["target_sha"], closeout)
@@ -2985,12 +2885,12 @@ class RoundExposureTests(unittest.TestCase):
             self.assertEqual(_run_with_home(
                 home, lambda: review.prepare_packet_request(
                     root, TEST_CLOSE_ROUND_ID, narrative)), 0)
-            request = root / "docs" / "reviews" / f"{TEST_CLOSE_ROUND_ID}-request.md"
+            artifacts = review.packet_review_artifacts(root, TEST_CLOSE_ROUND_ID)
+            request = artifacts["request"]
             self.assertIn(
                 f"- Reviewing: {reclose_head}   (diff against {previous_round_tip})",
                 request.read_text())
-            binding_path = next((root / "docs" / "reviews").glob(
-                f"{TEST_CLOSE_ROUND_ID}-request.binding*.json"))
+            binding_path = artifacts["binding_path"]
             binding = review.read_round_request_binding(binding_path)
             self.assertEqual(binding["target_sha"], reclose_head)
             self.assertEqual(binding["base_sha"], previous_round_tip)

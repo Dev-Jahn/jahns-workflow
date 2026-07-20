@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from support import *  # noqa: F401,F403
+from waystone.features import review_layout
 
 
 class BasePolicyTests(unittest.TestCase):
@@ -144,12 +145,30 @@ class IngestTests(unittest.TestCase):
         (root / ".waystone.yml").write_text("version: 1\nproject: x\n")
         return root
 
+    def _legacy_request(self, root, round_id):
+        path = root / "docs/reviews" / f"{round_id}-request.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("historical request\n")
+        return path
+
     def _binding(self, root, round_id, *, target=None, base=None, reviewers=None):
-        return review.write_round_request_binding(
-            root, round_id, target or "a" * 40, "b" * 40 if base is None else base,
-            reviewers or ["codex:gpt-5.6-sol"], mode="packet",
-            narrative_digest=TEST_NARRATIVE_DIGEST,
-            rendered_request_digest=TEST_RENDERED_REQUEST_DIGEST)
+        owner = review_layout.new_run_id()
+        return review_layout.publish_json(
+            root / "docs/reviews", owner, review_layout.REQUEST_BINDING, {
+                "schema": review.ROUND_REQUEST_BINDING_SCHEMA,
+                "round_id": round_id,
+                "target_sha": target or "a" * 40,
+                "base_sha": "b" * 40 if base is None else base,
+                "reviewers": reviewers or ["codex:gpt-5.6-sol"],
+                "mode": "packet",
+                "canonical_store": "local-packet",
+                "narrative_digest": TEST_NARRATIVE_DIGEST,
+                "rendered_request_digest": TEST_RENDERED_REQUEST_DIGEST,
+                "at": "2026-07-21T00:00:00+00:00",
+            })
+
+    def _feedback(self, root, round_id):
+        return review.packet_review_artifacts(root, round_id)["feedback"]
 
     def _reply(self, *, model="gpt-5.6-sol", effort="high", target=None, extra=""):
         target = target or f"{'b' * 12}-{'a' * 12}"
@@ -301,7 +320,7 @@ class IngestTests(unittest.TestCase):
             src.write_bytes(self._reply(extra="foo: bar\n") + (
                 f"\nreply-metadata-json: {body_payload}\n").encode())
             self.assertEqual(review.ingest(root, round_id, src=src), 0)
-            feedback = root / f"docs/reviews/{round_id}-feedback.md"
+            feedback = self._feedback(root, round_id)
             projected = review.read_feedback_reply_metadata(
                 feedback, expected_round_id=round_id,
                 binding=review.read_round_request_binding(binding_path))
@@ -327,7 +346,7 @@ class IngestTests(unittest.TestCase):
             src = root / "reply.md"
             src.write_bytes(self._reply())
             self.assertEqual(review.ingest(root, round_id, src=src), 0)
-            feedback = root / f"docs/reviews/{round_id}-feedback.md"
+            feedback = self._feedback(root, round_id)
             header, tail = feedback.read_bytes().split(
                 review.FEEDBACK_HEADER_SEPARATOR, 1)
             padding_prefix = b"\ncache-padding: "
@@ -355,7 +374,7 @@ class IngestTests(unittest.TestCase):
             src = root / "reply.md"
             src.write_bytes(self._reply())
             self.assertEqual(review.ingest(root, round_id, src=src), 0)
-            feedback = root / f"docs/reviews/{round_id}-feedback.md"
+            feedback = self._feedback(root, round_id)
             binding = review.read_round_request_binding(binding_path)
             pristine = feedback.read_bytes()
             first = pristine.index(review.FEEDBACK_HEADER_SEPARATOR)
@@ -388,12 +407,18 @@ class IngestTests(unittest.TestCase):
             src = root / "reply.md"
             src.write_bytes(self._reply() + b"x" * (2 * 1024 * 1024))
             self.assertEqual(review.ingest(root, round_id, src=src), 0)
-            feedback = root / f"docs/reviews/{round_id}-feedback.md"
+            feedback = self._feedback(root, round_id)
             binding = review.read_round_request_binding(binding_path)
 
+            original_read_bytes = Path.read_bytes
+
+            def reject_feedback_read_bytes(path):
+                if path == feedback:
+                    raise AssertionError("receipt reader must use bounded reads")
+                return original_read_bytes(path)
+
             with mock.patch.object(
-                    Path, "read_bytes",
-                    side_effect=AssertionError("receipt reader must use bounded reads")):
+                    Path, "read_bytes", new=reject_feedback_read_bytes):
                 projected = review.read_feedback_reply_metadata(
                     feedback, expected_round_id=round_id, binding=binding)
             self.assertIs(projected["rendered_request_digest_matches"], True)
@@ -442,7 +467,7 @@ class IngestTests(unittest.TestCase):
             src = root / "reply.md"
             src.write_bytes(self._reply())
             self.assertEqual(review.ingest(root, round_id, src=src), 0)
-            feedback = root / f"docs/reviews/{round_id}-feedback.md"
+            feedback = self._feedback(root, round_id)
             binding, reason = review.ingest_round_binding(
                 root, round_id, common.load_config(root))
             self.assertIsNone(reason)
@@ -475,7 +500,7 @@ class IngestTests(unittest.TestCase):
             round_id = "2026-07-18-r1"
             binding_path = self._binding(root, round_id)
             binding = review.read_round_request_binding(binding_path)
-            feedback = root / f"docs/reviews/{round_id}-feedback.md"
+            feedback = root / "pre-echo-feedback.md"
             feedback.write_text(
                 "<!-- waystone feedback -->\n"
                 f"round: {round_id}\n"
@@ -503,7 +528,7 @@ class IngestTests(unittest.TestCase):
             src = root / "reply.md"
             src.write_bytes(self._reply())
             self.assertEqual(review.ingest(root, round_id, src=src), 0)
-            feedback = root / f"docs/reviews/{round_id}-feedback.md"
+            feedback = self._feedback(root, round_id)
             header, tail = feedback.read_bytes().split(
                 review.FEEDBACK_HEADER_SEPARATOR, 1)
             lines = header.decode().splitlines()
@@ -570,7 +595,7 @@ class IngestTests(unittest.TestCase):
             with contextlib.redirect_stderr(err):
                 self.assertEqual(review.ingest(root, round_id, src=src), 0)
             self.assertIn("structured reply header not found", err.getvalue())
-            feedback = root / f"docs/reviews/{round_id}-feedback.md"
+            feedback = self._feedback(root, round_id)
             binding, _reason = review.ingest_round_binding(
                 root, round_id, common.load_config(root))
             projected = review.read_feedback_reply_metadata(
@@ -600,7 +625,7 @@ class IngestTests(unittest.TestCase):
             src.write_bytes(body)
             rc = review.ingest(root, "2026-06-22-x", src=src)
             self.assertEqual(rc, 0)
-            dest = root / "docs/reviews/2026-06-22-x-feedback.md"
+            dest = self._feedback(root, "2026-06-22-x")
             content = dest.read_bytes()
             self.assertIn(body, content)                     # body byte-exact, verbatim (within the file)
             # verbatim body sits between the header separator and the appended triage skeleton
@@ -633,7 +658,7 @@ class IngestTests(unittest.TestCase):
                 + b"\n### WS-GPT-007 - exact issue\n- Severity: major\n")
 
             self.assertEqual(review.ingest(root, round_id, src=src), 0)
-            feedback = root / f"docs/reviews/{round_id}-feedback.md"
+            feedback = self._feedback(root, round_id)
             self.assertIn(
                 "| WS-GPT-007 — exact issue | major |  |  |  |  |",
                 feedback.read_text(encoding="utf-8"),
@@ -650,7 +675,7 @@ class IngestTests(unittest.TestCase):
                 + review.TRIAGE_END + b"\n")
             src.write_bytes(body)
             self.assertEqual(review.ingest(root, round_id, src=src), 0)
-            feedback = root / f"docs/reviews/{round_id}-feedback.md"
+            feedback = self._feedback(root, round_id)
             before = feedback.read_bytes()
             actual_begin = before.rfind(review.TRIAGE_BEGIN)
             self.assertGreater(actual_begin, before.index(body))
@@ -674,20 +699,23 @@ class IngestTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as d:
             root = self._root(d)
-            rdir = root / "docs/reviews"
-            rdir.mkdir(parents=True)
+            round_id = "2026-07-18-r1"
+            binding_path = self._binding(root, round_id)
+            owner = binding_path.parent.name
             replacement = root / "triage.md"
             replacement.write_text("## Findings (triage skeleton v2)\n")
-            feedback = rdir / "r1-feedback.md"
+            feedback = self._feedback(root, round_id)
             for damaged in (b"header\nreply\n", review.TRIAGE_BEGIN + b"\nno end\n",
                             review.TRIAGE_BEGIN + b"\ncontent\n" + review.TRIAGE_END
                             + b"\ntrailing bytes"):
-                feedback.write_bytes(damaged)
+                review_layout.publish_markdown(
+                    root / "docs/reviews", owner, review_layout.FEEDBACK,
+                    damaged, replace=True)
                 before = feedback.read_bytes()
                 err = io.StringIO()
                 with contextlib.redirect_stderr(err):
                     self.assertEqual(review.main([
-                        "triage", "--round", "r1", "--file", str(replacement), str(root),
+                        "triage", "--round", round_id, "--file", str(replacement), str(root),
                     ]), 1)
                 self.assertEqual(feedback.read_bytes(), before)
                 self.assertIn("triage marker", err.getvalue())
@@ -705,7 +733,7 @@ class IngestTests(unittest.TestCase):
                 b"\nQuoted protocol line:\n" + review.TRIAGE_BEGIN + b"\n")
             src.write_bytes(body)
             self.assertEqual(review.ingest(root, round_id, src=src), 0)
-            feedback = root / f"docs/reviews/{round_id}-feedback.md"
+            feedback = self._feedback(root, round_id)
             content = feedback.read_bytes()
             # Hand-damage ONLY the canonical BEGIN (a discipline violation); the quoted BEGIN in
             # the verbatim reply and the canonical END at EOF remain — the masking case.
@@ -797,7 +825,7 @@ class IngestTests(unittest.TestCase):
             self.assertIs(events[0]["reviewer_configured"], True)
             self.assertEqual(events[0]["reply_metadata"]["model"], "gpt-5.6-sol")
 
-    def test_target_mismatch_and_sidecarless_legacy_are_not_configured_feedback(self):
+    def test_target_mismatch_and_legacy_packet_write_is_refused(self):
         import contextlib
         import io
         with tempfile.TemporaryDirectory() as d:
@@ -812,10 +840,14 @@ class IngestTests(unittest.TestCase):
             self.assertIn("review-target", err.getvalue())
 
             legacy_round = "2026-06-22-legacy"
+            request = self._legacy_request(root, legacy_round)
+            request_before = request.read_bytes()
             legacy = root / "legacy.md"
             legacy.write_bytes(self._reply())
             with contextlib.redirect_stderr(err):
-                self.assertEqual(review.ingest(root, legacy_round, src=legacy), 0)
+                self.assertEqual(review.ingest(root, legacy_round, src=legacy), 1)
+            self.assertTrue(legacy.exists())
+            self.assertEqual(request.read_bytes(), request_before)
             self.assertEqual(list((root / "docs/reviews").glob(
                 f"{legacy_round}-request.binding*.json")), [])
             events, skipped = overlay.load_review_ingests(root)
@@ -823,10 +855,6 @@ class IngestTests(unittest.TestCase):
             by_round = {event["round_id"]: event for event in events}
             self.assertIs(by_round[wrong_round]["review_target_matches"], False)
             self.assertIsNone(by_round[wrong_round]["reviewer_configured"])
-            self.assertIsNone(by_round[legacy_round]["review_target_matches"])
-            self.assertIsNone(by_round[legacy_round]["reviewer_configured"])
-            self.assertEqual(by_round[legacy_round]["reviewer_coverage_reason"],
-                             "round-binding-unavailable")
 
     def test_force_reingest_replaces_legacy_identity_event_for_round(self):
         with tempfile.TemporaryDirectory() as d:
@@ -842,8 +870,10 @@ class IngestTests(unittest.TestCase):
                 "reviewer": "old-model", "reviewer_configured": True,
                 "reviewer_coverage_reason": None, "provenance": "observed",
             }) + "\n")
-            dest = root / f"docs/reviews/{round_id}-feedback.md"
-            dest.write_text("old feedback")
+            artifacts = review.packet_review_artifacts(root, round_id)
+            dest = review_layout.publish_markdown(
+                root / "docs/reviews", artifacts["run_id"], review_layout.FEEDBACK,
+                b"old feedback")
             src = root / "corrected.md"
             src.write_bytes(self._reply())
             self.assertEqual(review.ingest(root, round_id, src=src, force=True), 0)
@@ -862,8 +892,11 @@ class IngestTests(unittest.TestCase):
             root = self._root(d)
             round_id = "2026-07-18-r1"
             self._binding(root, round_id)
-            dest = root / f"docs/reviews/{round_id}-feedback.md"
-            dest.write_bytes(b"old feedback")
+            artifacts = review.packet_review_artifacts(root, round_id)
+            dest = review_layout.publish_markdown(
+                root / "docs/reviews", artifacts["run_id"], review_layout.FEEDBACK,
+                b"old feedback")
+            original_feedback = dest.read_bytes()
             src = root / "corrected.md"
             src.write_bytes(self._reply())
             original = overlay.record_review_ingest
@@ -876,7 +909,7 @@ class IngestTests(unittest.TestCase):
             finally:
                 overlay.record_review_ingest = original
             self.assertEqual(rc, 1)
-            self.assertEqual(dest.read_bytes(), b"old feedback")
+            self.assertEqual(dest.read_bytes(), original_feedback)
             self.assertTrue(src.exists())
             self.assertIn("rolled back", err.getvalue())
 
@@ -892,14 +925,18 @@ class IngestTests(unittest.TestCase):
             self.assertEqual(review.ingest(root, "2026-06-22-x", src=src), 1)
             self.assertTrue(src.exists())  # not consumed on failure
 
-    def test_round_inferred_from_request(self):
+    def test_round_inferred_from_legacy_request_refuses_flat_feedback_write(self):
         with tempfile.TemporaryDirectory() as d:
             root = self._root(d)
             rdir = root / "docs/reviews"; rdir.mkdir(parents=True)
-            (rdir / "2026-06-20-a-request.md").write_text("req")
+            request = rdir / "2026-06-20-a-request.md"
+            request.write_text("req")
+            before = request.read_bytes()
             src = root / "inbox.md"; src.write_bytes(b"review body")
-            self.assertEqual(review.ingest(root, None, src=src), 0)
-            self.assertTrue((rdir / "2026-06-20-a-feedback.md").is_file())
+            self.assertEqual(review.ingest(root, None, src=src), 1)
+            self.assertTrue(src.exists())
+            self.assertEqual(request.read_bytes(), before)
+            self.assertFalse((rdir / "2026-06-20-a-feedback.md").exists())
 
     def test_packet_ingest_does_not_synthesize_missing_sidecar_from_request(self):
         with tempfile.TemporaryDirectory() as d:
@@ -907,22 +944,28 @@ class IngestTests(unittest.TestCase):
             rdir = root / "docs" / "reviews"
             rdir.mkdir(parents=True)
             rid = "2026-06-20-a"
-            (rdir / f"{rid}-request.md").write_text(
+            request = rdir / f"{rid}-request.md"
+            request.write_text(
                 f"# Review Request — {rid}\n\n"
                 f"- Reviewing: {'a' * 40}   (diff against (root))\n")
+            before = request.read_bytes()
             src = root / "inbox.md"
             src.write_bytes(b"review body")
-            self.assertEqual(review.ingest(root, rid, src=src), 0)
+            self.assertEqual(review.ingest(root, rid, src=src), 1)
             sidecars = list(rdir.glob(f"{rid}-request.binding*.json"))
             self.assertEqual(sidecars, [])
+            self.assertTrue(src.exists())
+            self.assertEqual(request.read_bytes(), before)
+            self.assertFalse((rdir / f"{rid}-feedback.md").exists())
 
     def test_reingest_requires_force_and_preserves_source_on_refusal(self):
         with tempfile.TemporaryDirectory() as d:
             root = self._root(d)
+            self._binding(root, "2026-06-22-x")
             first = root / "first.md"
             first.write_bytes(b"first review")
             self.assertEqual(review.ingest(root, "2026-06-22-x", src=first), 0)
-            dest = root / "docs/reviews/2026-06-22-x-feedback.md"
+            dest = self._feedback(root, "2026-06-22-x")
             original = dest.read_bytes()
 
             second = root / "second.md"
@@ -958,6 +1001,7 @@ class IngestTests(unittest.TestCase):
         import io
         with tempfile.TemporaryDirectory() as d:
             root = self._root(d)
+            self._binding(root, "2026-06-22-x")
             src = root / "inbox.md"
             src.write_bytes(b"review body")
             orig = overlay.evaluate_boundary
@@ -1011,16 +1055,48 @@ class PendingReviewTests(unittest.TestCase):
             root, round_id, target, base, reviewers or ["gpt-5.6-sol"], mode="packet",
             **self._projection_digests())
 
+    def _canonical_request(
+            self, root: Path, round_id: str, target: str, *, base: str = "b" * 40,
+            reviewers: list[str] | None = None,
+    ) -> dict:
+        reviews_dir = root / "docs" / "reviews"
+        run_id = review_layout.new_run_id()
+        rendered = review_layout.bind_markdown_run_id(
+            self.REQUEST.encode(), run_id).decode()
+        rendered_digest = review._canonical_rendered_request_digest(rendered)
+        rendered = rendered.replace(self.REQUEST_DIGEST_SENTINEL, rendered_digest, 1)
+        narrative = review.stored_narrative_path(root, round_id)
+        narrative.parent.mkdir(parents=True, exist_ok=True)
+        narrative.write_text(self.NARRATIVE)
+        review_layout.publish_json(
+            reviews_dir, run_id, review_layout.REQUEST_BINDING, {
+                "schema": review.ROUND_REQUEST_BINDING_SCHEMA,
+                "round_id": round_id,
+                "target_sha": target,
+                "base_sha": base,
+                "reviewers": reviewers or ["gpt-5.6-sol"],
+                "mode": "packet",
+                "canonical_store": "local-packet",
+                "narrative_digest": review._canonical_narrative_digest(self.NARRATIVE),
+                "rendered_request_digest": rendered_digest,
+                "at": "2026-01-01T00:00:00+00:00",
+            })
+        review_layout.publish_markdown(
+            reviews_dir, run_id, review_layout.REQUEST, rendered.encode())
+        return review.packet_review_artifacts(root, round_id)
+
     def _projection_digests(self) -> dict[str, str]:
         return {
             "narrative_digest": review._canonical_narrative_digest(self.NARRATIVE),
             "rendered_request_digest": review._canonical_rendered_request_digest(self.REQUEST),
         }
 
-    def _reply(self, model: str, base: str, target: str, *, echo: bool = True) -> bytes:
-        digest_line = (
-            f"request-digest: {self._projection_digests()['rendered_request_digest']}\n"
-            if echo else "")
+    def _reply(
+            self, model: str, base: str, target: str, *, echo: bool = True,
+            request_digest: str | None = None,
+    ) -> bytes:
+        digest = request_digest or self._projection_digests()["rendered_request_digest"]
+        digest_line = f"request-digest: {digest}\n" if echo else ""
         return (f"model: {model}\neffort: xhigh\n"
                 f"review-target: {base[:12]}-{target[:12]}\n"
                 f"{digest_line}\nreviewed\n").encode()
@@ -1036,6 +1112,18 @@ class PendingReviewTests(unittest.TestCase):
             sorted(directory.glob(f"{round_id}-request.binding*.json")),
             expected_round_id=round_id)
         self.assertIsNotNone(binding)
+        return self._settlement_for_paths(
+            root, round_id,
+            request=directory / f"{round_id}-request.md",
+            binding=binding_path,
+            feedback=directory / f"{round_id}-feedback.md",
+            suffix=suffix)
+
+    def _settlement_for_paths(
+            self, root: Path, round_id: str, *, request: Path, binding: Path,
+            feedback: Path, suffix: str = "",
+    ) -> Path:
+        directory = root / "docs" / "reviews"
         settlement_dir = directory / "legacy-settlements"
         settlement_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1048,9 +1136,9 @@ class PendingReviewTests(unittest.TestCase):
             "disposition": "archived-unverifiable",
             "reason": "pre-canonical-feedback-envelope",
             "round_id": round_id,
-            "request_sha256": digest(directory / f"{round_id}-request.md"),
-            "binding_sha256": digest(binding_path),
-            "feedback_sha256": digest(directory / f"{round_id}-feedback.md"),
+            "request_sha256": digest(request),
+            "binding_sha256": digest(binding),
+            "feedback_sha256": digest(feedback),
             "decision_source": (
                 "decision/pre-header-feedback-settlement-method ruling 2026-07-20"),
             "rationale": (
@@ -1264,14 +1352,25 @@ class PendingReviewTests(unittest.TestCase):
             round_id = "2026-01-01-reingested"
             base = "b" * 40
             target = "a" * 40
-            self._request(root, round_id, target, base=base)
-            self._legacy_feedback(root, round_id)
-            self._settlement(root, round_id)
+            artifacts = self._canonical_request(root, round_id, target, base=base)
+            request_digest = artifacts["binding"]["rendered_request_digest"]
+
+            first = root / "first-reply.md"
+            first.write_bytes(self._reply(
+                "gpt-5.6-sol", base, target, request_digest=request_digest))
+            self.assertEqual(review.ingest(root, round_id, src=first), 0)
+            original_feedback = artifacts["feedback"].read_bytes()
+            self._settlement_for_paths(
+                root, round_id, request=artifacts["request"],
+                binding=artifacts["binding_path"], feedback=artifacts["feedback"])
 
             source = root / "reply.md"
-            source.write_bytes(self._reply("gpt-5.6-sol", base, target))
+            source.write_bytes(self._reply(
+                "gpt-5.6-sol", base, target, request_digest=request_digest)
+                + b"corrected\n")
             self.assertEqual(review.ingest(root, round_id, src=source, force=True), 0)
 
+            self.assertNotEqual(artifacts["feedback"].read_bytes(), original_feedback)
             self.assertEqual(review.pending_reviews(root), [])
             self.assertEqual(review.archived_unverifiable_reviews(root), [])
 
@@ -1281,11 +1380,15 @@ class PendingReviewTests(unittest.TestCase):
             round_id = "2026-01-01-complete-with-marker"
             base = "b" * 40
             target = "a" * 40
-            self._request(root, round_id, target, base=base)
+            artifacts = self._canonical_request(root, round_id, target, base=base)
             source = root / "reply.md"
-            source.write_bytes(self._reply("gpt-5.6-sol", base, target))
+            source.write_bytes(self._reply(
+                "gpt-5.6-sol", base, target,
+                request_digest=artifacts["binding"]["rendered_request_digest"]))
             self.assertEqual(review.ingest(root, round_id, src=source), 0)
-            self._settlement(root, round_id)
+            self._settlement_for_paths(
+                root, round_id, request=artifacts["request"],
+                binding=artifacts["binding_path"], feedback=artifacts["feedback"])
 
             dispositions = review.packet_review_dispositions(root)
             self.assertEqual(dispositions["actionable"], [])
@@ -1358,39 +1461,46 @@ class PendingReviewTests(unittest.TestCase):
             base = "b" * 40
             old_target = "a" * 40
             new_target = "c" * 40
-            self._request(root, round_id, old_target, base=base, reviewers=["old-reviewer"])
+            artifacts = self._canonical_request(
+                root, round_id, new_target, base=base, reviewers=["new-reviewer"])
+            request_digest = artifacts["binding"]["rendered_request_digest"]
             source = root / "old-reply.md"
-            source.write_bytes(self._reply("old-reviewer", base, old_target))
+            source.write_bytes(self._reply(
+                "old-reviewer", base, old_target, request_digest=request_digest))
             self.assertEqual(review.ingest(root, round_id, src=source), 0)
 
-            review.write_round_request_binding(
-                root, round_id, new_target, base, ["new-reviewer"], mode="packet",
-                **self._projection_digests())
             pending = review.pending_reviews(root)
             self.assertEqual([(row["target_sha"], row["reviewers"]) for row in pending],
                              [(new_target, ["new-reviewer"])])
 
             corrected = root / "new-reply.md"
-            corrected.write_bytes(self._reply("new-reviewer", base, new_target))
+            corrected.write_bytes(self._reply(
+                "new-reviewer", base, new_target, request_digest=request_digest))
             self.assertEqual(review.ingest(root, round_id, src=corrected, force=True), 0)
             self.assertEqual(review.pending_reviews(root), [])
 
     def test_corrupt_latest_binding_keeps_old_matching_feedback_pending_unknown(self):
-        for corrupt_content in ("", '{"schema":'):
-            with self.subTest(corrupt_content=corrupt_content), tempfile.TemporaryDirectory() as d:
+        for corruption in ("missing-schema", "invalid-schema"):
+            with self.subTest(corruption=corruption), tempfile.TemporaryDirectory() as d:
                 root = self._root(d)
                 round_id = "2026-01-01-corrupt-latest"
                 base = "b" * 40
                 old_target = "a" * 40
-                self._request(root, round_id, old_target, base=base, reviewers=["old-reviewer"])
+                artifacts = self._canonical_request(
+                    root, round_id, old_target, base=base, reviewers=["old-reviewer"])
                 source = root / "old-reply.md"
-                source.write_bytes(self._reply("old-reviewer", base, old_target))
+                source.write_bytes(self._reply(
+                    "old-reviewer", base, old_target,
+                    request_digest=artifacts["binding"]["rendered_request_digest"]))
                 self.assertEqual(review.ingest(root, round_id, src=source), 0)
 
-                latest = review.write_round_request_binding(
-                    root, round_id, "c" * 40, base, ["new-reviewer"], mode="packet",
-                    **self._projection_digests())
-                latest.write_text(corrupt_content)
+                binding = _json.loads(artifacts["binding_path"].read_text())
+                if corruption == "missing-schema":
+                    binding.pop("schema")
+                else:
+                    binding["schema"] = "waystone-round-request-binding-999"
+                artifacts["binding_path"].write_text(
+                    _json.dumps(binding, sort_keys=True) + "\n")
 
                 pending = review.pending_reviews(root)
 
@@ -1534,14 +1644,17 @@ class PendingReviewTests(unittest.TestCase):
             round_id = "2026-01-01-unconfigured"
             base = "b" * 40
             target = "a" * 40
-            self._request(root, round_id, target, base=base, reviewers=["expected-reviewer"])
+            artifacts = self._canonical_request(
+                root, round_id, target, base=base, reviewers=["expected-reviewer"])
             source = root / "reply.md"
-            source.write_bytes(self._reply("someone-else", base, target))
+            source.write_bytes(self._reply(
+                "someone-else", base, target,
+                request_digest=artifacts["binding"]["rendered_request_digest"]))
             self.assertEqual(review.ingest(root, round_id, src=source), 0)
 
             self.assertEqual(review.pending_reviews(root), [])
 
-    def test_digestless_legacy_completion_is_labeled_independently_of_reviewer_coverage(self):
+    def test_digestless_legacy_ingest_is_refused_and_preserves_flat_bytes(self):
         with tempfile.TemporaryDirectory() as d:
             root = self._root(d)
             round_id = "2026-01-01-legacy-unconfigured"
@@ -1549,37 +1662,24 @@ class PendingReviewTests(unittest.TestCase):
             target = "a" * 40
             binding_path = write_legacy_round_request_binding(
                 root, round_id, target, base, ["expected-reviewer"])
-            (root / "docs/reviews" / f"{round_id}-request.md").write_text("request\n")
+            request = root / "docs/reviews" / f"{round_id}-request.md"
+            request.write_text("request\n")
+            before = {
+                request: request.read_bytes(),
+                binding_path: binding_path.read_bytes(),
+            }
             source = root / "reply.md"
             source.write_bytes(self._reply("someone-else", base, target, echo=False))
-            self.assertEqual(review.ingest(root, round_id, src=source), 0)
+            source_before = source.read_bytes()
 
-            binding = review.read_round_request_binding(binding_path)
-            metadata = review.read_feedback_reply_metadata(
-                root / "docs/reviews" / f"{round_id}-feedback.md",
-                expected_round_id=round_id, binding=binding)
-            self.assertIs(metadata["review_target_matches"], True)
-            self.assertEqual(metadata["reviewer_coverage_reason"], "reviewer-not-configured")
-            self.assertIsNone(metadata["narrative_digest_matches"])
-            self.assertEqual(metadata["narrative_coverage_reason"], "legacy-pre-digest")
-            self.assertIsNone(metadata["rendered_request_digest_matches"])
-            self.assertEqual(
-                metadata["rendered_request_coverage_reason"],
-                "request-digest-missing-legacy-fallback")
-            self.assertEqual(review.pending_reviews(root), [])
+            self.assertEqual(review.ingest(root, round_id, src=source), 1)
 
-            review.write_round_request_binding(
-                root, round_id, target, base, ["expected-reviewer"], mode="packet",
-                **self._projection_digests())
-            latest_binding, reason = review.ingest_round_binding(
-                root, round_id, common.load_config(root))
-            self.assertIsNone(reason)
-            after_reprepare = review.read_feedback_reply_metadata(
-                root / "docs/reviews" / f"{round_id}-feedback.md",
-                expected_round_id=round_id, binding=latest_binding)
-            self.assertEqual(
-                after_reprepare["rendered_request_coverage_reason"],
-                "request-digest-missing-legacy-fallback")
+            self.assertEqual(source.read_bytes(), source_before)
+            for path, content in before.items():
+                self.assertEqual(path.read_bytes(), content)
+            self.assertFalse(
+                (root / "docs/reviews" / f"{round_id}-feedback.md").exists())
+            self.assertFalse((root / "docs/reviews" / "runs").exists())
 
     def test_one_damaged_binding_isolates_to_its_round(self):
         with tempfile.TemporaryDirectory() as d:

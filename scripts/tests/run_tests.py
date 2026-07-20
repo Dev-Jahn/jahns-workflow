@@ -111,6 +111,7 @@ from test_review_protocol import (
     PacketPublicationTests,
     RoundExposureTests,
 )
+from test_review_runs_layout import ReviewRunsLayoutTests
 from test_review_settlement import (
     BasePolicyTests,
     IngestTests,
@@ -206,6 +207,7 @@ _TEST_CLASSES = (
     RemoteTests,
     PacketPublicationTests,
     RoundExposureTests,
+    ReviewRunsLayoutTests,
     BasePolicyTests,
     IngestTests,
     PendingReviewTests,

@@ -31,7 +31,7 @@ Subcommands (also `waystone review <sub>`):
   prepare --round ID --narrative PATH [root]
                                        render and bind a request from the round exposure
   ingest [--round ID] [--force]  parse the reply header, byte-exact copy /tmp/review.md →
-                                 <id>-feedback.md, then append triage
+                                 the resolved feedback artifact, then append triage
   triage --round ID --file PATH [root] replace only the marked triage tail
 """
 from __future__ import annotations
@@ -55,6 +55,7 @@ from common import (
     git_full_sha, hold_project_lock, load_config, migrate_project_state, normalize_config,
     parse_iso_timestamp, project_state_path, write_bytes_atomic, write_text_atomic,
 )  # noqa: E402
+from waystone.features import review_layout  # noqa: E402
 
 CODEX_BOT = "chatgpt-codex-connector[bot]"  # REST `user.login` form
 INBOX = Path("/tmp/review.md")  # fixed drop-file: user saves the reviewer reply here, byte-exact
@@ -458,10 +459,22 @@ def _round_requires_digest_binding(round_id: object) -> bool:
 
 def read_round_request_binding(path: Path, *, expected_round_id: str | None = None) -> dict:
     """Load one request sidecar without silently accepting damaged projection evidence."""
+    source = Path(path)
+    if source.is_symlink() or not source.is_file():
+        raise WorkflowError(
+            f"corrupt review binding {source}: expected a regular non-symlink file")
     try:
-        data = _read_json_without_duplicate_fields(path)
+        data = _read_json_without_duplicate_fields(source)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as e:
-        raise WorkflowError(f"corrupt review binding {path}: {type(e).__name__}") from e
+        raise WorkflowError(f"corrupt review binding {source}: {type(e).__name__}") from e
+    return _validate_round_request_binding_payload(
+        data, source=source, expected_round_id=expected_round_id)
+
+
+def _validate_round_request_binding_payload(
+        data: object, *, source: Path, expected_round_id: str | None = None,
+) -> dict:
+    """Validate already-read binding bytes so canonical identity checks are not reopened."""
     schema = data.get("schema") if isinstance(data, dict) else None
     round_id = data.get("round_id") if isinstance(data, dict) else None
     round_date = _round_request_binding_date(round_id)
@@ -487,10 +500,10 @@ def read_round_request_binding(path: Path, *, expected_round_id: str | None = No
             or data.get("canonical_store") != (
                 "local-packet" if data.get("mode") == "packet" else "github-pr-comment")
             or parse_iso_timestamp(data.get("at")) is None):
-        raise WorkflowError(f"corrupt review binding {path}: invalid schema or fields")
+        raise WorkflowError(f"corrupt review binding {source}: invalid schema or fields")
     if expected_round_id is not None and data["round_id"] != expected_round_id:
         raise WorkflowError(
-            f"corrupt review binding {path}: round_id {data['round_id']!r} does not match "
+            f"corrupt review binding {source}: round_id {data['round_id']!r} does not match "
             f"{expected_round_id!r}")
     return data
 
@@ -542,6 +555,152 @@ def latest_round_request_binding(
     except WorkflowError:
         return latest, None
     return latest, row
+
+
+def _canonical_packet_records(
+        directory: Path,
+) -> tuple[dict[str, dict], tuple[tuple[Path, WorkflowError, str | None], ...]]:
+    """Index valid packet bindings by payload round_id without deriving owner from filenames."""
+    artifacts, identity_rejections = review_layout.scan_canonical_request_bindings(directory)
+    records: dict[str, dict] = {}
+    rejected: list[tuple[Path, WorkflowError, str | None]] = [
+        (path, error, review_layout.rejected_binding_round_claim(directory, path))
+        for path, error in identity_rejections
+    ]
+    conflicted_rounds: set[str] = set()
+    for artifact in artifacts:
+        path = artifact["path"]
+        payload_round = artifact["payload"].get("round_id")
+        if _round_request_binding_date(payload_round) is None:
+            rejected.append((path, WorkflowError(
+                f"canonical review binding {path} has an invalid payload round_id"),
+                payload_round if isinstance(payload_round, str) else None))
+            continue
+        try:
+            row = _validate_round_request_binding_payload(
+                artifact["payload"], source=path, expected_round_id=payload_round)
+        except WorkflowError as error:
+            rejected.append((path, error, payload_round))
+            continue
+        if row["mode"] != "packet":
+            rejected.append((path, review_layout.IdentityConflict(
+                f"canonical review binding {path} is not packet mode"), payload_round))
+            continue
+        if payload_round in conflicted_rounds:
+            rejected.append((path, review_layout.IdentityConflict(
+                f"multiple canonical review owners claim round {payload_round!r}"),
+                payload_round))
+            continue
+        if payload_round in records:
+            prior = records.pop(payload_round)["binding_path"]
+            conflict = review_layout.IdentityConflict(
+                f"multiple canonical review owners claim round {payload_round!r}: "
+                f"{prior}, {path}")
+            rejected.extend((
+                (prior, conflict, payload_round),
+                (path, conflict, payload_round),
+            ))
+            conflicted_rounds.add(payload_round)
+            continue
+        records[payload_round] = {
+            "evidence": "canonical",
+            "run_id": artifact["run_id"],
+            "directory": path.parent,
+            "request": path.parent / "request.md",
+            "binding_path": path,
+            "binding": row,
+            "feedback": path.parent / "feedback.md",
+        }
+    return records, tuple(rejected)
+
+
+def _canonical_rejections_for_round(
+        rejected: tuple[tuple[Path, WorkflowError, str | None], ...], round_id: str,
+) -> tuple[tuple[Path, WorkflowError, str | None], ...]:
+    return tuple(row for row in rejected if row[2] == round_id)
+
+
+def _legacy_round_paths(directory: Path, round_id: str) -> list[Path]:
+    paths = [
+        directory / f"{round_id}-request.md",
+        directory / f"{round_id}-feedback.md",
+        *sorted(directory.glob(f"{round_id}-request.binding*.json")),
+    ]
+    return [path for path in paths if path.exists() or path.is_symlink()]
+
+
+def packet_review_artifacts(root: Path, round_id: str, cfg: dict | None = None) -> dict:
+    """Resolve one packet round to validated canonical, legacy, or absent evidence."""
+    policy = cfg or load_config(root)
+    directory = Path(root) / policy["reviews_dir"]
+    records, rejected = _canonical_packet_records(directory)
+    record = records.get(round_id)
+    legacy_paths = _legacy_round_paths(directory, round_id)
+    round_rejections = _canonical_rejections_for_round(rejected, round_id)
+    if record is None and round_rejections:
+        rejected_paths = ", ".join(str(path) for path, _error, _claim in round_rejections)
+        raise review_layout.IdentityConflict(
+            f"canonical binding identity conflict prevents flat fallback for {round_id!r}: "
+            f"{rejected_paths}")
+    if record is not None and legacy_paths:
+        raise review_layout.IdentityConflict(
+            f"canonical and flat legacy review evidence both claim round {round_id!r}")
+    if record is not None:
+        for kind, path in (
+                (review_layout.REQUEST, record["request"]),
+                (review_layout.FEEDBACK, record["feedback"]),
+        ):
+            if path.exists() or path.is_symlink():
+                artifact = review_layout.read_canonical_artifact(directory, path)
+                if artifact["kind"] != kind or artifact["run_id"] != record["run_id"]:
+                    raise review_layout.IdentityConflict(
+                        f"canonical review artifact does not belong to {record['run_id']}: {path}")
+        return record
+
+    for path in legacy_paths:
+        if ("-request.binding" in path.name
+                and round_request_binding_identity(path) is None):
+            continue
+        review_layout.read_legacy_artifact(directory, path)
+    if not legacy_paths:
+        return {
+            "evidence": "missing",
+            "run_id": None,
+            "directory": directory,
+            "request": directory / f"{round_id}-request.md",
+            "binding_path": None,
+            "binding": None,
+            "feedback": directory / f"{round_id}-feedback.md",
+        }
+    return {
+        "evidence": "legacy",
+        "run_id": None,
+        "directory": directory,
+        "request": directory / f"{round_id}-request.md",
+        "binding_path": None,
+        "binding": None,
+        "feedback": directory / f"{round_id}-feedback.md",
+    }
+
+
+def packet_review_round_ids(root: Path, cfg: dict | None = None) -> list[str]:
+    """List packet rounds from validated canonical bindings plus direct-child legacy requests."""
+    policy = cfg or load_config(root)
+    directory = Path(root) / policy["reviews_dir"]
+    records, rejected = _canonical_packet_records(directory)
+    legacy_rounds: set[str] = set()
+    if directory.is_dir():
+        for path in sorted(directory.glob("*-request.md")):
+            artifact = review_layout.read_legacy_artifact(directory, path)
+            legacy_rounds.add(artifact["round_id"])
+    namespace_conflicts = set(records) & legacy_rounds
+    rejected_claims = {claim for _path, _error, claim in rejected if claim is not None}
+    blocked_rounds = legacy_rounds & rejected_claims
+    if namespace_conflicts or blocked_rounds:
+        conflicts = sorted(namespace_conflicts | blocked_rounds)
+        raise review_layout.IdentityConflict(
+            f"canonical review namespace conflict for round(s): {', '.join(conflicts)}")
+    return sorted(set(records) | legacy_rounds)
 
 
 def legacy_review_settlement_identity(path: Path) -> tuple[str, int] | None:
@@ -713,13 +872,27 @@ def ingest_round_binding(root: Path, round_id: str, cfg: dict) -> tuple[dict | N
     mode = (cfg.get("review") or {}).get("mode", "packet")
     try:
         if mode == "packet":
+            artifacts = packet_review_artifacts(root, round_id, cfg)
+            if artifacts["evidence"] == "canonical":
+                row = artifacts["binding"]
+                return {
+                    **row,
+                    "source": str(artifacts["binding_path"]),
+                    "review_evidence": "canonical",
+                }, None
+            if artifacts["evidence"] == "missing":
+                return None, "missing-round-request-sidecar"
             paths = sorted(directory.glob(f"{round_id}-request.binding*.json"))
             if not paths:
                 return None, "missing-round-request-sidecar"
+            for path in paths:
+                if round_request_binding_identity(path) is None:
+                    continue
+                review_layout.read_legacy_artifact(directory, path)
             path, row = latest_round_request_binding(paths, expected_round_id=round_id)
             if path is None or row is None:
                 return None, "corrupt-round-binding:WorkflowError"
-            return {**row, "source": str(path)}, None
+            return {**row, "source": str(path), "review_evidence": "legacy"}, None
 
         paths = sorted(directory.glob(f"{round_id}-freeze-*.binding*.json"))
         if not paths:
@@ -861,6 +1034,16 @@ def _request_generation_in_directory(
     if (_round_request_binding_date(round_id) is None
             or normalize_request_digest(rendered_request_digest) is None):
         return None
+    canonical_path = Path(directory) / "request.binding.json"
+    if canonical_path.exists() or canonical_path.is_symlink():
+        reviews_dir = canonical_path.parent.parent.parent
+        artifact = review_layout.read_canonical_artifact(reviews_dir, canonical_path)
+        row = _validate_round_request_binding_payload(
+            artifact["payload"], source=canonical_path, expected_round_id=round_id)
+        if row.get("rendered_request_digest") != rendered_request_digest:
+            return None
+        return {**row, "source": str(canonical_path),
+                "review_evidence": artifact["evidence"]}
     try:
         paths = sorted(Path(directory).glob(f"{round_id}-request.binding*.json"))
     except (OSError, NotImplementedError):
@@ -885,8 +1068,10 @@ def _round_request_generation(
         root: Path, round_id: str, cfg: dict, rendered_request_digest: str,
 ) -> dict | None:
     mode = (cfg.get("review") or {}).get("mode", "packet")
-    directory = (Path(root) / cfg["reviews_dir"] if mode == "packet"
-                 else project_state_path(root) / "review-requests")
+    if mode == "packet":
+        directory = packet_review_artifacts(root, round_id, cfg)["directory"]
+    else:
+        directory = project_state_path(root) / "review-requests"
     return _request_generation_in_directory(directory, round_id, rendered_request_digest)
 
 
@@ -1146,13 +1331,24 @@ def packet_review_dispositions(
         raise WorkflowError("pending review age requires a timezone-aware local clock")
 
     settlements = _legacy_review_settlements(directory)
-    requests = {
-        path.name.removesuffix("-request.md"): path
-        for path in sorted(directory.glob("*-request.md"))
+    canonical_records, rejected = _canonical_packet_records(directory)
+    requests: dict[str, Path] = {}
+    for path in sorted(directory.glob("*-request.md")):
+        artifact = review_layout.read_legacy_artifact(directory, path)
+        requests[artifact["round_id"]] = path
+    rejected_rounds = {
+        claim for _path, _error, claim in rejected if claim is not None
     }
+    identity_conflicts = (
+        (rejected_rounds - set(canonical_records))
+        | (set(requests) & set(canonical_records))
+    )
+    for canonical_round, record in canonical_records.items():
+        requests[canonical_round] = record["request"]
     actionable: list[dict] = []
     archived: list[dict] = []
-    for round_id in sorted(set(requests) | set(settlements)):
+    for round_id in sorted(
+            set(requests) | set(settlements) | set(canonical_records) | identity_conflicts):
         request = requests.get(round_id)
         if _round_request_binding_date(round_id) is None:
             actionable.append({
@@ -1160,30 +1356,69 @@ def packet_review_dispositions(
                 "reviewers": [], "reason": "invalid-round-id",
             })
             continue
+        if round_id in identity_conflicts:
+            try:
+                requested_date = datetime.strptime(round_id[:10], "%Y-%m-%d").date()
+            except ValueError:
+                requested_date = None
+            actionable.append({
+                "round_id": round_id,
+                "age_days": ((local_now.date() - requested_date).days
+                             if requested_date is not None else None),
+                "target_sha": None,
+                "reviewers": [],
+                "reason": "canonical-artifact-identity-conflict",
+            })
+            continue
+        canonical_record = canonical_records.get(round_id)
         binding_paths = sorted(directory.glob(f"{round_id}-request.binding*.json"))
-        binding = None
-        binding_path = None
+        binding = canonical_record["binding"] if canonical_record is not None else None
+        binding_path = (
+            canonical_record["binding_path"] if canonical_record is not None else None)
         binding_resolution_reason = None
-        if binding_paths:
-            # One damaged sidecar must not abort every other round's derivation — the damaged
-            # round itself stays listed as pending with honest-unknown fields (binding None).
-            binding_path, binding = latest_round_request_binding(
-                binding_paths, expected_round_id=round_id)
-            if binding_path is None:
-                binding_resolution_reason = "binding-generation-collision"
+        if canonical_record is None and binding_paths:
+            try:
+                for path in binding_paths:
+                    if round_request_binding_identity(path) is None:
+                        continue
+                    review_layout.read_legacy_artifact(directory, path)
+            except review_layout.ReviewLayoutError:
+                binding_resolution_reason = "legacy-artifact-identity-conflict"
+            else:
+                # One damaged sidecar must not abort every other round's derivation — the damaged
+                # round itself stays listed as pending with honest-unknown fields (binding None).
+                binding_path, binding = latest_round_request_binding(
+                    binding_paths, expected_round_id=round_id)
+                if binding_path is None:
+                    binding_resolution_reason = "binding-generation-collision"
             if binding is not None:
                 if binding["mode"] != "packet":
                     # PR-mode rounds are completion-tracked by the PR machinery, not this
                     # packet-pending surface.
                     continue
 
-        feedback = directory / f"{round_id}-feedback.md"
-        metadata = read_feedback_reply_metadata(
-            feedback, expected_round_id=round_id, binding=binding,
-            request_generation_dir=directory)
-        projection_reason = (
-            _packet_projection_reason(root, round_id, request, binding)
-            if request is not None else "request-unavailable")
+        feedback = (canonical_record["feedback"] if canonical_record is not None
+                    else directory / f"{round_id}-feedback.md")
+        identity_reason = None
+        if canonical_record is not None:
+            try:
+                if request is not None and (request.exists() or request.is_symlink()):
+                    review_layout.read_canonical_artifact(directory, request)
+                if feedback.exists() or feedback.is_symlink():
+                    review_layout.read_canonical_artifact(directory, feedback)
+            except review_layout.ReviewLayoutError:
+                identity_reason = "canonical-artifact-identity-conflict"
+        if identity_reason is None:
+            metadata = read_feedback_reply_metadata(
+                feedback, expected_round_id=round_id, binding=binding,
+                request_generation_dir=(canonical_record["directory"]
+                                        if canonical_record is not None else directory))
+            projection_reason = (
+                _packet_projection_reason(root, round_id, request, binding)
+                if request is not None else "request-unavailable")
+        else:
+            metadata = _unknown_feedback_metadata(identity_reason)
+            projection_reason = identity_reason
         # Complete = an ingested reply whose declared review-target matches the LATEST binding
         # and whose two generation digests match, with both on-disk projections reproduced from
         # that binding. Pre-digest history retains only the old target contract, labeled explicitly
@@ -1243,7 +1478,7 @@ def packet_review_dispositions(
             "reviewers": list(binding["reviewers"]) if binding is not None else [],
             "reason": reason,
         }
-        marker = settlements.get(round_id)
+        marker = settlements.get(round_id) if canonical_record is None else None
         if _legacy_review_settlement_matches(
                 marker, request=request, binding_path=binding_path,
                 feedback=feedback, binding=binding):
@@ -1540,7 +1775,20 @@ def prepared_request_path(root: Path, round_id: str, *, mode: str | None = None)
     cfg = load_config(root)
     selected = mode or (cfg.get("review") or {}).get("mode", "packet")
     if selected == "packet":
-        return Path(root) / cfg["reviews_dir"] / f"{round_id}-request.md"
+        directory = Path(root) / cfg["reviews_dir"]
+        records, rejected = _canonical_packet_records(directory)
+        record = records.get(round_id)
+        round_rejections = _canonical_rejections_for_round(rejected, round_id)
+        if record is None and round_rejections:
+            paths = ", ".join(str(path) for path, _error, _claim in round_rejections)
+            raise review_layout.IdentityConflict(
+                f"canonical binding identity conflict prevents flat request fallback: {paths}")
+        if record is not None:
+            if _legacy_round_paths(directory, round_id):
+                raise review_layout.IdentityConflict(
+                    f"canonical and flat legacy review evidence both claim round {round_id!r}")
+            return record["request"]
+        return directory / f"{round_id}-request.md"
     if selected == "pr":
         return project_state_path(root) / "review-requests" / f"{round_id}-request.md"
     raise WorkflowError(f"review prepare: unsupported review.mode {selected!r}")
@@ -1693,7 +1941,9 @@ def _canonical_rendered_request_digest(rendered: str) -> str:
     return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _render_review_request(round_id: str, exposure: dict, narrative: str) -> str:
+def _render_review_request(
+        round_id: str, exposure: dict, narrative: str, *, run_id: str | None = None,
+) -> str:
     try:
         template = REVIEW_REQUEST_TEMPLATE.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as e:
@@ -1738,6 +1988,9 @@ def _render_review_request(round_id: str, exposure: dict, narrative: str) -> str
         raise WorkflowError("rendered Reviewing field does not match the round exposure target")
     if not rendered.endswith("\n"):
         rendered += "\n"
+    if run_id is not None:
+        rendered = review_layout.bind_markdown_run_id(
+            rendered.encode("utf-8"), run_id).decode("utf-8")
     field = _rendered_request_digest_field(rendered)
     if field is None or field[2] != _REQUEST_DIGEST_SENTINEL:
         raise WorkflowError(
@@ -1756,6 +2009,7 @@ def prepare_review_request(root: Path, round_id: str, narrative_path: Path) -> i
     try:
         cfg = load_config(root)
         mode = (cfg.get("review") or {}).get("mode", "packet")
+        reviews_dir = Path(root) / cfg["reviews_dir"]
         _exposure_path, exposure = read_round_closeout_exposure(root, round_id)
         if exposure["review_mode"] != mode:
             raise WorkflowError(
@@ -1766,10 +2020,36 @@ def prepare_review_request(root: Path, round_id: str, narrative_path: Path) -> i
             raise WorkflowError(
                 f"current HEAD {head or '?'} differs from round exposure closeout head "
                 f"{exposure['head_sha']}; reclose the round before preparing review")
-        request = prepared_request_path(root, round_id, mode=mode)
+        canonical_record = None
+        run_id = None
+        if mode == "packet":
+            records, rejected = _canonical_packet_records(reviews_dir)
+            canonical_record = records.get(round_id)
+            round_rejections = _canonical_rejections_for_round(rejected, round_id)
+            if canonical_record is None and round_rejections:
+                paths = ", ".join(
+                    str(path) for path, _error, _claim in round_rejections)
+                raise review_layout.IdentityConflict(
+                    f"cannot prepare while this round has rejected canonical bindings: {paths}")
+            legacy_paths = _legacy_round_paths(reviews_dir, round_id)
+            if canonical_record is not None:
+                if legacy_paths:
+                    raise review_layout.IdentityConflict(
+                        f"canonical and flat legacy review evidence both claim round {round_id!r}")
+                run_id = canonical_record["run_id"]
+            else:
+                if legacy_paths:
+                    raise WorkflowError(
+                        "flat legacy evidence already exists for this round; prepare with a new "
+                        "round id instead of creating a second owner")
+                run_id = review_layout.new_run_id()
+            request = review_layout.canonical_artifact_path(
+                reviews_dir, run_id, review_layout.REQUEST)
+        else:
+            request = prepared_request_path(root, round_id, mode=mode)
         narrative = _read_review_narrative(narrative_path)
         narrative_digest = _canonical_narrative_digest(narrative)
-        rendered = _render_review_request(round_id, exposure, narrative)
+        rendered = _render_review_request(round_id, exposure, narrative, run_id=run_id)
         rendered_request_digest = _canonical_rendered_request_digest(rendered)
         expected = {
             "target_sha": exposure["head_sha"], "base_sha": exposure.get("base_sha"),
@@ -1777,24 +2057,42 @@ def prepare_review_request(root: Path, round_id: str, narrative_path: Path) -> i
             "narrative_digest": narrative_digest,
             "rendered_request_digest": rendered_request_digest,
         }
-        existing_paths = sorted(request.parent.glob(f"{round_id}-request.binding*.json"))
-        for path in existing_paths:
-            row = read_round_request_binding(path, expected_round_id=round_id)
-            if any(row.get(key) != expected[key]
-                   for key in ("target_sha", "base_sha", "reviewers", "mode")):
+        if mode == "packet":
+            if canonical_record is not None:
+                row = canonical_record["binding"]
+                if any(row.get(key) != value for key, value in expected.items()):
+                    raise WorkflowError(
+                        f"existing canonical request binding {canonical_record['binding_path']} "
+                        "differs from the requested generation; prepare with a new round id")
+                binding_path = canonical_record["binding_path"]
+            else:
+                binding_path = review_layout.publish_json(
+                    reviews_dir, run_id, review_layout.REQUEST_BINDING, {
+                        "schema": ROUND_REQUEST_BINDING_SCHEMA,
+                        "round_id": round_id,
+                        **expected,
+                        "canonical_store": "local-packet",
+                        "at": datetime.now().astimezone().isoformat(),
+                    })
+            review_layout.publish_markdown(
+                reviews_dir, run_id, review_layout.REQUEST, rendered.encode("utf-8"))
+        else:
+            existing_paths = sorted(request.parent.glob(f"{round_id}-request.binding*.json"))
+            for path in existing_paths:
+                row = read_round_request_binding(path, expected_round_id=round_id)
+                if not any(row.get(key) != expected[key]
+                           for key in ("target_sha", "base_sha", "reviewers", "mode")):
+                    continue
                 raise WorkflowError(
                     f"existing request sidecar {path} disagrees with the round exposure; "
                     "reclose and prepare with a new round id instead of superseding immutable evidence")
-        # Publish the immutable generation first. Any interruption after this point leaves old
-        # feedback bound to an older digest pair, while pending reports whichever projection has
-        # not yet caught up instead of preserving a false completed state.
-        binding_path = write_round_request_binding(
-            root, round_id, expected["target_sha"], expected["base_sha"],
-            expected["reviewers"], mode=mode, narrative_digest=narrative_digest,
-            rendered_request_digest=rendered_request_digest,
-            directory=request.parent)
-        request.parent.mkdir(parents=True, exist_ok=True)
-        write_bytes_atomic(request, rendered.encode("utf-8"))
+            binding_path = write_round_request_binding(
+                root, round_id, expected["target_sha"], expected["base_sha"],
+                expected["reviewers"], mode=mode, narrative_digest=narrative_digest,
+                rendered_request_digest=rendered_request_digest,
+                directory=request.parent)
+            request.parent.mkdir(parents=True, exist_ok=True)
+            write_bytes_atomic(request, rendered.encode("utf-8"))
         narrative_store = stored_narrative_path(root, round_id)
         narrative_store.parent.mkdir(parents=True, exist_ok=True)
         write_bytes_atomic(narrative_store, narrative.encode("utf-8"))
@@ -1850,26 +2148,40 @@ def verify_packet_publication(root: Path, round_id: str) -> int:
     if rdir.is_symlink() or not rdir.is_dir():
         print(f"remote: reviews directory must be a real directory: {rdir}", file=sys.stderr)
         return 1
-    request = rdir / f"{round_id}-request.md"
+    try:
+        artifacts = packet_review_artifacts(root, round_id, cfg)
+    except WorkflowError as error:
+        print(f"remote: packet identity conflict for round {round_id}: {error}", file=sys.stderr)
+        return 1
+    request = artifacts["request"]
     if request.is_symlink() or not request.is_file():
         print(f"remote: packet request must be a regular file: {request}", file=sys.stderr)
         return 1
     request_binding = parse_packet_request_binding(request)
     if request_binding is None:
         return 1
-    sidecar_paths = sorted(rdir.glob(f"{round_id}-request.binding*.json"))
-    if not sidecar_paths:
-        print(f"remote: packet request binding is missing for round {round_id}", file=sys.stderr)
-        return 1
-    if any(path.is_symlink() or not path.is_file() for path in sidecar_paths):
-        print(f"remote: packet binding sidecars must be regular files for round {round_id}",
-              file=sys.stderr)
-        return 1
-    binding_path, binding = latest_round_request_binding(
-        sidecar_paths, expected_round_id=round_id)
-    if binding_path is None or binding is None:
-        print(f"remote: latest packet binding is corrupt for round {round_id}", file=sys.stderr)
-        return 1
+    if artifacts["evidence"] == "canonical":
+        binding_path, binding = artifacts["binding_path"], artifacts["binding"]
+        if binding_path.is_symlink() or not binding_path.is_file():
+            print(f"remote: canonical packet binding must be a regular file: {binding_path}",
+                  file=sys.stderr)
+            return 1
+    else:
+        sidecar_paths = sorted(rdir.glob(f"{round_id}-request.binding*.json"))
+        if not sidecar_paths:
+            print(f"remote: packet request binding is missing for round {round_id}",
+                  file=sys.stderr)
+            return 1
+        if any(path.is_symlink() or not path.is_file() for path in sidecar_paths):
+            print(f"remote: packet binding sidecars must be regular files for round {round_id}",
+                  file=sys.stderr)
+            return 1
+        binding_path, binding = latest_round_request_binding(
+            sidecar_paths, expected_round_id=round_id)
+        if binding_path is None or binding is None:
+            print(f"remote: latest packet binding is corrupt for round {round_id}",
+                  file=sys.stderr)
+            return 1
     if binding["mode"] != "packet":
         print(f"remote: latest binding is not packet mode for round {round_id}", file=sys.stderr)
         return 1
@@ -1892,7 +2204,8 @@ def verify_packet_publication(root: Path, round_id: str) -> int:
         if exposure["review_mode"] != "packet" or not _binding_matches_exposure(
                 binding, exposure):
             raise WorkflowError("round exposure does not match the latest binding")
-        reproduced_text = _render_review_request(round_id, exposure, narrative)
+        reproduced_text = _render_review_request(
+            round_id, exposure, narrative, run_id=artifacts["run_id"])
         if (_canonical_rendered_request_digest(reproduced_text)
                 != binding["rendered_request_digest"]):
             raise WorkflowError("rendered request digest does not match the latest binding")
@@ -2724,7 +3037,7 @@ def status(root: Path, pr: int | None) -> int:
     if not rdir.is_dir():
         print("no reviews dir yet")
         return 0
-    reqs = sorted(p.stem[: -len("-request")] for p in rdir.glob("*-request.md"))
+    reqs = packet_review_round_ids(root, cfg)
     dispositions = packet_review_dispositions(root)
     awaiting = dispositions["actionable"]
     archived = dispositions["archived_unverifiable"]
@@ -2796,16 +3109,33 @@ def _marked_triage(content: bytes) -> bytes:
 def triage(root: Path, round_id: str, src: Path) -> int:
     """Replace the marked feedback tail while leaving every preceding byte untouched."""
     cfg = load_config(root)
-    dest = root / cfg["reviews_dir"] / f"{round_id}-feedback.md"
+    artifacts = packet_review_artifacts(root, round_id, cfg)
+    if artifacts["evidence"] == "missing":
+        raise WorkflowError(
+            f"review triage: no request or feedback evidence exists for round {round_id}")
+    if artifacts["evidence"] == "legacy":
+        raise WorkflowError(
+            f"review triage: flat legacy evidence for round {round_id} is read-only")
+    dest = artifacts["feedback"]
     try:
-        content = dest.read_bytes()
+        if artifacts["evidence"] == "canonical":
+            content = review_layout.read_canonical_artifact(
+                root / cfg["reviews_dir"], dest)["bytes"]
+        else:
+            content = dest.read_bytes()
         replacement = Path(src).read_bytes()
     except OSError as e:
         raise WorkflowError(f"review triage input unavailable: {e}") from e
     marker_start = _triage_marker_start(content)
     if TRIAGE_BEGIN in replacement or TRIAGE_END in replacement:
         raise WorkflowError("review triage input must not contain triage marker strings")
-    write_bytes_atomic(dest, content[:marker_start] + _marked_triage(replacement))
+    updated = content[:marker_start] + _marked_triage(replacement)
+    if artifacts["evidence"] == "canonical":
+        review_layout.publish_markdown(
+            root / cfg["reviews_dir"], artifacts["run_id"], review_layout.FEEDBACK,
+            updated, replace=True)
+    else:
+        write_bytes_atomic(dest, updated)
     print(f"updated triage section → {dest}")
     return 0
 
@@ -2815,13 +3145,14 @@ def ingest(root: Path, round_id: str | None, src: Path = INBOX, reviewer: str | 
     """Byte-exact ingest of an external review reply.
 
     The user saves the reviewer's reply to `src` (default /tmp/review.md) in a separate shell
-    (`cat > /tmp/review.md`, paste, Ctrl-D); this copies the body VERBATIM into
-    <reviews_dir>/<round-id>-feedback.md under a metadata header, then APPENDS a finding triage
-    skeleton beneath it. Identity comes only from the reply's leading structured header; the
-    deprecated ``reviewer`` argument is never identity evidence. The verbatim body is never edited.
-    Round id from --round, else the newest <reviews_dir>/*-request.md."""
+    (`cat > /tmp/review.md`, paste, Ctrl-D); this copies the body VERBATIM into the resolved
+    feedback artifact under a metadata header, then APPENDS a finding triage skeleton beneath it.
+    Identity comes only from the reply's leading structured header; the deprecated ``reviewer``
+    argument is never identity evidence. The verbatim body is never edited. Round id comes from
+    --round, else the newest canonical-or-legacy packet request."""
     import datetime
     cfg = load_config(root)
+    mode = (cfg.get("review") or {}).get("mode", "packet")
     if not src.is_file():
         print(f"review ingest: no review at {src}. In a SEPARATE shell run `cat > {src}`, paste "
               f"the reviewer's reply, press Ctrl-D, then re-run.", file=sys.stderr)
@@ -2832,15 +3163,31 @@ def ingest(root: Path, round_id: str | None, src: Path = INBOX, reviewer: str | 
         return 1
     rdir = root / cfg["reviews_dir"]
     if round_id is None:
-        reqs = sorted(p.stem[: -len("-request")] for p in rdir.glob("*-request.md")) if rdir.is_dir() else []
+        reqs = packet_review_round_ids(root, cfg)
         if reqs:
             round_id = reqs[-1]
         else:
             print("review ingest: no --round given and no *-request.md to infer it from.",
                   file=sys.stderr)
             return 1
-    rdir.mkdir(parents=True, exist_ok=True)
-    dest = rdir / f"{round_id}-feedback.md"
+    artifacts = packet_review_artifacts(root, round_id, cfg)
+    if artifacts["evidence"] == "missing" and mode == "packet":
+        print(
+            f"review ingest: no request or binding evidence exists for round {round_id}; "
+            "run review prepare first",
+            file=sys.stderr,
+        )
+        return 1
+    if artifacts["evidence"] == "legacy":
+        print(
+            f"review ingest: flat legacy evidence for round {round_id} is read-only; "
+            "prepare a new canonical round",
+            file=sys.stderr,
+        )
+        return 1
+    if artifacts["evidence"] in ("legacy", "missing"):
+        rdir.mkdir(parents=True, exist_ok=True)
+    dest = artifacts["feedback"]
 
     parsed_header = parse_review_reply_header(body)
     binding, binding_reason = ingest_round_binding(root, round_id, cfg)
@@ -2948,8 +3295,18 @@ def ingest(root: Path, round_id: str | None, src: Path = INBOX, reviewer: str | 
         f"verbatim-bytes: {len(body)}\n\n---\n\n"
     )
     content = header.encode("utf-8") + body + appended
-    prior_content = dest.read_bytes() if force and dest.is_file() else None
-    if force:
+    if artifacts["evidence"] == "canonical" and dest.is_file():
+        prior_content = review_layout.read_canonical_artifact(rdir, dest)["bytes"]
+    else:
+        prior_content = dest.read_bytes() if force and dest.is_file() else None
+    if artifacts["evidence"] == "canonical":
+        if dest.exists() and not force:
+            print(f"review ingest: feedback already exists for round {round_id}: {dest}; "
+                  "pass --force to replace it", file=sys.stderr)
+            return 1
+        review_layout.publish_markdown(
+            rdir, artifacts["run_id"], review_layout.FEEDBACK, content, replace=force)
+    elif force:
         write_bytes_atomic(dest, content)
     else:
         try:
@@ -2968,6 +3325,10 @@ def ingest(root: Path, round_id: str | None, src: Path = INBOX, reviewer: str | 
             try:
                 if prior_content is None:
                     dest.unlink(missing_ok=True)
+                elif artifacts["evidence"] == "canonical":
+                    review_layout.publish_markdown(
+                        rdir, artifacts["run_id"], review_layout.FEEDBACK,
+                        prior_content, replace=True)
                 else:
                     write_bytes_atomic(dest, prior_content)
             except OSError as rollback_error:

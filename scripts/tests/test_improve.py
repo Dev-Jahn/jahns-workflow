@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from support import *  # noqa: F401,F403
+from waystone.features import review_layout
 
 
 class CclogParseTests(unittest.TestCase):
@@ -704,6 +705,47 @@ class ImproveReviewsTests(unittest.TestCase):
         cov = _json.loads((out / "reviews_coverage.json").read_text())
         return rows, cov
 
+    def _legacy_feedback_from_canonical_ingest(
+            self, root, round_id, target, base_sha, reviewers, reply,
+            *, narrative_digest=None, rendered_request_digest=None, schema=None):
+        """Create production feedback canonically, then return its legacy fixture bytes."""
+        import shutil
+
+        reviews = root / "docs/reviews"
+        owner = review_layout.new_run_id()
+        selected_schema = schema or review.ROUND_REQUEST_BINDING_SCHEMA
+        payload = {
+            "schema": selected_schema,
+            "round_id": round_id,
+            "target_sha": target,
+            "base_sha": base_sha,
+            "reviewers": reviewers,
+            "mode": "packet",
+            "canonical_store": "local-packet",
+            "at": "2026-07-18T00:00:00+00:00",
+        }
+        if selected_schema == review.ROUND_REQUEST_BINDING_SCHEMA:
+            payload.update({
+                "narrative_digest": narrative_digest or TEST_NARRATIVE_DIGEST,
+                "rendered_request_digest": (
+                    rendered_request_digest or TEST_RENDERED_REQUEST_DIGEST),
+            })
+        review_layout.publish_json(
+            reviews, owner, review_layout.REQUEST_BINDING, payload)
+        review_layout.publish_markdown(
+            reviews, owner, review_layout.REQUEST,
+            (f"# request\n\n- Reviewing: {target}   "
+             f"(diff against {base_sha})\n").encode())
+        source = root / "canonical-reply.md"
+        source.write_text(reply)
+        self.assertEqual(review.ingest(root, round_id, src=source), 0)
+        canonical = review_layout.read_canonical_artifact(
+            reviews, reviews / "runs" / owner / "feedback.md")["bytes"]
+        _identity, separator, legacy = canonical.partition(b"\n")
+        self.assertEqual(separator, b"\n")
+        shutil.rmtree(reviews / "runs")
+        return legacy
+
     def test_reviews_projection(self):
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)
@@ -769,19 +811,21 @@ class ImproveReviewsTests(unittest.TestCase):
             rdir = root / "docs/reviews"
             rdir.mkdir(parents=True)
             round_id = "2026-07-18-r1"
+            reply_text = (
+                "model: gpt-5.6-sol\neffort: xhigh\n"
+                "review-target: bbbbbbbbbbbb-aaaaaaaaaaaa\n"
+                f"request-digest: {TEST_RENDERED_REQUEST_DIGEST}\n"
+                "foo: bar\n\nreview body\n")
+            feedback = self._legacy_feedback_from_canonical_ingest(
+                root, round_id, "a" * 40, "b" * 40,
+                ["codex:gpt-5.6-sol"], reply_text)
             (rdir / f"{round_id}-request.md").write_text("# request\n")
             review.write_round_request_binding(
                 root, round_id, "a" * 40, "b" * 40,
                 ["codex:gpt-5.6-sol"], mode="packet",
                 narrative_digest=TEST_NARRATIVE_DIGEST,
                 rendered_request_digest=TEST_RENDERED_REQUEST_DIGEST)
-            reply = root / "reply.md"
-            reply.write_text(
-                "model: gpt-5.6-sol\neffort: xhigh\n"
-                "review-target: bbbbbbbbbbbb-aaaaaaaaaaaa\n"
-                f"request-digest: {TEST_RENDERED_REQUEST_DIGEST}\n"
-                "foo: bar\n\nreview body\n")
-            self.assertEqual(review.ingest(root, round_id, src=reply), 0)
+            (rdir / f"{round_id}-feedback.md").write_bytes(feedback)
             (rdir / f"{round_id}-request.md").write_text(
                 f"# request\n\n- Reviewing: {'a' * 40}   (diff against {'b' * 40})\n")
             registry = base / "projects.json"
@@ -848,21 +892,24 @@ class ImproveReviewsTests(unittest.TestCase):
             rdir.mkdir(parents=True)
             target, base_sha = "a" * 40, "b" * 40
             round_id = "2026-07-18-r1"
-            (rdir / f"{round_id}-request.md").write_text(
-                f"# request\n\n- Reviewing: {target}   (diff against {base_sha})\n")
             binding_digest = "sha256:" + "2" * 64
             reply_digest = "sha256:" + "1" * 64
             reply_rendered_digest = "sha256:" + "3" * 64
+            reply_text = (
+                "model: expected-reviewer\neffort: high\n"
+                f"review-target: {base_sha[:12]}-{target[:12]}\n"
+                f"request-digest: {reply_rendered_digest}\n\nreview body\n")
+            feedback = self._legacy_feedback_from_canonical_ingest(
+                root, round_id, target, base_sha, ["expected-reviewer"], reply_text,
+                narrative_digest=reply_digest,
+                rendered_request_digest=reply_rendered_digest)
+            (rdir / f"{round_id}-request.md").write_text(
+                f"# request\n\n- Reviewing: {target}   (diff against {base_sha})\n")
             review.write_round_request_binding(
                 root, round_id, target, base_sha, ["expected-reviewer"], mode="packet",
                 narrative_digest=reply_digest,
                 rendered_request_digest=reply_rendered_digest)
-            reply = root / "reply.md"
-            reply.write_text(
-                "model: expected-reviewer\neffort: high\n"
-                f"review-target: {base_sha[:12]}-{target[:12]}\n"
-                f"request-digest: {reply_rendered_digest}\n\nreview body\n")
-            self.assertEqual(review.ingest(root, round_id, src=reply), 0)
+            (rdir / f"{round_id}-feedback.md").write_bytes(feedback)
             review.write_round_request_binding(
                 root, round_id, target, base_sha, ["expected-reviewer"], mode="packet",
                 narrative_digest=binding_digest,
@@ -902,15 +949,17 @@ class ImproveReviewsTests(unittest.TestCase):
             rdir.mkdir(parents=True)
             target, base_sha = "a" * 40, "b" * 40
             round_id = "2026-07-18-r1"
+            reply_text = (
+                "model: someone-else\neffort: high\n"
+                f"review-target: {base_sha[:12]}-{target[:12]}\n\nreviewed\n")
+            feedback = self._legacy_feedback_from_canonical_ingest(
+                root, round_id, target, base_sha, ["expected-reviewer"],
+                reply_text, schema=review.ROUND_REQUEST_BINDING_V1_SCHEMA)
             (rdir / f"{round_id}-request.md").write_text(
                 f"# request\n\n- Reviewing: {target}   (diff against {base_sha})\n")
             write_legacy_round_request_binding(
                 root, round_id, target, base_sha, ["expected-reviewer"])
-            reply = root / "reply.md"
-            reply.write_text(
-                "model: someone-else\neffort: high\n"
-                f"review-target: {base_sha[:12]}-{target[:12]}\n\nreviewed\n")
-            self.assertEqual(review.ingest(root, round_id, src=reply), 0)
+            (rdir / f"{round_id}-feedback.md").write_bytes(feedback)
             registry = base / "projects.json"
             registry.write_text(_json.dumps({
                 "projects": [{"name": "demo", "path": str(root)}]}))

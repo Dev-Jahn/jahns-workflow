@@ -150,13 +150,45 @@ def evaluate_rule2(root: Path, cfg: dict, severities, *, closing_done=frozenset(
     errors = 0
     rdir = root / cfg["reviews_dir"]
     if rdir.is_dir():
-        for fb in sorted(rdir.glob("*-feedback.md")):
-            rid = fb.stem[: -len("-feedback")]
+        import review
+        from waystone.features import review_layout
+
+        candidate_rounds: set[str] = set()
+        try:
+            canonical, rejected = review._canonical_packet_records(rdir)
+            candidate_rounds.update(canonical)
+            candidate_rounds.update(
+                claim for _path, _error, claim in rejected if claim is not None)
+        except WorkflowError:
+            errors += 1
+        for flat_feedback in sorted(rdir.glob("*-feedback.md")):
+            try:
+                artifact = review_layout.read_legacy_artifact(rdir, flat_feedback)
+            except review_layout.ReviewLayoutError:
+                errors += 1
+                continue
+            candidate_rounds.add(artifact["round_id"])
+        if round_filter is not None:
+            candidate_rounds = {round_filter}
+
+        for rid in sorted(candidate_rounds):
             if round_filter is not None and rid != round_filter:
                 continue
             try:
-                text = fb.read_text(encoding="utf-8", errors="replace")
-            except OSError:
+                artifacts = review.packet_review_artifacts(root, rid, cfg)
+                feedback = artifacts["feedback"]
+                if not feedback.exists() and not feedback.is_symlink():
+                    continue
+                if artifacts["evidence"] == "canonical":
+                    content = review_layout.read_canonical_artifact(
+                        rdir, feedback)["bytes"]
+                elif artifacts["evidence"] == "legacy":
+                    content = review_layout.read_legacy_artifact(
+                        rdir, feedback)["bytes"]
+                else:
+                    continue
+                text = content.decode("utf-8", errors="replace")
+            except (OSError, WorkflowError):
                 errors += 1
                 continue
             for f in improve._parse_triage(text):
@@ -634,15 +666,22 @@ def load_review_ingests(root: Path) -> tuple[list[dict], int]:
             if cfg is not None:
                 binding, _binding_reason = review.ingest_round_binding(
                     root, row["round_id"], cfg)
-                feedback = root / cfg["reviews_dir"] / f"{row['round_id']}-feedback.md"
+                try:
+                    artifacts = review.packet_review_artifacts(root, row["round_id"], cfg)
+                except WorkflowError:
+                    skipped += 1
+                    continue
+                feedback = artifacts["feedback"]
+                generation_dir = artifacts["directory"]
             else:
                 feedback = root / "__unavailable-feedback__"
+                generation_dir = feedback.parent
             projected = review.read_feedback_reply_metadata(
                 feedback, expected_round_id=row["round_id"], binding=binding,
                 request_generation_dir=(project_state_path(root) / "review-requests"
                                         if cfg is not None
                                         and (cfg.get("review") or {}).get("mode") == "pr"
-                                        else feedback.parent))
+                                        else generation_dir))
             row = {
                 **row,
                 "reviewer": projected["model"],

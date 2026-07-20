@@ -460,8 +460,17 @@ def reclose(root: Path, round_id: str) -> int:
                 f"current HEAD {head} is not a descendant of prior closeout "
                 f"{previous['head_sha']}; close with a new round id")
         mode = previous["review_mode"]
-        request = review.prepared_request_path(root, round_id, mode=mode)
-        if any(request.parent.glob(f"{round_id}-request.binding*.json")):
+        if mode == "packet":
+            artifacts = review.packet_review_artifacts(root, round_id)
+            binding_exists = (
+                artifacts["binding_path"] is not None
+                or any(artifacts["directory"].glob(
+                    f"{round_id}-request.binding*.json")))
+        else:
+            request = review.prepared_request_path(root, round_id, mode=mode)
+            binding_exists = any(
+                request.parent.glob(f"{round_id}-request.binding*.json"))
+        if binding_exists:
             raise WorkflowError(
                 "an immutable request sidecar already exists; close with a new round id")
         current_mode = (load_config(root).get("review") or {}).get("mode", "packet")
