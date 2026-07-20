@@ -107,6 +107,9 @@ from test_run_effects import (
 from test_run_lease import (
     RunLeaseTests,
 )
+from test_run_observe import (
+    RunObserveTests,
+)
 from test_run_preflight import (
     RunPreflightTests,
 )
@@ -222,6 +225,7 @@ _TEST_CLASSES = (
     RunDomainTests,
     RunEffectTests,
     RunLeaseTests,
+    RunObserveTests,
     RunPreflightTests,
     RunPromptTests,
     LockPrimitiveTests,
