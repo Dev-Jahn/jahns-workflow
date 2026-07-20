@@ -1,6 +1,6 @@
 # 0.12 승격 계약 목록 — main 인수용 초안
 
-- Status: draft proposal
+- Status: **confirmed v1** — main 인수 2026-07-20 (PC-01~PC-30 전량; 행 단위 조정은 사용자 override로 가능)
 - Basis: ADR-0014
 - Inventory reviewed: `docs/porting-ledger.md` 85 classes / 828 methods
 
