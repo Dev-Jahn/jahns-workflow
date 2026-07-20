@@ -464,3 +464,6 @@ tasks:
     status: done
     severity: "minor"
     origin: "review-2026-07-20-m1a-split"
+  - id: docs/m1b-slice-decomposition
+    title: "M1-B vertical slice 분해 계획(main 설계): transactional store §3-1·effect protocol §3-4·executor 경계 §3-6·4-role domain model·delegate wrapper 신엔진 호출·typed envelope·fault fixture 8건 표를 구현 task들로 분해 + PC 귀속(M1-B분)·편입 예약 6건(i10-strip·review-runs-uuid·#014/#015·ADR-0013 fault·_git 정렬·shim parent guard) 배치"
+    status: "pending"
