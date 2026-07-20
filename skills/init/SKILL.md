@@ -27,7 +27,7 @@ Shared resources: `$WAYSTONE_PLUGIN_ROOT/references/conventions.md` and
 ## Step 0 — Preconditions and mode
 
 1. Verify the project is a git repository (`git rev-parse --git-dir`). If not, ask the user whether to `git init` first; do not proceed without git.
-2. If `.waystone.yml` or legacy `.jahns-workflow.yml` already exists → **repair mode**: skip to Step 5 and re-run Steps 5–9 idempotently, reporting anything that drifted (missing dirs, stale generated views, missing host instruction stanza, unregistered project). The first `waystone` command renames the legacy config before reading it.
+2. If `.waystone.yml` already exists → **repair mode**: skip to Step 5 and re-run Steps 5–9 idempotently, reporting anything that drifted (missing dirs, stale generated views, missing host instruction stanza, unregistered project).
 
 ## Step 1 — Detect the existing structure
 
@@ -132,11 +132,9 @@ waystone validate tasks.yaml
 
 For Claude Code, insert `$WAYSTONE_PLUGIN_ROOT/templates/claude-md-stanza.md` into project `CLAUDE.md`.
 For Codex, insert `$WAYSTONE_PLUGIN_ROOT/templates/agents-md-stanza.md` into project `AGENTS.md`. Create the
-selected file if absent and substitute `{SSOT_PATH}`/`{GENERATED_DIR}`. Recognize and replace both the legacy
-`<!-- jahns-workflow:begin -->` … `<!-- jahns-workflow:end -->` block and the current
+selected file if absent and substitute `{SSOT_PATH}`/`{GENERATED_DIR}`. Recognize and replace the current
 `<!-- waystone:begin -->` … `<!-- waystone:end -->` block (the template's begin marker may carry an
-annotation). Always write the new `waystone` markers, never the legacy markers, and never duplicate
-the managed block. Do not touch anything outside the markers. If the selected host instruction file
+annotation), and never duplicate the managed block. Do not touch anything outside the markers. If the selected host instruction file
 currently carries a running status log (acting as a de-facto PROGRESS), propose moving that content
 into PROGRESS.md and leaving a pointer — show the user the move before applying it.
 

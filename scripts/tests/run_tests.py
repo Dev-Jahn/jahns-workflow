@@ -5187,6 +5187,23 @@ class IngestTests(unittest.TestCase):
             self.assertIs(metadata["review_target_matches"], True)
             self.assertIs(metadata["reviewer_configured"], True)
 
+    def test_ws_finding_blocks_build_triage_skeleton(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root(d)
+            round_id = "2026-07-18-r1"
+            self._binding(root, round_id)
+            src = root / "reply.md"
+            src.write_bytes(
+                self._reply()
+                + b"\n### WS-GPT-007 - exact issue\n- Severity: major\n")
+
+            self.assertEqual(review.ingest(root, round_id, src=src), 0)
+            feedback = root / f"docs/reviews/{round_id}-feedback.md"
+            self.assertIn(
+                "| WS-GPT-007 — exact issue | major |  |  |  |  |",
+                feedback.read_text(encoding="utf-8"),
+            )
+
     def test_triage_command_replaces_only_marked_tail_with_quoted_markers_in_reply(self):
         with tempfile.TemporaryDirectory() as d:
             root = self._root(d)
@@ -5982,25 +5999,21 @@ class StatuslineTests(unittest.TestCase):
             self.assertLess(elapsed, 0.5)
             pending.assert_called_once_with(root.resolve())
 
-    def test_statusline_is_empty_and_read_only_for_legacy_only_project_and_bad_registry(self):
+    def test_statusline_is_empty_and_read_only_outside_project_with_bad_registry(self):
         with tempfile.TemporaryDirectory() as d:
-            root = Path(d) / "legacy"
+            root = Path(d) / "outside"
             nested = root / "nested"
             nested.mkdir(parents=True)
-            legacy = root / ".jahns-workflow.yml"
-            legacy.write_bytes(b"version: 1\nproject: legacy\n")
             home = Path(d) / "home"
             machine = home / ".waystone"
             machine.mkdir(parents=True)
             registry = machine / "projects.json"
             registry.write_bytes(b"{not json")
-            before_legacy = legacy.read_bytes()
             before_registry = registry.read_bytes()
 
             rc, stdout, stderr, _elapsed = self._run(nested, home)
 
             self.assertEqual((rc, stdout, stderr), (0, "", ""))
-            self.assertEqual(legacy.read_bytes(), before_legacy)
             self.assertEqual(registry.read_bytes(), before_registry)
             self.assertFalse((root / ".waystone.yml").exists())
 
@@ -6891,16 +6904,6 @@ class TaskReadNudgeTests(unittest.TestCase):
             self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
             self.assertIn("waystone task", out["hookSpecificOutput"]["permissionDecisionReason"])
 
-    def test_legacy_config_still_activates_nudge(self):
-        with tempfile.TemporaryDirectory() as d:
-            root = Path(d)
-            (root / ".jahns-workflow.yml").write_text("version: 1\nproject: x\n")
-            (root / "tasks.yaml").write_text(TASKS_FIXTURE)
-            out = self.nudge.decide({"tool_name": "Read",
-                                     "tool_input": {"file_path": str(root / "tasks.yaml")}})
-            self.assertIsNotNone(out)
-            self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
-
     def test_allows_other_files_and_tools(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
@@ -7737,7 +7740,7 @@ class ImproveSelfSessionTests(unittest.TestCase):
 
 
 # feedback file exactly as review.ingest writes it: metadata header, byte-exact reviewer body
-# (which itself contains `### JW-GPT-NNN` blocks + `- Severity:` lines we must NOT parse), then an
+# (which itself contains `### WS-GPT-NNN` blocks + `- Severity:` lines we must NOT parse), then an
 # APPENDED triage table under `## Findings (triage skeleton …)` — the only thing improve reviews reads.
 _TRIAGE_FEEDBACK = """<!-- waystone feedback: verbatim body below; triage skeleton appended. -->
 round: 2026-07-01-alpha
@@ -7747,10 +7750,10 @@ source: /tmp/review.md
 
 ---
 
-### JW-GPT-001 — some finding
+### WS-GPT-001 — some finding
 - Severity: blocker
 
-### JW-GPT-002 — another finding
+### WS-GPT-002 — another finding
 - Severity: minor
 
 
@@ -7760,9 +7763,9 @@ source: /tmp/review.md
 
 | finding | severity | verdict (REAL/REJECTED/NEEDS-RULING) | evidence | task id |
 |---|---|---|---|---|
-| JW-GPT-001 — some finding | blocker | REAL | confirmed in code | fix/thing |
-| JW-GPT-002 — another finding | minor | REJECTED | wrong, see SSOT | |
-| JW-GPT-003 — unscored finding | ? |  |  |  |
+| WS-GPT-001 — some finding | blocker | REAL | confirmed in code | fix/thing |
+| WS-GPT-002 — another finding | minor | REJECTED | wrong, see SSOT | |
+| WS-GPT-003 — unscored finding | ? |  |  |  |
 """
 
 
@@ -7814,7 +7817,7 @@ class ImproveReviewsTests(unittest.TestCase):
             self.assertEqual(cov["projects_total"], 3)
             self.assertEqual([s["project"] for s in cov["projects_skipped"]], ["gone", "remote-only"])
             # a triage row that names its fix-task (task-id cell) is ONE finding, not two (dedup):
-            # JW-GPT-001 + JW-GPT-002 + JW-GPT-003 (triage) + fix/old (unreferenced task) = 4
+            # WS-GPT-001 + WS-GPT-002 + WS-GPT-003 (triage) + fix/old (unreferenced task) = 4
             self.assertEqual(cov["row_totals"], {"reviews": 2, "findings": 4})
 
             # rows sorted by (project, round_id)
@@ -7828,26 +7831,26 @@ class ImproveReviewsTests(unittest.TestCase):
             self.assertIsNone(alpha["review_target"])
 
             byid = {f["id"]: f for f in alpha["findings"]}
-            # triage findings: severity read structurally from the table cell (explicit). JW-GPT-001's
+            # triage findings: severity read structurally from the table cell (explicit). WS-GPT-001's
             # task-id cell names fix/thing (a joined task) → merged into ONE triage finding carrying
             # task_id; the separate fix/thing task finding is NOT emitted (dedup)
-            expected = {"id": "JW-GPT-001", "severity": "blocker", "status": "REAL",
+            expected = {"id": "WS-GPT-001", "severity": "blocker", "status": "REAL",
                         "type": "unknown", "source": "triage", "provenance": "explicit",
                         "task_id": "fix/thing"}
-            self.assertEqual({key: byid["JW-GPT-001"][key] for key in expected}, expected)
-            self.assertEqual(byid["JW-GPT-001"]["review_origin"], "2026-07-01-alpha")
-            self.assertTrue(byid["JW-GPT-001"]["source_pointer"].endswith(
+            self.assertEqual({key: byid["WS-GPT-001"][key] for key in expected}, expected)
+            self.assertEqual(byid["WS-GPT-001"]["review_origin"], "2026-07-01-alpha")
+            self.assertTrue(byid["WS-GPT-001"]["source_pointer"].endswith(
                 "2026-07-01-alpha-feedback.md:22"))
-            self.assertNotIn("fix/thing", byid)  # deduped into JW-GPT-001, not a second finding
-            self.assertEqual(byid["JW-GPT-002"]["status"], "REJECTED")
-            self.assertEqual(byid["JW-GPT-002"]["severity"], "minor")
+            self.assertNotIn("fix/thing", byid)  # deduped into WS-GPT-001, not a second finding
+            self.assertEqual(byid["WS-GPT-002"]["status"], "REJECTED")
+            self.assertEqual(byid["WS-GPT-002"]["severity"], "minor")
             # `?` severity is unparseable → provenance unknown, NOT keyword-guessed from prose
-            self.assertEqual(byid["JW-GPT-003"]["severity"], None)
-            self.assertEqual(byid["JW-GPT-003"]["provenance"], "unknown")
+            self.assertEqual(byid["WS-GPT-003"]["severity"], None)
+            self.assertEqual(byid["WS-GPT-003"]["provenance"], "unknown")
             # a finding-derived task NOT referenced by any triage row remains source "task"
             self.assertEqual(byid["fix/old"]["source"], "task")
             self.assertNotIn("feat/unrelated", byid)
-            # counts: blocker JW-GPT-001 + fix/old = 2; minor JW-GPT-002 = 1; unknown JW-GPT-003 = 1;
+            # counts: blocker WS-GPT-001 + fix/old = 2; minor WS-GPT-002 = 1; unknown WS-GPT-003 = 1;
             # the merged fix/thing is counted once (as its triage blocker), not doubled as a major
             self.assertEqual(alpha["counts"], {"blocker": 2, "major": 0, "minor": 1, "unknown": 1})
 
@@ -8029,20 +8032,20 @@ class ImproveReviewsTests(unittest.TestCase):
             self.assertEqual(review.pending_reviews(root), [])
 
     def test_triage_ignores_verbatim_body(self):
-        # the verbatim body's `### JW-GPT-*` blocks must not be parsed — only the appended table
+        # the verbatim body's `### WS-GPT-*` blocks must not be parsed — only the appended table
         findings = improve._parse_triage(_TRIAGE_FEEDBACK)
-        self.assertEqual([f["id"] for f in findings], ["JW-GPT-001", "JW-GPT-002", "JW-GPT-003"])
+        self.assertEqual([f["id"] for f in findings], ["WS-GPT-001", "WS-GPT-002", "WS-GPT-003"])
         # a feedback body with NO appended skeleton yields nothing
-        self.assertEqual(improve._parse_triage("just prose, no table\n### JW-GPT-9 — x"), [])
+        self.assertEqual(improve._parse_triage("just prose, no table\n### WS-GPT-9 — x"), [])
 
     def test_triage_type_column_accepts_taxonomy_and_preserves_unknown(self):
         feedback = """## Findings (triage skeleton v2)
 
 | finding | severity | type | verdict | evidence | task id |
 |---|---|---|---|---|---|
-| JW-GPT-101 — typed | major | architecture | REAL | ev | fix/typed |
-| JW-GPT-102 — blank | minor | | REJECTED | ev | |
-| JW-GPT-103 — noncanonical | blocker | performance | NEEDS-RULING | ev | |
+| WS-GPT-101 — typed | major | architecture | REAL | ev | fix/typed |
+| WS-GPT-102 — blank | minor | | REJECTED | ev | |
+| WS-GPT-103 — noncanonical | blocker | performance | NEEDS-RULING | ev | |
 """
         findings = improve._parse_triage(feedback)
         self.assertEqual(improve.FINDING_TYPES, (
@@ -8127,7 +8130,7 @@ class ImproveAuditTests(unittest.TestCase):
             {"project": "proj-a", "root": "/r", "round_id": "2026-07-01-alpha",
              "request_file": "/r/req.md", "feedback_file": "/r/fb.md",
              "findings": [
-                 {"id": "JW-GPT-001", "severity": "blocker", "status": "REAL",
+                 {"id": "WS-GPT-001", "severity": "blocker", "status": "REAL",
                   "source": "triage", "provenance": "explicit"},
                  {"id": "fix/x", "severity": "major", "status": "done",
                   "source": "task", "provenance": "explicit"}],
@@ -9140,7 +9143,7 @@ class ImproveM1DefectTests(unittest.TestCase):
                 "## Findings (triage skeleton — verify each)\n\n"
                 "| finding | severity | verdict | evidence | task id |\n"
                 "|---|---|---|---|---|\n"
-                "| JW-GPT-001 — the one bug | blocker | REAL | confirmed | fix/the-bug |\n")
+                "| WS-GPT-001 — the one bug | blocker | REAL | confirmed | fix/the-bug |\n")
             (proj / "tasks.yaml").write_text(
                 "version: 1\nproject: a\ntasks:\n"
                 "  - id: fix/the-bug\n    title: 'fix'\n    status: pending\n"
@@ -9487,11 +9490,11 @@ class DelegateSnapshotTests(unittest.TestCase):
             delegate._check_snapshot_preconditions(root)  # no raise
 
     def test_precondition_reserved_report_filename(self):
-        # H2: a pre-existing JW_REPORT.yaml would be baked into the base, then consumed as the
+        # H2: a pre-existing WAYSTONE_REPORT.yaml would be baked into the base, then consumed as the
         # delegate's report and phantom-deleted by the patch — refuse up front.
         with tempfile.TemporaryDirectory() as d:
             root = self._repo(d)
-            (root / "JW_REPORT.yaml").write_text("stale: report\n")
+            (root / "WAYSTONE_REPORT.yaml").write_text("stale: report\n")
             with self.assertRaises(delegate.WorkflowError) as cm:
                 delegate._check_snapshot_preconditions(root)
             self.assertIn("reserved", str(cm.exception))
@@ -9911,7 +9914,7 @@ class DelegateRunTests(unittest.TestCase):
             (record_dir / "last_message.md").write_text("delegate summary", encoding="utf-8")
             (record_dir / "runner.jsonl").write_text("{}\n", encoding="utf-8")
             if report is not None:
-                (worktree / "JW_REPORT.yaml").write_text(report, encoding="utf-8")
+                (worktree / "WAYSTONE_REPORT.yaml").write_text(report, encoding="utf-8")
             return (rc, 0.42)
         return fake
 
@@ -9956,9 +9959,9 @@ class DelegateRunTests(unittest.TestCase):
             self.assertEqual(delegate._read_status(rec)["state"], "needs-review")
             # prompt carries acceptance criterion text
             self.assertIn("criterion alpha here", (rec / "prompt.txt").read_text())
-            # JW_REPORT consumed from the worktree (not left to pollute the patch)
+            # WAYSTONE_REPORT consumed from the worktree (not left to pollute the patch)
             wt = _run_with_home(home, lambda: delegate._worktree_path(root, rec.name))
-            self.assertFalse((wt / "JW_REPORT.yaml").exists())
+            self.assertFalse((wt / "WAYSTONE_REPORT.yaml").exists())
             contract = yaml.safe_load((rec / "artifact" / "contract.yaml").read_text())
             self.assertEqual(contract["schema"], "waystone-artifact-1")
             self.assertFalse(contract["empty"])
@@ -10346,7 +10349,7 @@ class DelegateRunTests(unittest.TestCase):
                 (record_dir / "last_message.md").write_text("no change needed", encoding="utf-8")
                 (record_dir / "runner.stderr").write_text(
                     "loopback: Failed RTM_NEWADDR: Operation not permitted\n", encoding="utf-8")
-                (worktree / "JW_REPORT.yaml").write_text(report, encoding="utf-8")
+                (worktree / "WAYSTONE_REPORT.yaml").write_text(report, encoding="utf-8")
                 return (0, 0.42)
 
             with contextlib.redirect_stdout(io.StringIO()):
@@ -10810,15 +10813,15 @@ class DelegateRunTests(unittest.TestCase):
             self.assertEqual(delegate._read_status(rec)["state"], "failed-runner")
             self.assertTrue((rec / "exposure.json").exists())  # exposure recorded before runner
 
-    def test_run_refuses_preexisting_jw_report(self):
-        # H2 repro: an untracked JW_REPORT.yaml in the user's tree must refuse the run entirely —
+    def test_run_refuses_preexisting_waystone_report(self):
+        # H2 repro: an untracked WAYSTONE_REPORT.yaml in the user's tree must refuse the run entirely —
         # before any record is created (no phantom deletion via the patch).
         with tempfile.TemporaryDirectory() as d:
             root, home = self._project(d)
-            (root / "JW_REPORT.yaml").write_text("stale: report\n")  # untracked user file
+            (root / "WAYSTONE_REPORT.yaml").write_text("stale: report\n")  # untracked user file
             with self.assertRaises(delegate.WorkflowError) as cm:
                 self._run(root, home, self._fake_runner({"impl.py": "x\n"}))
-            self.assertIn("JW_REPORT.yaml", str(cm.exception))
+            self.assertIn("WAYSTONE_REPORT.yaml", str(cm.exception))
             self.assertFalse(_run_with_home(home, lambda: delegate._delegations_dir(root)).exists())
 
     def test_non_utf8_text_change_roundtrip(self):
@@ -10843,13 +10846,13 @@ class DelegateRunTests(unittest.TestCase):
             self.assertIn(b"caf\xe9 au lait", patch)  # original bytes preserved, not mangled
 
     def test_non_utf8_report_marked_invalid(self):
-        # H1: a non-UTF-8 JW_REPORT.yaml must surface as delegate_report invalid, not crash the run
+        # H1: a non-UTF-8 WAYSTONE_REPORT.yaml must surface as delegate_report invalid, not crash the run
         with tempfile.TemporaryDirectory() as d:
             root, home = self._project(d)
 
             def fake(worktree, model, prompt_path, record_dir):
                 (worktree / "impl.py").write_text("x\n")
-                (worktree / "JW_REPORT.yaml").write_bytes(b"verification: caf\xe9\n")
+                (worktree / "WAYSTONE_REPORT.yaml").write_bytes(b"verification: caf\xe9\n")
                 (record_dir / "last_message.md").write_text("x")
                 return (0, 0.1)
             import contextlib
@@ -11066,7 +11069,7 @@ def _deleg_fake(changes, report=None, rc=0):
             (worktree / name).write_text(content)
         (record_dir / "last_message.md").write_text("s", encoding="utf-8")
         if report is not None:
-            (worktree / "JW_REPORT.yaml").write_text(report, encoding="utf-8")
+            (worktree / "WAYSTONE_REPORT.yaml").write_text(report, encoding="utf-8")
         return (rc, 0.1)
     return fake
 
@@ -14527,10 +14530,10 @@ def _rule2_project(d):
         "meta\n\n## Findings (triage skeleton v1)\n"
         "| Finding | Severity | Verdict | Evidence | Task |\n"
         "| --- | --- | --- | --- | --- |\n"
-        "| JW-GPT-001 — a | `blocker` | REAL | ev | `fix/finding-a` |\n"
-        "| JW-GPT-002 — b | `major` | REAL | ev | `fix/finding-b` |\n"
-        "| JW-GPT-003 — c | `blocker` | REJECTED | ev | `fix/finding-c` |\n"
-        "| JW-GPT-004 — u | `major` | NEEDS-RULING | ev | |\n")
+        "| WS-GPT-001 — a | `blocker` | REAL | ev | `fix/finding-a` |\n"
+        "| WS-GPT-002 — b | `major` | REAL | ev | `fix/finding-b` |\n"
+        "| WS-GPT-003 — c | `blocker` | REJECTED | ev | `fix/finding-c` |\n"
+        "| WS-GPT-004 — u | `major` | NEEDS-RULING | ev | |\n")
     home = Path(d) / "home"
     home.mkdir()
     return root, home
@@ -14559,7 +14562,7 @@ class OverlayRuleTests(unittest.TestCase):
             fired_ids = sorted(f["task_id"] for f in out["fires"])
             # fix/finding-a fires (open blocker, REAL); b is done; c is REJECTED; d is minor
             self.assertEqual(fired_ids, ["fix/finding-a"])
-            # JW-GPT-004 has no linked task -> unlinked, not a fire
+            # WS-GPT-004 has no linked task -> unlinked, not a fire
             self.assertEqual(out["unlinked"], 1)
 
     def test_rule2_closing_done_override_suppresses_fire(self):
@@ -14590,7 +14593,7 @@ _M2_TRIAGE_FEEDBACK = (
     "meta\n\n## Findings (triage skeleton v1)\n"
     "| Finding | Severity | Verdict | Evidence | Task |\n"
     "| --- | --- | --- | --- | --- |\n"
-    "| JW-GPT-001 — a | `blocker` | REAL | ev | `fix/finding-a` |\n")
+    "| WS-GPT-001 — a | `blocker` | REAL | ev | `fix/finding-a` |\n")
 
 
 def _check_project(d):
@@ -15341,8 +15344,8 @@ class EvidenceTests(unittest.TestCase):
             "meta\n\n## Findings (triage skeleton v1)\n"
             "| Finding | Severity | Verdict | Evidence | Task |\n"
             "| --- | --- | --- | --- | --- |\n"
-            "| JW-GPT-001 — linked | `blocker` | REAL | ev | `fix/open` |\n"
-            "| JW-GPT-002 — unknown link | `major` | NEEDS-RULING | ev | |\n")
+            "| WS-GPT-001 — linked | `blocker` | REAL | ev | `fix/open` |\n"
+            "| WS-GPT-002 — unknown link | `major` | NEEDS-RULING | ev | |\n")
         home = d / "home"
         home.mkdir()
         ddir = _run_with_home(home, lambda: delegate._delegations_dir(root))
@@ -15455,8 +15458,8 @@ class EvidenceTests(unittest.TestCase):
             root, home, registry = self._fixture(d)
             feedback = root / "docs" / "reviews" / "2026-01-01-r1-feedback.md"
             feedback.write_text(feedback.read_text().replace(
-                "| JW-GPT-002 — unknown link | `major` | NEEDS-RULING | ev | |",
-                "| JW-GPT-002 — external task | `major` | NEEDS-RULING | ev | `feat/deleg-only` |"))
+                "| WS-GPT-002 — unknown link | `major` | NEEDS-RULING | ev | |",
+                "| WS-GPT-002 — external task | `major` | NEEDS-RULING | ev | `feat/deleg-only` |"))
             ddir = _run_with_home(home, lambda: delegate._delegations_dir(root))
             self._delegation(
                 ddir / "did-unverified-external", "feat/deleg-only", "needs-review", verified=False)
@@ -15674,7 +15677,7 @@ class ImproveL2BTests(unittest.TestCase):
                 "## Findings (triage skeleton v2)\n"
                 "| finding | severity | type | verdict | evidence | task id |\n"
                 "|---|---|---|---|---|---|\n"
-                "| JW-GPT-001 — x | major | correctness | REAL | `scripts/improve.py:10` | feat/x |\n")
+                "| WS-GPT-001 — x | major | correctness | REAL | `scripts/improve.py:10` | feat/x |\n")
             exposure = root / ".waystone" / "exposure"
             exposure.mkdir(parents=True)
             (exposure / f"round-{rid}.json").write_text(_json.dumps({
@@ -16069,7 +16072,7 @@ class ImproveL2BAdversarialTests(unittest.TestCase):
             "## Findings (triage skeleton v2)\n"
             "| finding | severity | type | verdict | evidence | task id |\n"
             "|---|---|---|---|---|---|\n"
-            "| JW-GPT-001 — x | major | scope | REAL | "
+            "| WS-GPT-001 — x | major | scope | REAL | "
             "`../scripts/improve.py:731` | fix/x |\n")
         self.assertEqual(parsed[0]["evidence_pointers"], ["../scripts/improve.py:731"])
         with tempfile.TemporaryDirectory() as d:
@@ -17758,37 +17761,6 @@ class MigrationV2Phase1Tests(unittest.TestCase):
             self.assertEqual(second.getvalue(), "")
             self.assertEqual(git(old_worktree, "status", "--porcelain").returncode, 0)
 
-    def test_jahns_workflow_chain_keeps_linked_worktree_valid_until_phase2(self):
-        with tempfile.TemporaryDirectory() as d:
-            d = Path(d)
-            home = d / "home"
-            root = d / "repo"
-            root.mkdir()
-            init_repo(root)
-            slug = common._project_slug(root)
-            legacy = home / ".claude" / "jahns-workflow"
-            record = legacy / "delegations" / slug / "did-chain"
-            record.mkdir(parents=True)
-            (record / "status.json").write_text(_json.dumps({"state": "needs-review"}))
-            old_worktree = legacy / "worktrees" / slug / "did-chain"
-            old_worktree.parent.mkdir(parents=True)
-            self.assertEqual(
-                git(root, "worktree", "add", "--detach", str(old_worktree), "HEAD").returncode, 0)
-
-            self._run(home, lambda: common.migrate_home_data(home))
-
-            self.assertTrue(old_worktree.is_dir())
-            self.assertEqual(git(old_worktree, "rev-parse", "--git-dir").returncode, 0)
-            self.assertEqual([path.name for path in legacy.iterdir()], ["worktrees"])
-
-            self._run(home, lambda: common.migrate_project_state(root))
-            new_worktree = home / ".waystone" / "cache" / "worktrees" / slug / "did-chain"
-            self.assertFalse(old_worktree.exists())
-            self.assertEqual(git(new_worktree, "rev-parse", "--git-dir").returncode, 0)
-            listing = git(root, "worktree", "list", "--porcelain").stdout
-            self.assertIn(str(new_worktree), listing)
-            self.assertNotIn(str(old_worktree), listing)
-
     def test_symlinked_legacy_root_is_rejected_without_touching_target(self):
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)
@@ -18497,77 +18469,6 @@ class MigrationV2HookTests(unittest.TestCase):
 
 
 class MigrationTests(unittest.TestCase):
-    def test_home_data_dir_moves_at_dispatcher_entry(self):
-        import contextlib
-        import io
-        import waystone
-
-        with tempfile.TemporaryDirectory() as d:
-            home = Path(d) / "home"
-            old = home / ".claude" / "jahns-workflow"
-            old.mkdir(parents=True)
-            (old / "sentinel").write_text("kept")
-            with contextlib.redirect_stderr(io.StringIO()):
-                self.assertEqual(_run_with_home(home, lambda: waystone.main([])), 1)
-            new = home / ".claude" / "waystone"
-            preserved = home / ".claude" / "waystone.pre-0.9"
-            self.assertFalse(old.exists())
-            self.assertFalse(new.exists())
-            self.assertEqual((preserved / "sentinel").read_text(), "kept")
-
-    def test_home_data_dir_conflict_warns_without_moving(self):
-        import contextlib
-        import io
-
-        with tempfile.TemporaryDirectory() as d:
-            home = Path(d) / "home"
-            old = home / ".claude" / "jahns-workflow"
-            new = home / ".claude" / "waystone"
-            old.mkdir(parents=True)
-            new.mkdir(parents=True)
-            (old / "legacy").write_text("old")
-            (new / "current").write_text("new")
-            err = io.StringIO()
-            with contextlib.redirect_stderr(err):
-                common.migrate_home_data(home)
-            self.assertTrue((old / "legacy").is_file())
-            preserved = home / ".claude" / "waystone.pre-0.9"
-            self.assertFalse(new.exists())
-            self.assertTrue((preserved / "current").is_file())
-            self.assertIn(str(old), err.getvalue())
-            self.assertIn(str(new), err.getvalue())
-            self.assertIn(str(preserved), err.getvalue())
-
-    def test_legacy_config_is_found_and_renamed_on_load(self):
-        with tempfile.TemporaryDirectory() as d:
-            root = Path(d) / "repo"
-            nested = root / "a" / "b"
-            nested.mkdir(parents=True)
-            legacy = root / ".jahns-workflow.yml"
-            legacy.write_text("version: 1\nproject: legacy\n")
-            self.assertEqual(common.find_project_root(nested), root.resolve())
-            self.assertEqual(common.load_config(root)["project"], "legacy")
-            self.assertFalse(legacy.exists())
-            self.assertTrue((root / ".waystone.yml").is_file())
-
-    def test_config_conflict_prefers_new_and_warns(self):
-        import contextlib
-        import io
-
-        with tempfile.TemporaryDirectory() as d:
-            root = Path(d)
-            legacy = root / ".jahns-workflow.yml"
-            current = root / ".waystone.yml"
-            legacy.write_text("version: 1\nproject: legacy\n")
-            current.write_text("version: 1\nproject: current\n")
-            err = io.StringIO()
-            with contextlib.redirect_stderr(err):
-                cfg = common.load_config(root)
-            self.assertEqual(cfg["project"], "current")
-            self.assertTrue(legacy.is_file())
-            self.assertIn(str(legacy), err.getvalue())
-            self.assertIn(str(current), err.getvalue())
-
     def test_legacy_profile_and_delta_schema_load(self):
         with tempfile.TemporaryDirectory() as d:
             root, home = _overlay_project(d)
@@ -18589,14 +18490,11 @@ class MigrationTests(unittest.TestCase):
         self.assertTrue(review.emit_marker("review-cycle", {"cycle": 8}).startswith(
             "<!-- waystone-review-cycle:v1"))
 
-    def test_init_skill_upgrades_legacy_managed_markers(self):
+    def test_init_skill_uses_current_managed_markers(self):
         text = (SCRIPTS.parent / "skills" / "init" / "SKILL.md").read_text()
-        for marker in (
-            "<!-- jahns-workflow:begin -->", "<!-- jahns-workflow:end -->",
-            "<!-- waystone:begin -->", "<!-- waystone:end -->",
-        ):
+        for marker in ("<!-- waystone:begin -->", "<!-- waystone:end -->"):
             self.assertIn(marker, text)
-        self.assertIn("always write", text.lower())
+        self.assertIn("never duplicate", text.lower())
         for surface in (
             "waystone consent record install.agents accept",
             "waystone consent record install.hooks accept",
@@ -19166,7 +19064,7 @@ class L2CImproveFeedbackTests(unittest.TestCase):
                 "  - id: feat/x\n    title: x\n    status: done\n    round: r2\n")
             reviews_dir = root / "docs" / "reviews"
             reviews_dir.mkdir(parents=True)
-            for rid, fid in (("r1", "JW-GPT-001"), ("r2", "JW-GPT-002")):
+            for rid, fid in (("r1", "WS-GPT-001"), ("r2", "WS-GPT-002")):
                 (reviews_dir / f"{rid}-feedback.md").write_text(
                     "## Findings (triage skeleton v2)\n"
                     "| finding | severity | type | verdict | evidence | task id |\n"
@@ -20484,15 +20382,9 @@ class CodexPluginContractTests(unittest.TestCase):
                 os.environ["WAYSTONE_HOST"] = "codex"
                 os.environ.pop("CODEX_HOME", None)
                 self.assertEqual(_run_with_home(home, common.machine_dir), home / ".waystone")
-                legacy = home / ".claude" / "jahns-workflow"
-                legacy.mkdir(parents=True)
-                (legacy / "sentinel").write_text("keep")
                 self.assertEqual(_run_with_home(
                     home, common.migrate_home_data, isolate_storage=False),
                                  home / ".waystone")
-                self.assertFalse(legacy.exists())
-                self.assertEqual(
-                    (home / ".claude" / "waystone.pre-0.9" / "sentinel").read_text(), "keep")
                 self.assertFalse((home / ".claude" / "waystone").exists())
                 os.environ["CODEX_HOME"] = str(home / "custom-codex")
                 self.assertEqual(_run_with_home(home, common.machine_dir), home / ".waystone")

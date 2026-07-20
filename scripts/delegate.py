@@ -247,10 +247,10 @@ def _check_snapshot_preconditions(root: Path) -> None:
         raise WorkflowError("repository has no commits yet (unborn HEAD) — commit something before delegating")
     if (root / ".gitmodules").exists():
         raise WorkflowError("submodules are not supported in M1 (.gitmodules present) — refusing a partial snapshot")
-    if (root / "JW_REPORT.yaml").exists():
+    if (root / "WAYSTONE_REPORT.yaml").exists():
         # H2: it would be baked into the base, consumed as the delegate's report, and phantom-deleted
         # from the user's tree by the resulting patch.
-        raise WorkflowError("JW_REPORT.yaml is a reserved delegation-protocol filename — "
+        raise WorkflowError("WAYSTONE_REPORT.yaml is a reserved delegation-protocol filename — "
                             "remove or rename it and retry")
     rc, out, _ = _git(root, "ls-files", "-u")
     if rc == 0 and out:
@@ -1876,10 +1876,10 @@ def _active_delegation_for_task(root: Path, task_id: str) -> tuple[str, str] | N
 
 # ---- artifact contract (§8 — harness-computed vs delegate-claimed provenance) -
 def _read_report(worktree: Path) -> dict:
-    """Read + remove JW_REPORT.yaml from the worktree BEFORE the result snapshot (so it never pollutes
+    """Read + remove WAYSTONE_REPORT.yaml from the worktree BEFORE the result snapshot (so it never pollutes
     the patch, S4). present ∈ {True, False, 'invalid'} — a missing/unparseable report is named, not
     silently passed."""
-    p = worktree / "JW_REPORT.yaml"
+    p = worktree / "WAYSTONE_REPORT.yaml"
     if not p.exists():
         return {"present": False}
     raw = p.read_bytes()  # bytes: a non-UTF-8 report must surface as invalid, never crash (H1)

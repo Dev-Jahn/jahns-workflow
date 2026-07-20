@@ -750,13 +750,13 @@ def _run_codex_trace(sources: list[Path], projects: set[str], out_dir: Path,
 # Project review evidence, projected — NOT re-implemented. The on-disk feedback format is exactly
 # what `review.ingest` writes: a metadata header, the byte-exact reviewer body, then an APPENDED
 # markdown triage table under `## Findings (triage skeleton …)` whose rows are
-#   | JW-GPT-NNN — title | <severity> | <verdict> | <evidence> | <task id> |
+#   | WS-GPT-NNN — title | <severity> | <verdict> | <evidence> | <task id> |
 # We parse ONLY that appended table (the last such heading), never the verbatim body (§3.8: no
 # defensive multi-format guessing). Finding-derived tasks carry the review-round link in their
 # `origin` field (`review-<round-id>`), set by `waystone task add --origin` in skills/review/SKILL.md — the
 # `round` field records the FIXING round (stamped at close), so origin is the correct join key.
 _TRIAGE_HEADING = "## Findings (triage skeleton"
-_FINDING_ID_RE = re.compile(r"JW-GPT-\d+")
+_FINDING_ID_RE = re.compile(r"WS-GPT-\d+")
 _VERDICT_RE = re.compile(r"\b(REAL|REJECTED|NEEDS-RULING)\b", re.IGNORECASE)
 _FINDING_PATH_RE = re.compile(
     r"(?<![A-Za-z0-9_.-])((?:\.?[A-Za-z0-9_.-]+/)+(?:[A-Za-z0-9_.-]+))"

@@ -19,7 +19,6 @@ import sys
 from pathlib import Path
 
 CONFIG_NAME = ".waystone.yml"
-LEGACY_CONFIG_NAME = ".jahns-workflow.yml"
 
 REASON = (
     "tasks.yaml is the long machine-validated registry — read it through the CLI, not whole:\n"
@@ -31,10 +30,10 @@ REASON = (
 
 
 def _find_project_root(start: Path) -> Path | None:
-    """Walk upward from `start` to the directory holding either config name (mirrors common)."""
+    """Walk upward from `start` to the directory holding the Waystone config (mirrors common)."""
     cur = start.resolve()
     for p in (cur, *cur.parents):
-        if any((p / name).is_file() for name in (CONFIG_NAME, LEGACY_CONFIG_NAME)):
+        if (p / CONFIG_NAME).is_file():
             return p
     return None
 

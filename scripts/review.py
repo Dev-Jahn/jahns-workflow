@@ -131,8 +131,8 @@ MARKER_RE = re.compile(
     r"<!--\s*(?:waystone|jw)-([a-z-]+):v([12])\s*\n(.*?)\n\s*-->", re.DOTALL)
 FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
 MERGE_OK_VERDICTS = {"shipped", "shipped-with-risk", "approved", "approve", "lgtm"}
-# output-contract finding blocks: `### JW-GPT-NNN — <title>` then a `- Severity: <x>` line.
-FINDING_RE = re.compile(r"(?m)^#{2,4}\s+(JW-GPT-\d+)\s*[-—:]\s*(.+?)\s*$")
+# output-contract finding blocks: `### WS-GPT-NNN — <title>` then a `- Severity: <x>` line.
+FINDING_RE = re.compile(r"(?m)^#{2,4}\s+(WS-GPT-\d+)\s*[-—:]\s*(.+?)\s*$")
 SEVERITY_RE = re.compile(r"(?im)^\s*[-*]?\s*Severity\s*:\s*`?(blocker|major|minor)`?")
 
 
@@ -2727,7 +2727,7 @@ def ingest(root: Path, round_id: str | None, src: Path = INBOX, reviewer: str | 
         for f in findings:
             lines.append(f"| {f['id']} — {f['title']} | {f['severity']} |  |  |  |  |")
     else:
-        lines.append("_No `JW-GPT-NNN` finding blocks parsed — triage the verbatim reply directly._")
+        lines.append("_No `WS-GPT-NNN` finding blocks parsed — triage the verbatim reply directly._")
     triage_body = ("\n".join(lines) + "\n").encode("utf-8")
     appended = b"\n\n---\n\n" + _marked_triage(triage_body)
 

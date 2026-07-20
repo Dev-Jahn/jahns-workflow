@@ -21,7 +21,6 @@ from pathlib import Path
 import yaml
 
 CONFIG_NAME = ".waystone.yml"
-LEGACY_CONFIG_NAME = ".jahns-workflow.yml"
 TASKS_NAME = "tasks.yaml"
 
 
@@ -357,10 +356,6 @@ def _legacy_codex_root(home: Path | None = None) -> Path:
     codex_home = (Path(os.environ["CODEX_HOME"]).expanduser()
                   if os.environ.get("CODEX_HOME") else base_home / ".codex")
     return codex_home / "waystone"
-
-
-def _legacy_data_dir(home: Path | None = None) -> Path:
-    return (Path.home() if home is None else Path(home)) / ".claude" / "jahns-workflow"
 
 
 def _preserved_legacy_root(root: Path) -> Path:
@@ -917,26 +912,6 @@ def _preserve_phase1_root(root: Path) -> None:
 def migrate_home_data(home: Path | None = None) -> Path:
     """Phase 1: eagerly merge machine state and preserve both legacy host roots without deletion."""
     # 0.9.0-b wraps this entry point in registry.lock; C2 intentionally contains no flock logic.
-    old = _legacy_data_dir(home)
-    claude = _legacy_claude_root(home)
-    old_present = _real_directory(old, "jahns-workflow legacy root")
-    claude_present = _real_directory(claude, "Claude legacy root")
-    if old_present and not claude_present:
-        _validate_legacy_root(old)
-        claude.mkdir(parents=True)
-        for child in sorted(old.iterdir()):
-            if child.name == "worktrees":
-                continue
-            _move_entry(child, claude / child.name)
-        if not any(old.iterdir()):
-            old.rmdir()
-    elif old_present and claude_present:
-        print(
-            f"waystone: legacy data dir {old} and legacy waystone dir {claude} both exist; "
-            f"leaving {old} untouched",
-            file=sys.stderr,
-        )
-
     roots = []
     for host, root in _legacy_roots(home):
         if _real_directory(root, f"{host} legacy root"):
@@ -968,14 +943,6 @@ def _phase2_sources(home: Path | None = None) -> list[tuple[str, Path]]:
                 seen.add(key)
                 sources.append((host, source))
     return sources
-
-
-def _phase2_worktree_sources(home: Path | None = None) -> list[tuple[str, Path]]:
-    source = _legacy_data_dir(home)
-    if not _real_directory(source, "jahns-workflow legacy root"):
-        return []
-    _validate_legacy_root(source)
-    return [("claude", source)]
 
 
 def _ensure_project_state_raw(root: Path) -> Path:
@@ -1347,8 +1314,7 @@ def migrate_project_state(root: Path, home: Path | None = None) -> bool:
     slug = _project_slug(root)
     pending_worktrees = _pending_worktree_markers(slug)
     sources = _phase2_sources(home)
-    worktree_sources = _phase2_worktree_sources(home)
-    if not sources and not worktree_sources and not pending_worktrees:
+    if not sources and not pending_worktrees:
         return False
     state = root / ".waystone"
     try:
@@ -1372,7 +1338,7 @@ def migrate_project_state(root: Path, home: Path | None = None) -> bool:
             "exposure": [(host, source / "exposure" / slug) for host, source in sources],
         }
         delegations = _delegation_sources(sources, slug)
-        worktrees = _worktree_sources(sources + worktree_sources, slug)
+        worktrees = _worktree_sources(sources, slug)
         has_project_items = any(path.is_file() for _host, path in resume + start_here)
         has_project_items = has_project_items or any(
             path.is_dir() for source_list in trees.values() for _host, path in source_list)
@@ -1453,7 +1419,7 @@ ROUND_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-[a-z0-9][a-z0-9-]*$")
 
 
 def find_project_root(start: Path) -> Path | None:
-    """Walk upward from `start` to find either the current or legacy project config."""
+    """Walk upward from `start` to find the current project config."""
     cur = start.resolve()
     for p in (cur, *cur.parents):
         if has_project_config(p):
@@ -1462,23 +1428,7 @@ def find_project_root(start: Path) -> Path | None:
 
 
 def has_project_config(root: Path) -> bool:
-    return any((root / name).is_file() for name in (CONFIG_NAME, LEGACY_CONFIG_NAME))
-
-
-def _migrate_project_config(root: Path) -> Path:
-    legacy = root / LEGACY_CONFIG_NAME
-    current = root / CONFIG_NAME
-    if current.exists():
-        if legacy.exists():
-            print(
-                f"waystone: legacy config {legacy} and new config {current} both exist; "
-                f"using {current} and leaving {legacy} untouched",
-                file=sys.stderr,
-            )
-        return current
-    if legacy.is_file():
-        os.rename(legacy, current)
-    return current
+    return (root / CONFIG_NAME).is_file()
 
 
 def load_yaml(path: Path):
@@ -1562,7 +1512,7 @@ def normalize_config(cfg: dict | None, *, source: Path | None = None) -> dict:
 
 
 def load_config(root: Path) -> dict:
-    path = _migrate_project_config(root)
+    path = root / CONFIG_NAME
     return normalize_config(load_yaml(path), source=path)
 
 
