@@ -67,11 +67,11 @@ def init_repo(root: Path):
 def _synthetic_codex_fingerprint(worktree: Path) -> dict:
     """Hermetic fingerprint for tests that exercise transport behavior, not discovery."""
     return {
-        "schema": "waystone-codex-runner-proof-2",
+        "schema": "waystone-codex-runner-proof-3",
         "resolved_codex_path": "/opt/waystone-test/bin/codex",
         "codex_version": {"stdout": "codex-cli 9.9.9", "stderr": "test build"},
         "codex_executable": {"size": 1234, "mtime_ns": 5678},
-        "machine": "test-machine",
+        "hostname": "test-machine",
         "host_identity": {
             "source": "/etc/machine-id", "value": "0123456789abcdef0123456789abcdef",
         },
@@ -11014,11 +11014,11 @@ def _latest_rec(root, home):
 class CodexRunnerVerificationGateTests(unittest.TestCase):
     def setUp(self):
         self.proof = {
-            "schema": "waystone-codex-runner-proof-2",
+            "schema": "waystone-codex-runner-proof-3",
             "resolved_codex_path": "/opt/waystone-test/bin/codex",
             "codex_version": {"stdout": "codex-cli 9.9.9", "stderr": "build test"},
             "codex_executable": {"size": 1234, "mtime_ns": 5678},
-            "machine": "test-machine",
+            "hostname": "test-machine",
             "host_identity": {"source": "/etc/machine-id", "value": "test-host-id"},
             "platform": {"system": "TestOS", "machine": "test-arch"},
             "kernel": {"release": "1.2.3", "version": "test-kernel"},
@@ -11098,6 +11098,7 @@ class CodexRunnerVerificationGateTests(unittest.TestCase):
         return root, worktree, record, prompt
 
     def test_runtime_fingerprint_records_all_bounded_axes(self):
+        import types
         from unittest import mock
 
         with tempfile.TemporaryDirectory() as d:
@@ -11135,7 +11136,11 @@ class CodexRunnerVerificationGateTests(unittest.TestCase):
                     "value": "test-profile",
                 },
             }
+            uname = types.SimpleNamespace(
+                node="", system="TestOS", machine="test-arch",
+                release="1.2.3", version="test-kernel")
             with mock.patch.dict(os.environ, {"PATH": str(fake_bin)}), \
+                 mock.patch.object(delegate.platform, "uname", return_value=uname), \
                  mock.patch.object(delegate, "_stable_host_identity", return_value=host), \
                  mock.patch.object(delegate, "_host_sandbox_observation", return_value=observed), \
                  mock.patch.object(delegate, "_execution_principal_identity",
@@ -11146,12 +11151,13 @@ class CodexRunnerVerificationGateTests(unittest.TestCase):
                                    return_value=process_context):
                 proof = self.original_fingerprint(worktree)
 
-            self.assertEqual(proof["schema"], "waystone-codex-runner-proof-2")
+            self.assertEqual(proof["schema"], "waystone-codex-runner-proof-3")
             self.assertEqual(proof["resolved_codex_path"], str(fake_codex.resolve()))
             self.assertEqual(proof["codex_version"], {
                 "stdout": "codex-cli 7.8.9", "stderr": "build abc"})
             self.assertEqual(proof["codex_executable"], {
                 "size": fake_codex.stat().st_size, "mtime_ns": fake_codex.stat().st_mtime_ns})
+            self.assertEqual(proof["hostname"], "")
             self.assertEqual(proof["host_identity"], host)
             self.assertTrue(proof["platform"]["system"])
             self.assertTrue(proof["platform"]["machine"])
@@ -11513,20 +11519,58 @@ class CodexRunnerVerificationGateTests(unittest.TestCase):
                 "source": "/sys/kernel/security/lsm", "status": "unavailable",
             })
 
-    def test_environment_machine_id_and_version_mismatch_reprobe_and_name_axes(self):
+    def test_hostname_change_is_diagnostic_only_and_skips_probe(self):
+        import types
+
+        original = b"version: 1\nproject: demo\ndelegation:\n  enabled: true\n"
+        with tempfile.TemporaryDirectory() as d:
+            root, worktree, record, prompt = self._fixture(Path(d), original)
+            marker = root / ".waystone" / "codex-runner-verified"
+            marker.parent.mkdir()
+            (marker.parent / ".gitignore").write_text("*\n")
+            recorded = _json.loads(_json.dumps(self.proof))
+            recorded["hostname"] = "Mac.local"
+            marker.write_text(self._proof_text(recorded))
+            calls = {"runner": 0}
+            original_probe = delegate._run_codex_sandbox_probe
+            original_run = delegate.subprocess.run
+
+            def probe(*args, **kwargs):
+                raise AssertionError("a hostname-only change must not rerun the probe")
+
+            def run(*args, **kwargs):
+                if args and args[0] and args[0][0] == "git":
+                    return original_run(*args, **kwargs)
+                calls["runner"] += 1
+                return types.SimpleNamespace(returncode=0)
+
+            delegate._run_codex_sandbox_probe = probe
+            delegate.subprocess.run = run
+            try:
+                self.assertEqual(delegate._run_codex(
+                    worktree, "gpt-test", prompt, record)[0], 0)
+            finally:
+                delegate.subprocess.run = original_run
+                delegate._run_codex_sandbox_probe = original_probe
+
+            self.assertEqual(calls, {"runner": 1})
+            self.assertEqual(marker.read_text(), self._proof_text(recorded))
+            self.assertEqual(_json.loads(marker.read_text())["hostname"], "Mac.local")
+
+    def test_environment_identity_and_version_mismatch_reprobe_and_name_axes(self):
         import contextlib
         import io
         import types
 
         original = b"version: 1\nproject: demo\ndelegation:\n  enabled: true\n"
         cases = (
-            ({"machine": "other-machine",
-              "host_identity": {"source": "/etc/machine-id", "value": "other-host-id"},
-              "platform": {"system": "OtherOS", "machine": "other-arch"},
+            ({"host_identity": {"source": "/etc/machine-id", "value": "other-host-id"}},
+             ("host_identity",)),
+            ({"platform": {"system": "OtherOS", "machine": "other-arch"},
               "worktree_cache_mount": {
                   "device_boundary": "/foreign-cache", "device": 999,
                   "filesystem_id": 1000, "readonly": True,
-              }}, ("machine", "host_identity", "platform", "worktree_cache_mount")),
+              }}, ("platform", "worktree_cache_mount")),
             ({"codex_version": {"stdout": "codex-cli 9.9.8", "stderr": "build test"}},
              ("codex_version",)),
             ({"codex_version": {"stdout": "codex-cli 9.9.9"}},
@@ -11589,6 +11633,53 @@ class CodexRunnerVerificationGateTests(unittest.TestCase):
                 self.assertIn("fingerprint mismatch", stderr.getvalue())
                 for axis in changed_axes:
                     self.assertIn(axis, stderr.getvalue())
+
+    def test_v2_marker_reprobes_once_and_is_rewritten_as_v3(self):
+        import contextlib
+        import io
+        import types
+
+        original = b"version: 1\nproject: demo\ndelegation:\n  enabled: true\n"
+        with tempfile.TemporaryDirectory() as d:
+            root, worktree, record, prompt = self._fixture(Path(d), original)
+            marker = root / ".waystone" / "codex-runner-verified"
+            marker.parent.mkdir()
+            (marker.parent / ".gitignore").write_text("*\n")
+            legacy = _json.loads(_json.dumps(self.proof))
+            legacy["schema"] = "waystone-codex-runner-proof-2"
+            legacy["machine"] = legacy.pop("hostname")
+            marker.write_text(self._proof_text(legacy))
+            calls = {"probe": 0, "runner": 0}
+            original_probe = delegate._run_codex_sandbox_probe
+            original_run = delegate.subprocess.run
+
+            def probe(*args, **kwargs):
+                calls["probe"] += 1
+                return self._passed_probe()
+
+            def run(*args, **kwargs):
+                if args and args[0] and args[0][0] == "git":
+                    return original_run(*args, **kwargs)
+                calls["runner"] += 1
+                return types.SimpleNamespace(returncode=0)
+
+            delegate._run_codex_sandbox_probe = probe
+            delegate.subprocess.run = run
+            stderr = io.StringIO()
+            try:
+                with contextlib.redirect_stderr(stderr):
+                    self.assertEqual(delegate._run_codex(
+                        worktree, "gpt-test", prompt, record)[0], 0)
+                    self.assertEqual(delegate._run_codex(
+                        worktree, "gpt-test", prompt, record)[0], 0)
+            finally:
+                delegate.subprocess.run = original_run
+                delegate._run_codex_sandbox_probe = original_probe
+
+            self.assertEqual(calls, {"probe": 1, "runner": 2})
+            self.assertEqual(marker.read_text(), self._proof_text())
+            self.assertIn("fingerprint mismatch", stderr.getvalue())
+            self.assertIn("schema", stderr.getvalue())
 
     def test_legacy_fixed_string_marker_is_reprobed_and_rewritten_as_json(self):
         import contextlib
@@ -11861,6 +11952,57 @@ class CodexRunnerVerificationGateTests(unittest.TestCase):
             self.assertEqual(marker.read_text(), self._proof_text())
             self.assertIn("fingerprint mismatch", stderr.getvalue())
             self.assertIn("host_identity", stderr.getvalue())
+
+    def test_lock_recheck_suppresses_prelock_mismatch_if_race_resolves(self):
+        import contextlib
+        import io
+        import types
+        from unittest import mock
+
+        original = b"version: 1\nproject: demo\ndelegation:\n  enabled: true\n"
+        with tempfile.TemporaryDirectory() as d:
+            root, worktree, record, prompt = self._fixture(Path(d), original)
+            marker = root / ".waystone" / "codex-runner-verified"
+            marker.parent.mkdir()
+            (marker.parent / ".gitignore").write_text("*\n")
+            stale = _json.loads(_json.dumps(self.proof))
+            stale["host_identity"]["value"] = "resolved-before-lock-recheck"
+            marker.write_text(self._proof_text(stale))
+            calls = {"runner": 0}
+            original_probe = delegate._run_codex_sandbox_probe
+            original_run = delegate.subprocess.run
+            original_flock = delegate.fcntl.flock
+
+            def probe(*args, **kwargs):
+                raise AssertionError("a race-resolved marker must skip the probe")
+
+            def run(*args, **kwargs):
+                if args and args[0] and args[0][0] == "git":
+                    return original_run(*args, **kwargs)
+                calls["runner"] += 1
+                return types.SimpleNamespace(returncode=0)
+
+            def flock(stream, operation):
+                result = original_flock(stream, operation)
+                if operation == delegate.fcntl.LOCK_EX:
+                    marker.write_text(self._proof_text())
+                return result
+
+            delegate._run_codex_sandbox_probe = probe
+            delegate.subprocess.run = run
+            stderr = io.StringIO()
+            try:
+                with mock.patch.object(delegate.fcntl, "flock", side_effect=flock):
+                    with contextlib.redirect_stderr(stderr):
+                        self.assertEqual(delegate._run_codex(
+                            worktree, "gpt-test", prompt, record)[0], 0)
+            finally:
+                delegate.subprocess.run = original_run
+                delegate._run_codex_sandbox_probe = original_probe
+
+            self.assertEqual(calls, {"runner": 1})
+            self.assertEqual(marker.read_text(), self._proof_text())
+            self.assertEqual(stderr.getvalue(), "")
 
     def test_concurrent_runner_paths_probe_once_under_checkout_local_lock(self):
         import concurrent.futures
@@ -12208,8 +12350,101 @@ class CodexRunnerVerificationGateTests(unittest.TestCase):
 
             self.assertEqual(calls, {"probe": 1, "runner": 1})
             self.assertIn("tracked", stderr.getvalue())
-            self.assertIn("git rm --cached", stderr.getvalue())
-            self.assertIn(".waystone/codex-runner-verified", stderr.getvalue())
+            self.assertEqual(stderr.getvalue().count(
+                "git rm --cached -f -- .waystone/codex-runner-verified"), 1)
+
+    def test_tracked_marker_deleted_from_worktree_still_prints_untrack_guidance(self):
+        import contextlib
+        import io
+        import types
+
+        original = b"version: 1\nproject: demo\ndelegation:\n  enabled: true\n"
+        with tempfile.TemporaryDirectory() as d:
+            root, worktree, record, prompt = self._fixture(Path(d), original)
+            marker = root / ".waystone" / "codex-runner-verified"
+            marker.parent.mkdir()
+            marker.write_text(self._proof_text())
+            self.assertEqual(git(root, "add", "-f", str(marker)).returncode, 0)
+            self.assertEqual(git(root, "commit", "-qm", "track invalid proof").returncode, 0)
+            marker.unlink()
+            self.assertFalse(marker.exists())
+            self.assertEqual(git(
+                root, "ls-files", "--error-unmatch",
+                ".waystone/codex-runner-verified").returncode, 0)
+            calls = {"probe": 0, "runner": 0}
+            original_probe = delegate._run_codex_sandbox_probe
+            original_run = delegate.subprocess.run
+
+            def probe(*args, **kwargs):
+                calls["probe"] += 1
+                return self._passed_probe()
+
+            def run(*args, **kwargs):
+                if args and args[0] and args[0][0] == "git":
+                    return original_run(*args, **kwargs)
+                calls["runner"] += 1
+                return types.SimpleNamespace(returncode=0)
+
+            delegate._run_codex_sandbox_probe = probe
+            delegate.subprocess.run = run
+            stderr = io.StringIO()
+            try:
+                with contextlib.redirect_stderr(stderr):
+                    self.assertEqual(delegate._run_codex(
+                        worktree, "gpt-test", prompt, record)[0], 0)
+            finally:
+                delegate.subprocess.run = original_run
+                delegate._run_codex_sandbox_probe = original_probe
+
+            self.assertEqual(calls, {"probe": 1, "runner": 1})
+            self.assertEqual(marker.read_text(), self._proof_text())
+            self.assertEqual(stderr.getvalue().count(
+                "git rm --cached -f -- .waystone/codex-runner-verified"), 1)
+
+    def test_staged_invalid_marker_guidance_uses_forced_cached_removal(self):
+        import contextlib
+        import io
+        import types
+
+        original = b"version: 1\nproject: demo\ndelegation:\n  enabled: true\n"
+        with tempfile.TemporaryDirectory() as d:
+            root, worktree, record, prompt = self._fixture(Path(d), original)
+            marker = root / ".waystone" / "codex-runner-verified"
+            marker.parent.mkdir()
+            marker.write_text("invalid staged proof\n")
+            self.assertEqual(git(root, "add", "-f", str(marker)).returncode, 0)
+            self.assertEqual(git(
+                root, "ls-files", "--error-unmatch",
+                ".waystone/codex-runner-verified").returncode, 0)
+            calls = {"probe": 0, "runner": 0}
+            original_probe = delegate._run_codex_sandbox_probe
+            original_run = delegate.subprocess.run
+
+            def probe(*args, **kwargs):
+                calls["probe"] += 1
+                return self._passed_probe()
+
+            def run(*args, **kwargs):
+                if args and args[0] and args[0][0] == "git":
+                    return original_run(*args, **kwargs)
+                calls["runner"] += 1
+                return types.SimpleNamespace(returncode=0)
+
+            delegate._run_codex_sandbox_probe = probe
+            delegate.subprocess.run = run
+            stderr = io.StringIO()
+            try:
+                with contextlib.redirect_stderr(stderr):
+                    self.assertEqual(delegate._run_codex(
+                        worktree, "gpt-test", prompt, record)[0], 0)
+            finally:
+                delegate.subprocess.run = original_run
+                delegate._run_codex_sandbox_probe = original_probe
+
+            self.assertEqual(calls, {"probe": 1, "runner": 1})
+            self.assertEqual(marker.read_text(), self._proof_text())
+            self.assertEqual(stderr.getvalue().count(
+                "git rm --cached -f -- .waystone/codex-runner-verified"), 1)
 
     def test_invalid_marker_content_is_reprobed_and_atomically_rewritten(self):
         import contextlib
@@ -12296,6 +12531,8 @@ class CodexRunnerVerificationGateTests(unittest.TestCase):
             delegate._run_codex_sandbox_probe = lambda *args, **kwargs: self._passed_probe()
 
             def run(*args, **kwargs):
+                if args and args[0] and args[0][0] == "git":
+                    return original_run(*args, **kwargs)
                 calls["runner"] += 1
                 raise AssertionError("main runner must not start")
 

@@ -91,7 +91,7 @@ _CLAUDE_EFFORT_VALUES = ("low", "medium", "high", "xhigh")
 _VERIFIER_SESSION_ENV = "WAYSTONE_VERIFIER_SESSION"
 _CODEX_RUNNER_VERIFIED_MARKER = "codex-runner-verified"
 _CODEX_RUNNER_VERIFICATION_LOCK = "codex-runner-verification.lock"
-_CODEX_RUNNER_PROOF_SCHEMA = "waystone-codex-runner-proof-2"
+_CODEX_RUNNER_PROOF_SCHEMA = "waystone-codex-runner-proof-3"
 _CODEX_SANDBOX_INVOCATION_CONTRACT = "codex-exec:workspace-write:v1"
 _IOPLATFORM_UUID_RE = re.compile(
     r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
@@ -1277,14 +1277,14 @@ def _codex_runner_fingerprint(worktree: Path) -> dict:
             f"cannot query Codex runner version from {resolved}: "
             f"{detail or f'rc {version_process.returncode}'}")
     uname = platform.uname()
-    if not all((uname.node, uname.system, uname.machine, uname.release, uname.version)):
+    if not all((uname.system, uname.machine, uname.release, uname.version)):
         raise WorkflowError("cannot fingerprint Codex runner: platform identity is incomplete")
     return {
         "schema": _CODEX_RUNNER_PROOF_SCHEMA,
         "resolved_codex_path": str(resolved),
         "codex_version": version,
         "codex_executable": {"size": info.st_size, "mtime_ns": info.st_mtime_ns},
-        "machine": uname.node,
+        "hostname": uname.node,
         "host_identity": _stable_host_identity(uname.system),
         "platform": {"system": uname.system, "machine": uname.machine},
         "kernel": {"release": uname.release, "version": uname.version},
@@ -1303,8 +1303,9 @@ def _codex_runner_proof_text(fingerprint: dict) -> str:
 
 
 def _codex_runner_comparison_view(fingerprint: dict) -> dict:
-    """Return deterministic proof axes; version stderr is retained only as diagnostics."""
+    """Return deterministic proof axes after removing record-only diagnostics."""
     comparable = json.loads(json.dumps(fingerprint, ensure_ascii=False))
+    comparable.pop("hostname", None)
     version = comparable.get("codex_version")
     if isinstance(version, dict):
         # Presence and string type remain contractual; only the dynamic diagnostic value is ignored.
@@ -1399,7 +1400,7 @@ def _codex_runner_marker_recorded(
     try:
         info = marker_path.lstat()
     except FileNotFoundError:
-        return False
+        info = None
     except OSError as e:
         raise WorkflowError(f"cannot inspect Codex runner proof at {marker_path}: {e}") from e
     project_root = marker_path.parent.parent
@@ -1417,10 +1418,12 @@ def _codex_runner_marker_recorded(
         if diagnose:
             print(
                 f"waystone: checkout-local Codex runner proof {marker_path} is git-tracked "
-                f"and is ignored; from {project_root}, run git rm --cached -- {relative}; "
+                f"and is ignored; from {project_root}, run git rm --cached -f -- {relative}; "
                 "a fresh preflight probe will run",
                 file=sys.stderr,
             )
+        return False
+    if info is None:
         return False
     if not stat.S_ISREG(info.st_mode):
         if diagnose:
@@ -1494,7 +1497,8 @@ def _codex_runner_verification_marker(
     project_root = Path(root)
     load_config(project_root)  # validate config and surface legacy-key removal guidance
     marker_path = ensure_project_state_dir(project_root) / _CODEX_RUNNER_VERIFIED_MARKER
-    return marker_path, _codex_runner_marker_recorded(marker_path, fingerprint), fingerprint
+    return marker_path, _codex_runner_marker_recorded(
+        marker_path, fingerprint, diagnose=False), fingerprint
 
 
 def _run_codex(worktree: Path, model: str, prompt_path: Path, record_dir: Path,
