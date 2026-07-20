@@ -10113,8 +10113,8 @@ class DelegateRunTests(unittest.TestCase):
                 kwargs["stdout"].write('{"type":"result","result":"done"}\n')
                 return subprocess.CompletedProcess(cmd, 0)
 
-            rc, _duration = delegate._run_claude(
-                root, "sonnet", prompt, root, runner=transport)
+            rc, _duration = delegate._run_implementer_transport(
+                delegate._run_claude, root, "sonnet", prompt, root, runner=transport)
             self.assertEqual(rc, 0)
             cmd, kwargs = calls[0]
             self.assertEqual(cmd[:4], ["claude", "-p", "--model", "sonnet"])
@@ -10124,6 +10124,12 @@ class DelegateRunTests(unittest.TestCase):
             self.assertIn("WebFetch", cmd[cmd.index("--disallowedTools") + 1])
             self.assertEqual(Path(kwargs["cwd"]), root)
             self.assertNotIn("WAYSTONE_VERIFIER_SESSION", kwargs["env"])
+            self.assertEqual(
+                kwargs["env"]["UV_CACHE_DIR"], str(root / ".waystone-uv-cache"))
+            self.assertEqual(
+                kwargs["env"]["UV_TOOL_DIR"], str(root / ".waystone-uv-cache" / "tools"))
+            self.assertEqual(
+                kwargs["env"]["UV_TOOL_BIN_DIR"], str(root / ".waystone-uv-cache" / "bin"))
             self.assertEqual((root / "last_message.md").read_text(), "done")
 
     def test_run_claude_rejects_non_object_stream_event_as_transport_failure(self):
@@ -17053,22 +17059,212 @@ class UvCacheTests(unittest.TestCase):
                         "waystone-sandbox-write-probe\n")
                 return types.SimpleNamespace(returncode=0, stderr="")
 
-            before = os.environ.get("UV_CACHE_DIR")
+            env_names = (
+                "UV_CACHE_DIR", "UV_TOOL_DIR", "UV_TOOL_BIN_DIR", "UV_NO_CACHE",
+                "WAYSTONE_VERIFIER_SESSION",
+            )
+            before = tuple(os.environ.get(name) for name in env_names)
             delegate.subprocess.run = fake
             try:
                 self.assertEqual(delegate._run_env_prep(worktree, ["true"])[0], 0)
-                self.assertEqual(delegate._run_codex(
-                    worktree, "gpt-5.6-sol", prompt, record)[0], 0)
+                self.assertEqual(delegate._run_implementer_transport(
+                    delegate._run_codex, worktree,
+                    "gpt-5.6-sol", prompt, record)[0], 0)
             finally:
                 delegate.subprocess.run = orig
             expected = str(worktree / ".waystone-uv-cache")
             self.assertEqual(seen[0]["UV_CACHE_DIR"], expected)
             self.assertEqual(seen[2]["UV_CACHE_DIR"], expected)
+            self.assertEqual(seen[0]["UV_TOOL_DIR"], str(Path(expected) / "tools"))
+            self.assertEqual(seen[2]["UV_TOOL_DIR"], str(Path(expected) / "tools"))
+            self.assertEqual(seen[0]["UV_TOOL_BIN_DIR"], str(Path(expected) / "bin"))
+            self.assertEqual(seen[2]["UV_TOOL_BIN_DIR"], str(Path(expected) / "bin"))
             self.assertEqual(
                 os.path.realpath(Path(seen[1]["UV_CACHE_DIR"]).parent.parent),
                 os.path.realpath(worktree.parent))
             self.assertTrue(all("WAYSTONE_VERIFIER_SESSION" not in env for env in seen))
-            self.assertEqual(os.environ.get("UV_CACHE_DIR"), before)
+            self.assertEqual(tuple(os.environ.get(name) for name in env_names), before)
+
+    def test_declared_env_prep_warms_runner_cache_for_offline_suite_and_lint(self):
+        import base64
+        import functools
+        import http.server
+        import threading
+        import zipfile
+
+        def write_wheel(directory, name, version, files, entry_points=None):
+            normalized = name.replace("-", "_")
+            dist_info = f"{normalized}-{version}.dist-info"
+            payloads = {
+                **files,
+                f"{dist_info}/METADATA": (
+                    f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"),
+                f"{dist_info}/WHEEL": (
+                    "Wheel-Version: 1.0\nGenerator: waystone-test\n"
+                    "Root-Is-Purelib: true\nTag: py3-none-any\n"),
+            }
+            if entry_points is not None:
+                payloads[f"{dist_info}/entry_points.txt"] = entry_points
+            records = []
+            for path, content in payloads.items():
+                raw = content.encode()
+                digest = base64.urlsafe_b64encode(hashlib.sha256(raw).digest()).rstrip(b"=").decode()
+                records.append(f"{path},sha256={digest},{len(raw)}")
+            records.append(f"{dist_info}/RECORD,,")
+            payloads[f"{dist_info}/RECORD"] = "\n".join(records) + "\n"
+            wheel = directory / f"{normalized}-{version}-py3-none-any.whl"
+            with zipfile.ZipFile(wheel, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                for path, content in payloads.items():
+                    archive.writestr(path, content)
+            return wheel
+
+        class QuietHandler(http.server.SimpleHTTPRequestHandler):
+            def log_message(self, _format, *_args):
+                pass
+
+        declared = common.load_config(SCRIPTS.parent)["delegation"]["env_prep"]
+        self.assertEqual(declared, [
+            "uv sync --script scripts/tests/run_tests.py --locked",
+            "uv tool run ruff@0.15.22 --version",
+        ])
+        self.assertIsNotNone(shutil.which("uv"), "real uv required by env-prep contract")
+
+        with tempfile.TemporaryDirectory() as d:
+            root, home = _deleg_project(d)
+            scripts = root / "scripts"
+            (scripts / "tests").mkdir(parents=True)
+            (scripts / "tests" / "run_tests.py").write_text(
+                "#!/usr/bin/env python3\n"
+                "# /// script\n"
+                "# requires-python = \">=3.10\"\n"
+                "# dependencies = [\"pyyaml\"]\n"
+                "# ///\n"
+                "import yaml\n"
+                "assert yaml.GATE_MARKER == 'offline-suite-ready'\n")
+            (scripts / "lint_target.py").write_text("VALUE = 1\n")
+            (root / ".waystone.yml").write_text(
+                "version: 1\nproject: demo\ndelegation:\n  env_prep:\n"
+                + "".join(f"    - {command}\n" for command in declared))
+
+            index = Path(d) / "index"
+            packages = index / "packages"
+            packages.mkdir(parents=True)
+            pyyaml_wheel = write_wheel(
+                packages, "pyyaml", "6.0.3",
+                {"yaml/__init__.py": "GATE_MARKER = 'offline-suite-ready'\n"})
+            ruff_wheel = write_wheel(
+                packages, "ruff", "0.15.22",
+                {"ruff_stub.py": (
+                    "import pathlib\n"
+                    "import sys\n\n"
+                    "def main():\n"
+                    "    if sys.argv[1:] == ['--version']:\n"
+                    "        print('ruff 0.15.22')\n"
+                    "        return 0\n"
+                    "    expected = ['check', 'scripts', '--select', 'F401,F841']\n"
+                    "    if sys.argv[1:] != expected:\n"
+                    "        print(f'unexpected arguments: {sys.argv[1:]!r}', file=sys.stderr)\n"
+                    "        return 2\n"
+                    "    if not pathlib.Path('scripts/lint_target.py').is_file():\n"
+                    "        print('lint target missing', file=sys.stderr)\n"
+                    "        return 2\n"
+                    "    print('All checks passed!')\n"
+                    "    return 0\n")},
+                "[console_scripts]\nruff = ruff_stub:main\n")
+            for name, wheel in (("pyyaml", pyyaml_wheel), ("ruff", ruff_wheel)):
+                simple = index / "simple" / name
+                simple.mkdir(parents=True)
+                (simple / "index.html").write_text(
+                    f'<a href="../../packages/{wheel.name}">{wheel.name}</a>\n')
+            handler = functools.partial(QuietHandler, directory=str(index))
+            server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            started = False
+            stopped = False
+            checks = {}
+            managed_env = {
+                "UV_DEFAULT_INDEX": f"http://127.0.0.1:{server.server_port}/simple/",
+                "UV_NO_CONFIG": "1",
+                "UV_PYTHON": sys.executable,
+                "UV_PYTHON_DOWNLOADS": "never",
+            }
+            cleared_env = (
+                "UV_OFFLINE", "UV_INDEX", "UV_INDEX_URL", "UV_EXTRA_INDEX_URL",
+                "UV_FIND_LINKS", "UV_NO_INDEX", "UV_NO_CACHE", "UV_CONSTRAINT",
+                "UV_OVERRIDE", "UV_EXCLUDE_NEWER",
+            )
+            previous = {
+                name: os.environ.get(name) for name in (*managed_env, *cleared_env)
+            }
+
+            def fake(worktree, _model, _prompt_path, record_dir):
+                nonlocal stopped
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+                stopped = True
+                shutil.rmtree(index)
+                env = dict(os.environ)
+                env["UV_OFFLINE"] = "1"
+                suite = subprocess.run(
+                    ["uv", "run", "scripts/tests/run_tests.py"], cwd=worktree,
+                    capture_output=True, text=True, timeout=60, env=env)
+                lint = subprocess.run(
+                    ["uvx", "ruff", "check", "scripts", "--select", "F401,F841"],
+                    cwd=worktree, capture_output=True, text=True, timeout=60, env=env)
+                checks.update({"suite": suite, "lint": lint, "env": env})
+                (record_dir / "last_message.md").write_text("offline gates exercised")
+                return 0, 0.1
+
+            try:
+                thread.start()
+                started = True
+                for name in cleared_env:
+                    os.environ.pop(name, None)
+                os.environ.update(managed_env)
+                lock_cache = Path(d) / "lock-cache"
+                lock_env = {
+                    **os.environ,
+                    "UV_CACHE_DIR": str(lock_cache),
+                    "UV_TOOL_DIR": str(lock_cache / "tools"),
+                    "UV_TOOL_BIN_DIR": str(lock_cache / "bin"),
+                }
+                locked = subprocess.run(
+                    ["uv", "lock", "--script", "scripts/tests/run_tests.py"],
+                    cwd=root, capture_output=True, text=True, timeout=60, env=lock_env)
+                self.assertEqual(locked.returncode, 0, locked.stderr or locked.stdout)
+                self.assertTrue((scripts / "tests" / "run_tests.py.lock").is_file())
+                if lock_cache.exists():
+                    shutil.rmtree(lock_cache)
+                added = git(
+                    root, "add", ".waystone.yml", "scripts/tests/run_tests.py",
+                    "scripts/tests/run_tests.py.lock", "scripts/lint_target.py")
+                self.assertEqual(added.returncode, 0, added.stderr)
+                committed = git(root, "commit", "-qm", "offline gate fixture")
+                self.assertEqual(committed.returncode, 0, committed.stderr)
+                _deleg_run(root, home, fake)
+            finally:
+                if started and not stopped:
+                    server.shutdown()
+                    server.server_close()
+                    thread.join(timeout=5)
+                elif not started:
+                    server.server_close()
+                for name, value in previous.items():
+                    if value is None:
+                        os.environ.pop(name, None)
+                    else:
+                        os.environ[name] = value
+
+            self.assertFalse(thread.is_alive())
+            for name in ("suite", "lint"):
+                result = checks[name]
+                self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+            self.assertEqual(checks["env"]["UV_OFFLINE"], "1")
+            self.assertEqual(
+                checks["env"]["UV_CACHE_DIR"],
+                str(_run_with_home(home, lambda: delegate._worktree_path(
+                    root, _latest_rec(root, home).name)) / ".waystone-uv-cache"))
 
     def test_cache_is_excluded_but_other_untracked_result_is_kept(self):
         with tempfile.TemporaryDirectory() as d:

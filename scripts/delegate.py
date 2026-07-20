@@ -700,11 +700,47 @@ def _resolve_env_prep(worktree: Path, cfg: dict) -> tuple[str, list[str]]:
     return "none-detected", []
 
 
+def _implementer_env(worktree: Path) -> dict[str, str]:
+    """Return the writable runner environment shared by prep and implementer transports."""
+    cache = worktree / ".waystone-uv-cache"
+    env = {
+        **os.environ,
+        "UV_CACHE_DIR": str(cache),
+        "UV_TOOL_DIR": str(cache / "tools"),
+        "UV_TOOL_BIN_DIR": str(cache / "bin"),
+    }
+    env.pop("UV_NO_CACHE", None)
+    env.pop(_VERIFIER_SESSION_ENV, None)
+    return env
+
+
+def _run_implementer_transport(transport, worktree: Path, *args, **kwargs):
+    """Run a transport with the same writable uv namespace used by environment prep."""
+    names = (
+        "UV_CACHE_DIR", "UV_TOOL_DIR", "UV_TOOL_BIN_DIR", "UV_NO_CACHE",
+        _VERIFIER_SESSION_ENV,
+    )
+    previous = {name: os.environ.get(name) for name in names}
+    env = _implementer_env(worktree)
+    try:
+        for name in names:
+            if name in env:
+                os.environ[name] = env[name]
+            else:
+                os.environ.pop(name, None)
+        return transport(worktree, *args, **kwargs)
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
 def _run_env_prep(worktree: Path, commands: list[str]) -> tuple[int, str]:
     """Run each prep command in the worktree cwd (no shell, shlex.split, 600s each). Returns (rc,
     stderr_tail<=20 lines); rc 0 means every command succeeded."""
-    env = {**os.environ, "UV_CACHE_DIR": str(worktree / ".waystone-uv-cache")}
-    env.pop(_VERIFIER_SESSION_ENV, None)  # prep belongs to writable implementer RUN scope
+    env = _implementer_env(worktree)
     for cmd in commands:
         try:
             p = subprocess.run(shlex.split(cmd), cwd=str(worktree),
@@ -2125,8 +2161,9 @@ def _run_claimed_body(root: Path, plan: dict, did: str, record_dir: Path, human)
               f"{plan['runner_override']['reason']}", file=sys.stderr)
     runner_kwargs = {"effort": binding["effort"]} if "effort" in binding else {}
     try:
-        runner_rc, duration = run_external(
-            worktree_path, model, record_dir / "prompt.txt", record_dir, **runner_kwargs)
+        runner_rc, duration = _run_implementer_transport(
+            run_external, worktree_path, model, record_dir / "prompt.txt", record_dir,
+            **runner_kwargs)
     except _RunnerProbeFailure as e:
         probe = e.probe_result
         classification = probe.get("classification") if isinstance(probe, dict) else None
