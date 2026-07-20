@@ -41,6 +41,14 @@ improve/overlay/review/round는 M1-A에서 **이동하지 않는다**(계획 §3
 
 ## 커밋 규율 (순수 기계 증명)
 
+> **집행 deviation note (2026-07-20, WS-GPT-401 정정):** task 브랜치의 move/adapter 커밋 분리는
+> dev 머지 시 bird당 squash 1개로 합쳐진다(이중 표기 `[m1a-move][m1a-adapter]`). 이는 의도된
+> 원자성이다 — shim 없는 move-only 중간 상태는 배포하지 않는다. diff-0 증명은 커밋 경계에
+> 의존하지 않는다: 아카이브 보고서의 AST 대조는 인접 bird 커밋을 BASE로 치환하면 target
+> ancestry만으로 동일 digest가 재생된다(fresh clone 실증 — 이동 파일은 task 커밋과 squash
+> 사이 blob-identical, adapter 추가분은 bird 간 delta로 감사 가능). 보고서에 인용된 task-branch
+> SHA는 unreferenced라 clone에 부재할 수 있다 — 재현 시 위 치환 처방을 쓰라.
+
 1. **move 커밋**: `git mv` + import 경로 수정만. 함수 본문 diff 0 (`git diff --find-renames`로
    본문 무변경 확인 가능해야 함). 커밋 메시지에 `[m1a-move]` 표기.
 2. **adapter 커밋**: 잔류 모듈·bin 진입점의 import 전환. `[m1a-adapter]` 표기.

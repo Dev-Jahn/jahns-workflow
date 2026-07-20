@@ -424,3 +424,30 @@ tasks:
     status: done
     severity: "minor"
     origin: "review-2026-07-20-review-remediation"
+  - id: docs/m1a-provenance-hygiene
+    result: "split-plan 커밋 규율 절에 deviation note(squash 원자성 의도·target-ancestry 재실행 처방·unreferenced SHA 경고) — main 직접"
+    title: "M1-A 증거 provenance 위생: split-plan에 squash-머지 deviation note(커밋 분리는 bird 원자성으로 대체·move-only 중간 미배포 의도) + 보고서 증명의 target-ancestry 재실행 처방(인접 bird BASE 치환 시 동일 digest — fresh clone 실증됨) 명기 (WS-GPT-401, verifier: 핵심 기각·잔여 provenance minor)"
+    status: "done"
+    severity: "minor"
+    origin: "review-2026-07-20-m1a-split"
+  - id: fix/shim-orphan-child-rebind
+    title: "legacy shim 선행 import 시 orphan child 캐시로 dotted import(waystone.core 등) AttributeError — adapter __path__ 설정 직후 캐시된 waystone.* 1단계 child를 identity-보존 setattr rebind(삭제 금지 — delete-children은 monkeypatch 침묵 miss 회귀 실증됨). M1-B dotted-import 소비자 착지 전 수리 조건 (WS-GPT-402, verifier REAL latent minor·메커니즘 정정: 원인은 orphan 캐시 자체)"
+    status: "pending"
+    severity: "minor"
+    origin: "review-2026-07-20-m1a-split"
+  - id: docs/shim-supported-patch-surface
+    title: "shim 3종의 지원 monkeypatch 표면 문서화(setattr/delattr만 — dict-직접 조작은 비관례·전달 기술적 불가·소비자 0, wrapper 우회는 identity 파괴로 더 큰 위반) (WS-GPT-403, verifier major 기각→minor known-limitation)"
+    status: "pending"
+    severity: "minor"
+    origin: "review-2026-07-20-m1a-split"
+  - id: fix/run-tests-selfdir-bootstrap
+    title: "run_tests.py 상단 self-dir sys.path bootstrap 3행 — -m/import/runpy 표면 복원(소비자 0인 잠재 협소화·계약 표면(direct 실행)은 무결이나 저비용 위생, tempdir 실증됨) (WS-GPT-404, verifier major 기각→minor)"
+    status: "pending"
+    severity: "minor"
+    origin: "review-2026-07-20-m1a-split"
+  - id: docs/m1a-manifest-approved-diffs
+    result: "manifest에 ID별 −1/+9 approved-diffs 목록(finding·verdict·task·commit 결속) + 시작 commit 재정의 ruling 명문화 + 라벨 정정 — main 직접"
+    title: "suite manifest approved-diffs 절에 ID별 −1/+9 목록(각각 finding·verdict·done task 결속 — verifier 추적표 있음) + 시작 commit 재정의(b027d52→568eebc, 수리-선행 main 지시 근거) ruling 각주 + 헤더 라벨 정정 — 기록 형식이 §4 문언을 어긴 것이 유일 잔여(무감사 변경 0, exit 유지) (WS-GPT-405, verifier major 기각→minor)"
+    status: "done"
+    severity: "minor"
+    origin: "review-2026-07-20-m1a-split"

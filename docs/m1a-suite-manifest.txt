@@ -1,11 +1,31 @@
 # M1-A suite identity manifest — ADR-0014 Amendment 2 §4
 # pinned-at: dev 568eebc (분할 실제 착수 commit; full run: Ran 838 tests, OK)
-# re-pin 사유: 최초 pin(830 @ b027d52) 이후 분할 착수 전에 리뷰 수리 wave w5가 main 승인
-#   하에 테스트 8건을 추가(selector 1·writer 3·sunset2 4) — 기계 분할은 이 commit부터 시작.
+# re-pin ruling (main, 2026-07-20 — WS-GPT-405 정정으로 명문화): M1-A 시작 commit은
+#   b027d52가 아니라 568eebc다. 최초 pin(830 @ b027d52)은 조기 pin이었다 — main이 "수리 wave
+#   (w5) 마감 후 분할 발사"를 명시 지시했고(docs/reviews/2026-07-20-review-remediation-feedback.md
+#   종합 처분), 실제 기계 분할 커밋 5개는 전부 568eebc 이후다. 근거 회신·보고서: 위 feedback
+#   triage + docs/meta/agent-reports-2026-07-20/w5-*.md.
 # rule: M1-A 도중 suite 변경은 (1) 기계 분할에 따른 이동(test-ID 보존) (2) main 명시 승인 +
 #       아래 차이 기록 절에 기재된 항목 외 불허. exit ③의 green은 이 전수의 실행 green이다.
 # count: 838
-# --- approved-diffs: (없음) ---
+# --- approved-diffs (최초 pin 830 @ b027d52 대비, ID별 −1/+9 = net +8; 전 항목 main-인수
+#     finding·done task 결속 — 무감사 변경 0) ---
+# DEL MigrationSunsetTests.test_preserved_profile_mismatching_live_is_refused_without_repair
+#     — oracle 반전 삭제측 (WS-GPT-304② REAL major, fix/sunset-live-profile-overreach, 568eebc)
+# ADD MigrationSunsetTests.test_preserved_profile_mismatching_live_is_accepted_without_repair
+#     — oracle 반전 수용측 (동상)
+# ADD MigrationSunsetTests.test_preserved_profile_without_live_is_accepted_without_repair (동상)
+# ADD MigrationSunsetTests.test_unsafe_marker_ancestor_is_refused_without_repair
+#     (WS-GPT-305 REAL major, fix/worktrees-cache-ancestor-symlink, 568eebc)
+# ADD DelegateRunTests.test_run_refuses_symlinked_worktrees_cache_ancestor_without_external_write (동상)
+# ADD DelegateRunTests.test_run_refuses_worktrees_cache_outside_machine_root_without_write (동상)
+# ADD PacketPublicationTests.test_prepare_rejects_noncanonical_binding_instead_of_reporting_success
+#     (WS-GPT-303 minor, fix/review-binding-writer-identity, 1028217)
+# ADD PendingReviewTests.test_binding_writer_rejects_renamed_noncanonical_generation (동상)
+# ADD PendingReviewTests.test_generation_lookups_ignore_noncanonical_binding_names (동상)
+# ADD TaskCliTests.test_linked_read_refuses_uninitialized_explicit_selector_before_canonical_redirect
+#     (WS-GPT-306 minor, fix/linked-read-selector-init-gate, 13587b4)
+# --- end approved-diffs ---
 AcceptFieldTests.test_accept_add_repeats_round_trips_and_packet_records_provenance
 AcceptFieldTests.test_claim_rejects_dependency_drift_after_prepare
 AcceptFieldTests.test_task_add_rejects_accept_flag
