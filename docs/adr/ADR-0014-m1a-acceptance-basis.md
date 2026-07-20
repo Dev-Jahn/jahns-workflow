@@ -189,3 +189,27 @@ dispatch 경로(`scripts/delegate.py` — packet 조립 :544-592, TASK_BLOCK 렌
    routing_note 부채의 일부이며 그 제약(값 검증 또는 투영 자체의 제거)은 M1-B
    `fix/delegate-prompt-i10-surface-strip`이 소유한다. M1-A에서의 값 검증 추가는 동작 변경
    이므로 §3에 따라 불허된다.
+
+## Amendment 2 — Addendum 3 (2026-07-20) — M1-A 호환 shim의 계약 경계 ruling 2건
+
+closeout 리뷰 finding WS-GPT-501·502(검증 후 minor)가 요구한 경계 결정을 accepted ruling으로
+명문화한다. 두 건 모두 M1-A exit를 재열지 않는다(검증: invariant/suite 게이트 무손상, 대상
+표면의 소비자 0 실증).
+
+1. **`waystone` package root는 의도적으로 비어 있다 (WS-GPT-501 수용 ruling).** 지원 계약은
+   **submodule import의 import-order 무관성**(`from waystone.X import …`·`import waystone.X`
+   — 실소비 전부)이며, adapter의 legacy `import waystone` 표면(`main`/`os` 노출)은
+   **scripts-first 경로 전용**이다. repo-first 순서에서 빈 root가 선택되는 것은 skeleton
+   설계의 수용된 성질이다 — 그 조합(repo-first + legacy shim 선행)의 소비자는 0이고, repo
+   내 유일한 `PYTHONPATH=scripts` 용례는 release smoke가 **오염으로 규정해 제거하는** 경로다
+   (test_release 격리 계약). root에 cli 표면을 재수출하는 수리는 **기각한다** — cli.main→
+   common→waystone.core의 실제 순환 import를 도입한다(검증자 실증). w6 rebind와 그 scripts-
+   first 증명 범위는 올바르다.
+2. **compat shim의 지원 monkeypatch 표면 = `setattr`/`delattr`뿐 (WS-GPT-502 ruling).**
+   direct module-dict mutation(`mock.patch.dict(module.__dict__, …)`·`vars(module)[…]=…` 등)은
+   M1-A "동작 무변경" 계약 **외**로 확정한다. 근거 결속: ⑴ 전달이 기술적으로 불가하다 —
+   이동된 함수의 globals는 owner 모듈 dict이고 module `__dict__`는 가로채기 매핑으로 교체
+   불가 ⑵ 소비자 0 실증 — suite의 module-attr patch 전수가 setattr 표면, dict-patch 전수가
+   os.environ 대상 ⑶ wrapper 우회는 re-export identity 파괴로 더 큰 관측 변경. 이 제한은
+   shim 3종의 **모듈 docstring**에 표기해 `help()`/`__doc__`에서 가시화한다(종전 metaclass
+   docstring 단독 표기는 비가시 — 함께 정정).

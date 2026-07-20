@@ -470,3 +470,9 @@ tasks:
   - id: feat/delegation-network-resilience
     title: "위임 agent의 네트워크 단절·API 오류 자율 복원: orchestrator 관여 0으로 네트워크 복구 대기→retry→중단 지점 resume까지 runner/transport 계층이 자체 수행 (0.12 신엔진 executor 경계 §3-6·effect protocol 위에서 — 세션 이동 등 일상 단절에 wave가 격추되지 않게; 사용자 요청 2026-07-20, 당장 구현하지 말고 M1-B+ 배치 시 편입 검토)"
     status: "pending"
+  - id: docs/adr-0014-addendum3-shim-boundaries
+    result: "Addendum 3 착지 + shim 3종 모듈 docstring 가시화 — suite 838 rc=0 — main 직접"
+    title: "Addendum 3: shim 계약 경계 ruling 2건 명문화 — ①waystone root 의도적 공백 수용(submodule import-order 무관성이 지원 계약, legacy import waystone은 scripts-first 전용·소비자 0, root 재수출 수리는 순환 import로 기각) ②지원 monkeypatch 표면=setattr/delattr(dict mutation 계약 외, 근거 3축 결속) + 모듈 docstring 가시화 (WS-GPT-501 PARTIAL minor·502 NEEDS-RULING minor — 501 귀속은 w6 아닌 skeleton 설계, 유일 PYTHONPATH=scripts 용례는 release 게이트가 오염으로 제거)"
+    status: "done"
+    severity: "minor"
+    origin: "review-2026-07-20-m1a-review-closeout"

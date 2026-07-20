@@ -3,7 +3,13 @@
 # requires-python = ">=3.10"
 # dependencies = ["pyyaml"]
 # ///
-"""Compatibility adapter for shared Waystone helpers."""
+"""Compatibility adapter for shared Waystone helpers.
+
+Legacy monkeypatch forwarding supports the setattr/delattr surface only; direct module
+``__dict__`` mutation (e.g. ``mock.patch.dict``) is not forwarded to the moved owners
+(ADR-0014 Amendment 2 Addendum 3 §2 — the module dict cannot be replaced with an
+intercepting mapping; no current consumers use that surface).
+"""
 from __future__ import annotations
 
 import hashlib

@@ -3,7 +3,12 @@
 # requires-python = ">=3.10"
 # dependencies = ["pyyaml"]
 # ///
-"""Compatibility adapter for the delegation runtime."""
+"""Compatibility adapter for the delegation runtime.
+
+Legacy monkeypatch forwarding supports the setattr/delattr surface only; direct module
+``__dict__`` mutation is not forwarded to the moved owner (ADR-0014 Amendment 2
+Addendum 3 §2).
+"""
 from __future__ import annotations
 
 import sys
