@@ -329,3 +329,9 @@ tasks:
     status: "pending"
     severity: "major"
     origin: "review-2026-07-20-fleet-fix-wave"
+  - id: chore/m1a-suite-manifest-pin
+    title: "M1-A 착수 manifest: 시작 commit의 suite test-ID 전수(830)와 계수를 docs/m1a-suite-manifest.txt로 pin — ADR-0014 Amendment 2 §4(suite identity 고정), 이후 suite 변경은 test-ID 보존 이동 또는 main 승인 차이 기록만 허용"
+    status: "pending"
+  - id: docs/m1a-mechanical-split-plan
+    title: "M1-A 기계 분할 분해 계획: scripts/*.py 모놀리스의 분할 단위·이동 매핑·검증 절차 확정(동작 무변경, ADR-0014 순수 기계 ruling) + PC 마일스톤 귀속표 — main 설계 작업"
+    status: "pending"
