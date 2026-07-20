@@ -2,6 +2,17 @@
 
 round 단위 작업 이력이 이 파일에 축적된다. 활성 task와 의존성은 `tasks.yaml`(CLI: `waystone task`)과 생성 파일 `ROADMAP.md` 참조.
 
+## 2026-07-20-m1a-review-closeout
+
+- **Goal**: m1a-split packet의 codex ultra 리뷰(major 5) 처리 — 검증·처분·잔여 수리. M1-A exit 방어전.
+- **판정** (opus verifier 5기 반증, 전 건 실증): **major 5 전부 minor 강등, blocker 0, M1-A exit 유지.** 401 커밋분리(핵심 기각 — fresh clone에서 diff-0 재생, 잔여 provenance 위생) · 402 orphan import(REAL latent·소비자 0·리뷰어 수리안이 회귀임을 실증) · 403 dict-patch(소비자 0·전달 기술 불가) · 404 -m/runpy(그 표면 소비자 0·계약 표면 무결) · 405 manifest 재-pin(**ID별 10건 전수 추적 = 무감사 변경 0**·시작 재정의 정당·자기참조 불성립).
+- **Shipped**: 문서 2건 main 직접(`docs/m1a-provenance-hygiene`·`docs/m1a-manifest-approved-diffs` — manifest가 ID별 −1/+9 ledger+재정의 ruling 보유한 self-authorizing 기록으로, 965a9ef) + w6 기체 3건(`fix/shim-orphan-child-rebind` identity-보존 rebind·`fix/run-tests-selfdir-bootstrap` 4표면 복원·`docs/shim-supported-patch-surface`, 0247677). triage 결속 20c3a98.
+- **Gates**: w6 표적 41 rc=0 + full gate 838 rc=0. **잔여 blocker 0·major 0.**
+- **SSOT**: unchanged.
+- **Decisions pending**: decision/legacy-settlement-additional-cohort(minor, 사용자).
+- **Review**: requested (docs/reviews/2026-07-20-m1a-review-closeout-request.md).
+- **Next**: **M1-B 착수** — vertical slice 분해(main 설계). 편입 예약: delegate-prompt-i10-surface-strip(값 채널 포함)·review-runs-uuid-owner-directory·#014/#015 fixture·ADR-0013 fault 3건·delegate _git↔adapters.git 정렬·(신규) shim orphan guard의 real-package parent 경로.
+
 ## 2026-07-20-m1a-split
 
 - **Goal**: remediation packet의 codex ultra 리뷰 처리(6 finding) → 수리 wave w5 → **M1-A 기계 분할 전체 집행·exit 충족**. main은 관제탑 + ADR 정정 직접 집행.
