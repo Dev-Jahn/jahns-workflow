@@ -248,6 +248,7 @@ tasks:
     severity: "blocker"
     origin: "review-2026-07-20-fleet-fix-wave"
   - id: fix/env-prep-toolchain-digest-binding
+    notes: "구현+WS-GPT-102 fixture는 m1b-preflight가 폐쇄(2cdaf1c) — opus 검증 통과 후 병합 시 done 처리 예정"
     deps: ["feat/run-verification-preflight"]
     title: "env_prep toolchain(ruff 포함)의 source+artifact digest 결속: 위조 ruff wheel이 ambient index로 offline gate를 통과(재현됨) — 단 동일 gap이 명시 이월된 M1 target(ADR-0012 VerificationPlan·ADR-0013 child env)이라 minor, M1 해당 작업에 편입 (WS-GPT-102, verifier major→minor)"
     status: "pending"
@@ -560,3 +561,12 @@ tasks:
     ruling: "잠정 ruling 2026-07-21: ③⑤⑦⑧ 수용 확정. ①은 M1-B 한정 v1 adapter(legacy 문자열 = owner-authored criterion 원문, empty/blank/dup 거부, critic-not-required 기록)로 임시 준수하고 ADR-0010 amendment로 명문화 예정. ②는 null 보존 유지(정책 컴파일러 부재 중 합성 금지 — silent 강등 회피), amendment에서 확정. ④는 effects task의 kind 확장 여부와 함께 재판정."
     title: "m1b-spec 해석 일괄 판정: ①ADR-0010 acceptance envelope vs legacy 문자열(§2-6 tasks.yaml 불변과의 3자 충돌 — ADR-0010 amendment 필요) ②review decision null 허용 여부 ③no-retry 기본값(main 수용) ④RunSpec/snapshot의 EVIDENCE kind 재사용 ⑤canonical JSON·job id <run-uuid>:job 형식 고정(main 수용) ⑦PC-31 no-write 우선(main 수용) ⑧role binding은 preflight/VerificationPlan 소유(main 수용) — ①②④는 라운드 마감 시 ADR-0010 amendment로 확정 (m1b-spec 보고 ④)"
     status: "pending"
+  - id: decision/run-engine-format-pinning-batch
+    ruling: "잠정 ruling 2026-07-21: 현 구현 선택 전부 v1로 수용. gate/m1b-exit에서 docs/run-engine-formats.md(v1 format registry)로 명문화하고 이후 변경은 migration 경유로 강제. plan revision 모델(preflight ②: run당 1건 immutable, 변경=새 run)과 실패 preflight audit 부재(⑧: typed exception만)도 v1 수용 — audit 영속화는 store owner의 후속 schema."
+    title: "신엔진 v1 표현 계약 일괄 고정: store EVIDENCE reference kind 재사용·evidence digest cardinality(store ④1·⑤) / RunSpec·plan의 canonical JSON(sorted-key compact UTF-8)+sha256:<hex>·job id <run-uuid>:job(spec ⑤) / preflight의 verification-plan:<run_id> reference·runner proof 7축 이름·receipt schema(preflight ①③⑩) — 소비자 확산 전 format registry로 고정 필요"
+    status: "pending"
+  - id: chore/profile-v1-bytes-public-api
+    title: "profile_v1에 public read_profile_v1_bytes(bytes) API 추가: preflight가 read-race 제거 목적으로 _UniqueKeyLoader·_adapt_profile private 내부에 결합한 것을 public 경계로 승격 (m1b-preflight opus 검증 minor — 정당 목적·공개된 결합이나 경계 명확화 필요)"
+    status: "pending"
+    severity: "minor"
+    deps: ["feat/run-verification-preflight"]

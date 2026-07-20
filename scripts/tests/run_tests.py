@@ -104,6 +104,9 @@ from test_run_domain import (
 from test_run_lease import (
     RunLeaseTests,
 )
+from test_run_preflight import (
+    RunPreflightTests,
+)
 from test_review_protocol import (
     LockPrimitiveTests,
     LockWiringTests,
@@ -206,6 +209,7 @@ _TEST_CLASSES = (
     ReleaseToMainTests,
     RunDomainTests,
     RunLeaseTests,
+    RunPreflightTests,
     LockPrimitiveTests,
     LockWiringTests,
     MarkerTests,
