@@ -1,10 +1,11 @@
 # 0.12 승격 계약 목록 (confirmed v1)
 
-- Status: **confirmed v1** — main 인수 2026-07-20 (PC-01~PC-30 전량; 행 단위 조정은 사용자 override로 가능)
+- Status: **confirmed v1 + WS-GPT-204 addendum** — main 인수 2026-07-20 (PC-01~PC-30) + ruling 집행(PC-31; 행 단위 조정은 사용자 override로 가능)
 - Basis: ADR-0014
 - Inventory reviewed: `docs/porting-ledger.md` 85 classes / 828 methods
 
-이 문서는 main이 2026-07-20 인수·확정한 계약 목록이다(v1 — 확정 기록은 ADR-0014 Amendment).
+이 문서는 main이 2026-07-20 인수·확정하고 WS-GPT-204 ruling으로 PC-31을 추가한 계약 목록이다
+(v1 확정 기록은 ADR-0014 Amendment, PC-31 추가 근거는 해당 ruling).
 각 행은 legacy test 자체나 출력 등급이 아니라 새 시스템에 남길 **의미 계약** 하나를 확정한다.
 각 계약 테스트 의무가 귀속되는 마일스톤은 ADR-0014 Amendment의 단계별 gate 원칙을 따른다. 원 테스트 클래스는
 채굴 anchor일 뿐 port 지시가 아니다. 같은 클래스에서 아래 행이 명명하지 않은 assertion은
@@ -38,6 +39,7 @@
 | PC-12 | pending projection은 exact latest request/binding/feedback 결속만 완료로 보고 손상·불일치는 해당 run만 `unknown`으로 격리한다. | ①, ②, ③(E-02) | `PendingReviewTests`, `IngestTests`, `PacketPublicationTests` | 여러 healthy/corrupt run fixture를 함께 읽어 stale fallback 0, healthy projection 중단 0을 검증한다. |
 | PC-13 | PR review cycle/freeze evidence는 exact rendered digest generation에 결속되고 v1 legacy·v2 혼재, 동률·충돌·손상은 stale evidence를 새 evidence로 승격하지 않는다. | ①, ②, ③(E-01) | `MarkerTests`, `PacketPublicationTests`, `L3GapClosureAcceptanceTests` | canonical review reader와 legacy adapter를 분리해 version-skew·digest conflict·cross-owner corruption fixture로 재작성한다. |
 | PC-14 | 기존 flat `docs/reviews/` request·binding·feedback·sidecar archive는 rename 없이 legacy evidence로 계속 읽히고, 새 writer가 그 bytes를 소급 수정하지 않는다. | ① | `MarkerTests`, `PacketPublicationTests`, `IngestTests`, `L3GapClosureAcceptanceTests` | ADR-0009의 legacy-adapter 경계에서 실제 역사 fixture read와 canonical next-write를 검증하되 filename 분해를 신규 identity 규칙으로 복제하지 않는다. |
+| PC-31 | 미초기화 root(`.waystone.yml` 부재 등)에서는 어떤 명령도 project state(`.waystone/`)를 생성하지 않고 typed refusal한다. | ② | `UninitializedRootGateTests` | 새 kernel의 root-gate 경계에 모든 명령을 통과시키고 typed refusal과 `.waystone/` no-write를 계약 테스트로 검증한다. |
 
 ### Registry mutation·delegation 산출물 안전
 
@@ -78,6 +80,14 @@
 - E-08: positive liveness/exit evidence, 사유 있는 `unknown`, unknown에서 destructive resolution 금지
 - E-09 잔여: hostname·cwd·mtime/inode·열거 순서와 filename 분해를 durable authority로 쓰지 않음
 - ADR-0003 '취소, quiescence, cleanup 안전 계약' 절(계획 §3-9 유래): cancellation·quiescence·cleanup의 독립 fault 계약
+- ADR-0013 lease principal CAS (TODO M1-B): heartbeat renew·effect 시작·submit·completion·apply·cleanup마다
+  current `owner_token + fencing_epoch + entity_version`을 exact-match/CAS하고, mismatch·current principal 판독
+  불가는 각각 `lease_principal_mismatch`·`lease_principal_unknown`으로 mutation을 거부
+- ADR-0013 lock 후 DB tuple recheck (TODO M1-B): 실제 OS lock handle을 얻은 뒤 current
+  `owner_token + fencing_epoch + entity_version`을 다시 확인하고 stale tuple이면 critical section에 진입하지 않음
+- ADR-0013 reclaim race (TODO M1-B): lease expiry만으로 takeover하지 않으며 positive quiescence·effect
+  absence 뒤의 reclaim과 구 owner mutation 경합에서도 current tuple CAS를 잃은 principal의 renew·effect·
+  submit·takeover·cleanup을 거부
 
 `docs/traceability-matrix.md`가 I-10의 근접 증거로 언급한
 `ImproveL2BAdversarialTests.test_f12_scope_is_structured_and_packet_text_is_never_mined`는 characterization
@@ -132,3 +142,99 @@ coverage가 아니므로 승격 근거로 세지 않는다.
 - **review transport 세부:** `MarkerTests`, `MergeGateTests`, `PacketPublicationTests`, `IngestTests`,
   `PendingReviewTests`, `FrozenAcceptanceTests`의 GitHub REST pagination, bot regex, exact warning/CLI
   text와 flat filename parsing 구현. PC-09~PC-14의 digest·receipt·history 계약만 남긴다.
+
+## Ledger reverse closure (85 classes)
+
+다음 표는 `docs/porting-ledger.md`의 class 전수를 **class → 처분**으로 역대조한 양방향 closure다.
+PC 행이 한 의미라도 참조한 class는 `승격` 한쪽에만 두고 해당 PC ID 전부를 적었다. 위 비승격 절이
+같은 class의 나머지 legacy 관측면을 버린다고 설명하더라도 그것은 class 전체의 두 번째 처분이 아니다.
+PC 참조가 없는 class는 기존 비승격 절 하나에만 배치했다. 따라서 class-level 처분은
+`승격(PC 행 참조)` 39개 + `비승격(절 명명)` 46개 = ledger 85개이며 중복·누락·ledger 밖 참조는 0개다.
+
+| Legacy class | 정확히 한 class-level 처분 |
+|---|---|
+| `ReleaseToMainTests` | 비승격 — release·remote·배포 구현 |
+| `LockPrimitiveTests` | 비승격 — machine-local 저장 배치 |
+| `LockWiringTests` | 승격 — PC-03 |
+| `MarkerTests` | 승격 — PC-09, PC-13, PC-14 |
+| `MergeGateTests` | 비승격 — review transport 세부 |
+| `TasksGateTests` | 승격 — PC-02 |
+| `RemoteTests` | 비승격 — release·remote·배포 구현 |
+| `PacketPublicationTests` | 승격 — PC-09, PC-10, PC-11, PC-12, PC-13, PC-14 |
+| `ResumeStartHereTests` | 비승격 — CLI·dispatcher 내부 동작 |
+| `StoragePathTests` | 비승격 — machine-local 저장 배치 |
+| `DashboardLockingTests` | 비승격 — machine-local 저장 배치 |
+| `WaystoneStorageCliTests` | 비승격 — machine-local 저장 배치 |
+| `ConfigTests` | 승격 — PC-23 |
+| `TextSurgeryTests` | 승격 — PC-01 |
+| `NextActionableTests` | 승격 — PC-04 |
+| `LaneTests` | 비승격 — CLI·dispatcher 내부 동작 |
+| `RoundCloseTests` | 승격 — PC-05, PC-06, PC-07, PC-08 |
+| `BasePolicyTests` | 승격 — PC-09, PC-23 |
+| `IngestTests` | 승격 — PC-11, PC-12, PC-14 |
+| `PendingReviewTests` | 승격 — PC-10, PC-11, PC-12 |
+| `StatuslineTests` | 비승격 — CLI·dispatcher 내부 동작 |
+| `FrozenAcceptanceTests` | 승격 — PC-02, PC-06 |
+| `IntegrationSmokeTests` | 비승격 — release·remote·배포 구현 |
+| `TaskCliTests` | 승격 — PC-01, PC-03 |
+| `UninitializedRootGateTests` | 승격 — PC-31 |
+| `TaskArchiveTests` | 승격 — PC-04 |
+| `ParkedTaskContractTests` | 승격 — PC-02, PC-04, PC-06 |
+| `TaskReadNudgeTests` | 비승격 — CLI·dispatcher 내부 동작 |
+| `TaskRegressionTests` | 승격 — PC-01, PC-03, PC-04 |
+| `CclogParseTests` | 비승격 — improve/analytics projection 형식 |
+| `CclogLayoutTests` | 비승격 — improve/analytics projection 형식 |
+| `ImproveDiscoveryTests` | 비승격 — improve/analytics projection 형식 |
+| `ImproveTraceTests` | 비승격 — improve/analytics projection 형식 |
+| `ImproveSelfSessionTests` | 비승격 — improve/analytics projection 형식 |
+| `ImproveReviewsTests` | 비승격 — improve/analytics projection 형식 |
+| `ImproveAuditTests` | 비승격 — improve/analytics projection 형식 |
+| `ImproveDecideTests` | 비승격 — improve/analytics projection 형식 |
+| `ImproveMetricsTests` | 비승격 — improve/analytics projection 형식 |
+| `ImproveScopeTests` | 비승격 — improve/analytics projection 형식 |
+| `ImproveM1DefectTests` | 비승격 — improve/analytics projection 형식 |
+| `AcceptFieldTests` | 승격 — PC-01, PC-02, PC-15 |
+| `DelegateSnapshotTests` | 승격 — PC-17 |
+| `DelegateProfileTests` | 승격 — PC-27 |
+| `DelegatePacketTests` | 승격 — PC-15 |
+| `DelegateRunTests` | 승격 — PC-16, PC-18, PC-27 |
+| `CodexRunnerVerificationGateTests` | 승격 — PC-28, PC-29 |
+| `DelegateEffortTests` | 비승격 — legacy delegation mechanics |
+| `DelegateApplyTests` | 승격 — PC-17, PC-21, PC-22 |
+| `DelegateVerdictTests` | 승격 — PC-15, PC-18, PC-20, PC-21 |
+| `DelegateCorruptRecordTests` | 승격 — PC-19 |
+| `DelegateFanoutPlanTests` | 비승격 — legacy delegation mechanics |
+| `DelegatePacketDigestTests` | 승격 — PC-15, PC-29 |
+| `DelegateExpectAndCarrierTests` | 승격 — PC-15 |
+| `DelegateJsonEventsTests` | 비승격 — CLI·dispatcher 내부 동작 |
+| `DelegateStatusJsonTests` | 승격 — PC-19 |
+| `DelegateFanoutTemplateLintTests` | 비승격 — CLI·dispatcher 내부 동작 |
+| `DelegateMainContractTests` | 비승격 — CLI·dispatcher 내부 동작 |
+| `DelegateCliTests` | 비승격 — CLI·dispatcher 내부 동작 |
+| `OverlayStoreTests` | 승격 — PC-25 |
+| `OverlayRuleTests` | 비승격 — overlay·policy의 legacy 저장/임계값 |
+| `BoundaryWarnTests` | 비승격 — overlay·policy의 legacy 저장/임계값 |
+| `DelegateExposureOverlayTests` | 비승격 — overlay·policy의 legacy 저장/임계값 |
+| `RoundExposureTests` | 승격 — PC-08 |
+| `ReplayTests` | 비승격 — overlay·policy의 legacy 저장/임계값 |
+| `EvidenceTests` | 비승격 — improve/analytics projection 형식 |
+| `ImproveL2BTests` | 비승격 — improve/analytics projection 형식 |
+| `ImproveL2BAdversarialTests` | 비승격 — improve/analytics projection 형식 |
+| `DelegateVerifyTests` | 승격 — PC-16, PC-18, PC-20, PC-22, PC-27 |
+| `UvCacheTests` | 비승격 — machine-local 저장 배치 |
+| `ContractInjectTests` | 승격 — PC-30 |
+| `MigrationV2Phase1Tests` | 비승격 — migration mechanics |
+| `MigrationV2Phase2Tests` | 승격 — PC-24 |
+| `MigrationV2HookTests` | 비승격 — migration mechanics |
+| `MigrationTests` | 비승격 — migration mechanics |
+| `M2DocsTests` | 승격 — PC-30 |
+| `CodexHookTests` | 승격 — PC-06 |
+| `CodexTraceTests` | 비승격 — hook·static-doc wiring과 과거 gap harness |
+| `CodexVerifierTests` | 비승격 — hook·static-doc wiring과 과거 gap harness |
+| `L2CGuardTests` | 비승격 — hook·static-doc wiring과 과거 gap harness |
+| `L2CImproveFeedbackTests` | 비승격 — hook·static-doc wiring과 과거 gap harness |
+| `L2CAdversarialFixTests` | 비승격 — hook·static-doc wiring과 과거 gap harness |
+| `L2DPolicyMachineTests` | 승격 — PC-25, PC-26 |
+| `L2DAdversarialFindingTests` | 승격 — PC-26 |
+| `CodexPluginContractTests` | 비승격 — release·remote·배포 구현 |
+| `L3GapClosureAcceptanceTests` | 승격 — PC-13, PC-14, PC-16, PC-21, PC-22 |
