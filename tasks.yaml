@@ -248,6 +248,7 @@ tasks:
     severity: "blocker"
     origin: "review-2026-07-20-fleet-fix-wave"
   - id: fix/env-prep-toolchain-digest-binding
+    deps: ["feat/run-verification-preflight"]
     title: "env_prep toolchain(ruff 포함)의 source+artifact digest 결속: 위조 ruff wheel이 ambient index로 offline gate를 통과(재현됨) — 단 동일 gap이 명시 이월된 M1 target(ADR-0012 VerificationPlan·ADR-0013 child env)이라 minor, M1 해당 작업에 편입 (WS-GPT-102, verifier major→minor)"
     status: "pending"
     severity: "minor"
@@ -325,6 +326,7 @@ tasks:
     severity: "major"
     origin: "review-2026-07-20-ruling-execution"
   - id: fix/delegate-prompt-i10-surface-strip
+    deps: ["feat/run-spec-planning"]
     notes: "범위 명시(Addendum 2 §2): 투영 표면 제거뿐 아니라 routing_note '값 내용' 채널도 이 task 소유 — strip이 투영을 제거하면 값 채널도 소멸하나, routing_note를 잔존시키는 설계면 값 제약을 함께. anchor는 goal/bounds 재편성 검토(Addendum §1)"
     title: "worker prompt 조립에서 I-10 부채 표면(status·milestone·round·routing_note, deps 상태) 제거 — TASK_BLOCK 렌더가 registry 내부 표면을 전달(Amendment 2 Addendum이 known-debt로 고정); anchor는 goal/bounds 자료로 재편성 검토; M1-B delegate 재구축이 소유"
     status: "pending"
@@ -466,7 +468,7 @@ tasks:
     origin: "review-2026-07-20-m1a-split"
   - id: docs/m1b-slice-decomposition
     title: "M1-B vertical slice 분해 계획(main 설계): transactional store §3-1·effect protocol §3-4·executor 경계 §3-6·4-role domain model·delegate wrapper 신엔진 호출·typed envelope·fault fixture 8건 표를 구현 task들로 분해 + PC 귀속(M1-B분)·편입 예약 6건(i10-strip·review-runs-uuid·#014/#015·ADR-0013 fault·_git 정렬·shim parent guard) 배치"
-    status: "pending"
+    status: "done"
   - id: feat/delegation-network-resilience
     title: "위임 agent의 네트워크 단절·API 오류 자율 복원: orchestrator 관여 0으로 네트워크 복구 대기→retry→중단 지점 resume까지 runner/transport 계층이 자체 수행 (0.12 신엔진 executor 경계 §3-6·effect protocol 위에서 — 세션 이동 등 일상 단절에 wave가 격추되지 않게; 사용자 요청 2026-07-20, 당장 구현하지 말고 M1-B+ 배치 시 편입 검토)"
     status: "pending"
@@ -476,3 +478,56 @@ tasks:
     status: "done"
     severity: "minor"
     origin: "review-2026-07-20-m1a-review-closeout"
+  - id: feat/run-store-kernel
+    scope: ["waystone/runs/store.py", "waystone/runs/artifacts.py", "scripts/tests/test_run_store.py"]
+    title: "새 runtime store 커널: .waystone/state.db(SQLite WAL) 스키마 v1 + 트랜잭션/CAS/append-only transitions + content-addressed artifact store + UUIDv7 run_id — ADR-0005/0007, PC-18·19, E-06·E-09 잔여, JW-GPT-014 부류 재현 불가 fixture 포함 (m1b-slice-plan §5)"
+    status: "pending"
+  - id: feat/run-lease-fencing
+    scope: ["waystone/runs/lease.py", "scripts/tests/test_run_lease.py"]
+    title: "lease·fencing epoch·owner token·OS advisory lock 원시 계층: ADR-0013 3계약(lease principal CAS·lock 후 DB tuple recheck·reclaim race) + fault fixture 6·7·8 — mutation·effect·destructive cleanup 0 증명"
+    status: "pending"
+    deps: ["feat/run-store-kernel"]
+  - id: feat/run-domain-roles
+    scope: ["waystone/jobs", "scripts/tests/test_run_domain.py"]
+    title: "canonical 4-role domain model(coordinator/worker/verifier/reviewer) + executor_kind enum + profile v1 adapter(implementer→worker 판독, 미지원 binding typed refusal) — ADR-0008/0004, PC-27 부분"
+    status: "pending"
+  - id: feat/run-effect-protocol
+    title: "external effect commit protocol 엔진: planned→claimed→effect→observed→completed + effect 종류별 계약표 + unknown-effect 정직 차단 + crash recovery 결정표/reconcile — ADR-0002 전체, fixture 3(exited-unreconciled resume 1회) + effect-kind별 crash fixture"
+    status: "pending"
+    deps: ["feat/run-store-kernel", "feat/run-lease-fencing"]
+  - id: feat/run-spec-planning
+    title: "frozen RunSpec + one-task run 계획: job input freeze(PC-15)·dirty-tree snapshot(PC-17)·acceptance contract readiness·retry ceiling·미초기화 root typed refusal(PC-31 신규 표면) — ADR-0010"
+    status: "pending"
+    deps: ["feat/run-store-kernel", "feat/run-domain-roles"]
+  - id: feat/run-verification-preflight
+    title: "frozen VerificationPlan + capability preflight(dispatch precondition) + authoritative deterministic check의 engine action 실행 + runner proof bounded 관측축·relocation-stable digest — ADR-0012, PC-27·28·29, E-03 잔여, env-prep toolchain digest binding 편입(fix/env-prep-toolchain-digest-binding 동시 폐쇄)"
+    status: "pending"
+    deps: ["feat/run-spec-planning"]
+  - id: feat/run-supervisor-identity
+    title: "engine-owned detached supervisor + process identity(boot id·pid·start token·invocation digest) + monotonic heartbeat + atomic completion marker + stdout/stderr artifact digest — ADR-0003 supervision, fixture 1(stale heartbeat+live child 무정리)·2(PID 재사용 identity-mismatch), 세션 종료 후 생존(D6)"
+    status: "pending"
+    deps: ["feat/run-effect-protocol"]
+  - id: feat/run-observability
+    title: "run status/watch read-only projection: liveness/progress/current 3분리·derived health(stalled은 FSM 아님)·frozen closure 분모·조회 무부작용 — 계획 §3-8, fixture 5(status/watch 반복 호출 DB 불변), PC-19 healthy 무중단, E-08"
+    status: "pending"
+    deps: ["feat/run-store-kernel", "feat/run-supervisor-identity"]
+  - id: feat/run-cancel-quiescence
+    title: "취소·정지·정리 안전 계약: cancel은 의도만 기록, positive quiescence 관측+reconcile 후에만 terminal cancellation·cleanup, verified process identity 없이 signal 금지, cleanup은 별도 idempotent action — 계획 §3-9·ADR-0003 취소 절, fixture 4(unknown-effect 중 cancel 시 worktree/ref 유지), E-08 안전 귀결"
+    status: "pending"
+    deps: ["feat/run-supervisor-identity", "feat/run-effect-protocol"]
+  - id: feat/run-actions-transport
+    title: "carrier transport: actions next(3분기 비차단, engine-owned 내부 소진)·submit 5중 검증(현재 action·input digest·fencing epoch·result schema·artifact digest, Git-파생 사실 엔진 재도출) + 전 신규 CLI의 typed JSON envelope(exit enum·recoverable 분류) — ADR-0004, 계획 §3-3·§3-6"
+    status: "pending"
+    deps: ["feat/run-effect-protocol", "feat/run-spec-planning"]
+  - id: feat/run-verify-decision
+    title: "verifier 실행(read-only, 분리 actor)·integration decision(criterion exact set+result digest의 verifier evidence 결속)·apply 실행 시점 재검증(user dirt 보존·drift no-write)·retry=새 attempt+새 action id — PC-16·17·20·21·22, adapters.git 단일 원천(D5)"
+    status: "pending"
+    deps: ["feat/run-verification-preflight", "feat/run-effect-protocol"]
+  - id: feat/run-cli-bridge
+    title: "waystone run start/resume/status/watch/cancel 사용자 표면 + delegate opt-in bridge(one task=one run/job, 기본 경로 전환은 M1-C) — 계획 §3-3, D2, PC-31 표면"
+    status: "pending"
+    deps: ["feat/run-actions-transport", "feat/run-verify-decision", "feat/run-observability", "feat/run-cancel-quiescence", "fix/delegate-prompt-i10-surface-strip"]
+  - id: gate/m1b-exit
+    title: "M1-B exit 검증: 단일 run 완주(fixture runner+실 backend smoke)·effect별 crash recovery·fault fixture 8건·PC 귀속표(M1-B분) green·legacy suite green·network-resilience 기질 S1-S3·JW-GPT-014/015 처분 기록 — m1b-slice-plan §6"
+    status: "pending"
+    deps: ["feat/run-cli-bridge", "feat/review-runs-uuid-owner-directory", "feat/run-lease-fencing"]
