@@ -21,7 +21,7 @@
 
 Waystone is a Claude Code and Codex plugin that gives a project a durable source of direction, a validated task list, bounded work cycles, independent review, and a way to learn from past agent sessions. It is built for research and software projects that span many sessions or agents — where context, decisions, and verification evidence would otherwise scatter across chats and memory files.
 
-> **Status:** v0.11 Anchor & Attest is the current release. Completion judgments — review receipts, delegation verdicts, round closeouts — now derive only from immutable, re-derivable evidence: digest-bound request generations, read-time re-derivation of reviewer replies, and identity-attested runner probes, with honest failure modes across mixed-version and mixed-machine states. Next: enforceable guards, recorded waivers, and larger-scale orchestration.
+> **Status:** v0.11 Anchor & Attest is the current release. Completion judgments — review receipts, delegation verdicts, round closeouts — now derive only from immutable, re-derivable evidence: digest-bound request generations, read-time re-derivation of reviewer replies, and identity-attested runner probes, with honest failure modes across mixed-version and mixed-machine states. Next: v0.12 consolidates the harness into a single durable run engine behind a thin surface — one transactional runtime store, an explicit protocol for effects that live outside it (git refs, worktrees, runner processes), and honest reporting of what is running, how far it got, and what is merely unknown.
 
 <br>
 
