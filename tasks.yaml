@@ -467,3 +467,6 @@ tasks:
   - id: docs/m1b-slice-decomposition
     title: "M1-B vertical slice 분해 계획(main 설계): transactional store §3-1·effect protocol §3-4·executor 경계 §3-6·4-role domain model·delegate wrapper 신엔진 호출·typed envelope·fault fixture 8건 표를 구현 task들로 분해 + PC 귀속(M1-B분)·편입 예약 6건(i10-strip·review-runs-uuid·#014/#015·ADR-0013 fault·_git 정렬·shim parent guard) 배치"
     status: "pending"
+  - id: feat/delegation-network-resilience
+    title: "위임 agent의 네트워크 단절·API 오류 자율 복원: orchestrator 관여 0으로 네트워크 복구 대기→retry→중단 지점 resume까지 runner/transport 계층이 자체 수행 (0.12 신엔진 executor 경계 §3-6·effect protocol 위에서 — 세션 이동 등 일상 단절에 wave가 격추되지 않게; 사용자 요청 2026-07-20, 당장 구현하지 말고 M1-B+ 배치 시 편입 검토)"
+    status: "pending"
