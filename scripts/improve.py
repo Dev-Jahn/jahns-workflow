@@ -756,7 +756,7 @@ def _run_codex_trace(sources: list[Path], projects: set[str], out_dir: Path,
 # `origin` field (`review-<round-id>`), set by `waystone task add --origin` in skills/review/SKILL.md — the
 # `round` field records the FIXING round (stamped at close), so origin is the correct join key.
 _TRIAGE_HEADING = "## Findings (triage skeleton"
-_FINDING_ID_RE = re.compile(r"WS-GPT-\d+")
+_FINDING_ID_RE = re.compile(r"(?:JW|WS)-GPT-\d+")
 _VERDICT_RE = re.compile(r"\b(REAL|REJECTED|NEEDS-RULING)\b", re.IGNORECASE)
 _FINDING_PATH_RE = re.compile(
     r"(?<![A-Za-z0-9_.-])((?:\.?[A-Za-z0-9_.-]+/)+(?:[A-Za-z0-9_.-]+))"

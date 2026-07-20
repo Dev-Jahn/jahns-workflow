@@ -7969,8 +7969,8 @@ class ImproveSelfSessionTests(unittest.TestCase):
                               "anchor": "command-tag", "lines_excluded": 3})
 
 
-# feedback file exactly as review.ingest writes it: metadata header, byte-exact reviewer body
-# (which itself contains `### WS-GPT-NNN` blocks + `- Severity:` lines we must NOT parse), then an
+# historical feedback file exactly as review.ingest wrote it: metadata header, byte-exact reviewer body
+# (which itself contains `### JW-GPT-NNN` blocks + `- Severity:` lines we must NOT parse), then an
 # APPENDED triage table under `## Findings (triage skeleton …)` — the only thing improve reviews reads.
 _TRIAGE_FEEDBACK = """<!-- waystone feedback: verbatim body below; triage skeleton appended. -->
 round: 2026-07-01-alpha
@@ -7980,10 +7980,10 @@ source: /tmp/review.md
 
 ---
 
-### WS-GPT-001 — some finding
+### JW-GPT-001 — some finding
 - Severity: blocker
 
-### WS-GPT-002 — another finding
+### JW-GPT-002 — another finding
 - Severity: minor
 
 
@@ -7993,9 +7993,9 @@ source: /tmp/review.md
 
 | finding | severity | verdict (REAL/REJECTED/NEEDS-RULING) | evidence | task id |
 |---|---|---|---|---|
-| WS-GPT-001 — some finding | blocker | REAL | confirmed in code | fix/thing |
-| WS-GPT-002 — another finding | minor | REJECTED | wrong, see SSOT | |
-| WS-GPT-003 — unscored finding | ? |  |  |  |
+| JW-GPT-001 — some finding | blocker | REAL | confirmed in code | fix/thing |
+| JW-GPT-002 — another finding | minor | REJECTED | wrong, see SSOT | |
+| JW-GPT-003 — unscored finding | ? |  |  |  |
 """
 
 
@@ -8047,7 +8047,7 @@ class ImproveReviewsTests(unittest.TestCase):
             self.assertEqual(cov["projects_total"], 3)
             self.assertEqual([s["project"] for s in cov["projects_skipped"]], ["gone", "remote-only"])
             # a triage row that names its fix-task (task-id cell) is ONE finding, not two (dedup):
-            # WS-GPT-001 + WS-GPT-002 + WS-GPT-003 (triage) + fix/old (unreferenced task) = 4
+            # JW-GPT-001 + JW-GPT-002 + JW-GPT-003 (triage) + fix/old (unreferenced task) = 4
             self.assertEqual(cov["row_totals"], {"reviews": 2, "findings": 4})
 
             # rows sorted by (project, round_id)
@@ -8061,26 +8061,26 @@ class ImproveReviewsTests(unittest.TestCase):
             self.assertIsNone(alpha["review_target"])
 
             byid = {f["id"]: f for f in alpha["findings"]}
-            # triage findings: severity read structurally from the table cell (explicit). WS-GPT-001's
+            # triage findings: severity read structurally from the table cell (explicit). JW-GPT-001's
             # task-id cell names fix/thing (a joined task) → merged into ONE triage finding carrying
             # task_id; the separate fix/thing task finding is NOT emitted (dedup)
-            expected = {"id": "WS-GPT-001", "severity": "blocker", "status": "REAL",
+            expected = {"id": "JW-GPT-001", "severity": "blocker", "status": "REAL",
                         "type": "unknown", "source": "triage", "provenance": "explicit",
                         "task_id": "fix/thing"}
-            self.assertEqual({key: byid["WS-GPT-001"][key] for key in expected}, expected)
-            self.assertEqual(byid["WS-GPT-001"]["review_origin"], "2026-07-01-alpha")
-            self.assertTrue(byid["WS-GPT-001"]["source_pointer"].endswith(
+            self.assertEqual({key: byid["JW-GPT-001"][key] for key in expected}, expected)
+            self.assertEqual(byid["JW-GPT-001"]["review_origin"], "2026-07-01-alpha")
+            self.assertTrue(byid["JW-GPT-001"]["source_pointer"].endswith(
                 "2026-07-01-alpha-feedback.md:22"))
-            self.assertNotIn("fix/thing", byid)  # deduped into WS-GPT-001, not a second finding
-            self.assertEqual(byid["WS-GPT-002"]["status"], "REJECTED")
-            self.assertEqual(byid["WS-GPT-002"]["severity"], "minor")
+            self.assertNotIn("fix/thing", byid)  # deduped into JW-GPT-001, not a second finding
+            self.assertEqual(byid["JW-GPT-002"]["status"], "REJECTED")
+            self.assertEqual(byid["JW-GPT-002"]["severity"], "minor")
             # `?` severity is unparseable → provenance unknown, NOT keyword-guessed from prose
-            self.assertEqual(byid["WS-GPT-003"]["severity"], None)
-            self.assertEqual(byid["WS-GPT-003"]["provenance"], "unknown")
+            self.assertEqual(byid["JW-GPT-003"]["severity"], None)
+            self.assertEqual(byid["JW-GPT-003"]["provenance"], "unknown")
             # a finding-derived task NOT referenced by any triage row remains source "task"
             self.assertEqual(byid["fix/old"]["source"], "task")
             self.assertNotIn("feat/unrelated", byid)
-            # counts: blocker WS-GPT-001 + fix/old = 2; minor WS-GPT-002 = 1; unknown WS-GPT-003 = 1;
+            # counts: blocker JW-GPT-001 + fix/old = 2; minor JW-GPT-002 = 1; unknown JW-GPT-003 = 1;
             # the merged fix/thing is counted once (as its triage blocker), not doubled as a major
             self.assertEqual(alpha["counts"], {"blocker": 2, "major": 0, "minor": 1, "unknown": 1})
 
@@ -8262,11 +8262,38 @@ class ImproveReviewsTests(unittest.TestCase):
             self.assertEqual(review.pending_reviews(root), [])
 
     def test_triage_ignores_verbatim_body(self):
-        # the verbatim body's `### WS-GPT-*` blocks must not be parsed — only the appended table
+        # the verbatim body's `### JW-GPT-*` blocks must not be parsed — only the appended table
         findings = improve._parse_triage(_TRIAGE_FEEDBACK)
-        self.assertEqual([f["id"] for f in findings], ["WS-GPT-001", "WS-GPT-002", "WS-GPT-003"])
+        self.assertEqual([f["id"] for f in findings], ["JW-GPT-001", "JW-GPT-002", "JW-GPT-003"])
         # a feedback body with NO appended skeleton yields nothing
-        self.assertEqual(improve._parse_triage("just prose, no table\n### WS-GPT-9 — x"), [])
+        self.assertEqual(improve._parse_triage("just prose, no table\n### JW-GPT-9 — x"), [])
+
+    def test_triage_reads_preserved_archive_and_both_prefixes(self):
+        review_dir = SCRIPTS.parent / "docs" / "reviews"
+        preserved_names = (
+            "2026-07-18-carrier-lanes-feedback.md",
+            "2026-07-18-carrier-lanes-fixes-feedback.md",
+            "2026-07-18-generation-binding-feedback.md",
+            "2026-07-19-evidence-authority-feedback.md",
+            "2026-07-19-evidence-authority-fixes-feedback.md",
+            "2026-07-19-m0-contracts-feedback.md",
+        )
+        archived = []
+        for name in preserved_names:
+            text = (review_dir / name).read_text(encoding="utf-8", errors="replace")
+            archived.extend(improve._parse_triage(text))
+        self.assertGreater(len(archived), 0)
+        self.assertEqual(len(archived), 21)
+        self.assertTrue(all(finding["id"].startswith("JW-GPT-") for finding in archived))
+
+        current = improve._parse_triage(
+            "## Findings (triage skeleton v2)\n"
+            "| finding | severity | type | verdict | evidence | task id |\n"
+            "|---|---|---|---|---|---|\n"
+            "| WS-GPT-901 — current | major | correctness | REAL | ev | fix/current |\n")
+        self.assertEqual([finding["id"] for finding in current], ["WS-GPT-901"])
+        prefixes = {finding["id"].split("-GPT-", 1)[0] for finding in archived + current}
+        self.assertEqual(prefixes, {"JW", "WS"})
 
     def test_triage_type_column_accepts_taxonomy_and_preserves_unknown(self):
         feedback = """## Findings (triage skeleton v2)
@@ -14760,10 +14787,10 @@ def _rule2_project(d):
         "meta\n\n## Findings (triage skeleton v1)\n"
         "| Finding | Severity | Verdict | Evidence | Task |\n"
         "| --- | --- | --- | --- | --- |\n"
-        "| WS-GPT-001 — a | `blocker` | REAL | ev | `fix/finding-a` |\n"
-        "| WS-GPT-002 — b | `major` | REAL | ev | `fix/finding-b` |\n"
-        "| WS-GPT-003 — c | `blocker` | REJECTED | ev | `fix/finding-c` |\n"
-        "| WS-GPT-004 — u | `major` | NEEDS-RULING | ev | |\n")
+        "| JW-GPT-001 — a | `blocker` | REAL | ev | `fix/finding-a` |\n"
+        "| JW-GPT-002 — b | `major` | REAL | ev | `fix/finding-b` |\n"
+        "| JW-GPT-003 — c | `blocker` | REJECTED | ev | `fix/finding-c` |\n"
+        "| JW-GPT-004 — u | `major` | NEEDS-RULING | ev | |\n")
     home = Path(d) / "home"
     home.mkdir()
     return root, home
@@ -14792,7 +14819,7 @@ class OverlayRuleTests(unittest.TestCase):
             fired_ids = sorted(f["task_id"] for f in out["fires"])
             # fix/finding-a fires (open blocker, REAL); b is done; c is REJECTED; d is minor
             self.assertEqual(fired_ids, ["fix/finding-a"])
-            # WS-GPT-004 has no linked task -> unlinked, not a fire
+            # JW-GPT-004 has no linked task -> unlinked, not a fire
             self.assertEqual(out["unlinked"], 1)
 
     def test_rule2_closing_done_override_suppresses_fire(self):
@@ -18622,7 +18649,7 @@ class L2CImproveFeedbackTests(unittest.TestCase):
                 "  - id: feat/x\n    title: x\n    status: done\n    round: r2\n")
             reviews_dir = root / "docs" / "reviews"
             reviews_dir.mkdir(parents=True)
-            for rid, fid in (("r1", "WS-GPT-001"), ("r2", "WS-GPT-002")):
+            for rid, fid in (("r1", "JW-GPT-001"), ("r2", "WS-GPT-002")):
                 (reviews_dir / f"{rid}-feedback.md").write_text(
                     "## Findings (triage skeleton v2)\n"
                     "| finding | severity | type | verdict | evidence | task id |\n"
