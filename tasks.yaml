@@ -535,3 +535,7 @@ tasks:
     title: "templates/profile-schema.json과 legacy delegate validator 간 기존 불일치 기록·정합: unknown top-level field 허용 여부, whitespace-only use_for, generic entry 허용 위치/값, arbitrary backend schema vs 실제 runner token 지원 범위 — 신규 profile_v1 adapter는 fail-closed를 택함(m1b-domain 보고 ⑤1), M1-C cut-over 특성화 시 대조 필요"
     status: "pending"
     deps: ["feat/run-cli-bridge"]
+  - id: fix/run-store-permission-hardening
+    title: "ADR-0013 'DB·artifact permission과 symlink' 절의 store 적용: .waystone/ state 디렉터리·state.db·sidecar·staging·최종 artifact의 mode 고정(0700/0600/0400)·WAL/SHM owner-mode 검증·no-follow 강제 — m1b-store 보고 ④11이 확인한 분해 누락 귀속 공백의 폐쇄 (symlink 거부는 커널에 이미 구현, mode 계약이 잔여)"
+    status: "pending"
+    deps: ["feat/run-store-kernel"]

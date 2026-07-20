@@ -128,6 +128,10 @@ from test_tasks import (
     TaskRegressionTests,
     AcceptFieldTests,
 )
+from test_run_store import (
+    ArtifactStoreTests,
+    RunStoreTests,
+)
 
 _TEST_CLASSES = (
     DelegateFanoutPlanTests,
@@ -215,6 +219,8 @@ _TEST_CLASSES = (
     TaskReadNudgeTests,
     TaskRegressionTests,
     AcceptFieldTests,
+    ArtifactStoreTests,
+    RunStoreTests,
 )
 
 for _test_class in _TEST_CLASSES:
