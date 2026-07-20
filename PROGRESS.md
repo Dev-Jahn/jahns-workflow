@@ -2,6 +2,26 @@
 
 round 단위 작업 이력이 이 파일에 축적된다. 활성 task와 의존성은 `tasks.yaml`(CLI: `waystone task`)과 생성 파일 `ROADMAP.md` 참조.
 
+## 2026-07-20-fleet-fix-wave
+
+- **Goal**: 대기 결함·정리 task 전량 병렬 착수 — fleet w0720(codex 9기: 구현 7·read-only 분석 1·M0 exit 적대 리뷰 1) + finding당 opus verifier 11기. main은 관제탑(브리핑·회수·머지·게이트·인수)만.
+- **Shipped** (implementer=external-runner/codex:gpt-5.6-sol ultra, 커밋-고정 worktree 9기 @ 662f2e3, 순차 squash 머지):
+  - `fix/hook-matrix-color-env` — uv cache dir probe의 색상 env 중화(근치, 파서 관대화 아님). dev 22ec0db
+  - `fix/shallow-ancestry-honesty` — shallow에서 merge-base rc=1을 unverifiable로 정직 강등 + dead-PID verify-fetch ref sweep(+기존 vacuous glob 단언 수리). dev 2ddd8f8
+  - `fix/probe-machine-axis-hostname-drift` + `fix/marker-diagnostics-polish` — hostname을 신원 축에서 진단으로 강등(E-09), proof schema v3 승격(v2는 1회 정직 재프로브 — silent 재해석 금지), marker 안내 3건. dev 340514e
+  - `fix/registry-worktree-misroute-guard` — linked worktree mutation을 lock/migration 이전 fail-closed 거부(`noncanonical_intent_mutation`; git-dir↔common-dir 불일치 판정 + GIT_* 중화). 실사고 2건 경로 폐쇄. dev 0c4ac61
+  - `fix/reclose-diff-base-drift` — 재close가 generation 1 결속 base_sha 재사용, generation 1 부재는 fail-closed. dev caf1b34
+  - `fix/delegate-env-prep-uv-cache` — worktree-local uv cache pre-warm(.waystone.yml 선언 + run_tests.py.lock + ruff pin); UV_OFFLINE=1 실재현 검증(임시 HTTP index→source 완전 제거). 부모 env 재사용은 mutable ambient state라 기각. dev ca20c62
+  - `chore/legacy-name-residue` — live 표면 구명 잔재 0(JW_REPORT→WAYSTONE_REPORT, 신규 finding ID WS-GPT, old-name migration 호환 폐기), 이력 245건 분류 보존. dev f8d8732
+- **M0 exit 적대 리뷰** (codex read-only): 원판정 blocker 3/major 6/minor 2 → **finding당 opus verifier 1기 반증 후 blocker 2/major 4/minor 5 확정**. blocker 강등 1(CDX-2: porting-ledger가 곧 닫힌 특성화 manifest — 리뷰어가 디렉터리형 fixture를 기대), major 강등 3. 생존 전량 task 등록(blocker 2·major 3·doc-sync 번들 1). 판정표: `docs/meta/agent-reports-2026-07-20/m0-exit-adjudication.md`. **main 권고: M0 exit 보류, blocker 2건(threat model 완결·등급 gate 실행가능화 — 둘 다 문서/계약 작업) 폐쇄 후 재심.**
+- **Gates**: 머지별 표적 게이트 rc=0 ×7 + rename 머지 트리 full gate **833 tests rc=0** (evidence: docs/meta/agent-reports-2026-07-20/ 각 보고서의 VERIFIED — 전 기 pre-registered acceptance·RED-first 준수, threshold 완화 0). 병렬 9기 hot-file 충돌 **0건**(클러스터 인접 규약 + anchor 구획 분할).
+- **SSOT**: unchanged (views 재생성만).
+- **Decisions pending**: decision/m0-exit-verdict · decision/pre-header-feedback-settlement-method(분석: 원인은 pre-canonical envelope, 현 HEAD 동종 6건, 권고 = digest 결속 archived-unverifiable marker) · decision/delegate-readme-disposition · (기존) chore/migration-sunset 이관 확인.
+- **Review**: requested (docs/reviews/2026-07-20-fleet-fix-wave-request.md).
+- **route 기록**: main·orchestrator=main-session/fable-5 (route-note). implementer/M0리뷰=raw codex exec(fleet-dispatch 레시피 — delegate 하네스의 env_prep 결함이 이번 wave 수리 대상이라 우회, 규약대로 raw 레시피+finding 처리). **finding 검증은 opus clean-subagent fan-out — profile의 verifier 바인딩(external-runner/codex, 위임 결과 검증용)과 다른 표면**(리뷰 finding 반증)이므로 route-note 미기록, 여기 명시.
+- **부수 발견**: jw-* lowercase 스키마 어댑터 잔재(→ chore/legacy-schema-marker-residue) · baseline 대비 dev 테스트 drift 828→833(M1-A 게이트 운용 규칙 필요, CDX-3 task에서 판단) · zsh에서 `PIPESTATUS` 빈값(rc 캡처는 파이프 없이 직접).
+- **Next**: 사용자 ruling 4건 → blocker 2건 폐쇄 → M0 exit 재심 → M1-A.
+
 ## 2026-07-20-m0-characterization
 
 - **Goal**: M0-C 완주 — runtime-state 처분 감사 실물 확정, porting ledger 개시(828건), traceability matrix 골격. 리뷰어가 걸었던 `characterization-baseline` 게이팅이 M0-B 계약 5건 폐쇄로 해소되어 착수 가능해진 상태였다.
