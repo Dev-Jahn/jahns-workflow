@@ -146,3 +146,25 @@ M1-A exit ②(invariant 위반 0)는 절대치로는 달성 불가다 — 현행
    **WAYSTONE_REPORT 보고 계약 stanza뿐**이다. registry(tasks.yaml)·round·exposure·overlay 등
    내부 상태 표면의 경로·지시·프로토콜은 worker prompt에 전달하지 않는다. 이 경계는
    특성화 테스트가 단언한다(fix/i10-prompt-minimality-characterization).
+
+## Amendment 2 — Addendum (2026-07-20, 같은 날) — I-10 현행 위반의 부채 편입
+
+특성화 착수 작업(w4-i10)이 §5 경계의 **현행 위반**을 확정했다(main 독립 재현 완료): 실제
+dispatch 경로(`scripts/delegate.py` — packet 조립 :544-592, TASK_BLOCK 렌더 :651-665·:673-687,
+`prompt.txt` 저장 :2156)가 registry 유래 표면 `status`·`milestone`·`round`·`anchor`·
+`routing_note`(dependency 존재 시 `deps`+상태 포함)를 rendered worker prompt에 전달한다.
+따라서 "현행 템플릿에서 green"인 정직한 경계-준수 테스트는 작성 불가다.
+
+1. **Known-debt 목록 확장 (§1에 추가).** 위 표면 집합의 worker prompt 전달을 I-10 부채로
+   고정한다. 근거: `docs/meta/agent-reports-2026-07-20/w4-i10.md`(재현 명령 포함). 수리는
+   M1-B(delegate 재구축)가 소유한다 — `fix/delegate-prompt-i10-surface-strip`. 수리 시점에
+   `anchor`는 goal/bounds 자료로 재편성될 수 있다(규범 목표는 §5 그대로; 목표 표면 집합의
+   확정은 수리 task의 일).
+2. **특성화 테스트의 형태 재규정.** `fix/i10-prompt-minimality-characterization`은
+   pinned-debt 형태로 작성한다: ⑴ 양성 단언(goal·bounds·acceptance·WAYSTONE_REPORT stanza)
+   ⑵ 현행 부채 표면 5종의 **정확 고정**(exact pin — 목록 외 registry/내부 표면이 하나라도
+   추가되면 red) ⑶ 부채 목록 외 대표 내부 표면(tasks.yaml 경로·ROADMAP·PROGRESS·.waystone/·
+   round close·exposure·overlay 지시)의 부재 단언. 이로써 M1-A가 요구하는 보호(기계 이동 중
+   **신규** 유출 0)는 성립하며, WS-GPT-101 blocker는 이 테스트의 착지로 폐쇄된다.
+3. **정합성.** 이 처분은 §2(known-debt 대비 신규 위반 0)·§3(M1-A 순수 기계 — 부채 수리 불허)
+   의 기존 기계를 그대로 적용한 것이다. M1-A에서 이 부채를 수리하는 것 역시 불허된다.

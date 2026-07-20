@@ -236,6 +236,7 @@ tasks:
     status: "pending"
     severity: "major"
   - id: fix/i10-prompt-minimality-characterization
+    notes: "형태 재규정(Amendment 2 Addendum §2): 현행 위반 확정(NO-GO, w4-i10 보고 + main 재현)으로 순수 경계-준수 테스트는 작성 불가 — pinned-debt 형태로: 양성 단언 + 부채 표면 5종(status·milestone·round·anchor·routing_note) exact pin(추가 표면 유입 시 red) + 목록 외 대표 내부 표면 부재 단언. 수리는 fix/delegate-prompt-i10-surface-strip(M1-B)"
     title: "I-10 특성화 테스트 신설: rendered worker prompt가 goal·bounds·판정요청+WAYSTONE_REPORT 보고 계약 stanza만 담고 registry/round/exposure/overlay 내부 프로토콜을 전달하지 않음을 부정형으로 단언 — I-10 관측 공백(ledger 0행·matrix TODO·단언 테스트 0)이 M1-A 착수 blocker (WS-GPT-101, verifier REAL; bookkeeping 경계는 ADR-0014 Amendment 2가 확정)"
     status: "pending"
     severity: "blocker"
@@ -251,13 +252,15 @@ tasks:
     severity: "minor"
     origin: "review-2026-07-20-fleet-fix-wave"
   - id: fix/improve-dual-prefix-archive-reader
+    result: "dual-prefix reader 복원(improve._FINDING_ID_RE만) — 보존 corpus 21건 0→21 RED/GREEN(실물 6파일), review.FINDING_RE는 WS-only 유지, 실물 corpus 회귀 테스트 신설, suite 818 rc=0 — dev b6bde56 (squash of 2e0d51e)"
     title: "improve 역사 triage reader를 dual-prefix((JW|WS)-GPT)로 복원: rename이 아카이브 reader까지 WS 전용화해 보존된 JW finding 21건이 투영·recurrence·overlay rule 2에서 소거(21→0 재현), fixture 개서로 회귀 은폐 — 신규 생성(review.FINDING_RE)은 WS 유지, 실제 보존 파일 대상 회귀 테스트 추가 (WS-GPT-104, verifier REAL major)"
-    status: "pending"
+    status: "done"
     severity: "major"
     origin: "review-2026-07-20-fleet-fix-wave"
   - id: docs/adr-0014-amendment2-m1a-debt-and-suite-pin
+    result: "Amendment 2 — known-debt 목록 고정(#473/#510/#516 E-08·#486 E-09·특성화 공백), exit ②='debt 대비 신규 위반 0', M1-A 순수 기계 ruling, suite test-ID manifest pin, I-10 bookkeeping 경계(WAYSTONE_REPORT stanza만) — WS-GPT-201·202 반증 조건 충족, suite 817 rc=0 — dev HEAD"
     title: "ADR-0014 Amendment 2: M1-A exit ②를 'pinned known-debt(ledger #473/#510/#516 E-08 반-계약·#486 E-09·특성화 공백 목록) 대비 신규 위반 0'으로 정정(절대 0은 현행 suite가 위반 동작을 성공 고정해 동시성립 불가) + suite identity manifest pin(같은 patch가 suite 축소해도 통과하는 자기참조 제거) + M1-A 순수 기계 단계 ruling + I-10 bookkeeping 경계 확정 (WS-GPT-201 blocker·202 major, main 검증 REAL)"
-    status: "pending"
+    status: "done"
     severity: "blocker"
     origin: "review-2026-07-20-ruling-execution"
   - id: docs/plan-m1c-exit-supersession
@@ -290,3 +293,8 @@ tasks:
     status: "pending"
     severity: "major"
     origin: "review-2026-07-20-ruling-execution"
+  - id: fix/delegate-prompt-i10-surface-strip
+    title: "worker prompt 조립에서 I-10 부채 표면(status·milestone·round·routing_note, deps 상태) 제거 — TASK_BLOCK 렌더가 registry 내부 표면을 전달(Amendment 2 Addendum이 known-debt로 고정); anchor는 goal/bounds 자료로 재편성 검토; M1-B delegate 재구축이 소유"
+    status: "pending"
+    severity: "major"
+    origin: "review-2026-07-20-fleet-fix-wave"
