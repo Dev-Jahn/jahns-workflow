@@ -231,3 +231,62 @@ tasks:
     title: "재심 minor/major 정합 3건: promoted-contracts 확정/초안 이중 선언 동기화(WS-RX-2), plan §3-3 lease_epoch→fencing_epoch 표기 통일(WS-RX-3, accepted ADR 전부 fencing_epoch), promoted-contracts의 stale 'ADR-0003 §3-9' anchor 2건 실제 heading 인용으로(WS-RX-4)"
     status: done
     severity: "minor"
+  - id: decision/m1a-start-approval
+    title: "M1-A 착수 승인 — 사용자가 자율 처리 위임(2026-07-20 '리뷰패킷은 codex ultra로 처리, 후속작업 자율, 쭉 자율개발'). main 집행 조건: 두 round packet(fleet-fix-wave·ruling-execution)의 codex 적대 리뷰 회신 처리에서 미해소 blocker 0이면 착수 판정, blocker 발생 시 폐쇄 후 착수"
+    status: "pending"
+    severity: "major"
+  - id: fix/i10-prompt-minimality-characterization
+    title: "I-10 특성화 테스트 신설: rendered worker prompt가 goal·bounds·판정요청+WAYSTONE_REPORT 보고 계약 stanza만 담고 registry/round/exposure/overlay 내부 프로토콜을 전달하지 않음을 부정형으로 단언 — I-10 관측 공백(ledger 0행·matrix TODO·단언 테스트 0)이 M1-A 착수 blocker (WS-GPT-101, verifier REAL; bookkeeping 경계는 ADR-0014 Amendment 2가 확정)"
+    status: "pending"
+    severity: "blocker"
+    origin: "review-2026-07-20-fleet-fix-wave"
+  - id: fix/env-prep-toolchain-digest-binding
+    title: "env_prep toolchain(ruff 포함)의 source+artifact digest 결속: 위조 ruff wheel이 ambient index로 offline gate를 통과(재현됨) — 단 동일 gap이 명시 이월된 M1 target(ADR-0012 VerificationPlan·ADR-0013 child env)이라 minor, M1 해당 작업에 편입 (WS-GPT-102, verifier major→minor)"
+    status: "pending"
+    severity: "minor"
+    origin: "review-2026-07-20-fleet-fix-wave"
+  - id: fix/linked-read-lock-litter
+    title: "linked worktree에서 read(list/show)가 lock 획득으로 .waystone/{.gitignore,lock}을 생성 — 거부·정상 어느 경로든 잔재가 먼저 생김(재현). need_root read 경로에서 canonical 정규화 또는 typed 거부를 lock 이전에 (WS-GPT-103 잔여, verifier PARTIAL major→minor; 파괴 절반은 sunset이 기해소)"
+    status: "pending"
+    severity: "minor"
+    origin: "review-2026-07-20-fleet-fix-wave"
+  - id: fix/improve-dual-prefix-archive-reader
+    title: "improve 역사 triage reader를 dual-prefix((JW|WS)-GPT)로 복원: rename이 아카이브 reader까지 WS 전용화해 보존된 JW finding 21건이 투영·recurrence·overlay rule 2에서 소거(21→0 재현), fixture 개서로 회귀 은폐 — 신규 생성(review.FINDING_RE)은 WS 유지, 실제 보존 파일 대상 회귀 테스트 추가 (WS-GPT-104, verifier REAL major)"
+    status: "pending"
+    severity: "major"
+    origin: "review-2026-07-20-fleet-fix-wave"
+  - id: docs/adr-0014-amendment2-m1a-debt-and-suite-pin
+    title: "ADR-0014 Amendment 2: M1-A exit ②를 'pinned known-debt(ledger #473/#510/#516 E-08 반-계약·#486 E-09·특성화 공백 목록) 대비 신규 위반 0'으로 정정(절대 0은 현행 suite가 위반 동작을 성공 고정해 동시성립 불가) + suite identity manifest pin(같은 patch가 suite 축소해도 통과하는 자기참조 제거) + M1-A 순수 기계 단계 ruling + I-10 bookkeeping 경계 확정 (WS-GPT-201 blocker·202 major, main 검증 REAL)"
+    status: "pending"
+    severity: "blocker"
+    origin: "review-2026-07-20-ruling-execution"
+  - id: docs/plan-m1c-exit-supersession
+    title: "계획 M1-C exit의 legacy comparator 문구('기존 characterization green·old-new 등급 호환·구 관측 계약 동일')를 ADR-0014 기준(PC/invariant/accepted ADR semantic contract)으로 supersede — 현행은 같은 구현이 ADR 통과·계획 거부되는 이중 기준 (WS-GPT-203, main 검증 REAL 원문 확인)"
+    status: "pending"
+    severity: "major"
+    origin: "review-2026-07-20-ruling-execution"
+  - id: docs/promoted-reverse-closure-and-pc31
+    title: "승격 목록 reverse closure: ledger 85 클래스 전수가 {승격|명시 비승격} 정확히 한쪽에 속함을 양방향 검증 + 누락된 UninitializedRootGateTests의 미초기화 root no-write 계약을 PC-31로 승격(criterion ②) (WS-GPT-204, main 검증 REAL — 현 validator는 단방향)"
+    status: "pending"
+    severity: "major"
+    origin: "review-2026-07-20-ruling-execution"
+  - id: docs/matrix-regen-adr13-obligations
+    title: "traceability matrix를 HEAD 기준 재생성(삭제된 MigrationV2Phase2Tests 4건 인용 제거·I-07 현행 증거로 교체) + ADR-0013 신규 의무(token mismatch·lock 획득 후 DB tuple recheck·reclaim race fault test)를 matrix 행과 promoted 신규 의무 절·M1-B fixture 목록에 등록 (WS-GPT-205, main 검증 REAL)"
+    status: "pending"
+    severity: "major"
+    origin: "review-2026-07-20-ruling-execution"
+  - id: fix/review-binding-generation-collision
+    title: "binding generation 충돌 fail-open 폐쇄 3종: sequence regex를 형제들과 동일한 [1-9]\\d*로(현재 \\d+ 단독 예외), 논리 generation당 후보 ≠1이면 pending/unknown(하중 규칙 — glob이 여전히 -02를 흡수하므로 regex만으론 불충분), binding reader를 기존 duplicate-key 거부 parser로 (WS-GPT-206, verifier REAL 실라운드 재현 — settlement가 alias 추가에도 archived 유지)"
+    status: "pending"
+    severity: "major"
+    origin: "review-2026-07-20-ruling-execution"
+  - id: fix/sunset-preserved-profile-divergence
+    title: "sunset detector가 분기된 preserved profile을 완료 seed로 오인(fail-open 재현: preserved 분기→조용한 False, plain root 동형은 typed 거부 — 비대칭): 분기 시 profile.yml을 offender로 typed 거부, 동일-잔재 수용 유지 — '정상 완료 이관은 분기 profile을 만들 수 없다'(구 Phase 2가 거부) (WS-GPT-207, verifier REAL major)"
+    status: "pending"
+    severity: "major"
+    origin: "review-2026-07-20-ruling-execution"
+  - id: fix/sunset-marker-container-symlink
+    title: "pending-worktree marker container가 symlink/non-directory면 detector 우회(fail-open 재현, 구 0.11은 typed 거부 — 회귀·ADR-0013:52 위반): container가 real dir 아니면 container 자체를 offender로, no-follow symlink·regular-file acceptance 테스트 추가 — 형제 helper들은 이미 올바름(국소 불일치) (WS-GPT-208, verifier REAL major)"
+    status: "pending"
+    severity: "major"
+    origin: "review-2026-07-20-ruling-execution"

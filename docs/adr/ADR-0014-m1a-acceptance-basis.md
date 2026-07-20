@@ -116,3 +116,33 @@ ledger 배정 문단을 명시적으로 supersede한다. 계획서 원문은 역
 4. **본문 :30-31의 한정.** "legacy 828 suite의 green은 필요조건도 충분조건도 아니다"는 재구축
    마일스톤들의 acceptance에 대한 서술로 한정한다. 행동 보존을 선언한 기계 단계(M1-A)에서는
    위 ③이 필요조건이다.
+
+## Amendment 2 (2026-07-20) — 알려진 부채의 분리와 suite identity 고정
+
+리뷰 finding WS-GPT-201(blocker)·WS-GPT-202(major)가 확인한 결함을 고정한다: Amendment 1의
+M1-A exit ②(invariant 위반 0)는 절대치로는 달성 불가다 — 현행 suite 자체가 invariant에 반하는
+동작을 성공 조건으로 고정하고 있고(ledger가 E-08 반-계약으로 분류·settled), 그것을 M1-A에서
+고치면 동작 무변경 원칙이 깨진다. 또한 ③(현행 suite green)은 suite identity를 고정하지 않아
+같은 patch가 suite를 축소해도 통과하는 자기참조였다.
+
+1. **Known-debt 목록 (이 Amendment가 고정).** 다음은 M1-A 시점에 존재가 알려진 invariant
+   부채이며, M1-A exit 판정에서 제외된다:
+   - `docs/porting-ledger.md` #473(claim-only discard)·#510(running discard)·#516(orphan
+     discard) — E-08 반-계약 suite 고정, rewrite disposition·ruling settled, M1-B 이후
+     재구축 마일스톤이 해소를 소유한다.
+   - #486(shim identity의 size/mtime 판정) — E-09 반-계약, content digest rewrite 예정.
+   - `docs/promoted-contracts.md` "Legacy reference가 없는 신규 계약 의무" 절의 특성화 공백
+     전체 — 각 항목의 신규 테스트가 소유 마일스톤에서 신설된다.
+2. **M1-A exit ② 정정.** "I-01~12·E-01~09 위반 0"은 **위 known-debt 목록 대비 신규 위반 0**
+   으로 읽는다. 목록에 없는 위반의 신규 도입은 불허하며, 목록의 부채를 M1-A에서 수리하는 것도
+   불허한다(동작 무변경 — 수리는 소유 마일스톤의 일이다).
+3. **M1-A 성격 ruling (리뷰 open question 1).** M1-A는 **순수 기계 단계**다. 알려진
+   E-08/E-09 부채의 수리를 M1-A에 포함하는 노선은 기각한다.
+4. **Suite identity 고정 (exit ③ 정정).** M1-A 착수 시점에 시작 commit의 test-ID 전수와
+   계수를 manifest로 pin한다. M1-A 도중 suite 변경은 ⑴ 기계 분할에 따른 이동(test-ID 보존)
+   ⑵ main이 명시 승인해 manifest 차이 목록에 기록한 항목 외에는 불허한다. exit ③의 "green"은
+   이 manifest 전수의 실행 green이다.
+5. **I-10 bookkeeping 경계 (WS-GPT-101 폐쇄 지원).** worker prompt에 허용되는 bookkeeping은
+   **WAYSTONE_REPORT 보고 계약 stanza뿐**이다. registry(tasks.yaml)·round·exposure·overlay 등
+   내부 상태 표면의 경로·지시·프로토콜은 worker prompt에 전달하지 않는다. 이 경계는
+   특성화 테스트가 단언한다(fix/i10-prompt-minimality-characterization).
