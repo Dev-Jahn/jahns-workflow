@@ -471,6 +471,8 @@ tasks:
     title: "M1-B vertical slice 분해 계획(main 설계): transactional store §3-1·effect protocol §3-4·executor 경계 §3-6·4-role domain model·delegate wrapper 신엔진 호출·typed envelope·fault fixture 8건 표를 구현 task들로 분해 + PC 귀속(M1-B분)·편입 예약 6건(i10-strip·review-runs-uuid·#014/#015·ADR-0013 fault·_git 정렬·shim parent guard) 배치"
     status: "done"
   - id: feat/delegation-network-resilience
+    notes: "설계 전제(m1b-supervisor 보고 ④2·④3, 2026-07-21): ⑴ supervisor 사망+worker 생존 시 타 process는 waitpid로 원 returncode 회수 불가 — 완전한 completion 복구는 worker exec 전 barrier를 가진 engine-owned exit-receipt trampoline 필요 ⑵ detached Popen 성공~runtime identity 게시 전 window의 supervisor 사망은 reserved-without-observable-identity typed refusal로 남고 자동 재기동 없음(at-most-once 우선) — auto-restart/fenced re-entry protocol은 이 task가 소유. S1(unknown-effect 대기+resume)·S2(detached 생존)·S3(recoverable 분류) 기질 위에서 wait/retry/backoff/resume 정책 구현."
+    scope: ["waystone/runs/supervisor.py"]
     title: "위임 agent의 네트워크 단절·API 오류 자율 복원: orchestrator 관여 0으로 네트워크 복구 대기→retry→중단 지점 resume까지 runner/transport 계층이 자체 수행 (0.12 신엔진 executor 경계 §3-6·effect protocol 위에서 — 세션 이동 등 일상 단절에 wave가 격추되지 않게; 사용자 요청 2026-07-20, 당장 구현하지 말고 M1-B+ 배치 시 편입 검토)"
     status: "pending"
   - id: docs/adr-0014-addendum3-shim-boundaries
@@ -562,7 +564,7 @@ tasks:
     title: "m1b-spec 해석 일괄 판정: ①ADR-0010 acceptance envelope vs legacy 문자열(§2-6 tasks.yaml 불변과의 3자 충돌 — ADR-0010 amendment 필요) ②review decision null 허용 여부 ③no-retry 기본값(main 수용) ④RunSpec/snapshot의 EVIDENCE kind 재사용 ⑤canonical JSON·job id <run-uuid>:job 형식 고정(main 수용) ⑦PC-31 no-write 우선(main 수용) ⑧role binding은 preflight/VerificationPlan 소유(main 수용) — ①②④는 라운드 마감 시 ADR-0010 amendment로 확정 (m1b-spec 보고 ④)"
     status: "pending"
   - id: decision/run-engine-format-pinning-batch
-    ruling: "잠정 ruling 2026-07-21: 현 구현 선택 전부 v1로 수용. gate/m1b-exit에서 docs/run-engine-formats.md(v1 format registry)로 명문화하고 이후 변경은 migration 경유로 강제. plan revision 모델(preflight ②: run당 1건 immutable, 변경=새 run)과 실패 preflight audit 부재(⑧: typed exception만)도 v1 수용 — audit 영속화는 store owner의 후속 schema."
+    ruling: "잠정 ruling 2026-07-21: 현 구현 선택 전부 v1로 수용. gate/m1b-exit에서 docs/run-engine-formats.md(v1 format registry)로 명문화하고 이후 변경은 migration 경유로 강제. plan revision 모델(preflight ②: run당 1건 immutable, 변경=새 run)과 실패 preflight audit 부재(⑧: typed exception만)도 v1 수용 — audit 영속화는 store owner의 후속 schema. effects 추가분: ④7 reclaim 경합의 unreferenced orphan bytes는 ADR-0007 orphan artifact 범주(doctor 보고·자동삭제 금지)로 정합 수용, ④19 runner stdout/stderr artifact의 GC 도달성(receipt graph 재귀 mark vs 직접 DB reference)은 GC 구현 시점(M1-C+)에 확정. perm 추가분: ④3 SQLite actual-open의 O_NOFOLLOW 불가는 stdlib 한계로 수용(preflight 검증+선생성 fail-closed가 ADR 위협 경계 내 — 의도적 swap/TOCTOU는 명시적 비보호), ④4 기존 object는 ADR 전문의 의미 조건(owner access·non-owner write 부재·final write-bit 부재)으로 판정 수용(신규 object만 exact mode), ①② corruption fixture는 명시적 chmod 주입+descriptor seam으로 갱신 승인(계약 불변)."
     title: "신엔진 v1 표현 계약 일괄 고정: store EVIDENCE reference kind 재사용·evidence digest cardinality(store ④1·⑤) / RunSpec·plan의 canonical JSON(sorted-key compact UTF-8)+sha256:<hex>·job id <run-uuid>:job(spec ⑤) / preflight의 verification-plan:<run_id> reference·runner proof 7축 이름·receipt schema(preflight ①③⑩) — 소비자 확산 전 format registry로 고정 필요"
     status: "pending"
   - id: chore/profile-v1-bytes-public-api
@@ -570,3 +572,7 @@ tasks:
     status: "pending"
     severity: "minor"
     deps: ["feat/run-verification-preflight"]
+  - id: fix/effects-runner-absence-seam
+    title: "effects runner reconcile에 supervisor의 positive absence evidence 소비 seam 추가: 현행 effects는 runner WAI+marker 부재 시 quiescence callback 호출 전에 unknown-effect를 반환해 supervisor가 산출하는 boot/start-token exact-identity absence 증거를 받을 수 없음 — 영구 unknown-effect의 해소 경로(S1 기질 완성)를 additive effects 확장으로 연결 (m1b-supervisor 보고 ④1·⑤1, effects ④5의 consumer 측)"
+    status: "pending"
+    deps: ["feat/run-effect-protocol", "feat/run-supervisor-identity"]

@@ -145,6 +145,9 @@ from test_run_store import (
     ArtifactStoreTests,
     RunStoreTests,
 )
+from test_run_supervisor import (
+    RunSupervisorTests,
+)
 from test_run_spec import (
     RunSpecTests,
 )
@@ -242,6 +245,7 @@ _TEST_CLASSES = (
     AcceptFieldTests,
     ArtifactStoreTests,
     RunStoreTests,
+    RunSupervisorTests,
     RunSpecTests,
 )
 
