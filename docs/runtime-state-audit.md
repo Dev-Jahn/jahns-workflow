@@ -177,3 +177,37 @@ ingest provenance를 재파생할 수 없다. completion/merge authority는 Git 
 - §2-5의 porting ledger/traceability matrix는 이 처분표와 별개 산출물이다. 다만 M1에서
   delegation patch/review request 같은 canonical artifact writer를 옮길 때 byte-identical,
   machine JSON은 schema/value 동일, handoff는 의미 호환이라는 §6 M1-A 등급을 적용해야 한다.
+
+
+---
+
+## Finding 처분 (main 판정 2026-07-20)
+
+감사가 낸 6건을 성격별로 3건으로 통합해 처분했다.
+
+| Finding | 처분 | 근거 |
+|---|---|---|
+| **F-01** profile.yml의 권위가 untracked local | `fix/profile-intent-vs-capability-split` (major) | 실물 확인 결과 profile.yml은 **프로젝트 정책**이다 — "어려운 설계는 fable, 구현은 codex xhigh"는 이 프로젝트를 어떻게 일할지의 결정이며 다른 머신에서도 동일해야 한다. project 라우팅 의도(git-tracked)와 machine 능력·해석(local)을 분리한다. |
+| **F-06** machine-tier state의 처분 부재 | `docs/machine-tier-state-disposition` (major) | 계획서 §5-1은 project-local `.waystone/`만 다루는데, ADR-0011이 2026-07-19에 `~/.waystone/projects.json`을 canonical mapping 권위로 신설했다. 계획이 자기가 만든 권위를 아직 분류하지 않은 상태다. |
+| **F-02~F-05** 역사적 local-only 감사 기록 | **수용된 잔여** — `decision/local-audit-recoverability` (ruled) | 아래 참조. |
+
+### 수용된 잔여: 역사적 local-only 감사 기록
+
+**대상**: delegation record 101건 · round exposure 12건 · consent event 4건 · review-ingest provenance.
+
+**계약**: 이 기록들은 machine-local이며 **git에서 재파생 불가하고 유실 시 복구되지 않는다.** 이를
+결함이 아니라 **명시적으로 수용된 한계**로 확정한다(사용자 결정 2026-07-20).
+
+**근거**: ⑴ 백업·요약 기계는 그 자체가 두 번째 권위 표면이 되어 "원본과 요약 중 무엇이 맞나"를
+낳는다 — ADR-0006이 closeout manifest에 verifier verdict를 이식하지 않기로 한 것과 같은 논리다.
+⑵ 67MB 대부분이 러너 로그이며, git 편입 시 저장소가 매 라운드 부풀고 프롬프트 원문·모델 출력이
+공개 히스토리에 박힌다. ⑶ **정확성이 걸린 판정 — 무엇이 인수됐고 왜 — 은 이미 전부 git에 있다**
+(`tasks.yaml` result·`PROGRESS.md`·`docs/reviews/`·커밋 메시지). 사라지는 것은 과정의 세부다.
+
+**동반 규율 (수용의 조건)**:
+
+1. 완료 판정·인수 근거를 이 기록에만 의존해 기술하지 않는다 — 결론과 그 근거는 PROGRESS와
+   task result에 남기는 것이 규율이다.
+2. 머신 교체·초기화 시 이 기록이 함께 사라진다는 것을 전제로 운영한다.
+3. 다른 머신에서 수행한 위임의 기록은 그 머신에만 남는다 — 이는 정상 동작이며
+   cross-machine handoff는 git 경유(task·리뷰·PROGRESS)로 이루어진다(§5-3 ruling #6과 정합).

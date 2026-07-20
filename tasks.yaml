@@ -786,3 +786,31 @@ tasks:
     status: "pending"
     severity: "major"
     origin: "plan-0.12-M0C"
+  - id: fix/profile-intent-vs-capability-split
+    title: "profile.yml이 project 라우팅 의도(어느 역할을 어떤 성격의 백엔드에)와 machine 능력(그 백엔드가 이 머신에 있는가)을 한 파일에 섞어, 프로젝트 정책이 untracked local file에만 존재 — 의도는 git-tracked로, 능력·해석은 machine-local로 분리 (감사 F-01)"
+    status: "pending"
+    severity: "major"
+    origin: "audit-2026-07-19"
+  - id: docs/machine-tier-state-disposition
+    title: "계획서 §5-1이 project-local .waystone/만 다루고 machine-tier(~/.waystone/, 특히 ADR-0011이 오늘 신설한 projects.json canonical mapping)의 처분을 정의하지 않음 — §5-1에 machine-tier 층 추가 (감사 F-06)"
+    status: "pending"
+    severity: "major"
+    origin: "audit-2026-07-19"
+  - id: decision/local-audit-recoverability
+    ruling: "수용된 잔여로 명시한다 (사용자 결정 2026-07-20, 옵션 a). 대상: delegation record 101건 · round exposure 12건 · consent event 4건 · review-ingest provenance. 이들은 machine-local이며 git에서 재파생 불가하고 유실 시 복구되지 않는다. 근거: ⑴ 백업·요약 기계를 만들면 그 자체가 두 번째 권위 표면이 되어 '원본과 요약 중 무엇이 맞나'를 낳는다 — ADR-0006이 closeout manifest에 verifier verdict를 이식하지 않기로 한 것과 동일 논리 ⑵ 67MB 대부분이 러너 로그이며 git 편입 시 저장소가 매 라운드 부풀고 프롬프트 원문·모델 출력이 공개 히스토리에 박힌다 ⑶ 정확성이 걸린 판정(무엇이 인수됐고 왜)은 이미 전부 git에 있다 — 사라지는 것은 과정의 세부다. 동반 규율: ① 완료 판정·인수 근거를 이 기록에만 의존해 기술하지 않는다(결론과 근거는 PROGRESS·task result에) ② 머신 교체·초기화 시 함께 사라짐을 전제로 운영한다 ③ 다른 머신의 위임 기록은 그 머신에만 남는다(정상 동작)"
+    title: "역사적 local-only 감사 기록(delegation archive 101건·round exposure 12건·consent 4건·review-ingest provenance 8행)의 복구 가능성 계약 — git에서 재파생 불가함을 수용된 잔여로 명시할지, export/backup 경로를 제공할지 (감사 F-02~F-05 통합)"
+    status: "done"
+    severity: "major"
+    origin: "audit-2026-07-19"
+  - id: decision/claim-only-remnant-discard-proof
+    ruling: "폐기는 effect 미개시의 **적극 증명**이 있을 때만 허용한다 (main ruling 2026-07-19). 'exposure.json이 없다'는 effect가 없었다는 증거가 아니라 기록이 없다는 사실일 뿐이며, effect 개시 후 기록 쓰기 실패와 구분되지 않는다 — ADR-0002가 이미 '긍정적으로 미생성임을 확인한 경우에만 동일 action으로 생성'으로 같은 규율을 세웠고, E-08은 침묵을 종료 증거로 쓰지 못하게 한다. 따라서 claim-only 잔여물은 ⑴ fencing epoch 미진행 ⑵ 해당 action id가 각인된 worktree·ref·process·artifact의 부재를 **관측**했을 때만 폐기 가능하며, 관측 채널이 없으면 unknown-effect로 보존한다. M1 reconcile 경계 확정 시 이 조건으로 테스트를 재작성한다"
+    title: "claim-only crash 잔여물의 폐기 조건 — 현행 테스트는 effect 부재의 적극 증명 없이 폐기 가능하다고 단언하나 ADR-0003 §3-9는 destructive cleanup에 긍정적 quiescence 관측을 요구 (ledger needs-ruling #473)"
+    status: "done"
+    severity: "major"
+    origin: "ledger-2026-07-19"
+  - id: decision/shim-replacement-identity-basis
+    ruling: "교체 판정은 **content digest**에 결속한다 (main ruling 2026-07-19). size/mtime은 값싼 사전 필터로 유지할 수 있으나 단독 판정 근거가 될 수 없다 — 같은 크기·시각으로 교체되면 탐지에 실패하고, 이는 round-5 JW-GPT-013(디렉터리 stat→config 내용 digest)과 동일한 실수의 반복이다. 개정 E-09의 허용 조항(ambient 값은 scope·lifetime 선언 하에 locator/freshness로만)에 비추어도 stat은 locator일 뿐 identity가 아니다. E-03의 probe proof 재사용 축과 정합하게 executable content digest를 신뢰 축으로 삼아 재작성한다"
+    title: "stdout shim 교체 감지의 신원 축 — 현행은 executable size/mtime 단독 판정이나 개정 E-09는 incidental 파일시스템 메타데이터를 durable authority로 금지 (ledger needs-ruling #486)"
+    status: "done"
+    severity: "major"
+    origin: "ledger-2026-07-19"
