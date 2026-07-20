@@ -372,6 +372,7 @@ _SUB_OPTIONS = {
     "archive": {"threshold", "keep"},
 }
 _MUTATION_SUBCOMMANDS = frozenset({"add", "set", "drop", "archive"})
+_READ_SUBCOMMANDS = frozenset({"list", "show"})
 
 
 def _split(sub: str, rest: list[str]) -> tuple[list[str], dict, str | None]:
@@ -420,14 +421,15 @@ def _resolve_root(explicit: str | None) -> Path | None:
     return Path(explicit).resolve() if explicit else find_project_root(Path.cwd())
 
 
-def _refuse_linked_worktree_mutation(root: Path) -> None:
-    """Reject linked worktrees; fail closed when a checkout's Git context is unverifiable."""
+def _git_checkout_context(root: Path, action: str) -> tuple[Path, Path, Path] | None:
+    """Return scrubbed Git/private-common/top-level paths, or None for a non-Git project."""
     has_git_marker = any((candidate / ".git").exists() or (candidate / ".git").is_symlink()
                          for candidate in (root, *root.parents))
     env = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
     try:
         probe = subprocess.run(
-            ["git", "-C", str(root), "rev-parse", "--git-dir", "--git-common-dir"],
+            ["git", "-C", str(root), "rev-parse", "--git-dir", "--git-common-dir",
+             "--show-toplevel"],
             capture_output=True, text=True, timeout=15, env=env,
         )
     except (OSError, subprocess.TimeoutExpired) as e:
@@ -435,26 +437,75 @@ def _refuse_linked_worktree_mutation(root: Path) -> None:
             return  # without filesystem Git metadata, this root cannot be a linked worktree
         raise WorkflowError(
             f"project_context_unavailable: cannot verify Git checkout context for {root}"
-            f" ({e}); refusing registry mutation — run the command from the canonical checkout") from e
+            f" ({e}); refusing {action} — run the command from the canonical checkout") from e
     if probe.returncode != 0:
         if not has_git_marker:
             return  # without filesystem Git metadata, this root cannot be a linked worktree
         detail = probe.stderr.strip() or f"git exited {probe.returncode}"
         raise WorkflowError(
             f"project_context_unavailable: cannot verify Git checkout context for {root} "
-            f"({detail}); refusing registry mutation — "
+            f"({detail}); refusing {action} — "
             "run the command from the canonical checkout")
     observed = probe.stdout.splitlines()
-    if len(observed) != 2 or not all(observed):
+    if len(observed) != 3 or not all(observed):
         raise WorkflowError(
             f"project_context_unavailable: Git returned incomplete checkout context for {root}; "
-            "refusing registry mutation — run the command from the canonical checkout")
+            f"refusing {action} — run the command from the canonical checkout")
 
-    git_dir_text, common_dir_text = observed
+    git_dir_text, common_dir_text, worktree_root_text = observed
     git_dir = Path(git_dir_text)
     common_dir = Path(common_dir_text)
+    worktree_root = Path(worktree_root_text)
     git_dir = (git_dir if git_dir.is_absolute() else root / git_dir).resolve()
     common_dir = (common_dir if common_dir.is_absolute() else root / common_dir).resolve()
+    worktree_root = (worktree_root if worktree_root.is_absolute()
+                     else root / worktree_root).resolve()
+    return git_dir, common_dir, worktree_root
+
+
+def _canonical_read_root(root: Path) -> Path:
+    """Normalize a linked checkout read to a proven canonical checkout before any lock write."""
+    context = _git_checkout_context(root, "task registry read")
+    if context is None:
+        return root
+    git_dir, common_dir, active_worktree_root = context
+    if git_dir == common_dir:
+        return root
+
+    unavailable = (f"project_context_unavailable: cannot prove canonical checkout for linked "
+                   f"worktree {root}; refusing task registry read — pass the canonical checkout "
+                   "root explicitly")
+    try:
+        project_relative = root.relative_to(active_worktree_root)
+    except ValueError:
+        raise WorkflowError(unavailable)
+    canonical_worktree_root = common_dir.parent.resolve()
+    candidate_context = _git_checkout_context(canonical_worktree_root, "task registry read")
+    if (candidate_context is None or candidate_context[0] != candidate_context[1]
+            or candidate_context[1] != common_dir
+            or candidate_context[2] != canonical_worktree_root):
+        raise WorkflowError(unavailable)
+    canonical_root = (canonical_worktree_root / project_relative).resolve()
+    try:
+        canonical_root.relative_to(canonical_worktree_root)
+    except ValueError:
+        raise WorkflowError(unavailable)
+    canonical_context = (candidate_context if canonical_root == canonical_worktree_root
+                         else _git_checkout_context(canonical_root, "task registry read"))
+    if (canonical_context is None or canonical_context[0] != canonical_context[1]
+            or canonical_context[1] != common_dir
+            or canonical_context[2] != canonical_worktree_root
+            or find_project_root(canonical_root) != canonical_root):
+        raise WorkflowError(unavailable)
+    return canonical_root
+
+
+def _refuse_linked_worktree_mutation(root: Path) -> None:
+    """Reject linked worktrees; fail closed when a checkout's Git context is unverifiable."""
+    context = _git_checkout_context(root, "registry mutation")
+    if context is None:
+        return
+    git_dir, common_dir, _worktree_root = context
     if git_dir != common_dir:
         raise WorkflowError(
             f"noncanonical_intent_mutation: refusing task registry mutation for linked worktree "
@@ -480,12 +531,14 @@ def main(argv: list[str]) -> int:
         if root is None:
             print("waystone task: no initialized project (run inside one, or pass its path)", file=sys.stderr)
             return None
-        if sub in _MUTATION_SUBCOMMANDS:
-            try:
+        try:
+            if sub in _READ_SUBCOMMANDS:
+                root = _canonical_read_root(root)
+            elif sub in _MUTATION_SUBCOMMANDS:
                 _refuse_linked_worktree_mutation(root)
-            except WorkflowError as e:
-                print(f"waystone task: {e}", file=sys.stderr)
-                return None
+        except WorkflowError as e:
+            print(f"waystone task: {e}", file=sys.stderr)
+            return None
         try:
             # Lazy migration has its own short lock span before the verb's body lock.
             with hold_project_lock(root):

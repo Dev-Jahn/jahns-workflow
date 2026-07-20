@@ -6760,6 +6760,137 @@ class TaskCliTests(unittest.TestCase):
             alpha = next(t for t in data["tasks"] if t["id"] == "feat/alpha")
             self.assertEqual(alpha["status"], "active")
 
+    def test_linked_worktree_reads_use_canonical_checkout_without_linked_state(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            root = base / "repo"
+            linked = base / "linked"
+            home = base / "home"
+            root.mkdir()
+            home.mkdir()
+            init_repo(root)
+            (root / ".waystone.yml").write_text("version: 1\nproject: x\n")
+            (root / "tasks.yaml").write_text(TASKS_FIXTURE)
+            self.assertEqual(git(root, "add", ".waystone.yml", "tasks.yaml").returncode, 0)
+            self.assertEqual(git(root, "commit", "-qm", "add waystone project").returncode, 0)
+            added = git(root, "worktree", "add", "-q", "--detach", str(linked), "HEAD")
+            self.assertEqual(added.returncode, 0, added.stderr)
+            linked_tasks = (linked / "tasks.yaml").read_text()
+
+            canonical = yaml.safe_load(TASKS_FIXTURE)
+            canonical["tasks"][0]["title"] = "canonical checkout only"
+            (root / "tasks.yaml").write_text(
+                yaml.safe_dump(canonical, sort_keys=False, allow_unicode=True))
+
+            def invoke(argv, cwd):
+                previous = Path.cwd()
+                out, err = io.StringIO(), io.StringIO()
+                try:
+                    os.chdir(cwd)
+                    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                        rc = _run_with_home(home, lambda: tasks.main(argv))
+                finally:
+                    os.chdir(previous)
+                return rc, out.getvalue(), err.getvalue()
+
+            for cwd in (root, linked):
+                for argv in (["list"], ["show", "feat/alpha"]):
+                    with self.subTest(cwd=cwd.name, argv=argv):
+                        rc, out, err = invoke(argv, cwd)
+                        self.assertEqual(rc, 0, err)
+                        self.assertIn("canonical checkout only", out)
+            self.assertFalse((linked / ".waystone").exists())
+            self.assertEqual((linked / "tasks.yaml").read_text(), linked_tasks)
+
+    def test_linked_nested_project_read_maps_to_same_canonical_project(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            repo = base / "repo"
+            linked_worktree = base / "linked"
+            project = repo / "nested-project"
+            home = base / "home"
+            repo.mkdir()
+            home.mkdir()
+            init_repo(repo)
+            project.mkdir()
+            (project / ".waystone.yml").write_text("version: 1\nproject: nested\n")
+            (project / "tasks.yaml").write_text(TASKS_FIXTURE)
+            self.assertEqual(git(repo, "add", "nested-project").returncode, 0)
+            self.assertEqual(git(repo, "commit", "-qm", "add nested project").returncode, 0)
+            added = git(repo, "worktree", "add", "-q", "--detach", str(linked_worktree), "HEAD")
+            self.assertEqual(added.returncode, 0, added.stderr)
+            linked_project = linked_worktree / "nested-project"
+
+            canonical = yaml.safe_load(TASKS_FIXTURE)
+            canonical["tasks"][0]["title"] = "nested canonical checkout only"
+            (project / "tasks.yaml").write_text(
+                yaml.safe_dump(canonical, sort_keys=False, allow_unicode=True))
+            previous = Path.cwd()
+            out, err = io.StringIO(), io.StringIO()
+            try:
+                os.chdir(linked_project)
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    rc = _run_with_home(home, lambda: tasks.main(["list"]))
+            finally:
+                os.chdir(previous)
+
+            self.assertEqual(rc, 0, err.getvalue())
+            self.assertIn("nested canonical checkout only", out.getvalue())
+            self.assertFalse((linked_project / ".waystone").exists())
+
+    def test_linked_read_refuses_unprovable_canonical_root_before_state_creation(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            root = base / "repo"
+            linked = base / "linked"
+            home = base / "home"
+            admin = root / "nested" / "admin"
+            root.mkdir()
+            home.mkdir()
+            (root / "nested").mkdir()
+            initialized = subprocess.run(
+                ["git", "init", "-q", "-b", "main", f"--separate-git-dir={admin}", str(root)],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(initialized.returncode, 0, initialized.stderr)
+            self.assertEqual(git(root, "config", "user.email", "t@t").returncode, 0)
+            self.assertEqual(git(root, "config", "user.name", "t").returncode, 0)
+            (root / "f.txt").write_text("0")
+            (root / ".waystone.yml").write_text("version: 1\nproject: canonical\n")
+            (root / "tasks.yaml").write_text(TASKS_FIXTURE)
+            self.assertEqual(
+                git(root, "add", "f.txt", ".waystone.yml", "tasks.yaml").returncode, 0)
+            self.assertEqual(git(root, "commit", "-qm", "add waystone project").returncode, 0)
+            added = git(root, "worktree", "add", "-q", "--detach", str(linked), "HEAD")
+            self.assertEqual(added.returncode, 0, added.stderr)
+
+            # common_dir.parent is `nested`, but Git reports `root` as its worktree top-level.
+            # A decoy project there must not make that administrative parent look canonical.
+            (root / "nested" / ".waystone.yml").write_text("version: 1\nproject: decoy\n")
+            (root / "nested" / "tasks.yaml").write_text(TASKS_FIXTURE)
+            previous = Path.cwd()
+            out, err = io.StringIO(), io.StringIO()
+            try:
+                os.chdir(linked)
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    rc = _run_with_home(home, lambda: tasks.main(["list"]))
+            finally:
+                os.chdir(previous)
+
+            self.assertFalse((linked / ".waystone").exists())
+            self.assertEqual(rc, 1)
+            self.assertEqual(out.getvalue(), "")
+            self.assertIn("project_context_unavailable", err.getvalue())
+
     def test_dash_dash_values_use_equals_form_and_bare_form_refuses_loudly(self):
         import contextlib
         import io
