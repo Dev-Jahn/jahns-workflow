@@ -1643,6 +1643,40 @@ class RemoteTests(unittest.TestCase):
             self.assertFalse(pushed)
             self.assertIn("temporary fetch ref", info.get("reason", ""))
 
+    def test_next_fetch_sweeps_only_stale_generated_refs(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            bare, work = d / "remote.git", d / "work"
+            subprocess.run(
+                ["git", "init", "-q", "--bare", "-b", "main", str(bare)], check=True)
+            work.mkdir()
+            init_repo(work)
+            git(work, "remote", "add", "origin", str(bare))
+            git(work, "push", "-q", "-u", "origin", "main")
+            tip = git(work, "rev-parse", "HEAD").stdout.strip()
+
+            stale_pid = 2147483647
+            with self.assertRaises(ProcessLookupError):
+                os.kill(stale_pid, 0)
+            stale_ref = f"refs/waystone/verify-fetch-{stale_pid}-{'a' * 32}"
+            live_ref = f"refs/waystone/verify-fetch-{os.getpid()}-{'b' * 32}"
+            user_ref = "refs/waystone/verify-fetch-user-owned"
+            for ref in (stale_ref, live_ref, user_ref):
+                self.assertEqual(git(work, "update-ref", ref, tip).returncode, 0)
+
+            try:
+                fetched, info = common.fetch_upstream_head(work)
+                self.assertEqual(fetched, tip, info)
+                self.assertEqual(
+                    git(work, "show-ref", "--verify", "--quiet", stale_ref).returncode, 1)
+                self.assertEqual(
+                    git(work, "show-ref", "--verify", "--quiet", live_ref).returncode, 0)
+                self.assertEqual(
+                    git(work, "show-ref", "--verify", "--quiet", user_ref).returncode, 0)
+            finally:
+                git(work, "update-ref", "-d", live_ref)
+                git(work, "update-ref", "-d", user_ref)
+
     def test_live_fetch_evidence_ignores_fetch_head_overwrite_and_cleans_ref(self):
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)
@@ -1676,7 +1710,7 @@ class RemoteTests(unittest.TestCase):
             self.assertEqual(git(work, "rev-parse", "FETCH_HEAD").stdout.strip(), other_sha)
             refs = git(
                 work, "for-each-ref", "--format=%(refname)",
-                "refs/waystone/verify-fetch-").stdout.strip()
+                "refs/waystone/verify-fetch-*").stdout.strip()
             self.assertEqual(refs, "")
 
 
@@ -3158,6 +3192,45 @@ Fail-loud protocol boundaries.
                 self.assertEqual(review.verify_packet_publication(shallow, self.ROUND_ID), 1)
             self.assertIn("cannot determine", err.getvalue())
             self.assertIn("shallow", err.getvalue())
+
+    def test_shallow_rc_one_is_unverifiable_but_full_history_is_definitive(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            source, bare = base / "source", base / "remote.git"
+            shallow, full = base / "shallow", base / "full"
+            source.mkdir()
+            init_repo(source)
+            ancestor = git(source, "rev-parse", "HEAD").stdout.strip()
+            git(source, "branch", "ancestor", ancestor)
+            for value in ("1", "2"):
+                (source / "f.txt").write_text(value)
+                git(source, "commit", "-qam", f"c{value}")
+            tip = git(source, "rev-parse", "HEAD").stdout.strip()
+            subprocess.run(["git", "clone", "-q", "--bare", str(source), str(bare)], check=True)
+            subprocess.run(["git", "clone", "-q", str(bare), str(full)], check=True)
+            subprocess.run([
+                "git", "clone", "-q", "--depth=1", "--branch", "main",
+                f"file://{bare}", str(shallow),
+            ], check=True)
+            self.assertEqual(git(
+                shallow, "fetch", "-q", "--depth=1", "origin",
+                "ancestor:refs/remotes/origin/ancestor").returncode, 0)
+
+            self.assertEqual(
+                git(shallow, "rev-parse", "--is-shallow-repository").stdout.strip(), "true")
+            self.assertEqual(
+                git(shallow, "merge-base", "--is-ancestor", ancestor, tip).returncode, 1)
+            contained, reason = common.ancestry_status(shallow, ancestor, tip)
+            self.assertIsNone(contained)
+            self.assertIn("shallow", reason)
+            self.assertFalse(common.is_ancestor(shallow, ancestor, tip))
+
+            self.assertEqual(
+                git(full, "rev-parse", "--is-shallow-repository").stdout.strip(), "false")
+            self.assertEqual(common.ancestry_status(full, ancestor, tip), (True, ""))
+            self.assertEqual(
+                git(full, "merge-base", "--is-ancestor", tip, ancestor).returncode, 1)
+            self.assertEqual(common.ancestry_status(full, tip, ancestor), (False, ""))
 
     def test_direct_binding_rejects_committed_but_unpushed_packet(self):
         import contextlib

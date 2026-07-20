@@ -1603,6 +1603,35 @@ def _upstream_tracking(root: Path) -> tuple[str, str, str] | None:
     return fields[0], fields[1], fields[2]
 
 
+_VERIFY_FETCH_REF_PREFIX = "refs/waystone/verify-fetch-"
+_VERIFY_FETCH_REF_RE = re.compile(
+    rf"{re.escape(_VERIFY_FETCH_REF_PREFIX)}([1-9][0-9]*)-[0-9a-f]{{32}}")
+
+
+def _sweep_stale_verify_fetch_refs(root: Path) -> str | None:
+    rc, out, error = git_rc(
+        root, "for-each-ref", "--format=%(refname)", f"{_VERIFY_FETCH_REF_PREFIX}*")
+    if rc != 0:
+        return f"cannot enumerate temporary fetch refs: {error or 'git for-each-ref failed'}"
+    for ref in out.splitlines():
+        match = _VERIFY_FETCH_REF_RE.fullmatch(ref)
+        if match is None:
+            continue
+        # PID is only a same-host liveness locator; uncertainty preserves the ref.
+        try:
+            os.kill(int(match.group(1)), 0)
+        except ProcessLookupError:
+            pass
+        except (OSError, OverflowError):
+            continue
+        else:
+            continue
+        cleanup_rc, _, cleanup_error = git_rc(root, "update-ref", "-d", ref)
+        if cleanup_rc != 0:
+            return f"cannot delete stale temporary fetch ref {ref}: {cleanup_error or 'error'}"
+    return None
+
+
 def fetch_upstream_head(root: Path) -> tuple[str | None, dict]:
     """Fetch the exact tracked branch into a private ref and return its live commit.
 
@@ -1610,6 +1639,11 @@ def fetch_upstream_head(root: Path) -> tuple[str | None, dict]:
     read from a unique temporary ref, then the ref is deleted, so concurrent writes to the shared
     FETCH_HEAD pseudoref cannot change the publication evidence.
     """
+    sweep_error = _sweep_stale_verify_fetch_refs(root)
+    if sweep_error is not None:
+        return (None, {
+            "reason": f"temporary fetch ref sweep failed — remote unverifiable: {sweep_error}",
+        })
     tracking = _upstream_tracking(root)
     if tracking is None:
         return (None, {"reason": "no upstream tracking branch"})
@@ -1620,8 +1654,7 @@ def fetch_upstream_head(root: Path) -> tuple[str | None, dict]:
             **info,
             "reason": "upstream remote '.' is local repository state, not remote publication",
         })
-    temporary_ref = (
-        f"refs/waystone/verify-fetch-{os.getpid()}-{uuid.uuid4().hex}")
+    temporary_ref = f"{_VERIFY_FETCH_REF_PREFIX}{os.getpid()}-{uuid.uuid4().hex}"
     rc, _, fetch_error = git_rc(
         root, "fetch", "--quiet", "--no-tags", "--force", remote_name,
         f"+{branch_ref}:{temporary_ref}")
@@ -1671,12 +1704,24 @@ def ancestry_status(root: Path, a: str, b: str) -> tuple[bool | None, str]:
     if rc == 0:
         return True, ""
     if rc == 1:
-        return False, ""
+        shallow_rc, shallow, shallow_error = git_rc(
+            root, "rev-parse", "--is-shallow-repository")
+        if shallow_rc != 0:
+            detail = shallow_error or f"git rev-parse exited {shallow_rc}"
+            return None, f"cannot determine whether repository is shallow: {detail}"
+        if shallow == "true":
+            return None, (
+                "repository is shallow; git merge-base exit 1 cannot prove non-containment")
+        if shallow == "false":
+            return False, ""
+        return None, (
+            "git rev-parse --is-shallow-repository returned unexpected output: "
+            f"{shallow!r}")
     return None, error or f"git merge-base exited {rc}"
 
 
 def is_ancestor(root: Path, a: str, b: str) -> bool:
-    """True iff commit `a` is an ancestor of (i.e. contained in) commit `b`."""
+    """True only when `a` is proven contained in `b`; unverifiable fails closed to False."""
     status, _ = ancestry_status(root, a, b)
     return status is True
 
