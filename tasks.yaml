@@ -536,7 +536,7 @@ tasks:
     status: "pending"
     deps: ["feat/run-cli-bridge"]
   - id: fix/run-store-permission-hardening
-    title: "ADR-0013 'DB·artifact permission과 symlink' 절의 store 적용: .waystone/ state 디렉터리·state.db·sidecar·staging·최종 artifact의 mode 고정(0700/0600/0400)·WAL/SHM owner-mode 검증·no-follow 강제 — m1b-store 보고 ④11이 확인한 분해 누락 귀속 공백의 폐쇄 (symlink 거부는 커널에 이미 구현, mode 계약이 잔여)"
+    title: "ADR-0013 'DB·artifact permission과 symlink' 절의 store 적용: .waystone/ state 디렉터리·state.db·sidecar·staging·최종 artifact·lease OS lock leaf의 mode 고정(0700/0600/0400)·WAL/SHM owner-mode 검증·no-follow 강제 — m1b-store 보고 ④11 귀속 공백 폐쇄 + m1b-lease 보고 ④6의 lock leaf 포함 확정 (symlink 거부는 커널에 이미 구현, mode 계약이 잔여)"
     status: "pending"
     deps: ["feat/run-store-kernel"]
   - id: feat/review-pr-canonical-publication
@@ -552,3 +552,11 @@ tasks:
     status: "pending"
     severity: "minor"
     deps: ["feat/review-runs-uuid-owner-directory"]
+  - id: fix/lease-principal-project-executor-binding
+    title: "ADR-0013 full principal의 project/executor 결속 축을 store v2 migration으로 추가: actions/leases에 project·executor_kind binding column + leases (entity_kind,entity_id) UNIQUE/FK 승격 — claimed state.db를 타 project로 복사 시 원 principal 통과하는 gap 폐쇄 (m1b-lease 보고 ④1·⑤, main ruling D9: M1-B acceptance는 promoted 문언 triple로 충족, 이 축은 분리 수리)"
+    status: "pending"
+    deps: ["feat/run-effect-protocol"]
+  - id: decision/run-spec-v1-interpretation-batch
+    ruling: "잠정 ruling 2026-07-21: ③⑤⑦⑧ 수용 확정. ①은 M1-B 한정 v1 adapter(legacy 문자열 = owner-authored criterion 원문, empty/blank/dup 거부, critic-not-required 기록)로 임시 준수하고 ADR-0010 amendment로 명문화 예정. ②는 null 보존 유지(정책 컴파일러 부재 중 합성 금지 — silent 강등 회피), amendment에서 확정. ④는 effects task의 kind 확장 여부와 함께 재판정."
+    title: "m1b-spec 해석 일괄 판정: ①ADR-0010 acceptance envelope vs legacy 문자열(§2-6 tasks.yaml 불변과의 3자 충돌 — ADR-0010 amendment 필요) ②review decision null 허용 여부 ③no-retry 기본값(main 수용) ④RunSpec/snapshot의 EVIDENCE kind 재사용 ⑤canonical JSON·job id <run-uuid>:job 형식 고정(main 수용) ⑦PC-31 no-write 우선(main 수용) ⑧role binding은 preflight/VerificationPlan 소유(main 수용) — ①②④는 라운드 마감 시 ADR-0010 amendment로 확정 (m1b-spec 보고 ④)"
+    status: "pending"

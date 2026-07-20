@@ -101,6 +101,9 @@ from test_release import (
 from test_run_domain import (
     RunDomainTests,
 )
+from test_run_lease import (
+    RunLeaseTests,
+)
 from test_review_protocol import (
     LockPrimitiveTests,
     LockWiringTests,
@@ -199,6 +202,7 @@ _TEST_CLASSES = (
     RoundCloseTests,
     ReleaseToMainTests,
     RunDomainTests,
+    RunLeaseTests,
     LockPrimitiveTests,
     LockWiringTests,
     MarkerTests,
