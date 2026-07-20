@@ -1,4 +1,26 @@
-# WAVE w0720 — 관제 manifest (main 세션 전용)
+# WAVE w0720 + w0720b — 관제 manifest (main 세션 전용)
+
+## WAVE-2 (w0720b) — ruling 집행 wave, base **8392d5a**, 발사 2026-07-20 오후
+사용자 ruling: 2-a(marker)·3-삭제(집행됨)·4-통째삭제·**1-B**(합격기준 전환+git 기록 연속성 승격 원칙).
+| bg id | worktree | task | 성격 |
+|---|---|---|---|
+| bns2vctxk | w0720b-settlement | chore/pre-header-feedback-settlement | 구현: marker 기계+원 3건, 추가 3건은 감사만 |
+| bdqqyedox | w0720b-sunset | chore/migration-sunset | 구현: pre-0.9 기계 삭제→typed 거부 |
+| boqgl5h6m | w0720b-threat | fix/m0-threat-model-completion (blocker) | ADR-0013 신규 |
+| bhv32ru33 | w0720b-basis | docs/adr-m1a-acceptance-basis (blocker) | ADR-0014+promoted-contracts.md 초안 |
+| b96c3t5xa | w0720b-manifest | fix/adr-0006-closeout-manifest-gaps | ADR-0006 amend |
+| b5tioja7u | w0720b-runid | fix/run-id-grammar-unification | plan supersession+ADR-0005 note |
+| bw0rr3h9i | w0720b-docsync | docs/m0-exit-review-sync | 사실 반영 6항목 |
+hot-file: **plan 4분할**(threat=:613 / basis=:632-643 / runid=:190-193·:494 / docsync=:433·:479-492) ·
+review.py=settlement 단독 · common.py=sunset 단독. 머지: 코드 2기 먼저(settlement→sunset), docs 이후 순차.
+회수 후: basis의 promoted-contracts 초안은 **main 정독 인수 필수**(codex 제안일 뿐). threat·basis 착지+인수
+= M0 exit 재심 조건 충족 → 재심 리뷰(경량) → M1-A. w0720b 마감 시 round close.
+registry: m0-exit-verdict done(B)·settlement-method done·delegate-readme done(파일 삭제 f2bedea)·
+migration-sunset 조건해제·grade-gate blocker dropped→docs/adr-m1a-acceptance-basis 등록.
+Stop hook: install.hooks consent 기록+마커 활성화(이 프로젝트, 2026-07-20) — 기능 자체는 07-16 구현 완료였음.
+
+---
+# (이하 WAVE-1 기록)
 
 ## 진행 상태 (갱신: 회수 시마다)
 - ✅ colorenv → dev 22ec0db (push·registry done·worktree 정리)
