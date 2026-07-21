@@ -1,7 +1,8 @@
 # M1-B exit 증거표 — gate/m1b-exit
 
-- Status: 판정 진행 (2026-07-21, main) — 기준: `dev_docs/m1b-slice-plan.md` §6 (9항)
-- 대상: dev `dade8f8` (구현 15 task 전량 병합, 통합 suite 1088 green)
+- Status: **판정 확정** (2026-07-21, main; 리뷰 사이클 반영 갱신 — 하단 "리뷰 반영" 절)
+- 기준: `dev_docs/m1b-slice-plan.md` §6 (9항)
+- 대상: dev `dade8f8` (구현 15 task 전량 병합, 통합 suite 1088 green) → 리뷰 수리 후 `145e37b` (suite 1099 green)
 - 검증 체계: 기체 suite → main 독립 재실행 → opus 반증 검증(대형 10기) → 병합 조합 suite
   4중 게이트. 기체별 상세는 `docs/meta/agent-reports-2026-07-21/*.md` (보고 12건).
 
@@ -41,3 +42,21 @@
   (엔진 경로는 동일 green) — 단언을 token 매칭으로 정정 후 clean 재실행. 엔진/하네스 typed
   error 0회.
 - 스크립트·로그: scratchpad/fleet/smoke/{smoke.py,smoke.log} (세션 산출물, repo 외부).
+
+## 리뷰 반영 (2026-07-21-m1b-vertical-slice 회신, codex high — major 6)
+
+외부 리뷰가 초판 판정의 과대 항목 2곳을 정당하게 잡았고, 즉시 수리로 폐쇄했다:
+
+- **행 6 (PC-22)**: 초판은 crash-reconcile 창(공개·등록 상태)을 두고 green을 선언 —
+  과대. WS-GPT-602 수리(`ac863f7`: approval digest 4종 plan 동봉 + reconcile 재해시 대조)로
+  창 폐쇄 후 충족 확정.
+- **행 8 (S1)**: 초판은 WAI+launch 실패의 영구 unknown-effect(공개·등록 상태)를 두고 충족
+  선언 — 과대. WS-GPT-604 수리(`ac863f7`: RunnerAbsenceProbe seam, positive exact-identity
+  absence만 소비)로 수렴 경로 확보 후 충족 확정.
+- **추가 폐쇄**: WS-GPT-601(CONFIRMED major — verifier 발행 후 crash 시 resume 영구 brick,
+  exit 표가 놓친 조립 단계 crash recovery)을 `145e37b`(단계별 재진입 reload)로 폐쇄.
+- 나머지: 603 minor(ruling 유지·hardening task), 605 REJECTED(M1-C 계획 소관),
+  606 CONFIRMED(registry 정정 완료). 상세는 feedback triage.
+
+수리 3건 전부 4중 게이트(RED-first/기체 suite/main 재실행/opus 반증) 통과, 최종 suite
+**1099 green** @ `145e37b`. exit 9항 판정은 이 갱신 기준으로 확정이다.

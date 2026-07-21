@@ -40,13 +40,25 @@
 | `effect-observation:<action_id>:<digest_suffix>` | evidence | effects, verify |
 | `engine-check-evidence:<action_id>` | evidence | verify |
 | `verifier-evidence:<action_id>` | evidence | verify |
-| `fixture-verification:<action_id>` | evidence | verify |
 | `integration-decision:<action_id>` | **decision** | verify |
+| `runner-invocation:<lineage_key>:<action_id>` (lineage_key = `sha256:<hex>` — runner at-most-once/retry authority) | evidence | effects |
+| `transport-action-plan:<action_id>` | evidence | transport |
+| `transport-result:<action_component>` (action_component = sha256hex(action_id)) | evidence | transport |
+| `transport-result:<action_component>:artifact:<name_component>` | evidence | transport |
 | `cancellation-intent:<run_id>` | evidence | cancel |
 | `cancellation-terminal:<run_id>` | evidence | cancel |
 | `cancellation-cleanup-plan:<cleanup_action_id>` | evidence | cancel |
 
-canonical JSON payload의 `"schema"` 태그(버전 동봉): `waystone-run-spec-1`, `waystone-run-base-snapshot-1`, `waystone-verification-plan-1`, `waystone-verification-preflight-1`, `waystone-runner-proof-1`, `waystone-effect-plan-1`, `waystone-effect-intent-1`, `waystone-effect-observation-1`, `waystone-runner-completion-1`, `waystone-verifier-evidence-1`, `waystone-engine-check-evidence-1`, `waystone-integration-decision-1`, `waystone-integration-decision-intent-1`, `waystone-verification-transcript-1`, `waystone-cancellation-intent-1`, `waystone-cancellation-terminal-1`, `waystone-cancellation-cleanup-plan-1`.
+canonical JSON payload의 `"schema"` 태그(버전 동봉): `waystone-run-spec-1`, `waystone-run-base-snapshot-1`, `waystone-verification-plan-1`, `waystone-verification-preflight-1`, `waystone-runner-proof-1`, `waystone-effect-plan-1`, `waystone-effect-intent-1`, `waystone-effect-observation-1`, `waystone-runner-completion-1`, `waystone-verifier-evidence-1`, `waystone-engine-check-evidence-1`, `waystone-integration-decision-1`, `waystone-integration-decision-intent-1`, `waystone-verification-transcript-1`, `waystone-cancellation-intent-1`, `waystone-cancellation-terminal-1`, `waystone-cancellation-cleanup-plan-1`,
+`waystone-transport-action-plan-1`, `waystone-transport-result-1`.
+
+supervisor sidecar receipt 파일(CAS artifact 아님 — reference id 없음, canonical payload
+schema tag만): `waystone-supervisor-launch-1`, `waystone-supervisor-runtime-1`,
+`waystone-supervisor-heartbeat-1`, `waystone-supervisor-wait-1`.
+
+정정 이력 (2026-07-21, WS-GPT-606): 초판이 누락한 runner-invocation·transport 3행과
+supervisor schema 4종을 추가하고, artifact reference가 아닌 `fixture-verification:<action_id>`
+행(completion marker의 process_identity 문자열 — fixture 하네스 전용)을 삭제했다.
 
 ## 4. TransitionReason v1 enum (전수)
 

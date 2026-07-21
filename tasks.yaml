@@ -614,7 +614,7 @@ tasks:
     deps: ["feat/run-verification-preflight"]
   - id: fix/effects-runner-absence-seam
     title: "effects runner reconcile에 supervisor의 positive absence evidence 소비 seam 추가: 현행 effects는 runner WAI+marker 부재 시 quiescence callback 호출 전에 unknown-effect를 반환해 supervisor가 산출하는 boot/start-token exact-identity absence 증거를 받을 수 없음 — 영구 unknown-effect의 해소 경로(S1 기질 완성)를 additive effects 확장으로 연결 (m1b-supervisor 보고 ④1·⑤1, effects ④5의 consumer 측)"
-    status: "pending"
+    status: "done"
     deps: ["feat/run-effect-protocol", "feat/run-supervisor-identity"]
   - id: fix/supervisor-probe-binding-validation
     title: "Supervisor.probe_action의 identity-결속 자체 검증 추가: runtime ProcessIdentity가 요청 action·현재 lease principal/fence·frozen invocation에 결속됐는지 probe API 내부에서 검증하고 관측 identity를 반환 — 현재는 observe가 probe 전후 재검증으로 보상하나 다른 소비자(cancel 등)는 같은 방어를 얻지 못함 (m1b-observe 보고 ⑤1)"
@@ -628,7 +628,7 @@ tasks:
     deps: ["feat/run-store-kernel"]
   - id: fix/patch-effect-approval-reconcile-binding
     title: "PatchIntegrationEffect durable spec에 approval bundle digest 결속 + crash-reconcile 시 authority 재검증 hook: 현행은 apply_integration_decision의 이중 재검증 후 plan 저장되나, 저장~reconcile 사이 crash 경로에서 generic EffectEngine.reconcile이 approval 재검증 없이 실행 — PC-22 '실행 시점 재검증'의 crash 창 폐쇄 (m1b-verify 보고 ④1·⑤1, effects additive 확장)"
-    status: "pending"
+    status: "done"
     deps: ["feat/run-effect-protocol", "feat/run-verify-decision"]
   - id: chore/store-readonly-opener-public-api
     title: "RunStore에 public read-only opener 제공: status/watch·observe가 RunStore.open(migration·WAL 협상·gitignore 생성 부작용)을 피하려고 package-private schema validation+construction token으로 read-only backup store를 조립 중 — public 경계로 승격 (m1b-bridge 보고 ④3·m1b-observe ④2)"
@@ -644,3 +644,22 @@ tasks:
     status: "pending"
     severity: "minor"
     deps: ["feat/run-cli-bridge"]
+  - id: chore/apply-post-cas-attachment-alarm
+    title: "apply의 post-CAS observe에 target ref worktree-attachment 재검사 + typed alarm(선택적 정직성 hardening): verify.py 마지막 검사 이후 창에서 의도적 symref attach 시 CAS는 성공하고 worktree만 stale — 방지 불가(원자성 없음)·검출만 가능, ADR-0013 비보호 경계 내 (WS-GPT-603 검증 판정: 메커니즘 CONFIRMED·정상 경로 전제 REFUTED·major→minor)"
+    status: "pending"
+    severity: "minor"
+    deps: ["feat/run-verify-decision"]
+  - id: fix/engine-complete-reentry
+    title: "RunEngine._complete 재진입 복구: verifier evidence 발행~apply 완료 사이 어떤 지점의 crash/예외든 다음 resume이 발행된 terminal artifact를 reload(재검증)해 해당 단계부터 멱등 재개 — 현행은 verifier 무조건 재실행이 EffectRetryRefused에 막혀 run 영구 brick (WS-GPT-601 CONFIRMED major, opus 재현: 결정론적·비가역, 범위는 _complete 전 구간)"
+    status: "done"
+    severity: "major"
+    deps: ["feat/run-cli-bridge"]
+  - id: docs/adr-0009-reprepare-clarification
+    title: "ADR-0009에 same-round canonical 재발행 규칙 명문화: 현행 구현은 fixed leaf 계약에 따라 다른 bytes의 re-prepare를 거부(변경=새 round) — one-owner-per-round를 규범으로 확정하거나 canonical 방식의 generation 대체를 설계 (리뷰 open question 2, m1b-review-uuid ④1)"
+    status: "pending"
+    severity: "minor"
+  - id: chore/decision-actor-principal-binding
+    title: "PC-21 ActorIdentity의 신뢰 경계 강화 검토: 현행은 assembly configuration이 공급하는 actor_id 문자열의 정직성을 전제(ADR-0008 identity 모델) — durable executor principal과의 결속 또는 coordinator 인증 채널을 M2 multi-actor 시점에 설계 (리뷰 open question 4, m1b-verify opus 관찰)"
+    status: "pending"
+    severity: "minor"
+    deps: ["feat/run-verify-decision"]
