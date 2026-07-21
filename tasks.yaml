@@ -157,8 +157,10 @@ tasks:
     status: "dropped"
     severity: "blocker"
   - id: feat/review-runs-uuid-owner-directory
+    session_id: "81475563-8e0b-48ed-84e3-62f1c26acb0c"
+    round: 2026-07-21-m1b-vertical-slice
     title: "ADR-0009 canonical review layout(docs/reviews/runs/<uuid>/)의 writer/reader 구현: JW-GPT-015 보상의 유일 vehicle(feat/review-artifact-addressing)이 docs-only scope로 close돼 구현이 어느 milestone acceptance에도 없는 공백 — M1-B acceptance에 편입 필요 (WS-CDX-4, verifier CONFIRMED major; M0-A 동결 조건이 015의 M1-B 보상을 전제함)"
-    status: "pending"
+    status: done
     severity: "major"
   - id: fix/adr-0006-closeout-manifest-gaps
     session_id: "9c45406a-2fef-4660-b072-4824b6fcaede"
@@ -248,10 +250,12 @@ tasks:
     severity: "blocker"
     origin: "review-2026-07-20-fleet-fix-wave"
   - id: fix/env-prep-toolchain-digest-binding
+    session_id: "81475563-8e0b-48ed-84e3-62f1c26acb0c"
+    round: 2026-07-21-m1b-vertical-slice
     notes: "구현+WS-GPT-102 fixture는 m1b-preflight가 폐쇄(2cdaf1c) — opus 검증 통과 후 병합 시 done 처리 예정"
     deps: ["feat/run-verification-preflight"]
     title: "env_prep toolchain(ruff 포함)의 source+artifact digest 결속: 위조 ruff wheel이 ambient index로 offline gate를 통과(재현됨) — 단 동일 gap이 명시 이월된 M1 target(ADR-0012 VerificationPlan·ADR-0013 child env)이라 minor, M1 해당 작업에 편입 (WS-GPT-102, verifier major→minor)"
-    status: "pending"
+    status: done
     severity: "minor"
     origin: "review-2026-07-20-fleet-fix-wave"
   - id: fix/linked-read-lock-litter
@@ -327,10 +331,12 @@ tasks:
     severity: "major"
     origin: "review-2026-07-20-ruling-execution"
   - id: fix/delegate-prompt-i10-surface-strip
+    session_id: "81475563-8e0b-48ed-84e3-62f1c26acb0c"
+    round: 2026-07-21-m1b-vertical-slice
     deps: ["feat/run-spec-planning"]
     notes: "범위 명시(Addendum 2 §2): 투영 표면 제거뿐 아니라 routing_note '값 내용' 채널도 이 task 소유 — strip이 투영을 제거하면 값 채널도 소멸하나, routing_note를 잔존시키는 설계면 값 제약을 함께. anchor는 goal/bounds 재편성 검토(Addendum §1)"
     title: "worker prompt 조립에서 I-10 부채 표면(status·milestone·round·routing_note, deps 상태) 제거 — TASK_BLOCK 렌더가 registry 내부 표면을 전달(Amendment 2 Addendum이 known-debt로 고정); anchor는 goal/bounds 자료로 재편성 검토; M1-B delegate 재구축이 소유"
-    status: "pending"
+    status: done
     severity: "major"
     origin: "review-2026-07-20-fleet-fix-wave"
   - id: chore/m1a-suite-manifest-pin
@@ -468,8 +474,10 @@ tasks:
     severity: "minor"
     origin: "review-2026-07-20-m1a-split"
   - id: docs/m1b-slice-decomposition
+    session_id: "81475563-8e0b-48ed-84e3-62f1c26acb0c"
+    round: 2026-07-21-m1b-vertical-slice
     title: "M1-B vertical slice 분해 계획(main 설계): transactional store §3-1·effect protocol §3-4·executor 경계 §3-6·4-role domain model·delegate wrapper 신엔진 호출·typed envelope·fault fixture 8건 표를 구현 task들로 분해 + PC 귀속(M1-B분)·편입 예약 6건(i10-strip·review-runs-uuid·#014/#015·ADR-0013 fault·_git 정렬·shim parent guard) 배치"
-    status: "done"
+    status: done
   - id: feat/delegation-network-resilience
     notes: "설계 전제(m1b-supervisor 보고 ④2·④3, 2026-07-21): ⑴ supervisor 사망+worker 생존 시 타 process는 waitpid로 원 returncode 회수 불가 — 완전한 completion 복구는 worker exec 전 barrier를 가진 engine-owned exit-receipt trampoline 필요 ⑵ detached Popen 성공~runtime identity 게시 전 window의 supervisor 사망은 reserved-without-observable-identity typed refusal로 남고 자동 재기동 없음(at-most-once 우선) — auto-restart/fenced re-entry protocol은 이 task가 소유. S1(unknown-effect 대기+resume)·S2(detached 생존)·S3(recoverable 분류) 기질 위에서 wait/retry/backoff/resume 정책 구현."
     scope: ["waystone/runs/supervisor.py"]
@@ -482,65 +490,93 @@ tasks:
     severity: "minor"
     origin: "review-2026-07-20-m1a-review-closeout"
   - id: feat/run-store-kernel
+    session_id: "81475563-8e0b-48ed-84e3-62f1c26acb0c"
+    round: 2026-07-21-m1b-vertical-slice
     scope: ["waystone/runs/store.py", "waystone/runs/artifacts.py", "scripts/tests/test_run_store.py"]
     title: "새 runtime store 커널: .waystone/state.db(SQLite WAL) 스키마 v1 + 트랜잭션/CAS/append-only transitions + content-addressed artifact store + UUIDv7 run_id — ADR-0005/0007, PC-18·19, E-06·E-09 잔여, JW-GPT-014 부류 재현 불가 fixture 포함 (m1b-slice-plan §5)"
-    status: "pending"
+    status: done
   - id: feat/run-lease-fencing
+    session_id: "81475563-8e0b-48ed-84e3-62f1c26acb0c"
+    round: 2026-07-21-m1b-vertical-slice
     scope: ["waystone/runs/lease.py", "scripts/tests/test_run_lease.py"]
     title: "lease·fencing epoch·owner token·OS advisory lock 원시 계층: ADR-0013 3계약(lease principal CAS·lock 후 DB tuple recheck·reclaim race) + fault fixture 6·7·8 — mutation·effect·destructive cleanup 0 증명"
-    status: "pending"
+    status: done
     deps: ["feat/run-store-kernel"]
   - id: feat/run-domain-roles
+    session_id: "81475563-8e0b-48ed-84e3-62f1c26acb0c"
+    round: 2026-07-21-m1b-vertical-slice
     scope: ["waystone/jobs", "scripts/tests/test_run_domain.py"]
     title: "canonical 4-role domain model(coordinator/worker/verifier/reviewer) + executor_kind enum + profile v1 adapter(implementer→worker 판독, 미지원 binding typed refusal) — ADR-0008/0004, PC-27 부분"
-    status: "pending"
+    status: done
   - id: feat/run-effect-protocol
+    session_id: "81475563-8e0b-48ed-84e3-62f1c26acb0c"
+    round: 2026-07-21-m1b-vertical-slice
     title: "external effect commit protocol 엔진: planned→claimed→effect→observed→completed + effect 종류별 계약표 + unknown-effect 정직 차단 + crash recovery 결정표/reconcile — ADR-0002 전체, fixture 3(exited-unreconciled resume 1회) + effect-kind별 crash fixture"
-    status: "pending"
+    status: done
     deps: ["feat/run-store-kernel", "feat/run-lease-fencing"]
   - id: feat/run-spec-planning
+    session_id: "81475563-8e0b-48ed-84e3-62f1c26acb0c"
+    round: 2026-07-21-m1b-vertical-slice
     title: "frozen RunSpec + one-task run 계획: job input freeze(PC-15)·dirty-tree snapshot(PC-17)·acceptance contract readiness·retry ceiling·미초기화 root typed refusal(PC-31 신규 표면) — ADR-0010"
-    status: "pending"
+    status: done
     deps: ["feat/run-store-kernel", "feat/run-domain-roles"]
   - id: feat/run-verification-preflight
+    session_id: "81475563-8e0b-48ed-84e3-62f1c26acb0c"
+    round: 2026-07-21-m1b-vertical-slice
     title: "frozen VerificationPlan + capability preflight(dispatch precondition) + authoritative deterministic check의 engine action 실행 + runner proof bounded 관측축·relocation-stable digest — ADR-0012, PC-27·28·29, E-03 잔여, env-prep toolchain digest binding 편입(fix/env-prep-toolchain-digest-binding 동시 폐쇄)"
-    status: "pending"
+    status: done
     deps: ["feat/run-spec-planning"]
   - id: feat/run-supervisor-identity
+    session_id: "81475563-8e0b-48ed-84e3-62f1c26acb0c"
+    round: 2026-07-21-m1b-vertical-slice
     title: "engine-owned detached supervisor + process identity(boot id·pid·start token·invocation digest) + monotonic heartbeat + atomic completion marker + stdout/stderr artifact digest — ADR-0003 supervision, fixture 1(stale heartbeat+live child 무정리)·2(PID 재사용 identity-mismatch), 세션 종료 후 생존(D6)"
-    status: "pending"
+    status: done
     deps: ["feat/run-effect-protocol"]
   - id: feat/run-observability
+    session_id: "81475563-8e0b-48ed-84e3-62f1c26acb0c"
+    round: 2026-07-21-m1b-vertical-slice
     title: "run status/watch read-only projection: liveness/progress/current 3분리·derived health(stalled은 FSM 아님)·frozen closure 분모·조회 무부작용 — 계획 §3-8, fixture 5(status/watch 반복 호출 DB 불변), PC-19 healthy 무중단, E-08"
-    status: "pending"
+    status: done
     deps: ["feat/run-store-kernel", "feat/run-supervisor-identity"]
   - id: feat/run-cancel-quiescence
+    session_id: "81475563-8e0b-48ed-84e3-62f1c26acb0c"
+    round: 2026-07-21-m1b-vertical-slice
     title: "취소·정지·정리 안전 계약: cancel은 의도만 기록, positive quiescence 관측+reconcile 후에만 terminal cancellation·cleanup, verified process identity 없이 signal 금지, cleanup은 별도 idempotent action — 계획 §3-9·ADR-0003 취소 절, fixture 4(unknown-effect 중 cancel 시 worktree/ref 유지), E-08 안전 귀결"
-    status: "pending"
+    status: done
     deps: ["feat/run-supervisor-identity", "feat/run-effect-protocol"]
   - id: feat/run-actions-transport
+    session_id: "81475563-8e0b-48ed-84e3-62f1c26acb0c"
+    round: 2026-07-21-m1b-vertical-slice
     title: "carrier transport: actions next(3분기 비차단, engine-owned 내부 소진)·submit 5중 검증(현재 action·input digest·fencing epoch·result schema·artifact digest, Git-파생 사실 엔진 재도출) + 전 신규 CLI의 typed JSON envelope(exit enum·recoverable 분류) — ADR-0004, 계획 §3-3·§3-6"
-    status: "pending"
+    status: done
     deps: ["feat/run-effect-protocol", "feat/run-spec-planning"]
   - id: feat/run-verify-decision
+    session_id: "81475563-8e0b-48ed-84e3-62f1c26acb0c"
+    round: 2026-07-21-m1b-vertical-slice
     title: "verifier 실행(read-only, 분리 actor)·integration decision(criterion exact set+result digest의 verifier evidence 결속)·apply 실행 시점 재검증(user dirt 보존·drift no-write)·retry=새 attempt+새 action id — PC-16·17·20·21·22, adapters.git 단일 원천(D5)"
-    status: "pending"
+    status: done
     deps: ["feat/run-verification-preflight", "feat/run-effect-protocol"]
   - id: feat/run-cli-bridge
+    session_id: "81475563-8e0b-48ed-84e3-62f1c26acb0c"
+    round: 2026-07-21-m1b-vertical-slice
     title: "waystone run start/resume/status/watch/cancel 사용자 표면 + delegate opt-in bridge(one task=one run/job, 기본 경로 전환은 M1-C) — 계획 §3-3, D2, PC-31 표면"
-    status: "pending"
+    status: done
     deps: ["feat/run-actions-transport", "feat/run-verify-decision", "feat/run-observability", "feat/run-cancel-quiescence", "fix/delegate-prompt-i10-surface-strip"]
   - id: gate/m1b-exit
+    session_id: "81475563-8e0b-48ed-84e3-62f1c26acb0c"
+    round: 2026-07-21-m1b-vertical-slice
     title: "M1-B exit 검증: 단일 run 완주(fixture runner+실 backend smoke)·effect별 crash recovery·fault fixture 8건·PC 귀속표(M1-B분) green·legacy suite green·network-resilience 기질 S1-S3·JW-GPT-014/015 처분 기록 — m1b-slice-plan §6"
-    status: "pending"
+    status: done
     deps: ["feat/run-cli-bridge", "feat/review-runs-uuid-owner-directory", "feat/run-lease-fencing"]
   - id: chore/profile-v1-schema-runtime-drift
     title: "templates/profile-schema.json과 legacy delegate validator 간 기존 불일치 기록·정합: unknown top-level field 허용 여부, whitespace-only use_for, generic entry 허용 위치/값, arbitrary backend schema vs 실제 runner token 지원 범위 — 신규 profile_v1 adapter는 fail-closed를 택함(m1b-domain 보고 ⑤1), M1-C cut-over 특성화 시 대조 필요"
     status: "pending"
     deps: ["feat/run-cli-bridge"]
   - id: fix/run-store-permission-hardening
+    session_id: "81475563-8e0b-48ed-84e3-62f1c26acb0c"
+    round: 2026-07-21-m1b-vertical-slice
     title: "ADR-0013 'DB·artifact permission과 symlink' 절의 store 적용: .waystone/ state 디렉터리·state.db·sidecar·staging·최종 artifact·lease OS lock leaf의 mode 고정(0700/0600/0400)·WAL/SHM owner-mode 검증·no-follow 강제 — m1b-store 보고 ④11 귀속 공백 폐쇄 + m1b-lease 보고 ④6의 lock leaf 포함 확정 (symlink 거부는 커널에 이미 구현, mode 계약이 잔여)"
-    status: "pending"
+    status: done
     deps: ["feat/run-store-kernel"]
   - id: feat/review-pr-canonical-publication
     title: "PR-mode freeze/demotion publisher의 ADR-0009 canonical owner 연결: m1b-review-uuid는 packet-mode wiring으로 한정(브리핑 계약)했고 PR-mode live publication은 flat 유지 — ADR-0009 '신규 artifact는 canonical에만' 전면 적용은 review transport 재구축 마일스톤(PC-13 소유)에서, main ruling 2026-07-21: packet 한정 wiring 수용·전면 적용은 이 task로 분할 (m1b-review-uuid 보고 ④4)"
@@ -560,13 +596,17 @@ tasks:
     status: "pending"
     deps: ["feat/run-effect-protocol"]
   - id: decision/run-spec-v1-interpretation-batch
+    session_id: "81475563-8e0b-48ed-84e3-62f1c26acb0c"
+    round: 2026-07-21-m1b-vertical-slice
     ruling: "확정 ruling 2026-07-21: ①②③은 ADR-0010 Amendment(2026-07-21)로 명문화 — v1 acceptance adapter(legacy 문자열 원문 동결+critic-not-required 기록, envelope는 M2 dispatch-time 조립으로 이월), review decision null 보존(컴파일러 도입 시 mandatory 전환), no-retry 기본값(Amendment 소유). ④⑤⑦⑧은 docs/run-engine-formats.md v1 registry와 기존 잠정 ruling대로 확정."
     title: "m1b-spec 해석 일괄 판정: ①ADR-0010 acceptance envelope vs legacy 문자열(§2-6 tasks.yaml 불변과의 3자 충돌 — ADR-0010 amendment 필요) ②review decision null 허용 여부 ③no-retry 기본값(main 수용) ④RunSpec/snapshot의 EVIDENCE kind 재사용 ⑤canonical JSON·job id <run-uuid>:job 형식 고정(main 수용) ⑦PC-31 no-write 우선(main 수용) ⑧role binding은 preflight/VerificationPlan 소유(main 수용) — ①②④는 라운드 마감 시 ADR-0010 amendment로 확정 (m1b-spec 보고 ④)"
-    status: "done"
+    status: done
   - id: decision/run-engine-format-pinning-batch
+    session_id: "81475563-8e0b-48ed-84e3-62f1c26acb0c"
+    round: 2026-07-21-m1b-vertical-slice
     ruling: "잠정 ruling 2026-07-21 (누적): 각 기체의 v1 표현 선택 전부 수용, gate/m1b-exit에서 docs/run-engine-formats.md(v1 format registry)로 명문화 — store(EVIDENCE kind·evidence digest cardinality), spec(canonical JSON·job id), preflight(reference id·runner proof 7축·receipt schema), transport(wire format·exit enum 0/1/2/75), cancel(ADR-0003 세분 pending reason이 계획 요약 문언에 우선). GC: orphan bytes 3원(reclaim 경합·transport 2차 guard·cancel intent/terminal CAS)은 ADR-0007 orphan 범주 정합, 도달성은 M1-C+ GC에서. perm: SQLite open O_NOFOLLOW 한계 수용·기존 object 의미 조건 판정·fixture 갱신 승인·state_path_* taxonomy 수용. transport: blocked vocabulary는 필요 시 v-next migration·lease code wire 구분은 cli-bridge 재평가·unclassified=비자동재시도. verify: ④2 checkout-CAS TOCTOU 창은 ADR-0013 의도적 same-account 간섭 비보호 경계 내 수용, ④3 private integration ref target 수용(live-tree delivery는 M2 — bridge는 동등성 주장 금지), ④4 git_rc fail-closed 병용 수용, ⑨ criterion evidence digest availability 비강제 수용(별도 계약 승격 시 재론)."
     title: "신엔진 v1 표현 계약 일괄 고정: store EVIDENCE reference kind 재사용·evidence digest cardinality(store ④1·⑤) / RunSpec·plan의 canonical JSON(sorted-key compact UTF-8)+sha256:<hex>·job id <run-uuid>:job(spec ⑤) / preflight의 verification-plan:<run_id> reference·runner proof 7축 이름·receipt schema(preflight ①③⑩) — 소비자 확산 전 format registry로 고정 필요"
-    status: "pending"
+    status: done
   - id: chore/profile-v1-bytes-public-api
     title: "profile_v1에 public read_profile_v1_bytes(bytes) API 추가: preflight가 read-race 제거 목적으로 _UniqueKeyLoader·_adapt_profile private 내부에 결합한 것을 public 경계로 승격 (m1b-preflight opus 검증 minor — 정당 목적·공개된 결합이나 경계 명확화 필요)"
     status: "pending"

@@ -2,6 +2,19 @@
 
 round 단위 작업 이력이 이 파일에 축적된다. 활성 task와 의존성은 `tasks.yaml`(CLI: `waystone task`)과 생성 파일 `ROADMAP.md` 참조.
 
+## 2026-07-21-m1b-vertical-slice
+
+- **Goal**: M1-B one-task vertical slice 전체 — 분해 설계(main)부터 신엔진 15 task 구현·exit gate까지 하루 완주. main은 관제탑(브리핑·회수·ruling·인수), 구현은 codex 기체 12기(wave A~E ultra, bridge부터 사용자 지시로 high) + opus 보조 2기(fixture 수리·smoke).
+- **분해 설계** (`docs/m1b-slice-decomposition` → `dev_docs/m1b-slice-plan.md`): 결정 D1–D10, **PC 귀속표(M1-B분) 확정**(ADR-0014 Amendment §2 위임 이행 — PC-14~22·27~29·31 부분 + 신규 의무 I-10·E-03/06/08/09 잔여·ADR-0013 3행·취소 절), fixture 8건 소유 map, 편입 예약 7건 배치(network-resilience는 M2 배치 + S1–S3 기질을 M1-B exit에 편입).
+- **Shipped (구현 15 + gate)**: run-store-kernel(SQLite WAL store+CAS+append-only+UUIDv7+artifact CAS, JW-GPT-014 단일 transaction 증명) · run-domain-roles(4-role+profile v1 adapter) · review-runs-uuid-owner-directory(ADR-0009 canonical layout live 가동, JW-GPT-015 구조 소멸, legacy test ±8/48 main 승인) · run-lease-fencing(fixture 6·7·8, expiry≠권한) · run-spec-planning(frozen RunSpec·snapshot 무변조 — 가드 없는 status의 index 변경을 대조 실험으로 실증) · run-verification-preflight(WS-GPT-102 위조 toolchain 세탁 반증 폐쇄, env-prep digest 편입) · run-effect-protocol(5단계·kind 5종·unknown-effect 정직 대기·crash 결정표, D9 store additive 확장) · run-supervisor-identity(detached 생존 opus probe 실증 — S2) · run-observability(fixture 5, 100회 byte probe) · run-cancel-quiescence(fixture 4 5-case, EXITED∧reconcile∧principal 3중 게이트 — **2026-07-19 실사고 시나리오 구조 차단**, store-일관 위조 probe까지 fail-closed) · delegate-prompt-i10-surface-strip(I-10 최소 프롬프트, routing_note 투영 제거) · run-actions-transport(5중 검증·I-03 위조 probe 13/13·recoverable 분류 — S3) · run-store-permission-hardening(0700/0600/0400·no-follow — 기존 lock symlink 추종 실차단, umask fail-closed probe) · run-verify-decision(PC-16/17/20/21/22 — 판별성 probe·11-artifact tamper matrix) · run-cli-bridge(엔진 조립+CLI, e2e 실 detached 완주) · **gate/m1b-exit: exit 9항 전항 충족**(`dev_docs/m1b-exit-evidence.md`) — 실 backend smoke PASS(codex exec runner 완주·ref OID 일치·live tree 불변).
+- **검증 체계**: 기체 suite → main 독립 재실행 → **opus 반증 검증 10기**(전 기 blocker/major 0; 직접 probe: raw sqlite 우회·stale principal 20경로·위조 세탁·detached 생존·100회 byte 불변·파괴 4벡터+위조 상태·판별성·I-03 13종) → 병합 조합 suite. suite 838→**1088** (신규 계약 테스트 250, legacy 구식화 8건 승인 대체).
+- **Gates**: full suite 1088 rc=0 (병합 게이트 ×15 전부 green; 병합 사고 1건 — run_tests.py 충돌 마커 커밋 후 즉시 수리 7ec778a, 이후 충돌 검사 분리 절차 채택. perm·verify의 0400↔fixture 충돌 2건은 ruling으로 주입 방식 갱신, 계약 단언 불변).
+- **SSOT**: unchanged. **ADR-0010 Amendment**(v1 acceptance adapter·review decision null 보존·no-retry 기본값 — 3자 충돌 해소) + `docs/run-engine-formats.md` v1 format registry 확정.
+- **처분**: JW-GPT-014/015 blocked 2건 legacy-residual 종결(신규 시스템 재현 불가 fixture 보증). 후속 등록 12건(가장 중요: fix/effects-runner-absence-seam·fix/patch-effect-approval-reconcile-binding·fix/lease-principal-project-executor-binding·feat/run-production-assembly). 사용자 지시 반영: codex effort ultra→high(profile·memory 갱신).
+- **Decisions pending**: decision/legacy-settlement-additional-cohort(minor, 사용자).
+- **Review**: requested (docs/reviews/runs/<uuid>/… — canonical layout 첫 적용 여부는 release 하네스 기준, 실제 경로는 request 참조).
+- **Next**: M1-B 리뷰 회신 처리(codex high) → M1-C compatibility cut-over 분해(front door delegate 경로 전환·legacy characterization·_git 정렬·production assembly·DB schema upgrade smoke·PC-24).
+
 ## 2026-07-20-m1a-review-closeout
 
 - **Goal**: m1a-split packet의 codex ultra 리뷰(major 5) 처리 — 검증·처분·잔여 수리. M1-A exit 방어전.
