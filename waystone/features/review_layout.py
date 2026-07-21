@@ -19,6 +19,9 @@ REQUEST_BINDING = "request-binding"
 FEEDBACK = "feedback"
 PR_FREEZE = "pr-freeze"
 PR_DEMOTION = "pr-demotion"
+FINDING_CLAIM = "finding-claim"
+FINDING_VALIDATION = "finding-validation"
+FINDING_DISPOSITION = "finding-disposition"
 
 _FIXED_LEAVES = {
     REQUEST: "request.md",
@@ -35,21 +38,16 @@ _LOCAL_LOCATOR_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _MARKDOWN_IDENTITY_PREFIX = b"<!-- waystone-review-artifact:v1 "
 _MARKDOWN_IDENTITY_SUFFIX = b" -->\n"
 _MARKDOWN_IDENTITY_SCHEMA = "waystone-review-artifact-1"
-
-_LEGACY_PATTERNS = (
-    (REQUEST_BINDING, re.compile(
-        r"(?P<round_id>.+)-request\.binding(?:-[1-9]\d*)?\.json")),
-    (PR_FREEZE, re.compile(
-        r"(?P<round_id>.+)-freeze-[1-9]\d*\.binding(?:-[1-9]\d*)?\.json")),
-    (PR_DEMOTION, re.compile(
-        r"(?P<round_id>.+)-freeze-[1-9]\d*\.demotion(?:-[1-9]\d*)?\.json")),
-    (REQUEST, re.compile(r"(?P<round_id>.+)-request\.md")),
-    (FEEDBACK, re.compile(r"(?P<round_id>.+)-feedback\.md")),
-)
-
+_FINDING_LEAVES = {
+    FINDING_CLAIM: "claim.yaml",
+}
+_FINDING_DIRECTORIES = {
+    FINDING_VALIDATION: "validations",
+    FINDING_DISPOSITION: "dispositions",
+}
 
 class ReviewLayoutError(WorkflowError):
-    """Base class for typed canonical/legacy review-layout refusals."""
+    """Base class for typed canonical review-layout refusals."""
 
 
 class IdentityConflict(ReviewLayoutError):
@@ -112,6 +110,30 @@ def new_run_id(*, unix_ms: int | None = None) -> str:
 
 def canonical_run_directory(reviews_dir: Path, run_id: str) -> Path:
     return Path(reviews_dir) / "runs" / require_uuid7(run_id)
+
+
+def canonical_finding_directory(reviews_dir: Path, run_id: str, finding_id: str) -> Path:
+    """Return one UUID-owned finding directory under one canonical review run."""
+    return canonical_run_directory(reviews_dir, run_id) / "findings" / require_uuid7(finding_id)
+
+
+def canonical_finding_path(
+        reviews_dir: Path, run_id: str, finding_id: str, kind: str, revision: int | None = None,
+) -> Path:
+    """Return a safe claim/validation/disposition YAML path.
+
+    Claims have one immutable leaf. Revisions use four-digit display numbers; the chain digest,
+    not the number or directory order, is the authority for head resolution.
+    """
+    directory = canonical_finding_directory(reviews_dir, run_id, finding_id)
+    if kind in _FINDING_LEAVES:
+        if revision is not None:
+            raise ReviewLayoutError(f"{kind} does not accept a revision")
+        return directory / _FINDING_LEAVES[kind]
+    parent = _FINDING_DIRECTORIES.get(kind)
+    if parent is None or type(revision) is not int or revision < 1:
+        raise ReviewLayoutError(f"{kind} requires a positive integer revision")
+    return directory / parent / f"{revision:04d}.yaml"
 
 
 def canonical_artifact_path(
@@ -180,6 +202,20 @@ def publish_json(
     return path
 
 
+def publish_finding_yaml(
+        reviews_dir: Path, run_id: str, finding_id: str, kind: str, revision: int | None,
+        content: bytes,
+) -> Path:
+    """Publish one immutable finding YAML artifact using the canonical no-overwrite path."""
+    if kind not in (*_FINDING_LEAVES, *_FINDING_DIRECTORIES):
+        raise ReviewLayoutError(f"unknown finding artifact kind: {kind}")
+    if not isinstance(content, bytes):
+        raise TypeError("finding artifact content must be bytes")
+    path = canonical_finding_path(reviews_dir, run_id, finding_id, kind, revision)
+    _publish(Path(reviews_dir), path, content, replace=False)
+    return path
+
+
 def read_canonical_artifact(reviews_dir: Path, path: Path) -> dict[str, Any]:
     """Read one canonical artifact only after path and payload owner checks both pass."""
     artifact_path = Path(path)
@@ -206,6 +242,27 @@ def read_canonical_artifact(reviews_dir: Path, path: Path) -> dict[str, Any]:
     }
 
 
+def read_finding_artifact(
+        reviews_dir: Path, run_id: str, finding_id: str, kind: str, revision: int | None,
+) -> dict[str, Any]:
+    """Read one finding artifact after validating the full canonical owner path."""
+    path = canonical_finding_path(reviews_dir, run_id, finding_id, kind, revision)
+    _require_safe_finding_path(Path(reviews_dir), path)
+    try:
+        content = path.read_bytes()
+    except OSError as error:
+        raise ReviewLayoutError(f"finding artifact unavailable {path}: {error}") from error
+    return {
+        "run_id": require_uuid7(run_id),
+        "finding_id": require_uuid7(finding_id),
+        "kind": kind,
+        "revision": revision,
+        "path": path,
+        "bytes": content,
+        "evidence": "canonical",
+    }
+
+
 def read_canonical_run(reviews_dir: Path, run_id: str) -> tuple[dict[str, Any], ...]:
     """Read one owner directory without enumerating or parsing any adjacent owner."""
     directory = canonical_run_directory(reviews_dir, run_id)
@@ -221,7 +278,38 @@ def read_canonical_run(reviews_dir: Path, run_id: str) -> tuple[dict[str, Any], 
             raise IdentityConflict(f"canonical review sidecar directory is a symlink: {parent}")
         if parent.is_dir():
             paths.extend(sorted(parent.glob("*.json")))
-    return tuple(read_canonical_artifact(reviews_dir, path) for path in sorted(paths))
+    artifacts = [read_canonical_artifact(reviews_dir, path) for path in sorted(paths)]
+    findings = directory / "findings"
+    if findings.is_symlink():
+        raise IdentityConflict(f"canonical review findings directory is a symlink: {findings}")
+    if findings.exists() and not findings.is_dir():
+        raise IdentityConflict(f"canonical review findings path is not a directory: {findings}")
+    if findings.is_dir():
+        for finding_directory in sorted(findings.iterdir()):
+            if finding_directory.is_symlink():
+                raise IdentityConflict(
+                    f"canonical review finding directory is a symlink: {finding_directory}")
+            if not finding_directory.is_dir():
+                continue
+            finding_id = require_uuid7(finding_directory.name)
+            claim = finding_directory / _FINDING_LEAVES[FINDING_CLAIM]
+            if claim.exists() or claim.is_symlink():
+                artifact = read_finding_artifact(
+                    reviews_dir, run_id, finding_id, FINDING_CLAIM, None)
+                artifacts.append(artifact)
+            for kind, parent_name in _FINDING_DIRECTORIES.items():
+                parent = finding_directory / parent_name
+                if parent.is_symlink():
+                    raise IdentityConflict(f"canonical finding chain directory is a symlink: {parent}")
+                if parent.is_dir():
+                    for path in sorted(parent.glob("[0-9][0-9][0-9][0-9].yaml")):
+                        try:
+                            revision = int(path.stem)
+                        except ValueError:
+                            continue
+                        artifacts.append(read_finding_artifact(
+                            reviews_dir, run_id, finding_id, kind, revision))
+    return tuple(artifacts)
 
 
 def scan_canonical_request_bindings(
@@ -264,35 +352,6 @@ def rejected_binding_round_claim(reviews_dir: Path, path: Path) -> str | None:
     return claim if isinstance(claim, str) else None
 
 
-def read_legacy_artifact(reviews_dir: Path, path: Path) -> dict[str, Any]:
-    """Read one direct-child flat artifact using only the historical filename grammar."""
-    directory = Path(reviews_dir)
-    artifact_path = Path(path)
-    if artifact_path.parent != directory:
-        raise ReviewLayoutError(
-            f"legacy review artifact must be a direct child of {directory}: {artifact_path}")
-    if artifact_path.is_symlink() or not artifact_path.is_file():
-        raise ReviewLayoutError(
-            f"legacy review artifact must be a regular non-symlink file: {artifact_path}")
-    for kind, pattern in _LEGACY_PATTERNS:
-        match = pattern.fullmatch(artifact_path.name)
-        if match is None:
-            continue
-        try:
-            content = artifact_path.read_bytes()
-        except OSError as error:
-            raise ReviewLayoutError(
-                f"legacy review artifact unavailable {artifact_path}: {error}") from error
-        return {
-            "round_id": match.group("round_id"),
-            "kind": kind,
-            "path": artifact_path,
-            "bytes": content,
-            "evidence": "legacy",
-        }
-    raise ReviewLayoutError(f"unrecognized legacy review artifact: {artifact_path}")
-
-
 def _canonical_address(reviews_dir: Path, path: Path) -> tuple[str, str, str | None]:
     try:
         relative = path.relative_to(reviews_dir / "runs")
@@ -333,6 +392,20 @@ def _require_safe_canonical_path(reviews_dir: Path, path: Path) -> None:
         path.resolve(strict=False).relative_to(runs.resolve(strict=False))
     except ValueError as error:
         raise IdentityConflict(f"canonical review path escapes the runs tree: {path}") from error
+
+
+def _require_safe_finding_path(reviews_dir: Path, path: Path) -> None:
+    """Apply the run-tree safety checks to the deeper finding subtree."""
+    _require_safe_canonical_path(reviews_dir, path)
+    try:
+        relative = path.relative_to(Path(reviews_dir) / "runs")
+    except ValueError as error:
+        raise IdentityConflict(f"finding path is outside the canonical runs tree: {path}") from error
+    current = Path(reviews_dir)
+    for part in ("runs", *relative.parts):
+        current = current / part
+        if current.is_symlink():
+            raise IdentityConflict(f"canonical finding path contains a symlink: {current}")
 
 
 def _require_payload_owner(payload: Mapping[str, Any], run_id: str, path: Path) -> None:
