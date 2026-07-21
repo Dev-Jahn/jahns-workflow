@@ -669,7 +669,7 @@ tasks:
     status: "done"
   - id: feat/013-project-frame-work-brief
     title: "0.13 A1: PROJECT_BRIEF typed fact parser(ProjectFrame) + Semantic WorkBrief/CompletionContract 스키마·CAS ingress·semantic prompt renderer + brief config"
-    status: "pending"
+    status: "done"
   - id: feat/013-finding-disposition
     title: "0.13 B1: finding claim/validation/disposition 3-immutable-chain + review layout/CLI + selected-work materialization (REAL→task 자동 연결 제거)"
     status: "done"
