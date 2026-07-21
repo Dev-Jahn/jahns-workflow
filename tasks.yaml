@@ -672,7 +672,7 @@ tasks:
     status: "pending"
   - id: feat/013-finding-disposition
     title: "0.13 B1: finding claim/validation/disposition 3-immutable-chain + review layout/CLI + selected-work materialization (REAL→task 자동 연결 제거)"
-    status: "pending"
+    status: "done"
   - id: feat/013-staged-run-context-resume
     title: "0.13 A2: ProjectContext·production RunAssembly·RunSpec/store v2·worker result union·context_request/waiting_context resume·typed run start"
     status: "pending"
