@@ -2124,6 +2124,28 @@ def _load_verifier_evidence(
     )
 
 
+def reload_verifier_evidence(
+        run_id: str, attempt_id: str, action_id: str, *,
+        start: Path | None = None) -> VerifierEvidence:
+    """Reload and fully revalidate one published terminal verifier result."""
+    root = Path.cwd().resolve() if start is None else Path(start).resolve(strict=True)
+    expected_attempt = _nonempty(attempt_id, "attempt_id")
+    expected_action = _nonempty(action_id, "action_id")
+    spec, _snapshot, plan, dispatch = _authority(run_id, root)
+    evidence = _load_verifier_evidence(
+        root,
+        f"verifier-evidence:{expected_action}",
+        spec=spec,
+        plan=plan,
+        dispatch=dispatch,
+    )
+    if (evidence.attempt_id != expected_attempt
+            or evidence.action_id != expected_action):
+        raise EvidenceBindingRefusal(
+            "verifier evidence does not belong to the expected terminal lineage")
+    return evidence
+
+
 def _override_payload(value: BlockerOverride) -> dict[str, str]:
     return {
         "blocker_id": value.blocker_id,
@@ -2689,6 +2711,41 @@ def _load_integration_decision(
     )
 
 
+def reload_integration_decision(
+        run_id: str, attempt_id: str, action_id: str,
+        verifier_action_id: str, *, start: Path | None = None,
+        ) -> IntegrationDecision:
+    """Reload and fully revalidate one published terminal integration decision."""
+    root = Path.cwd().resolve() if start is None else Path(start).resolve(strict=True)
+    expected_attempt = _nonempty(attempt_id, "attempt_id")
+    expected_action = _nonempty(action_id, "action_id")
+    expected_verifier_action = _nonempty(
+        verifier_action_id, "verifier_action_id")
+    spec, _snapshot, plan, dispatch = _authority(run_id, root)
+    evidence = _load_verifier_evidence(
+        root,
+        f"verifier-evidence:{expected_verifier_action}",
+        spec=spec,
+        plan=plan,
+        dispatch=dispatch,
+    )
+    if (evidence.attempt_id != expected_attempt
+            or evidence.action_id != expected_verifier_action):
+        raise ApplyBindingRefusal(
+            "verifier evidence does not belong to the expected decision lineage")
+    decision = _load_integration_decision(
+        root,
+        f"integration-decision:{expected_action}",
+        spec=spec,
+        evidence=evidence,
+    )
+    if (decision.attempt_id != expected_attempt
+            or decision.action_id != expected_action):
+        raise ApplyBindingRefusal(
+            "integration decision does not belong to the expected terminal lineage")
+    return decision
+
+
 def _checked_out_target_ref(repository: Path, target_ref: str) -> None:
     components = target_ref.split("/")
     forbidden = set(" ~^:?*[\\")
@@ -2877,4 +2934,6 @@ __all__ = [
     "execute_verifier",
     "fingerprint_worktree",
     "record_integration_decision",
+    "reload_integration_decision",
+    "reload_verifier_evidence",
 ]

@@ -73,6 +73,8 @@ from waystone.runs.verify import (
     apply_integration_decision,
     execute_verifier,
     record_integration_decision,
+    reload_integration_decision,
+    reload_verifier_evidence,
 )
 from waystone.runs import store as store_module
 
@@ -525,6 +527,85 @@ class RunEngine:
         cancellation = CancellationEngine(store, effects, leases, supervisor)
         return cancellation.resume_cancel(run_id, action_id)
 
+    def _reference_is_published(self, reference_id: str) -> bool:
+        with RunStore.open(self.root) as store:
+            try:
+                store.get_artifact_reference(reference_id)
+            except RecordNotFoundError:
+                return False
+        return True
+
+    @staticmethod
+    def _finished_apply_call_is_quiescent(plan) -> bool:
+        """A resumed synchronous apply has no detached executor left to observe."""
+        return plan.kind is EffectKind.PATCH_INTEGRATION
+
+    def _resume_published_apply(
+            self, spec: RunSpec, evidence: VerifierEvidence,
+            decision: IntegrationDecision, target_ref: str) -> ApplyResult | None:
+        action_id = _apply_action_id(spec.run_id)
+        with RunStore.open(self.root) as store:
+            try:
+                action = store.get_entity(EntityKind.ACTION, action_id)
+            except RecordNotFoundError:
+                return None
+            effects = EffectEngine(store, LeaseManager(store))
+            plan = effects._load_plan(action_id)  # noqa: SLF001 - reentry authority check
+            expected_spec = {
+                "repository": str(self.root),
+                "target_ref": target_ref,
+                "expected_parent_oid": evidence.result.base_oid,
+                "expected_parent_tree_oid": evidence.result.base_tree_oid,
+                "integration_commit_oid": evidence.result.result_oid,
+                "integration_tree_oid": evidence.result.result_tree_oid,
+                "approval_digests": {
+                    "run_spec_digest": spec.run_spec_digest,
+                    "verification_plan_digest": evidence.verification_plan_digest,
+                    "verifier_evidence_digest": evidence.artifact_reference.digest,
+                    "integration_decision_digest": decision.artifact_reference.digest,
+                },
+            }
+            if (plan.run_id != spec.run_id or plan.job_id != spec.job_id
+                    or plan.attempt_id != evidence.attempt_id
+                    or plan.action_id != action_id
+                    or plan.kind is not EffectKind.PATCH_INTEGRATION
+                    or plan.spec != expected_spec):
+                raise EngineBindingRefusal(
+                    "published apply action differs from the accepted terminal lineage")
+
+            if action.state == "completed":
+                with store._connection_lock:  # noqa: SLF001 - terminal transition evidence
+                    rows = store._connection.execute(  # noqa: SLF001
+                        "SELECT evidence_digest FROM transitions "
+                        "WHERE entity_kind = ? AND entity_id = ? "
+                        "AND next_state = 'completed' AND reason = ?",
+                        (EntityKind.ACTION.value, action_id,
+                         TransitionReason.COMPLETED.value),
+                    ).fetchall()
+                if (len(rows) != 1
+                        or not isinstance(rows[0]["evidence_digest"], str)):
+                    raise EngineBindingRefusal(
+                        "completed apply action lacks one terminal observed digest")
+                observed_digest = rows[0]["evidence_digest"]
+            else:
+                result = effects.reconcile_actions(
+                    (action_id,),
+                    quiescence_probe=self._finished_apply_call_is_quiescent,
+                )[0]
+                if result.state is not EffectResultState.COMPLETED:
+                    raise EngineBindingRefusal(
+                        result.reason or "published apply action did not reconcile")
+                if result.observed_digest is None:
+                    raise EngineBindingRefusal(
+                        "reconciled apply action lacks observed evidence")
+                observed_digest = result.observed_digest
+        return ApplyResult(
+            action_id=action_id,
+            target_ref=target_ref,
+            result_oid=evidence.result.result_oid,
+            observed_digest=observed_digest,
+        )
+
     def _complete(self, spec: RunSpec) -> CompletionResult:
         assembly = self._require_assembly()
         attempt_id = _attempt_id(spec.run_id)
@@ -534,28 +615,45 @@ class RunEngine:
             except RecordNotFoundError:
                 store.create_attempt(
                     spec.run_id, spec.job_id, attempt_id, initial_state="running")
-        evidence = execute_verifier(
-            spec.run_id,
-            attempt_id,
-            _verify_action_id(spec.run_id),
-            self.root,
-            assembly.result_ref,
-            assembly.worker_actor_id,
-            assembly.verifier_actor,
-            assembly.check_executor,
-            assembly.verifier_adapter,
-            start=self.root,
-        )
-        decision_input = assembly.decision_input(evidence, assembly.coordinator_actor)
-        if not isinstance(decision_input, DecisionInput):
-            raise EngineBindingRefusal("decision_input did not return DecisionInput")
-        decision = record_integration_decision(
-            spec.run_id,
-            attempt_id,
-            _decision_action_id(spec.run_id),
-            decision_input,
-            start=self.root,
-        )
+        verify_action_id = _verify_action_id(spec.run_id)
+        if self._reference_is_published(f"verifier-evidence:{verify_action_id}"):
+            evidence = reload_verifier_evidence(
+                spec.run_id, attempt_id, verify_action_id, start=self.root)
+        else:
+            evidence = execute_verifier(
+                spec.run_id,
+                attempt_id,
+                verify_action_id,
+                self.root,
+                assembly.result_ref,
+                assembly.worker_actor_id,
+                assembly.verifier_actor,
+                assembly.check_executor,
+                assembly.verifier_adapter,
+                start=self.root,
+            )
+        decision_action_id = _decision_action_id(spec.run_id)
+        if self._reference_is_published(
+                f"integration-decision:{decision_action_id}"):
+            decision = reload_integration_decision(
+                spec.run_id,
+                attempt_id,
+                decision_action_id,
+                verify_action_id,
+                start=self.root,
+            )
+        else:
+            decision_input = assembly.decision_input(
+                evidence, assembly.coordinator_actor)
+            if not isinstance(decision_input, DecisionInput):
+                raise EngineBindingRefusal("decision_input did not return DecisionInput")
+            decision = record_integration_decision(
+                spec.run_id,
+                attempt_id,
+                decision_action_id,
+                decision_input,
+                start=self.root,
+            )
         if decision.outcome is not DecisionOutcome.ACCEPT:
             raise EngineBindingRefusal("rejected decision cannot enter apply")
 
@@ -580,17 +678,19 @@ class RunEngine:
                     EffectResultState.COMPLETED, EffectResultState.NOOP}:
                 raise EngineBindingRefusal(
                     target_result.reason or "private integration target was not established")
-        applied = apply_integration_decision(
-            spec.run_id,
-            attempt_id,
-            _apply_action_id(spec.run_id),
-            self.root,
-            assembly.result_ref,
-            target,
-            evidence.artifact_reference.reference_id,
-            decision.artifact_reference.reference_id,
-            start=self.root,
-        )
+        applied = self._resume_published_apply(spec, evidence, decision, target)
+        if applied is None:
+            applied = apply_integration_decision(
+                spec.run_id,
+                attempt_id,
+                _apply_action_id(spec.run_id),
+                self.root,
+                assembly.result_ref,
+                target,
+                evidence.artifact_reference.reference_id,
+                decision.artifact_reference.reference_id,
+                start=self.root,
+            )
         with RunStore.open(self.root) as store:
             job = store.get_entity(EntityKind.JOB, spec.job_id)
             if job.state != "accepted":
@@ -616,6 +716,7 @@ class RunEngine:
 
     def resume(self, run_id: str) -> ResumeResult:
         spec = load_run_spec(run_id, start=self.root)
+        completion_started = False
         with RunStore.open(self.root) as store:
             run = store.get_run(run_id)
             if run.state in _CANCELLATION_STATES:
@@ -633,6 +734,15 @@ class RunEngine:
                         "run_state": "completed",
                     },
                 )
+            try:
+                store.get_artifact_reference(
+                    f"verifier-evidence:{_verify_action_id(run_id)}")
+            except RecordNotFoundError:
+                pass
+            else:
+                completion_started = True
+        if completion_started:
+            return ResumeResult(run_id, completion=self._complete(spec))
         dispatch = load_dispatch_ready(run_id, start=self.root)
         with RunStore.open(self.root) as store:
             if not self._runner_actions(store, run_id):

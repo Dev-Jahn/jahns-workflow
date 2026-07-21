@@ -82,6 +82,8 @@ from waystone.runs.verify import (
     execute_verifier,
     fingerprint_worktree,
     record_integration_decision,
+    reload_integration_decision,
+    reload_verifier_evidence,
 )
 import waystone.runs.verify as verify_module
 
@@ -1732,6 +1734,81 @@ class RunVerifyTests(unittest.TestCase):
                              for item in outcomes), 1)
         self.assertEqual(
             self.semantic_reference_count(fixture.root, "verifier-evidence:"), 1)
+
+    def test_pc18_pc20_pc21_public_reload_revalidates_terminal_authority(self):
+        """Published evidence and decision reload through their full authority chain."""
+        fixture = self.prepare()
+        evidence, decision = self.verified_decision(fixture)
+
+        with self.supported_filesystem():
+            reloaded_evidence = reload_verifier_evidence(
+                fixture.spec.run_id,
+                evidence.attempt_id,
+                evidence.action_id,
+                start=fixture.root,
+            )
+            reloaded_decision = reload_integration_decision(
+                fixture.spec.run_id,
+                decision.attempt_id,
+                decision.action_id,
+                evidence.action_id,
+                start=fixture.root,
+            )
+
+        self.assertEqual(reloaded_evidence, evidence)
+        self.assertEqual(reloaded_decision, decision)
+        with self.supported_filesystem(), self.assertRaises(EvidenceBindingRefusal):
+            reload_verifier_evidence(
+                fixture.spec.run_id,
+                f"{evidence.attempt_id}:different",
+                evidence.action_id,
+                start=fixture.root,
+            )
+        with self.supported_filesystem(), self.assertRaises(ApplyBindingRefusal):
+            reload_integration_decision(
+                fixture.spec.run_id,
+                f"{decision.attempt_id}:different",
+                decision.action_id,
+                evidence.action_id,
+                start=fixture.root,
+            )
+
+    def test_pc20_public_evidence_reload_refuses_tampered_terminal_bytes(self):
+        """Reload rehashes published verifier bytes instead of trusting their reference."""
+        fixture = self.prepare()
+        evidence = self.verify(fixture)
+        artifact_path = ArtifactStore(fixture.root).path_for(
+            evidence.artifact_reference.digest)
+        os.chmod(artifact_path, 0o600)
+        artifact_path.write_bytes(b"{}")
+        os.chmod(artifact_path, 0o400)
+
+        with self.supported_filesystem(), self.assertRaises(EvidenceBindingRefusal):
+            reload_verifier_evidence(
+                fixture.spec.run_id,
+                evidence.attempt_id,
+                evidence.action_id,
+                start=fixture.root,
+            )
+
+    def test_pc21_public_decision_reload_refuses_tampered_terminal_bytes(self):
+        """Reload rehashes the published decision and its verifier authority."""
+        fixture = self.prepare()
+        evidence, decision = self.verified_decision(fixture)
+        artifact_path = ArtifactStore(fixture.root).path_for(
+            decision.artifact_reference.digest)
+        os.chmod(artifact_path, 0o600)
+        artifact_path.write_bytes(b"{}")
+        os.chmod(artifact_path, 0o400)
+
+        with self.supported_filesystem(), self.assertRaises(ApplyBindingRefusal):
+            reload_integration_decision(
+                fixture.spec.run_id,
+                decision.attempt_id,
+                decision.action_id,
+                evidence.action_id,
+                start=fixture.root,
+            )
 
     def test_pc20_pc21_retry_requires_new_attempt_and_new_action_identity(self):
         """PC-20/PC-21: verify and decision retries require fresh lineage IDs."""

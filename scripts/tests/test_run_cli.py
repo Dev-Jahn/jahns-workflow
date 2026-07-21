@@ -23,8 +23,10 @@ from unittest import mock
 
 from waystone.cli import main as cli_main
 from waystone.cli import run_group
+from waystone.runs import engine as engine_module
 from waystone.jobs.domain import ExecutionCategory, Role, RoleBinding
 from waystone.runs import store as store_module
+from waystone.runs.effects import EffectEngine
 from waystone.runs.engine import PreflightInputs, RunAssembly, RunEngine
 from waystone.runs.preflight import (
     CapabilitySet,
@@ -65,6 +67,10 @@ from waystone.runs.verify import (
 
 def sha256(payload: bytes) -> str:
     return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+class InjectedCompletionCrash(BaseException):
+    """Model a process-ending fault that ordinary exception recovery cannot catch."""
 
 
 class RunCliTests(unittest.TestCase):
@@ -374,6 +380,30 @@ class RunCliTests(unittest.TestCase):
                     for table in tables
                 }
 
+    def start_ready_run(self, engine: RunEngine) -> str:
+        result = engine.start("feat/example")
+        self.wait_for_marker(engine.root)
+        return result.run_id
+
+    def drive_to_completion(self, engine: RunEngine, run_id: str):
+        for _ in range(5):
+            result = engine.resume(run_id)
+            if result.completion is not None:
+                return result.completion
+        self.fail("run did not reach completion after runner exit")
+
+    def assert_completed(self, root: Path, run_id: str) -> None:
+        with self.supported_filesystem(), RunStore.open(root) as store:
+            self.assertEqual(store.get_run(run_id).state, "completed")
+            self.assertEqual(
+                store.get_entity(EntityKind.JOB, f"{run_id}:job").state,
+                "accepted",
+            )
+
+    @staticmethod
+    def unexpected_stage(*_args, **_kwargs):
+        raise AssertionError("a completed _complete stage was executed again")
+
     def test_one_task_cli_run_completes_through_supervisor_verify_decision_and_private_apply(self):
         root, worker, toolchain = self.project(delay=1.0)
         engine = RunEngine(root, self.assembly(root, worker, toolchain))
@@ -411,6 +441,163 @@ class RunCliTests(unittest.TestCase):
             root, "rev-parse", f"refs/waystone/integration/{run_id}").stdout.strip()
         self.assertEqual(integrated, result)
         self.assertEqual(git(root, "status", "--porcelain").stdout, "")
+
+    def test_complete_reentry_after_decision_callback_exception_resumes_at_decision(self):
+        root, worker, toolchain = self.project()
+        normal = self.assembly(root, worker, toolchain)
+        crashing = replace(normal, decision_input=lambda *_: (_ for _ in ()).throw(
+            InjectedCompletionCrash()))
+        engine = RunEngine(root, crashing)
+
+        with self.supported_filesystem():
+            run_id = self.start_ready_run(engine)
+            with self.assertRaises(InjectedCompletionCrash):
+                self.drive_to_completion(engine, run_id)
+            completion = self.drive_to_completion(RunEngine(root, normal), run_id)
+
+        self.assertEqual(completion.verifier.action_id, f"{run_id}:verify")
+        self.assert_completed(root, run_id)
+
+    def test_ws_gpt_601_record_decision_exception_does_not_brick_resume(self):
+        root, worker, toolchain = self.project()
+        assembly = self.assembly(root, worker, toolchain)
+        engine = RunEngine(root, assembly)
+
+        with self.supported_filesystem():
+            run_id = self.start_ready_run(engine)
+            with mock.patch.object(
+                    engine_module,
+                    "record_integration_decision",
+                    side_effect=InjectedCompletionCrash()), \
+                    self.assertRaises(InjectedCompletionCrash):
+                self.drive_to_completion(engine, run_id)
+            completion = self.drive_to_completion(
+                RunEngine(root, self.assembly(root, worker, toolchain)), run_id)
+
+        self.assertEqual(completion.decision.outcome, DecisionOutcome.ACCEPT)
+        self.assert_completed(root, run_id)
+
+    def test_complete_reentry_after_decision_publication_resumes_at_apply(self):
+        root, worker, toolchain = self.project()
+        assembly = self.assembly(root, worker, toolchain)
+        engine = RunEngine(root, assembly)
+
+        with self.supported_filesystem():
+            run_id = self.start_ready_run(engine)
+            with mock.patch.object(
+                    engine_module,
+                    "apply_integration_decision",
+                    side_effect=InjectedCompletionCrash()), \
+                    self.assertRaises(InjectedCompletionCrash):
+                self.drive_to_completion(engine, run_id)
+            no_prior_stages = replace(
+                self.assembly(root, worker, toolchain),
+                check_executor=self.unexpected_stage,
+                decision_input=self.unexpected_stage,
+            )
+            completion = self.drive_to_completion(
+                RunEngine(root, no_prior_stages), run_id)
+
+        self.assertEqual(completion.applied.action_id, f"{run_id}:apply")
+        self.assert_completed(root, run_id)
+
+    def test_complete_reentry_after_apply_only_reconciles_terminal_transitions(self):
+        root, worker, toolchain = self.project()
+        assembly = self.assembly(root, worker, toolchain)
+        engine = RunEngine(root, assembly)
+        original_apply = engine_module.apply_integration_decision
+
+        def crash_after_apply(*args, **kwargs):
+            original_apply(*args, **kwargs)
+            raise InjectedCompletionCrash()
+
+        with self.supported_filesystem():
+            run_id = self.start_ready_run(engine)
+            with mock.patch.object(
+                    engine_module,
+                    "apply_integration_decision",
+                    side_effect=crash_after_apply), \
+                    self.assertRaises(InjectedCompletionCrash):
+                self.drive_to_completion(engine, run_id)
+            no_prior_stages = replace(
+                self.assembly(root, worker, toolchain),
+                check_executor=self.unexpected_stage,
+                decision_input=self.unexpected_stage,
+            )
+            with mock.patch.object(
+                    engine_module,
+                    "apply_integration_decision",
+                    side_effect=self.unexpected_stage):
+                completion = self.drive_to_completion(
+                    RunEngine(root, no_prior_stages), run_id)
+
+        self.assertEqual(completion.applied.action_id, f"{run_id}:apply")
+        self.assert_completed(root, run_id)
+
+    def test_complete_reentry_reconciles_published_nonterminal_apply(self):
+        root, worker, toolchain = self.project()
+        assembly = self.assembly(root, worker, toolchain)
+        engine = RunEngine(root, assembly)
+        original_execute = EffectEngine.execute_effect
+
+        def crash_after_apply_claim(effects, claimed):
+            if claimed.plan.action_id.endswith(":apply"):
+                raise InjectedCompletionCrash()
+            return original_execute(effects, claimed)
+
+        with self.supported_filesystem():
+            run_id = self.start_ready_run(engine)
+            with mock.patch.object(
+                    EffectEngine,
+                    "execute_effect",
+                    new=crash_after_apply_claim), \
+                    self.assertRaises(InjectedCompletionCrash):
+                self.drive_to_completion(engine, run_id)
+            no_prior_stages = replace(
+                self.assembly(root, worker, toolchain),
+                check_executor=self.unexpected_stage,
+                decision_input=self.unexpected_stage,
+            )
+            completion = self.drive_to_completion(
+                RunEngine(root, no_prior_stages), run_id)
+
+        self.assertEqual(completion.applied.action_id, f"{run_id}:apply")
+        self.assert_completed(root, run_id)
+
+    def test_complete_reentry_after_terminal_store_error_does_not_reapply(self):
+        root, worker, toolchain = self.project()
+        assembly = self.assembly(root, worker, toolchain)
+        engine = RunEngine(root, assembly)
+        original_transition = RunStore.record_transition
+        failed = False
+
+        def transient_store_error(store, entity_kind, entity_id, **kwargs):
+            nonlocal failed
+            if (not failed and entity_kind is EntityKind.JOB
+                    and kwargs.get("next_state") == "accepted"):
+                failed = True
+                raise RuntimeError("simulated transient terminal store error")
+            return original_transition(store, entity_kind, entity_id, **kwargs)
+
+        with self.supported_filesystem():
+            run_id = self.start_ready_run(engine)
+            with mock.patch.object(
+                    RunStore, "record_transition", new=transient_store_error), \
+                    self.assertRaisesRegex(RuntimeError, "transient terminal store error"):
+                self.drive_to_completion(engine, run_id)
+            no_prior_stages = replace(
+                self.assembly(root, worker, toolchain),
+                check_executor=self.unexpected_stage,
+                decision_input=self.unexpected_stage,
+            )
+            with mock.patch.object(
+                    engine_module,
+                    "apply_integration_decision",
+                    side_effect=self.unexpected_stage):
+                self.drive_to_completion(RunEngine(root, no_prior_stages), run_id)
+
+        self.assertTrue(failed)
+        self.assert_completed(root, run_id)
 
     def test_planned_runner_dispatch_returns_busy_without_waiting_for_completion(self):
         root, worker, toolchain = self.project(delay=1.0)
