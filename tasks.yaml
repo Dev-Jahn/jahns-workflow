@@ -216,8 +216,9 @@ tasks:
     status: done
     severity: "blocker"
   - id: decision/legacy-settlement-additional-cohort
+    ruling: "자율 확정 (2026-07-22 main, ruling 자율권 지시 이후 첫 적용): w0720b 감사 표대로 처분 — carrier-lanes-fixes·generation-binding 2건은 body target이 raw 최신 binding과 일치하므로 settlement marker 포함, evidence-authority는 binding-unavailable(cutoff 이후 v1 binding)로 포함 불가를 사실대로 기록. 단 실행은 보류: 0.13 C2가 legacy round/review settlement 기계 자체를 폐기하므로 marker 삽입 작업은 무의미해질 가능성이 높음 — 이 ruling은 기록 권위로만 남기고, 0.13 cutover 후 해당 계보가 여전히 살아있을 때만 집행한다."
     title: "추가 동종 3건(carrier-lanes-fixes·generation-binding·evidence-authority) settlement marker 포함 여부 ruling — w0720b 감사 완료: 3건 모두 구식 envelope(verbatim-bytes 부재)이며 body target은 raw 최신 binding과 일치, evidence-authority는 cutoff(2026-07-18) 이후 v1 binding이라 binding-unavailable. 근거: docs/meta/agent-reports-2026-07-20/w2-settlement.md 감사 표"
-    status: "pending"
+    status: "done"
     severity: "minor"
   - id: docs/adr-0014-phased-exit-amendment
     session_id: "9c45406a-2fef-4660-b072-4824b6fcaede"
