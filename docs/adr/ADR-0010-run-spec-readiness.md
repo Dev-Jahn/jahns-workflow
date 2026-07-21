@@ -255,3 +255,32 @@ blocking concern이 없어야 run을 `completed`로 전이할 수 있다. 결과
   비용을 부과하므로 기각.
 - **green test와 verifier evidence를 adversarial review로 간주** — round-6에서 모든 기계적 gate가
   green인 기각 attempt의 설계 결함을 잡지 못했으므로 기각.
+
+## Amendment (2026-07-21) — M1-B v1 adapter ruling: legacy acceptance·review decision·retry 기본값
+
+M1-B 구현(`feat/run-spec-planning`)이 확인한 3자 충돌을 고정한다: 본문의 구조화 acceptance
+envelope(+deterministic validator·독립 critic)는 현행 task registry의 `accept: [string]`
+및 계획 §2-6(tasks.yaml 형식 0.12 불변)과 동시에 문자 그대로 성립할 수 없다
+(`decision/run-spec-v1-interpretation-batch`, m1b-spec 보고 ④1·②·③ — opus 독립 검증이
+충돌 실재를 확인).
+
+1. **v1 acceptance adapter (M1-B~envelope 이행 전까지의 계약 준수 형태).** planner는 legacy
+   `accept` 문자열을 owner-authored criterion **원문**으로 동결하고 empty/blank/duplicate만
+   deterministic 거부하며, readiness 판정을 `frozen-ready`·critic 처분을 `critic-not-required`로
+   **명시 기록**한다. 이는 본문 envelope의 대체가 아니라 이행기 adapter다 — 전체 envelope·
+   validator·critic 의무는 면제되지 않고 소유가 이월된다.
+2. **envelope의 착지 경로.** 구조화 envelope는 tasks.yaml 형식을 바꾸지 않고 **dispatch-time
+   acceptance contract 조립**(owner가 dispatch 시점에 envelope를 작성·동결, registry 문자열은
+   그 원문 재료)으로 구현한다. 소유: M2의 goal freeze/acceptance 경계(계획 M2-5와 결속).
+   그 시점까지 v1 adapter 출력의 `critic-not-required`는 "critic 미실행"의 정직한 기록이며
+   준수 주장이 아니다.
+3. **review decision 부재 = null 보존.** 정책 컴파일러가 없는 동안 planner는 decision을
+   합성하지 않는다(silent 강등 회피 — 명시 입력만 동결, project-defined reason fail-closed).
+   본문의 "모든 frozen spec은 none|required 결정을 가져야 한다"는 정책 컴파일러 도입 후의
+   목표 상태로 한정하며, 컴파일러 도입 시 mandatory로 전환한다.
+4. **retry 기본값.** 정책 원천 부재 시 v1 기본은 no-retry(`max_attempts_per_job=1`,
+   `max_total_attempts=1`, retryable class 없음, stop)와 positive bounded meter(1 day,
+   attempt-start)다. 이 수치는 본문이 아니라 이 Amendment가 소유하며, profile/project policy
+   원천이 생기면 그쪽이 우선한다.
+
+이 Amendment는 본문 계약의 목표 상태를 바꾸지 않는다 — 이행기 형태와 그 소유를 고정할 뿐이다.
