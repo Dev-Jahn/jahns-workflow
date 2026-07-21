@@ -22,6 +22,7 @@ from unittest import mock
 from waystone.jobs.domain import ExecutionCategory, Role, RoleBinding
 from waystone.runs.artifacts import ArtifactStore
 from waystone.runs.effects import ArtifactWriteEffect, EffectEngine, EffectRetryRefused
+from waystone.runs.effects import ApprovalAuthorityMismatch
 from waystone.runs.lease import LeaseManager
 from waystone.runs.preflight import (
     CapabilitySet,
@@ -1546,6 +1547,102 @@ class RunVerifyTests(unittest.TestCase):
         self.assertEqual(action_count, 0)
         self.assertEqual(self.git_oid(fixture.root, fixture.target_ref), target_before)
         self.assertEqual(fingerprint_worktree(fixture.root), tree_before)
+
+    def test_pc22_patch_reconcile_rehashes_durable_approval_bundle(self):
+        """WS-GPT-602: crash reconcile cannot apply tampered approval bytes."""
+        approval_fields = {
+            "run_spec_digest": lambda fixture, evidence, decision: (
+                fixture.spec.run_spec_digest),
+            "verification_plan_digest": lambda fixture, evidence, decision: (
+                fixture.plan.verification_plan_digest),
+            "verifier_evidence_digest": lambda fixture, evidence, decision: (
+                evidence.artifact_reference.digest),
+            "integration_decision_digest": lambda fixture, evidence, decision: (
+                decision.artifact_reference.digest),
+        }
+
+        def crash_after_plan(fixture, evidence, decision, action_id):
+            with mock.patch.object(
+                    EffectEngine, "execute_effect",
+                    side_effect=RuntimeError("simulated apply crash after durable plan")):
+                with self.assertRaisesRegex(RuntimeError, "simulated apply crash"):
+                    apply_integration_decision(
+                        fixture.spec.run_id,
+                        evidence.attempt_id,
+                        action_id,
+                        fixture.root,
+                        fixture.result_ref,
+                        fixture.target_ref,
+                        evidence.artifact_reference.reference_id,
+                        decision.artifact_reference.reference_id,
+                        start=fixture.root,
+                    )
+
+        cases = (
+            ("verifier_evidence_digest", "tampered"),
+            ("integration_decision_digest", "tampered"),
+            ("integration_decision_digest", "missing"),
+        )
+        for authority, mutation in cases:
+            with self.subTest(authority=authority, mutation=mutation):
+                fixture = self.prepare()
+                evidence, decision = self.verified_decision(fixture)
+                action_id = f"action-apply-crash-tamper-{authority}"
+                target_before = self.git_oid(fixture.root, fixture.target_ref)
+                crash_after_plan(fixture, evidence, decision, action_id)
+
+                expected_approval = {
+                    key: resolve(fixture, evidence, decision)
+                    for key, resolve in approval_fields.items()
+                }
+                with self.supported_filesystem(), RunStore.open(fixture.root) as store:
+                    effects = EffectEngine(store, LeaseManager(store))
+                    plan = effects._load_plan(action_id)  # noqa: SLF001
+                    self.assertEqual(
+                        plan.spec.get("approval_digests"), expected_approval)
+
+                tamper_digest = expected_approval[authority]
+                tamper_path = ArtifactStore(fixture.root).path_for(tamper_digest)
+                if mutation == "missing":
+                    tamper_path.unlink()
+                else:
+                    os.chmod(tamper_path, 0o600)
+                    tamper_path.write_bytes(b"tampered post-plan approval authority")
+                    os.chmod(tamper_path, 0o400)
+
+                with self.supported_filesystem(), RunStore.open(fixture.root) as store:
+                    effects = EffectEngine(store, LeaseManager(store))
+                    with mock.patch.object(
+                            effects, "_execute_driver",
+                            wraps=effects._execute_driver) as driver:  # noqa: SLF001
+                        with self.assertRaises(
+                                ApprovalAuthorityMismatch) as raised:
+                            effects.reconcile_actions(
+                                (action_id,), quiescence_probe=lambda plan: True)
+                    driver.assert_not_called()
+                self.assertEqual(
+                    raised.exception.code, "approval_authority_mismatch")
+                self.assertEqual(raised.exception.authority, authority)
+                self.assertEqual(
+                    self.git_oid(fixture.root, fixture.target_ref), target_before)
+
+        fixture = self.prepare()
+        evidence, decision = self.verified_decision(fixture)
+        action_id = "action-apply-crash-approval-unchanged"
+        crash_after_plan(fixture, evidence, decision, action_id)
+        with self.supported_filesystem(), RunStore.open(fixture.root) as store:
+            effects = EffectEngine(store, LeaseManager(store))
+            with mock.patch.object(
+                    effects, "_execute_driver",
+                    wraps=effects._execute_driver) as driver:  # noqa: SLF001
+                result = effects.reconcile_actions(
+                    (action_id,), quiescence_probe=lambda plan: True)[0]
+            self.assertEqual(result.state.value, "completed")
+            self.assertEqual(driver.call_count, 1)
+        self.assertEqual(
+            self.git_oid(fixture.root, fixture.target_ref),
+            self.git_oid(fixture.root, fixture.result_ref),
+        )
 
     def test_pc22_cas_race_is_refused_without_overwriting_concurrent_result(self):
         """PC-22: apply's execution-time CAS preserves a concurrent target update."""

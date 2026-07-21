@@ -30,6 +30,7 @@ from waystone.runs.effects import (
     EffectEngine,
     EffectRetryRefused,
     EffectResultState,
+    PatchApprovalDigests,
     PatchIntegrationEffect,
     RunnerCompletionMarker,
     RunnerExecutionEffect,
@@ -2805,6 +2806,12 @@ def apply_integration_decision(
                 expected_parent_tree_oid=fresh.base_tree_oid,
                 integration_commit_oid=fresh.result_oid,
                 integration_tree_oid=fresh.result_tree_oid,
+                approval_digests=PatchApprovalDigests(
+                    run_spec_digest=spec.run_spec_digest,
+                    verification_plan_digest=evidence.verification_plan_digest,
+                    verifier_evidence_digest=evidence.artifact_reference.digest,
+                    integration_decision_digest=decision.artifact_reference.digest,
+                ),
             ),
         )
         claimed = effects.claim_effect(effect_plan, ttl_seconds=30)

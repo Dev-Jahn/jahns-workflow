@@ -1032,6 +1032,44 @@ class RunEffectTests(unittest.TestCase):
             "claimed")
         self.assertEqual(self.effect_calls.get(plan.action_id, 0), 0)
 
+    def test_runner_positive_absence_probe_converges_wai_to_one_first_execution(self):
+        """WS-GPT-604: exact-identity absence consumes an unused runner WAI once."""
+        case = self.make_case(EffectKind.RUNNER_EXECUTION, "runner-positive-absence")
+
+        def crash(stage, plan):
+            if stage == "after-effect-intent":
+                raise InjectedCrash()
+
+        with mock.patch.object(
+                self.engine, "_effect_fault_point", side_effect=crash):  # noqa: SLF001
+            with self.assertRaises(InjectedCrash):
+                self.engine.execute_effect(case.claimed)
+
+        unchanged = self.engine.reconcile_actions((case.action_id,))[0]
+        self.assertEqual(unchanged.state, EffectResultState.UNKNOWN_EFFECT)
+        self.assertEqual(self.runner_calls.get(case.action_id, 0), 0)
+        self.assertEqual(self.effect_calls.get(case.action_id, 0), 0)
+
+        probed = []
+
+        def positive_absence(plan):
+            probed.append(plan.action_id)
+            return True
+
+        converged = self.engine.reconcile_actions(
+            (case.action_id,), runner_absence_probe=positive_absence)[0]
+        self.assertEqual(converged.state, EffectResultState.COMPLETED)
+        self.assertEqual(probed, [case.action_id])
+        self.assertEqual(self.runner_calls.get(case.action_id), 1)
+        self.assertEqual(self.effect_calls.get(case.action_id), 1)
+
+        repeated = self.engine.reconcile_actions(
+            (case.action_id,), runner_absence_probe=positive_absence)[0]
+        self.assertEqual(repeated.state, EffectResultState.NOOP)
+        self.assertEqual(probed, [case.action_id])
+        self.assertEqual(self.runner_calls.get(case.action_id), 1)
+        self.assertEqual(self.effect_calls.get(case.action_id), 1)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

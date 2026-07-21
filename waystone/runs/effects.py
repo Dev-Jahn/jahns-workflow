@@ -118,6 +118,21 @@ class EffectExecutionFailed(EffectError):
         super().__init__(f"action {action_id!r}: {detail}")
 
 
+class ApprovalAuthorityMismatch(EffectError):
+    """A durable patch approval artifact no longer proves its planned digest."""
+
+    code = "approval_authority_mismatch"
+
+    def __init__(self, action_id: str, authority: str, digest: str, detail: str):
+        self.action_id = action_id
+        self.authority = authority
+        self.digest = digest
+        self.detail = detail
+        super().__init__(
+            f"action {action_id!r} approval {authority!r} at {digest} cannot be verified: "
+            f"{detail}")
+
+
 class RunnerMarkerError(EffectError):
     """A completion marker cannot be published without overwriting or ambiguity."""
 
@@ -181,6 +196,31 @@ class RunnerExecutionEffect:
 
 
 @dataclass(frozen=True)
+class PatchApprovalDigests:
+    """Content identities frozen when a patch integration is approved."""
+
+    run_spec_digest: str
+    verification_plan_digest: str
+    verifier_evidence_digest: str
+    integration_decision_digest: str
+
+    def __post_init__(self) -> None:
+        for field in (
+                "run_spec_digest", "verification_plan_digest",
+                "verifier_evidence_digest", "integration_decision_digest"):
+            object.__setattr__(
+                self, field, validate_sha256_digest(getattr(self, field)))
+
+    def to_payload(self) -> dict[str, str]:
+        return {
+            "run_spec_digest": self.run_spec_digest,
+            "verification_plan_digest": self.verification_plan_digest,
+            "verifier_evidence_digest": self.verifier_evidence_digest,
+            "integration_decision_digest": self.integration_decision_digest,
+        }
+
+
+@dataclass(frozen=True)
 class PatchIntegrationEffect:
     repository: Path
     target_ref: str
@@ -188,6 +228,7 @@ class PatchIntegrationEffect:
     expected_parent_tree_oid: str
     integration_commit_oid: str
     integration_tree_oid: str
+    approval_digests: PatchApprovalDigests | None = None
 
 
 EffectSpec = (
@@ -272,6 +313,7 @@ class RunnerCompletionMarker:
 RunnerExecutor = Callable[[RunnerLaunchIntent], None]
 RunnerIdentityVerifier = Callable[[RunnerCompletionMarker], bool]
 QuiescenceProbe = Callable[[EffectPlan], bool]
+RunnerAbsenceProbe = Callable[[EffectPlan], bool]
 
 
 def _nonempty(value: str, label: str) -> str:
@@ -555,6 +597,11 @@ class EffectEngine:
                 "integration_commit_oid": commit,
                 "integration_tree_oid": tree,
             }
+            if effect.approval_digests is not None:
+                if not isinstance(effect.approval_digests, PatchApprovalDigests):
+                    raise TypeError(
+                        "patch approval_digests must be PatchApprovalDigests or None")
+                spec["approval_digests"] = effect.approval_digests.to_payload()
             target = {"repository": str(repository), "ref": target_ref, "commit": commit}
             expected = {"parent": parent, "tree": parent_tree}
             return kind, spec, target, expected
@@ -580,10 +627,26 @@ class EffectEngine:
                 return ArtifactWriteEffect(content)
             if kind is EffectKind.RUNNER_EXECUTION:
                 return RunnerExecutionEffect(str(spec["invocation_digest"]))
+            approval = None
+            if "approval_digests" in spec:
+                raw_approval = spec["approval_digests"]
+                if (not isinstance(raw_approval, dict)
+                        or set(raw_approval) != {
+                            "run_spec_digest", "verification_plan_digest",
+                            "verifier_evidence_digest", "integration_decision_digest"}):
+                    raise ValueError("patch approval digests are malformed")
+                approval = PatchApprovalDigests(
+                    run_spec_digest=raw_approval["run_spec_digest"],
+                    verification_plan_digest=raw_approval["verification_plan_digest"],
+                    verifier_evidence_digest=raw_approval["verifier_evidence_digest"],
+                    integration_decision_digest=(
+                        raw_approval["integration_decision_digest"]),
+                )
             return PatchIntegrationEffect(
                 Path(spec["repository"]), str(spec["target_ref"]),
                 str(spec["expected_parent_oid"]), str(spec["expected_parent_tree_oid"]),
-                str(spec["integration_commit_oid"]), str(spec["integration_tree_oid"]))
+                str(spec["integration_commit_oid"]), str(spec["integration_tree_oid"]),
+                approval)
         except (KeyError, TypeError, ValueError) as error:
             raise InvalidEffectPlan(action_id, f"stored {kind.value} spec is malformed") from error
 
@@ -1693,10 +1756,47 @@ class EffectEngine:
             return False, "positive quiescence was not established"
         return True, None
 
+    def _verify_patch_approval_authority(self, plan: EffectPlan) -> None:
+        if plan.kind is not EffectKind.PATCH_INTEGRATION:
+            return
+        approval = plan.spec.get("approval_digests")
+        if approval is None:
+            return
+        if not isinstance(approval, dict):
+            raise InvalidEffectPlan(
+                plan.action_id, "patch approval digest bundle is malformed")
+        for authority in (
+                "run_spec_digest", "verification_plan_digest",
+                "verifier_evidence_digest", "integration_decision_digest"):
+            digest = str(approval[authority])
+            try:
+                self._artifacts.read(digest)
+            except Exception as error:
+                if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                    raise
+                raise ApprovalAuthorityMismatch(
+                    plan.action_id, authority, digest, str(error)) from error
+
+    @staticmethod
+    def _runner_absent(
+            plan: EffectPlan,
+            probe: RunnerAbsenceProbe | None) -> tuple[bool, str | None]:
+        if probe is None:
+            return False, "positive runner absence observation is unavailable"
+        try:
+            observed = probe(plan)
+        except Exception as error:
+            return False, f"runner absence observation failed: {error}"
+        if observed is not True:
+            return False, "positive runner absence was not established"
+        return True, None
+
     def _execute_existing_intent(
             self, plan: EffectPlan, principal: LeasePrincipal,
-            intent: Mapping[str, object]) -> EffectResult:
-        if plan.kind is EffectKind.RUNNER_EXECUTION:
+            intent: Mapping[str, object], *,
+            allow_absent_runner_first_execution: bool = False) -> EffectResult:
+        if (plan.kind is EffectKind.RUNNER_EXECUTION
+                and not allow_absent_runner_first_execution):
             return EffectResult(
                 plan.action_id, EffectResultState.UNKNOWN_EFFECT,
                 reason="runner launch intent forbids same-action relaunch")
@@ -1719,12 +1819,14 @@ class EffectEngine:
 
     def _reconcile_one(
             self, action_id: str, *, ttl_seconds: float,
-            quiescence_probe: QuiescenceProbe | None) -> EffectResult:
+            quiescence_probe: QuiescenceProbe | None,
+            runner_absence_probe: RunnerAbsenceProbe | None) -> EffectResult:
         plan = self._load_plan(action_id)
         action = self._store.get_entity(EntityKind.ACTION, action_id)
         if action.state == "completed":
             return EffectResult(action_id, EffectResultState.NOOP)
         if action.state == "planned":
+            self._verify_patch_approval_authority(plan)
             principal = self._maybe_current_principal(action)
             if principal is None:
                 claimed = self.claim_effect(plan, ttl_seconds=ttl_seconds)
@@ -1743,6 +1845,7 @@ class EffectEngine:
                     ObservationDisposition.UNKNOWN, ObservationDisposition.IN_FLIGHT,
                     ObservationDisposition.CONFLICT}:
                 return self._result_from_observation(plan, observation)
+            self._verify_patch_approval_authority(plan)
             quiescent, reason = self._quiescent(plan, quiescence_probe)
             if not quiescent:
                 return EffectResult(
@@ -1761,6 +1864,18 @@ class EffectEngine:
             observation = self._observe(plan, intent)
             if observation.disposition is ObservationDisposition.DESIRED:
                 return self._commit_observation(plan, principal, observation)
+            if (plan.kind is EffectKind.RUNNER_EXECUTION
+                    and observation.disposition is ObservationDisposition.UNKNOWN
+                    and observation.reason
+                    == "runner launch intent exists but no completion marker is observable"):
+                absent, reason = self._runner_absent(plan, runner_absence_probe)
+                if absent:
+                    return self._execute_existing_intent(
+                        plan, principal, intent,
+                        allow_absent_runner_first_execution=True)
+                if runner_absence_probe is not None:
+                    return EffectResult(
+                        action_id, EffectResultState.UNKNOWN_EFFECT, reason=reason)
             if observation.disposition in {
                     ObservationDisposition.UNKNOWN, ObservationDisposition.IN_FLIGHT,
                     ObservationDisposition.CONFLICT}:
@@ -1769,6 +1884,7 @@ class EffectEngine:
                 return EffectResult(
                     action_id, EffectResultState.UNKNOWN_EFFECT,
                     reason="runner intent exists without positive completion evidence")
+            self._verify_patch_approval_authority(plan)
             quiescent, reason = self._quiescent(plan, quiescence_probe)
             if not quiescent:
                 return EffectResult(
@@ -1795,13 +1911,16 @@ class EffectEngine:
 
     def reconcile_actions(
             self, action_ids: Iterable[str], *, ttl_seconds: float = 30,
-            quiescence_probe: QuiescenceProbe | None = None) -> tuple[EffectResult, ...]:
+            quiescence_probe: QuiescenceProbe | None = None,
+            runner_absence_probe: RunnerAbsenceProbe | None = None,
+            ) -> tuple[EffectResult, ...]:
         """Reobserve authority and converge actions without replaying uncertain effects."""
         identities = tuple(_nonempty(action_id, "action_id") for action_id in action_ids)
         return tuple(
             self._reconcile_one(
                 action_id, ttl_seconds=ttl_seconds,
-                quiescence_probe=quiescence_probe)
+                quiescence_probe=quiescence_probe,
+                runner_absence_probe=runner_absence_probe)
             for action_id in identities
         )
 
