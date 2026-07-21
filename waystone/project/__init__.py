@@ -471,6 +471,15 @@ def has_project_config(root: Path) -> bool:
 def normalize_config(cfg: dict | None, *, source: Path | None = None) -> dict:
     """Apply defaults + validation to a parsed config mapping (from disk OR from a PR head)."""
     cfg = dict(cfg or {})
+    if "ssot" in cfg:
+        raise ValueError("ssot: is not supported; use the canonical brief: key")
+    cfg.setdefault("brief", "PROJECT_BRIEF.md")
+    brief = cfg["brief"]
+    if not isinstance(brief, str) or not brief.strip():
+        raise ValueError("brief: must be a non-empty relative path inside the repo")
+    brief_path = Path(brief)
+    if brief_path.is_absolute() or ".." in brief_path.parts:
+        raise ValueError(f"brief must be a relative path inside the repo: {brief!r}")
     cfg.setdefault("progress", "PROGRESS.md")
     cfg.setdefault("adr_dir", "docs/adr")
     cfg.setdefault("reviews_dir", "docs/reviews")
