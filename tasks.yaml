@@ -703,5 +703,5 @@ tasks:
     severity: "blocker"
   - id: fix/013-worker-result-schema-compat
     title: "G013-06 폐쇄 — WorkerResult backend-facing schema를 object-root로 재구성(real Codex의 root oneOf 거부 호환), engine-side union 검증은 무약화 유지"
-    status: "pending"
+    status: "done"
     severity: "blocker"
