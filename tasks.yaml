@@ -701,3 +701,7 @@ tasks:
     title: "0.13 gate FAIL 폐쇄 — G013-01~05: public staged 실행 조립(start→DAG→close happy path)·WorkerResult outcome lineage·review-cycle head 영속화·failed child 종결·legacy config 잔재 (RED-first, evidence: dev_docs/0.13-gate-evidence.md)"
     status: "done"
     severity: "blocker"
+  - id: fix/013-worker-result-schema-compat
+    title: "G013-06 폐쇄 — WorkerResult backend-facing schema를 object-root로 재구성(real Codex의 root oneOf 거부 호환), engine-side union 검증은 무약화 유지"
+    status: "pending"
+    severity: "blocker"
