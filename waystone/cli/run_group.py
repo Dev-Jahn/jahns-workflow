@@ -6,7 +6,7 @@ import stat
 from pathlib import Path
 from typing import Mapping
 
-from waystone.adapters.git import git_full_sha
+from waystone.adapters.git import GitReadError, git_full_sha, git_read_bytes
 from waystone.core import WorkflowError
 from waystone.jobs import completion
 from waystone.jobs.profile import RunAssembly as ProductionRunAssembly, assemble_run
@@ -14,12 +14,20 @@ from waystone.jobs.work_brief import import_owner_source_file, parse_work_brief_
 from waystone.project.brief import ProjectFactRef, read_project_frame_at_commit
 from waystone.project.context import resolve_project_context
 from waystone.runs.artifacts import ArtifactReference, ArtifactReferenceKind
+from waystone.runs.assurance import (
+    compile_assurance_plan,
+    digest_bytes,
+    parse_candidate_bytes,
+    parse_evaluation_evidence_bytes,
+    parse_review_cycle_bytes,
+)
 from waystone.runs.engine import (
     CancelReason,
     ResumeResult,
     RunEngine,
     StagedRunEngine,
 )
+from waystone.runs.spec import PromotionLineage, ResultPolicy, load_run_spec
 from waystone.runs.transport import (
     ActionPlanRefusal,
     TransportError,
@@ -105,6 +113,32 @@ def _compile_completion(
 ) -> completion.CompletionContract:
     objective = brief.objective.ref.to_dict()
     prefix = objective.get("fact_id", "").partition("/")[0]
+    extended = [
+        expectation for expectation in brief.evidence_expected
+        if expectation.text is not None or expectation.source is not None
+    ]
+    if extended:
+        if len(extended) != len(brief.evidence_expected):
+            raise ActionPlanRefusal(
+                "evidence_expected cannot mix authority-complete and legacy-shaped criteria")
+        mode = {"explore": "learning", "evaluate": "evaluation",
+                "promote": "promotion"}[brief.lifecycle_stage]
+        criteria = [{
+            "id": expectation.criterion_id,
+            "mode": mode,
+            "text": expectation.text,
+            "source": expectation.source.to_dict(),
+            "binding": (
+                "nonbinding" if brief.lifecycle_stage == "explore" else "binding"),
+            "evidence": {"kind": expectation.kind},
+        } for expectation in brief.evidence_expected]
+        return completion.compile_completion_contract(
+            assembly.context.active_worktree_root,
+            brief.lifecycle_stage,
+            brief.objective.ref,
+            criteria,
+            artifact_store=assembly.artifact_store,
+        )
     if brief.lifecycle_stage == "explore" and (
             objective.get("kind") != "project-fact"
             or prefix not in {"hypothesis", "question"}
@@ -112,9 +146,6 @@ def _compile_completion(
         raise ActionPlanRefusal(
             "the WorkBrief does not identify authority for an explore learning criterion; "
             "A2 will not infer it from prose")
-    if brief.lifecycle_stage == "evaluate":
-        raise ActionPlanRefusal(
-            "evaluate CompletionContract source selection belongs to the B2 assurance compiler")
     if objective["kind"] == "project-fact":
         source_frame = read_project_frame_at_commit(
             assembly.context.active_worktree_root, objective["commit"])
@@ -145,6 +176,89 @@ def _compile_completion(
         criteria,
         artifact_store=assembly.artifact_store,
     )
+
+
+def _evidence_sources(brief) -> tuple[Mapping[str, object], ...]:
+    items = [*brief.current_state, *brief.known_failures, *brief.constraints,
+             *brief.non_goals, *brief.open_questions]
+    sources = []
+    for item in items:
+        for source in item.sources:
+            payload = source.to_dict()
+            if payload.get("kind") == "evidence" and "reference_id" in payload:
+                sources.append(payload)
+    return tuple(sources)
+
+
+def _one_evidence_source(brief, prefix: str) -> Mapping[str, object]:
+    matches = tuple(
+        source for source in _evidence_sources(brief)
+        if str(source.get("reference_id", "")).startswith(prefix))
+    if len(matches) != 1:
+        raise ActionPlanRefusal(
+            f"{brief.lifecycle_stage} requires exactly one {prefix} evidence source")
+    return matches[0]
+
+
+def _candidate_input(assembly: ProductionRunAssembly, brief):
+    source = _one_evidence_source(brief, "candidate:")
+    candidate = parse_candidate_bytes(
+        assembly.artifact_store.read(source["digest"]))
+    descriptor = {
+        "reference_id": source["reference_id"],
+        "digest": source["digest"],
+        "target_ref": candidate.target_ref,
+        "target_oid": candidate.target_oid,
+        "code_sha": candidate.code_sha,
+        "config_digest": candidate.config_digest,
+        "producer_result_digest": candidate.producer["result_digest"],
+    }
+    producer = load_run_spec(
+        candidate.producer["run_id"], start=assembly.context.canonical_root)
+    if producer.run_spec_digest != candidate.producer["run_spec_digest"]:
+        raise ActionPlanRefusal("candidate producer RunSpec digest does not match descriptor")
+    return candidate, descriptor, producer
+
+
+def _evaluation_spec_input(brief) -> Mapping[str, object]:
+    matches = []
+    for expectation in brief.evidence_expected:
+        if expectation.source is None:
+            continue
+        source = expectation.source.to_dict()
+        if source.get("kind") == "evaluation-spec":
+            matches.append(source)
+    unique = {completion.canonical_json(item): item for item in matches}
+    if len(unique) != 1:
+        raise ActionPlanRefusal(
+            f"{brief.lifecycle_stage} requires one frozen evaluation-spec AuthorityRef")
+    source = next(iter(unique.values()))
+    return {"commit": source["commit"], "path": source["path"],
+            "digest": source["digest"], "generation": source["generation"]}
+
+
+def _integration_target(root: Path) -> str:
+    try:
+        target = git_read_bytes(root, "symbolic-ref", "-q", "HEAD").decode("ascii").strip()
+    except (GitReadError, UnicodeDecodeError) as error:
+        raise ActionPlanRefusal(
+            "candidate-producing explore requires an attached integration target ref") from error
+    if not target.startswith("refs/heads/"):
+        raise ActionPlanRefusal("integration target must be an attached refs/heads/* ref")
+    return target
+
+
+def _root_objective_digest(brief) -> str:
+    return digest_bytes(completion.canonical_json(brief.objective.ref.to_dict()))
+
+
+def _review_cycle_chain(assembly: ProductionRunAssembly, head: str | None):
+    cycles = []
+    while head is not None:
+        cycle = parse_review_cycle_bytes(assembly.artifact_store.read(head))
+        cycles.append(cycle)
+        head = cycle.supersedes_digest
+    return tuple(reversed(cycles))
 
 
 def _start_with_assembly(
@@ -185,12 +299,88 @@ def _start_with_assembly(
         raise ActionPlanRefusal(
             "--owner-request is forbidden unless objective_ref.kind is owner-request")
     contract = _compile_completion(assembly, brief)
-    assurance_content = completion.canonical_json({
-        "actions": [],
-        "lifecycle_stage": brief.lifecycle_stage,
-        "schema": "waystone-assurance-plan-1",
-    })
-    head = git_full_sha(assembly.context.active_worktree_root)
+    root = assembly.context.active_worktree_root
+    evaluation_spec = None
+    candidate_descriptor = None
+    evaluation = None
+    promotion_lineage = None
+    result_policy = None
+    review_cycles = ()
+    if brief.lifecycle_stage in {"evaluate", "promote"}:
+        _candidate, candidate_descriptor, candidate_producer = _candidate_input(
+            assembly, brief)
+        if brief.lifecycle_stage == "evaluate":
+            evaluation_spec = _evaluation_spec_input(brief)
+            target = _integration_target(root)
+            promotion_lineage = PromotionLineage(
+                id=brief.brief_id,
+                root_objective_ref_digest=_root_objective_digest(brief),
+                integration_target_ref=target,
+                parent_run_spec_digest=candidate_producer.run_spec_digest,
+                candidate_chain_head_digest=candidate_descriptor["digest"],
+                review_cycle_head_digest=None,
+            )
+            evaluation = {"spec": dict(evaluation_spec), "evidence": None}
+            result_policy = ResultPolicy("evidence-only", None, None)
+        else:
+            evidence_source = _one_evidence_source(brief, "evaluation-evidence:")
+            evidence_value = parse_evaluation_evidence_bytes(
+                assembly.artifact_store.read(evidence_source["digest"]))
+            evaluation_run_id = str(evidence_source["reference_id"]).removeprefix(
+                "evaluation-evidence:")
+            evaluation_producer = load_run_spec(
+                evaluation_run_id, start=assembly.context.canonical_root)
+            if (evaluation_producer.promotion_lineage is None
+                    or evaluation_producer.candidate != candidate_descriptor):
+                raise ActionPlanRefusal(
+                    "evaluation evidence producer does not carry the promoted candidate lineage")
+            producer_spec = evaluation_producer.evaluation.get("spec")
+            if not isinstance(producer_spec, Mapping):
+                raise ActionPlanRefusal(
+                    "evaluation evidence producer lacks its frozen evaluation spec")
+            evaluation_spec = dict(producer_spec)
+            if (evidence_value.result != "pass"
+                    or evidence_value.candidate_digest != candidate_descriptor["digest"]
+                    or evidence_value.evaluation_spec_digest != evaluation_spec["digest"]
+                    or evidence_value.evaluation_generation != evaluation_spec["generation"]):
+                raise ActionPlanRefusal(
+                    "promotion requires passed evidence for the exact candidate/spec generation")
+            inherited = evaluation_producer.promotion_lineage
+            promotion_lineage = PromotionLineage(
+                inherited.id, inherited.root_objective_ref_digest,
+                inherited.integration_target_ref, evaluation_producer.run_spec_digest,
+                candidate_descriptor["digest"], inherited.review_cycle_head_digest)
+            review_cycles = _review_cycle_chain(
+                assembly, inherited.review_cycle_head_digest)
+            evaluation = {
+                "spec": dict(evaluation_spec),
+                "evidence": {
+                    "reference_id": evidence_source["reference_id"],
+                    "digest": evidence_source["digest"],
+                    "generation": evidence_value.evaluation_generation,
+                },
+            }
+            expected_oid = git_full_sha(root, inherited.integration_target_ref)
+            if expected_oid is None:
+                raise ActionPlanRefusal("promotion integration target is not locally reachable")
+            result_policy = ResultPolicy(
+                "integration-ref", inherited.integration_target_ref, expected_oid)
+    assurance_content = compile_assurance_plan(
+        brief.lifecycle_stage,
+        evaluation_spec=evaluation_spec,
+        completion_contract={
+            "reference_id": "completion-contract:<pending>",
+            "digest": digest_bytes(contract.canonical_bytes()),
+        },
+        compiled_from=(() if evaluation_spec is None else ({
+            "kind": "evaluation-spec",
+            **evaluation_spec,
+        },)),
+        promotion_lineage_id=(
+            None if promotion_lineage is None else promotion_lineage.id),
+        review_cycles=review_cycles,
+    ).canonical_bytes()
+    head = git_full_sha(root)
     if head is None:
         raise ActionPlanRefusal("active worktree HEAD cannot be resolved")
     frame = read_project_frame_at_commit(
@@ -204,6 +394,10 @@ def _start_with_assembly(
         frame_status_ref=frame.status_ref,
         project_fact_refs=facts,
         owner_request_reference=owner_reference,
+        promotion_lineage=promotion_lineage,
+        candidate=candidate_descriptor,
+        evaluation=evaluation,
+        result_policy=result_policy,
     )
 
 

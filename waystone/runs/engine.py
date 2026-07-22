@@ -16,11 +16,28 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Iterator, Mapping, Sequence
 
+from waystone.adapters.git import GitReadError, git_full_sha, git_read_bytes
 from waystone.core import WorkflowError
 from waystone.jobs.domain import Role
 from waystone.jobs.profile import RunAssembly as ProductionRunAssembly
 from waystone.project.brief import FrameStatusRef, ProjectFactRef
-from waystone.runs.artifacts import ArtifactReference, ArtifactReferenceKind
+from waystone.runs.artifacts import (
+    ArtifactReference, ArtifactReferenceKind, ArtifactStore, validate_sha256_digest,
+)
+from waystone.runs.assurance import (
+    Candidate,
+    EvaluationEvidence,
+    assert_evaluation_generation_available,
+    ReviewCycleExhausted,
+    ReviewCycle,
+    assert_promotion_unblocked,
+    execute_assurance_dag,
+    parse_assurance_plan_bytes,
+    parse_candidate_bytes,
+    parse_evaluation_evidence_bytes,
+    parse_evaluation_spec_bytes,
+    parse_review_cycle_bytes,
+)
 from waystone.runs.cancel import CancellationEngine, CancellationResult
 from waystone.runs.effects import (
     EffectEngine,
@@ -74,25 +91,22 @@ from waystone.runs.transport import (
 from waystone.runs.worker_result import (
     AdaptedWorkerResult,
     ContextRequestedWorkerResult,
+    CompletedWorkerResult,
     ContextResponse,
     WorkerResultAdapter,
+    parse_runner_completion_marker_v2_bytes,
     parse_context_response_bytes,
     revise_work_brief_for_response,
+    capture_result_snapshot,
 )
 from waystone.runs.verify import (
     ActorIdentity,
     ApplyResult,
     DecisionInput,
-    DecisionOutcome,
     EngineCheckExecutor,
     IntegrationDecision,
     VerifierAdapter,
     VerifierEvidence,
-    apply_integration_decision,
-    execute_verifier,
-    record_integration_decision,
-    reload_integration_decision,
-    reload_verifier_evidence,
 )
 from waystone.runs import store as store_module
 
@@ -234,6 +248,10 @@ class StagedRunEngine:
         frame_status_ref: FrameStatusRef,
         project_fact_refs: Sequence[ProjectFactRef],
         owner_request_reference: ArtifactReference | None = None,
+        promotion_lineage=None,
+        candidate: Mapping[str, object] | None = None,
+        evaluation: Mapping[str, object] | None = None,
+        result_policy=None,
     ) -> StagedStartResult:
         spec = plan_one_task_run(
             task_id,
@@ -243,6 +261,10 @@ class StagedRunEngine:
             frame_status_ref=frame_status_ref,
             project_fact_refs=project_fact_refs,
             owner_request_reference=owner_request_reference,
+            promotion_lineage=promotion_lineage,
+            candidate=candidate,
+            evaluation=evaluation,
+            result_policy=result_policy,
             artifact_store=self.assembly.artifact_store,
             run_store=self.assembly.store,
             start=self.input_root,
@@ -294,8 +316,19 @@ class StagedRunEngine:
             raise EngineBindingRefusal(
                 "worker result may be consumed only after its bound runner action is observed")
         spec = load_run_spec(run_id, start=self.root)
+        plan = self.assembly.effect_executor._load_plan(action_id)  # noqa: SLF001
+        marker_path = Path(plan.spec["completion_marker"])
+        try:
+            marker = parse_runner_completion_marker_v2_bytes(marker_path.read_bytes())
+        except (OSError, WorkflowError) as error:
+            raise EngineBindingRefusal(
+                f"completed staged runner lacks a valid marker v2: {error}") from error
+        if (marker.run_id != run_id or marker.job_id != spec.job_id
+                or marker.action_id != action_id):
+            raise EngineBindingRefusal("runner marker v2 identity differs from the bound action")
         adapted = WorkerResultAdapter(
-            self.input_root, self.assembly.artifact_store).adapt(
+            self.input_root, self.assembly.artifact_store).adapt_published(
+                marker.worker_result_digest,
                 run_id=run_id,
                 job_id=spec.job_id,
                 attempt_id=attempt_id,
@@ -426,6 +459,334 @@ class StagedRunEngine:
     def resume(self, run_id: str) -> Mapping[str, object]:
         return self.assembly.transport.actions_next(run_id)
 
+    def execute_stage(
+        self,
+        run_id: str,
+        handlers: Mapping[str, Callable[[], object]],
+        *,
+        regression_contract_digest: str | None = None,
+        supported_scope_digest: str | None = None,
+        accepted_risks_digest: str | None = None,
+    ) -> tuple[tuple[str, object], ...]:
+        """Run exactly the frozen stage DAG and close only its declared completion path."""
+        spec = load_run_spec(run_id, start=self.root)
+        plan = parse_assurance_plan_bytes(
+            self.assembly.artifact_store.read(spec.assurance_plan.digest))
+        if plan.lifecycle_stage is not spec.lifecycle_stage:
+            raise EngineBindingRefusal("AssurancePlan stage differs from RunSpec")
+        stage = spec.lifecycle_stage.value
+        candidate_ref = None
+        candidate_oid = None
+        if spec.candidate is not None:
+            candidate_ref = spec.candidate["target_ref"]
+            candidate_oid = spec.candidate["target_oid"]
+            if git_full_sha(self.input_root, candidate_ref) != candidate_oid:
+                raise EngineBindingRefusal("frozen candidate ref changed before stage execution")
+        if stage == "explore":
+            candidate_ref = spec.result_policy.target_ref
+            if candidate_ref is None or git_full_sha(self.input_root, candidate_ref) is not None:
+                raise EngineBindingRefusal(
+                    "explore candidate publication requires an absent run-owned ref")
+        if spec.lifecycle_stage.value == "promote":
+            if spec.frame_status_ref.status != "committed":
+                raise EngineBindingRefusal("promotion requires a committed project frame")
+            required_records = {
+                "regression contract": regression_contract_digest,
+                "supported scope": supported_scope_digest,
+                "accepted risks": accepted_risks_digest,
+            }
+            for label, digest in required_records.items():
+                if digest is None:
+                    raise EngineBindingRefusal(f"promotion requires a {label} record")
+                try:
+                    self.assembly.artifact_store.read(digest)
+                except WorkflowError as error:
+                    raise EngineBindingRefusal(
+                        f"promotion {label} record is not present in canonical CAS") from error
+            if spec.promotion_lineage is None or spec.candidate is None:
+                raise EngineBindingRefusal("promotion lineage/candidate is not frozen")
+            target_ref = spec.result_policy.target_ref
+            expected_oid = spec.result_policy.expected_oid
+            if (target_ref is None or expected_oid is None
+                    or git_full_sha(self.input_root, target_ref) != expected_oid):
+                raise EngineBindingRefusal(
+                    "promotion target differs from its frozen expected-old OID")
+            candidate_lineage = self._candidate_lineage(spec.candidate["digest"])
+            assert_promotion_unblocked(
+                self.root / "docs" / "reviews",
+                spec.promotion_lineage.id,
+                candidate_lineage,
+            )
+            review = plan.review
+            if (plan.requires("adversarial-review")
+                    and review["consumed_cycles"] >= review["max_cycles"]):
+                exhausted = ReviewCycleExhausted(
+                    review["consumed_cycles"], review["max_cycles"])
+                self._wait_for_review_budget(spec, exhausted)
+                raise exhausted
+        results = execute_assurance_dag(
+            plan,
+            handlers,
+            mutation_digest=lambda: capture_result_snapshot(self.input_root).digest,
+        )
+        if stage == "explore":
+            try:
+                reference = self.assembly.store.get_artifact_reference(
+                    f"candidate:{run_id}")
+            except RecordNotFoundError as error:
+                raise EngineBindingRefusal(
+                    "explore completed without a published candidate descriptor") from error
+            candidate = parse_candidate_bytes(
+                self.assembly.artifact_store.read_reference(reference))
+            if (candidate.target_ref != candidate_ref
+                    or git_full_sha(self.input_root, candidate.target_ref)
+                    != candidate.target_oid):
+                raise EngineBindingRefusal(
+                    "explore candidate ref does not match its frozen published descriptor")
+        elif stage == "evaluate":
+            if (candidate_ref is None or candidate_oid is None
+                    or git_full_sha(self.input_root, candidate_ref) != candidate_oid):
+                raise EngineBindingRefusal("evaluate mutated its frozen candidate ref")
+            try:
+                evidence = self.assembly.store.get_artifact_reference(
+                    f"evaluation-evidence:{run_id}")
+            except RecordNotFoundError as error:
+                raise EngineBindingRefusal(
+                    "evaluate completed without bound evaluation evidence") from error
+            parse_evaluation_evidence_bytes(
+                self.assembly.artifact_store.read_reference(evidence))
+        else:
+            assert candidate_ref is not None and candidate_oid is not None
+            if git_full_sha(self.input_root, candidate_ref) != candidate_oid:
+                raise EngineBindingRefusal("promotion mutated its evaluated candidate ref")
+            assert spec.result_policy.target_ref is not None
+            if git_full_sha(self.input_root, spec.result_policy.target_ref) != candidate_oid:
+                raise EngineBindingRefusal(
+                    "promotion apply did not publish the evaluated candidate OID")
+        evidence_digest = spec.run_spec_digest
+        if results and isinstance(results[-1][1], str):
+            try:
+                validate_sha256_digest(results[-1][1])
+            except ValueError:
+                pass
+            else:
+                evidence_digest = results[-1][1]
+        self._record_stage_completion(spec, evidence_digest)
+        return results
+
+    def publish_candidate(
+        self,
+        run_id: str,
+        attempt_id: str,
+        adapted: AdaptedWorkerResult,
+        *,
+        target_oid: str,
+        config_digest: str,
+        supersedes_candidate_digest: str | None = None,
+        repair_of_finding_refs: Sequence[str] = (),
+    ) -> Candidate:
+        """Publish one explore result with creation-only candidate-ref CAS."""
+        spec = load_run_spec(run_id, start=self.root)
+        plan = parse_assurance_plan_bytes(
+            self.assembly.artifact_store.read(spec.assurance_plan.digest))
+        if (spec.lifecycle_stage.value != "explore"
+                or not plan.requires("candidate-publish")
+                or not isinstance(adapted.result, CompletedWorkerResult)):
+            raise EngineBindingRefusal(
+                "candidate publication requires a completed explore result and frozen action")
+        target_ref = spec.result_policy.target_ref
+        if target_ref != f"refs/waystone/candidates/{run_id}":
+            raise EngineBindingRefusal("candidate target ref is not the frozen run-owned ref")
+        candidate = Candidate(
+            candidate_id=run_id,
+            producer={
+                "run_id": run_id,
+                "run_spec_digest": spec.run_spec_digest,
+                "result_digest": adapted.worker_result_artifact.digest,
+            },
+            code_sha=target_oid,
+            config_digest=config_digest,
+            target_ref=target_ref,
+            target_oid=target_oid,
+            supersedes_candidate_digest=supersedes_candidate_digest,
+            repair_of_finding_refs=tuple(repair_of_finding_refs),
+        )
+        candidate_artifact = self.assembly.artifact_store.write(candidate.canonical_bytes())
+        action_id = f"{run_id}:candidate-publish"
+        try:
+            effect_plan = self.assembly.effect_executor.plan_effect(
+                run_id, spec.job_id, attempt_id, action_id,
+                GitRefEffect(self.input_root, target_ref, None, target_oid),
+            )
+            claimed = self.assembly.effect_executor.claim_effect(effect_plan, ttl_seconds=30)
+            result = self.assembly.effect_executor.execute_effect(claimed)
+        except EffectStateRefusal:
+            result = self.assembly.effect_executor.reconcile_actions((action_id,))[0]
+        if result.state not in {EffectResultState.COMPLETED, EffectResultState.NOOP}:
+            raise EngineBindingRefusal(result.reason or "candidate publication did not complete")
+        reference_id = f"candidate:{run_id}"
+        try:
+            reference = self.assembly.store.get_artifact_reference(reference_id)
+        except RecordNotFoundError:
+            job = self.assembly.store.get_entity(EntityKind.JOB, spec.job_id)
+            self.assembly.store.record_transition(
+                EntityKind.JOB, spec.job_id, expected_version=job.version,
+                next_state=job.state, reason=TransitionReason.CANDIDATE_PUBLISHED,
+                evidence_digest=candidate_artifact.digest,
+                artifact_references=(ArtifactReference(
+                    reference_id, ArtifactReferenceKind.EVIDENCE,
+                    candidate_artifact.digest, candidate_artifact.size),),
+            )
+        else:
+            if reference.digest != candidate_artifact.digest:
+                raise EngineBindingRefusal(
+                    "published candidate reference differs from the deterministic descriptor")
+        return candidate
+
+    def publish_evaluation_evidence(
+        self,
+        run_id: str,
+        *,
+        evaluator_action_id: str,
+        result: str,
+        metric_artifacts: Sequence[Mapping[str, str]],
+        prior_evidence: Sequence[EvaluationEvidence] = (),
+        holdout_exposed: bool = False,
+    ) -> tuple[EvaluationEvidence, ArtifactReference]:
+        """Bind a read-only evaluator result to the exact candidate/spec generation."""
+        spec = load_run_spec(run_id, start=self.root)
+        plan = parse_assurance_plan_bytes(
+            self.assembly.artifact_store.read(spec.assurance_plan.digest))
+        if (spec.lifecycle_stage.value != "evaluate"
+                or not plan.requires("read-only-evaluator")
+                or spec.candidate is None):
+            raise EngineBindingRefusal(
+                "evaluation evidence requires a frozen evaluate plan and candidate")
+        frozen_spec = spec.evaluation.get("spec")
+        if not isinstance(frozen_spec, Mapping):
+            raise EngineBindingRefusal("evaluation spec is not frozen")
+        try:
+            spec_bytes = git_read_bytes(
+                self.input_root, "show",
+                f"{frozen_spec['commit']}:{frozen_spec['path']}")
+        except GitReadError as error:
+            raise EngineBindingRefusal(f"evaluation spec is unavailable: {error}") from error
+        parsed_spec = parse_evaluation_spec_bytes(spec_bytes)
+        with self.assembly.store._connection_lock:  # noqa: SLF001 - evidence index
+            rows = self.assembly.store._connection.execute(  # noqa: SLF001
+                "SELECT reference_id FROM artifacts WHERE reference_id LIKE ?",
+                ("evaluation-evidence:%",),
+            ).fetchall()
+        indexed_evidence = []
+        for row in rows:
+            reference = self.assembly.store.get_artifact_reference(row["reference_id"])
+            indexed_evidence.append(parse_evaluation_evidence_bytes(
+                self.assembly.artifact_store.read_reference(reference)))
+        assert_evaluation_generation_available(
+            spec.candidate["digest"], parsed_spec,
+            (*indexed_evidence, *prior_evidence),
+            holdout_exposed=holdout_exposed,
+        )
+        evidence = EvaluationEvidence(
+            candidate_digest=spec.candidate["digest"],
+            evaluation_spec_digest=frozen_spec["digest"],
+            evaluation_generation=frozen_spec["generation"],
+            evaluator_action_id=evaluator_action_id,
+            result=result,
+            metric_artifacts=tuple(dict(item) for item in metric_artifacts),
+        )
+        artifact = self.assembly.artifact_store.write(evidence.canonical_bytes())
+        reference = ArtifactReference(
+            f"evaluation-evidence:{run_id}", ArtifactReferenceKind.EVIDENCE,
+            artifact.digest, artifact.size,
+        )
+        job = self.assembly.store.get_entity(EntityKind.JOB, spec.job_id)
+        self.assembly.store.record_transition(
+            EntityKind.JOB, spec.job_id, expected_version=job.version,
+            next_state=job.state, reason=TransitionReason.EVALUATION_EVIDENCE,
+            evidence_digest=artifact.digest, artifact_references=(reference,),
+        )
+        return evidence, reference
+
+    def append_review_cycle(
+        self, run_id: str, *, target_result_digest: str, review_digest: str,
+    ) -> ReviewCycle:
+        """Append one immutable review cycle without trusting a caller-supplied count."""
+        spec = load_run_spec(run_id, start=self.root)
+        plan = parse_assurance_plan_bytes(
+            self.assembly.artifact_store.read(spec.assurance_plan.digest))
+        if (spec.promotion_lineage is None
+                or plan.review.get("promotion_lineage_id") != spec.promotion_lineage.id
+                or not plan.requires("adversarial-review")):
+            raise EngineBindingRefusal("run has no frozen risk-gated review action")
+        cycles = []
+        head = plan.review.get("cycle_chain_head_digest")
+        while head is not None:
+            cycle = parse_review_cycle_bytes(self.assembly.artifact_store.read(head))
+            cycles.append(cycle)
+            head = cycle.supersedes_digest
+        cycles.reverse()
+        if len(cycles) != plan.review["consumed_cycles"]:
+            raise EngineBindingRefusal(
+                "AssurancePlan consumed review count does not rederive from its CAS chain")
+        maximum = plan.review["max_cycles"]
+        if len(cycles) >= maximum:
+            exhausted = ReviewCycleExhausted(len(cycles), maximum)
+            self._wait_for_review_budget(spec, exhausted)
+            raise exhausted
+        cycle = ReviewCycle(
+            promotion_lineage_id=spec.promotion_lineage.id,
+            cycle=len(cycles) + 1,
+            target_result_digest=target_result_digest,
+            review_digest=review_digest,
+            supersedes_digest=(cycles[-1].digest if cycles else None),
+        )
+        self.assembly.artifact_store.write(cycle.canonical_bytes())
+        return cycle
+
+    def _candidate_lineage(self, candidate_digest: object) -> tuple[str, ...]:
+        current = validate_sha256_digest(candidate_digest)  # type: ignore[arg-type]
+        lineage = []
+        seen = set()
+        while current is not None:
+            if current in seen:
+                raise EngineBindingRefusal("candidate supersedes lineage contains a cycle")
+            seen.add(current)
+            candidate = parse_candidate_bytes(self.assembly.artifact_store.read(current))
+            lineage.append(current)
+            current = candidate.supersedes_candidate_digest
+        return tuple(reversed(lineage))
+
+    def _wait_for_review_budget(
+            self, spec: RunSpec, exhausted: ReviewCycleExhausted) -> None:
+        artifact = self.assembly.artifact_store.write(
+            json.dumps(
+                exhausted.waiting_user(), sort_keys=True, separators=(",", ":")
+            ).encode("utf-8"))
+        for kind, identity in ((EntityKind.JOB, spec.job_id), (EntityKind.RUN, spec.run_id)):
+            entity = (
+                self.assembly.store.get_entity(kind, identity)
+                if kind is EntityKind.JOB else self.assembly.store.get_run(identity))
+            if entity.state != "waiting_user":
+                self.assembly.store.record_transition(
+                    kind, identity, expected_version=entity.version,
+                    next_state="waiting_user",
+                    reason=TransitionReason.REVIEW_CYCLE_EXHAUSTED,
+                    evidence_digest=artifact.digest,
+                )
+
+    def _record_stage_completion(self, spec: RunSpec, evidence_digest: str) -> None:
+        for kind, identity in ((EntityKind.JOB, spec.job_id), (EntityKind.RUN, spec.run_id)):
+            entity = (
+                self.assembly.store.get_entity(kind, identity)
+                if kind is EntityKind.JOB else self.assembly.store.get_run(identity))
+            if entity.state != "completed":
+                self.assembly.store.record_transition(
+                    kind, identity, expected_version=entity.version,
+                    next_state="completed", reason=TransitionReason.COMPLETED,
+                    evidence_digest=evidence_digest,
+                )
+
 
 _CANCELLATION_STATES = {
     "cancel-requested",
@@ -447,22 +808,6 @@ def _runner_action_id(run_id: str, check_id: str) -> str:
 
 def _verify_action_id(run_id: str) -> str:
     return f"{run_id}:verify"
-
-
-def _decision_action_id(run_id: str) -> str:
-    return f"{run_id}:decision"
-
-
-def _target_action_id(run_id: str) -> str:
-    return f"{run_id}:integration-target"
-
-
-def _apply_action_id(run_id: str) -> str:
-    return f"{run_id}:apply"
-
-
-def _target_ref(run_id: str) -> str:
-    return f"refs/waystone/integration/{run_id}"
 
 
 def _regular_file(path: Path, label: str) -> None:
@@ -778,192 +1123,12 @@ class RunEngine:
         cancellation = CancellationEngine(store, effects, leases, supervisor)
         return cancellation.resume_cancel(run_id, action_id)
 
-    def _reference_is_published(self, reference_id: str) -> bool:
-        with RunStore.open(self.root) as store:
-            try:
-                store.get_artifact_reference(reference_id)
-            except RecordNotFoundError:
-                return False
-        return True
-
-    @staticmethod
-    def _finished_apply_call_is_quiescent(plan) -> bool:
-        """A resumed synchronous apply has no detached executor left to observe."""
-        return plan.kind is EffectKind.PATCH_INTEGRATION
-
-    def _resume_published_apply(
-            self, spec: RunSpec, evidence: VerifierEvidence,
-            decision: IntegrationDecision, target_ref: str) -> ApplyResult | None:
-        action_id = _apply_action_id(spec.run_id)
-        with RunStore.open(self.root) as store:
-            try:
-                action = store.get_entity(EntityKind.ACTION, action_id)
-            except RecordNotFoundError:
-                return None
-            effects = EffectEngine(store, LeaseManager(store))
-            plan = effects._load_plan(action_id)  # noqa: SLF001 - reentry authority check
-            expected_spec = {
-                "repository": str(self.root),
-                "target_ref": target_ref,
-                "expected_parent_oid": evidence.result.base_oid,
-                "expected_parent_tree_oid": evidence.result.base_tree_oid,
-                "integration_commit_oid": evidence.result.result_oid,
-                "integration_tree_oid": evidence.result.result_tree_oid,
-                "approval_digests": {
-                    "run_spec_digest": spec.run_spec_digest,
-                    "verification_plan_digest": evidence.verification_plan_digest,
-                    "verifier_evidence_digest": evidence.artifact_reference.digest,
-                    "integration_decision_digest": decision.artifact_reference.digest,
-                },
-            }
-            if (plan.run_id != spec.run_id or plan.job_id != spec.job_id
-                    or plan.attempt_id != evidence.attempt_id
-                    or plan.action_id != action_id
-                    or plan.kind is not EffectKind.PATCH_INTEGRATION
-                    or plan.spec != expected_spec):
-                raise EngineBindingRefusal(
-                    "published apply action differs from the accepted terminal lineage")
-
-            if action.state == "completed":
-                with store._connection_lock:  # noqa: SLF001 - terminal transition evidence
-                    rows = store._connection.execute(  # noqa: SLF001
-                        "SELECT evidence_digest FROM transitions "
-                        "WHERE entity_kind = ? AND entity_id = ? "
-                        "AND next_state = 'completed' AND reason = ?",
-                        (EntityKind.ACTION.value, action_id,
-                         TransitionReason.COMPLETED.value),
-                    ).fetchall()
-                if (len(rows) != 1
-                        or not isinstance(rows[0]["evidence_digest"], str)):
-                    raise EngineBindingRefusal(
-                        "completed apply action lacks one terminal observed digest")
-                observed_digest = rows[0]["evidence_digest"]
-            else:
-                result = effects.reconcile_actions(
-                    (action_id,),
-                    quiescence_probe=self._finished_apply_call_is_quiescent,
-                )[0]
-                if result.state is not EffectResultState.COMPLETED:
-                    raise EngineBindingRefusal(
-                        result.reason or "published apply action did not reconcile")
-                if result.observed_digest is None:
-                    raise EngineBindingRefusal(
-                        "reconciled apply action lacks observed evidence")
-                observed_digest = result.observed_digest
-        return ApplyResult(
-            action_id=action_id,
-            target_ref=target_ref,
-            result_oid=evidence.result.result_oid,
-            observed_digest=observed_digest,
-        )
-
     def _complete(self, spec: RunSpec) -> CompletionResult:
-        assembly = self._require_assembly()
-        attempt_id = _attempt_id(spec.run_id)
-        with RunStore.open(self.root) as store:
-            try:
-                store.get_entity(EntityKind.ATTEMPT, attempt_id)
-            except RecordNotFoundError:
-                store.create_attempt(
-                    spec.run_id, spec.job_id, attempt_id, initial_state="running")
-        verify_action_id = _verify_action_id(spec.run_id)
-        if self._reference_is_published(f"verifier-evidence:{verify_action_id}"):
-            evidence = reload_verifier_evidence(
-                spec.run_id, attempt_id, verify_action_id, start=self.root)
-        else:
-            evidence = execute_verifier(
-                spec.run_id,
-                attempt_id,
-                verify_action_id,
-                self.root,
-                assembly.result_ref,
-                assembly.worker_actor_id,
-                assembly.verifier_actor,
-                assembly.check_executor,
-                assembly.verifier_adapter,
-                start=self.root,
-            )
-        decision_action_id = _decision_action_id(spec.run_id)
-        if self._reference_is_published(
-                f"integration-decision:{decision_action_id}"):
-            decision = reload_integration_decision(
-                spec.run_id,
-                attempt_id,
-                decision_action_id,
-                verify_action_id,
-                start=self.root,
-            )
-        else:
-            decision_input = assembly.decision_input(
-                evidence, assembly.coordinator_actor)
-            if not isinstance(decision_input, DecisionInput):
-                raise EngineBindingRefusal("decision_input did not return DecisionInput")
-            decision = record_integration_decision(
-                spec.run_id,
-                attempt_id,
-                decision_action_id,
-                decision_input,
-                start=self.root,
-            )
-        if decision.outcome is not DecisionOutcome.ACCEPT:
-            raise EngineBindingRefusal("rejected decision cannot enter apply")
-
-        target = _target_ref(spec.run_id)
-        with RunStore.open(self.root) as store:
-            leases = LeaseManager(store)
-            effects = EffectEngine(store, leases)
-            try:
-                target_plan = effects.plan_effect(
-                    spec.run_id,
-                    spec.job_id,
-                    attempt_id,
-                    _target_action_id(spec.run_id),
-                    GitRefEffect(self.root, target, None, spec.base_snapshot.head),
-                )
-                claimed = effects.claim_effect(target_plan, ttl_seconds=30)
-                target_result = effects.execute_effect(claimed)
-            except EffectStateRefusal:
-                target_result = effects.reconcile_actions(
-                    (_target_action_id(spec.run_id),))[0]
-            if target_result.state not in {
-                    EffectResultState.COMPLETED, EffectResultState.NOOP}:
-                raise EngineBindingRefusal(
-                    target_result.reason or "private integration target was not established")
-        applied = self._resume_published_apply(spec, evidence, decision, target)
-        if applied is None:
-            applied = apply_integration_decision(
-                spec.run_id,
-                attempt_id,
-                _apply_action_id(spec.run_id),
-                self.root,
-                assembly.result_ref,
-                target,
-                evidence.artifact_reference.reference_id,
-                decision.artifact_reference.reference_id,
-                start=self.root,
-            )
-        with RunStore.open(self.root) as store:
-            job = store.get_entity(EntityKind.JOB, spec.job_id)
-            if job.state != "accepted":
-                store.record_transition(
-                    EntityKind.JOB,
-                    spec.job_id,
-                    expected_version=job.version,
-                    next_state="accepted",
-                    reason=TransitionReason.COMPLETED,
-                    evidence_digest=applied.observed_digest,
-                )
-            run = store.get_run(spec.run_id)
-            if run.state != "completed":
-                store.record_transition(
-                    EntityKind.RUN,
-                    spec.run_id,
-                    expected_version=run.version,
-                    next_state="completed",
-                    reason=TransitionReason.COMPLETED,
-                    evidence_digest=applied.observed_digest,
-                )
-        return CompletionResult(spec.run_id, evidence, decision, applied)
+        assurance = parse_assurance_plan_bytes(
+            ArtifactStore(self.root).read(spec.assurance_plan.digest))
+        raise EngineConfigurationUnavailable(
+            f"RunSpec v2 {assurance.lifecycle_stage.value} completion must execute "
+            "through StagedRunEngine.execute_stage with its frozen exact action DAG")
 
     def resume(self, run_id: str) -> ResumeResult:
         spec = load_run_spec(run_id, start=self.root)

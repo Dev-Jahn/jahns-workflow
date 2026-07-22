@@ -324,6 +324,9 @@ class TransitionReason(str, Enum):
     CANCEL_REQUESTED = "cancel-requested"
     CONTEXT_REQUESTED = "context-requested"
     CONTEXT_PROVIDED = "context-provided"
+    CANDIDATE_PUBLISHED = "candidate-published"
+    REVIEW_CYCLE_EXHAUSTED = "review-cycle-exhausted"
+    EVALUATION_EVIDENCE = "evaluation-evidence"
 
 
 @dataclass(frozen=True)

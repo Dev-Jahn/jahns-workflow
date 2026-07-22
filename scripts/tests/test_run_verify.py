@@ -19,8 +19,17 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from unittest import mock
 
+from test_work_brief import (
+    completion_contract as semantic_completion_contract,
+    payload as work_brief_payload,
+    project_bytes,
+)
+from waystone.features.review_layout import new_run_id
+from waystone.jobs import completion
 from waystone.jobs.domain import ExecutionCategory, Role, RoleBinding
+from waystone.project.brief import read_project_frame_at_commit
 from waystone.runs.artifacts import ArtifactStore
+from waystone.runs.assurance import compile_assurance_plan
 from waystone.runs.effects import ArtifactWriteEffect, EffectEngine, EffectRetryRefused
 from waystone.runs.effects import ApprovalAuthorityMismatch
 from waystone.runs.lease import LeaseManager
@@ -177,16 +186,19 @@ class RunVerifyTests(unittest.TestCase):
             ".waystone/\n.toolchains/\nignored.bin\n", encoding="utf-8")
         (root / "tracked.txt").write_bytes(b"tracked-base\n")
         (root / "staged.txt").write_bytes(b"staged-base\n")
+        (root / "PROJECT_BRIEF.md").write_bytes(project_bytes())
         git(root, "add", "-A")
         self.assertEqual(git(root, "commit", "-qm", "verify fixture").returncode, 0)
 
         state = root / ".waystone"
         state.mkdir()
         (state / "profile.yml").write_text(
-            "schema: waystone-profile-1\n"
+            "schema: waystone-profile-2\n"
             "bindings:\n"
-            "  implementer: {execution: external-runner, backend: 'codex:gpt-test'}\n"
-            "  verifier: {backend: 'codex:gpt-verify', entry: adversarial-review}\n",
+            "  coordinator: {execution: in-session, backend: 'host:current'}\n"
+            "  worker: {execution: external, backend: 'codex:gpt-test'}\n"
+            "  verifier: {execution: external, backend: 'codex:gpt-verify'}\n"
+            "  reviewer: {execution: external, backend: 'codex:gpt-review'}\n",
             encoding="utf-8",
         )
         toolchain = root / ".toolchains" / "verify.whl"
@@ -254,8 +266,21 @@ class RunVerifyTests(unittest.TestCase):
         ) for axis, source, status in rows)
 
     def make_dispatch_ready(self, root: Path, toolchain_path: Path):
+        head = self.git_oid(root, "HEAD")
+        frame = read_project_frame_at_commit(root, head)
+        contract = semantic_completion_contract(root, frame)
+        brief_body = work_brief_payload(head, frame, new_run_id())
+        brief_body["task_id"] = "feat/example"
         with self.supported_filesystem():
-            spec = plan_one_task_run("feat/example", start=root)
+            spec = plan_one_task_run(
+                "feat/example",
+                work_brief_content=completion.canonical_json(brief_body),
+                completion_contract_content=contract.canonical_bytes(),
+                assurance_plan_content=compile_assurance_plan("explore").canonical_bytes(),
+                frame_status_ref=frame.status_ref,
+                project_fact_refs=(frame.fact_ref("hypothesis/solver"),),
+                start=root,
+            )
             plan = freeze_verification_plan(
                 spec.run_id, self.definition(), start=root)
 
@@ -1461,7 +1486,7 @@ class RunVerifyTests(unittest.TestCase):
                 with self.supported_filesystem(), RunStore.open(fixture.root) as store:
                     if authority == "run-spec":
                         reference = store.get_artifact_reference(
-                            f"run-spec:{fixture.spec.run_id}")
+                            f"run-spec:{fixture.spec.run_id}:1")
                     elif authority == "base-snapshot":
                         reference = store.get_artifact_reference(
                             f"base-snapshot:{fixture.spec.run_id}")

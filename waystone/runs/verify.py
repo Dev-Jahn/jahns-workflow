@@ -25,6 +25,7 @@ from waystone.runs.artifacts import (
     ArtifactStore,
     validate_sha256_digest,
 )
+from waystone.runs.assurance import AssurancePlan
 from waystone.runs.effects import (
     ArtifactWriteEffect,
     EffectEngine,
@@ -1190,8 +1191,15 @@ def execute_verifier(
         result_ref: str, worker_actor_id: str, actor: ActorIdentity,
         check_executor: EngineCheckExecutor, verifier_adapter: VerifierAdapter, *,
         retry_of: str | None = None,
-        start: Path | None = None) -> VerifierEvidence:
+        start: Path | None = None,
+        assurance_plan: AssurancePlan | None = None) -> VerifierEvidence:
     """Serialize one verifier lineage through terminal evidence publication."""
+    if assurance_plan is not None:
+        if not isinstance(assurance_plan, AssurancePlan):
+            raise TypeError("assurance_plan must be an AssurancePlan")
+        if assurance_plan.verification.get("independent") != "required":
+            raise EvidenceBindingRefusal(
+                "frozen stage assurance does not authorize independent verification")
     root = Path(repository).resolve(strict=True)
     authority_root = root if start is None else Path(start).resolve(strict=True)
     if authority_root != root:

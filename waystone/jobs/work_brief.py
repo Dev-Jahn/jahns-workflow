@@ -14,6 +14,7 @@ from waystone.project import TASK_ID_RE
 from waystone.runs.artifacts import ArtifactStore, StoredArtifact, validate_sha256_digest
 
 from .completion import (
+    AuthorityRef,
     AuthorityRefRefusal,
     CompletionContract,
     ObjectiveRef,
@@ -191,9 +192,15 @@ class DecisionSpace:
 class EvidenceExpectation:
     criterion_id: str
     kind: str
+    text: str | None = None
+    source: AuthorityRef | None = None
 
-    def to_dict(self) -> dict[str, str]:
-        return {"criterion_id": self.criterion_id, "kind": self.kind}
+    def to_dict(self) -> dict[str, Any]:
+        row: dict[str, Any] = {"criterion_id": self.criterion_id, "kind": self.kind}
+        if self.text is not None and self.source is not None:
+            row["text"] = self.text
+            row["source"] = self.source.to_dict()
+        return row
 
 
 @dataclass(frozen=True)
@@ -377,10 +384,25 @@ def _expectations(value: Any) -> tuple[EvidenceExpectation, ...]:
     result = []
     for index, item in enumerate(value):
         row = _mapping(item, f"evidence_expected[{index}]")
-        _exact_fields(row, {"criterion_id", "kind"}, f"evidence_expected[{index}]")
+        base = {"criterion_id", "kind"}
+        if set(row) == base:
+            text = None
+            source = None
+        elif set(row) == base | {"text", "source"}:
+            text = _string(row["text"], f"evidence_expected[{index}].text")
+            try:
+                source = parse_authority_ref(
+                    row["source"], f"evidence_expected[{index}].source")
+            except AuthorityRefRefusal as error:
+                raise WorkBriefSchemaRefusal(str(error)) from error
+        else:
+            _exact_fields(row, base | {"text", "source"}, f"evidence_expected[{index}]")
+            raise AssertionError("unreachable")
         result.append(EvidenceExpectation(
             _string(row["criterion_id"], f"evidence_expected[{index}].criterion_id"),
             _string(row["kind"], f"evidence_expected[{index}].kind"),
+            text,
+            source,
         ))
     ids = [item.criterion_id for item in result]
     if len(ids) != len(set(ids)):
@@ -418,6 +440,13 @@ def _validate_contract(brief: WorkBrief, contract: CompletionContract) -> None:
         if expectation.kind != criteria[criterion_id].evidence.kind:
             raise WorkBriefContractRefusal(
                 f"evidence_expected kind mismatch for criterion {criterion_id!r}")
+        if expectation.text is not None and expectation.text != criteria[criterion_id].text:
+            raise WorkBriefContractRefusal(
+                f"evidence_expected text mismatch for criterion {criterion_id!r}")
+        if (expectation.source is not None
+                and expectation.source.to_dict() != criteria[criterion_id].source.to_dict()):
+            raise WorkBriefContractRefusal(
+                f"evidence_expected source mismatch for criterion {criterion_id!r}")
 
 
 def parse_work_brief_bytes(
@@ -487,6 +516,10 @@ def parse_work_brief_bytes(
         references=_references(payload["references"]),
         open_questions=_semantic_list(payload["open_questions"], "open_questions"),
     )
+    if brief.lifecycle_stage == "evaluate" and any(
+            item.text is None or item.source is None for item in brief.evidence_expected):
+        raise WorkBriefSchemaRefusal(
+            "evaluate evidence_expected items require criterion text and frozen source")
 
     if revision > 1:
         if artifact_store is None:

@@ -33,6 +33,14 @@ from waystone.runs.artifacts import (
     StoredArtifact,
     validate_sha256_digest,
 )
+from waystone.runs.assurance import (
+    AssurancePlan,
+    digest_bytes,
+    parse_assurance_plan_bytes,
+    parse_candidate_bytes,
+    parse_evaluation_evidence_bytes,
+    parse_evaluation_spec_bytes,
+)
 from waystone.runs.store import EntityKind, RecordNotFoundError, RunStore, TransitionReason
 
 
@@ -730,16 +738,29 @@ def _new_spec(
     return replace(constructed, run_spec_digest=_digest(constructed.canonical_bytes()))
 
 
-def _validate_assurance_plan(content: bytes, stage: LifecycleStage) -> None:
+def _validate_assurance_plan(content: bytes, stage: LifecycleStage) -> AssurancePlan:
     try:
-        document = yaml.safe_load(content.decode("utf-8"))
-    except (UnicodeDecodeError, yaml.YAMLError) as error:
-        raise RunSpecArtifactError("<planning>", f"assurance plan is invalid YAML: {error}") from error
-    if (not isinstance(document, Mapping)
-            or document.get("schema") != "waystone-assurance-plan-1"
-            or document.get("lifecycle_stage") != stage.value):
+        plan = parse_assurance_plan_bytes(content)
+    except WorkflowError as error:
+        raise RunSpecArtifactError("<planning>", str(error)) from error
+    if plan.lifecycle_stage is not stage:
         raise RunSpecArtifactError(
             "<planning>", "assurance plan schema/stage does not match the WorkBrief")
+    return plan
+
+
+def _bind_assurance_completion_contract(
+        plan: AssurancePlan, reference_id: str, contract_digest: str) -> bytes:
+    digest = validate_sha256_digest(contract_digest)
+    existing = plan.completion.get("contract")
+    if existing is not None:
+        if not isinstance(existing, Mapping) or existing.get("digest") != digest:
+            raise RunSpecArtifactError(
+                "<planning>", "AssurancePlan completion contract digest differs from input")
+    return replace(plan, completion={
+        "contract": {"reference_id": reference_id, "digest": digest},
+        "allowed_outcomes": list(plan.completion["allowed_outcomes"]),
+    }).canonical_bytes()
 
 
 def _validate_frame_status(reference: FrameStatusRef) -> None:
@@ -809,6 +830,118 @@ def _validate_stage_payload(
     return dict(candidate), dict(evaluation)
 
 
+def _validate_frozen_assurance_inputs(
+        root: Path, artifact_store: ArtifactStore, stage: LifecycleStage,
+        plan: AssurancePlan, candidate: Mapping[str, object] | None,
+        evaluation: Mapping[str, object]) -> None:
+    plan_spec = plan.verification.get("evaluation_spec")
+    frozen_spec = evaluation.get("spec")
+    if stage is LifecycleStage.EXPLORE:
+        if plan_spec is not None:
+            raise ValueError("explore assurance cannot freeze an evaluation spec")
+        return
+    if not isinstance(plan_spec, Mapping) or not isinstance(frozen_spec, Mapping):
+        raise ValueError("evaluate/promote assurance requires the RunSpec evaluation tuple")
+    if (plan_spec.get("digest") != frozen_spec.get("digest")
+            or plan_spec.get("generation") != frozen_spec.get("generation")):
+        raise ValueError("AssurancePlan and RunSpec evaluation spec tuples differ")
+    assert candidate is not None
+    candidate_content = artifact_store.read(candidate["digest"])  # type: ignore[arg-type]
+    descriptor = parse_candidate_bytes(candidate_content)
+    expected_candidate = {
+        "target_ref": descriptor.target_ref,
+        "target_oid": descriptor.target_oid,
+        "code_sha": descriptor.code_sha,
+        "config_digest": descriptor.config_digest,
+        "producer_result_digest": descriptor.producer["result_digest"],
+    }
+    if any(candidate.get(key) != value for key, value in expected_candidate.items()):
+        raise ValueError("candidate descriptor differs from its content-addressed bytes")
+    if git_full_sha(root, descriptor.target_ref) != descriptor.target_oid:
+        raise ValueError("candidate ref is not locally reachable at its frozen immutable OID")
+    try:
+        spec_content = git_read_bytes(
+            root, "show", f"{frozen_spec['commit']}:{frozen_spec['path']}")
+    except GitReadError as error:
+        raise ValueError(f"evaluation spec is not locally readable: {error}") from error
+    if digest_bytes(spec_content) != frozen_spec["digest"]:
+        raise ValueError("evaluation spec digest differs from committed bytes")
+    parsed_spec = parse_evaluation_spec_bytes(spec_content)
+    if parsed_spec.generation != frozen_spec["generation"]:
+        raise ValueError("evaluation spec generation differs from frozen descriptor")
+    if stage is LifecycleStage.PROMOTE:
+        evidence_ref = evaluation["evidence"]
+        assert isinstance(evidence_ref, Mapping)
+        evidence = parse_evaluation_evidence_bytes(
+            artifact_store.read(evidence_ref["digest"]))  # type: ignore[arg-type]
+        if (evidence.result != "pass"
+                or evidence.candidate_digest != candidate["digest"]
+                or evidence.evaluation_spec_digest != frozen_spec["digest"]
+                or evidence.evaluation_generation != frozen_spec["generation"]):
+            raise ValueError("promotion evidence does not pass the frozen candidate/spec tuple")
+
+
+def _validate_promotion_lineage(
+        artifact_store: ArtifactStore, stage: LifecycleStage,
+        objective: ObjectiveRef, lineage: PromotionLineage | None,
+        candidate: Mapping[str, object] | None, result_policy: ResultPolicy,
+        assurance: AssurancePlan) -> None:
+    if lineage is None:
+        if stage is not LifecycleStage.EXPLORE:
+            raise ValueError("evaluate/promote requires a promotion lineage")
+        return
+    objective_digest = _digest(_canonical_json(objective.to_dict()))
+    if lineage.root_objective_ref_digest != objective_digest:
+        raise ValueError("promotion lineage root objective digest does not rederive")
+    if assurance.review.get("promotion_lineage_id") not in (None, lineage.id):
+        raise ValueError("AssurancePlan review lineage differs from RunSpec lineage")
+    if (assurance.review.get("cycle_chain_head_digest")
+            != lineage.review_cycle_head_digest):
+        raise ValueError("review cycle head differs between AssurancePlan and RunSpec lineage")
+    if stage in (LifecycleStage.EVALUATE, LifecycleStage.PROMOTE):
+        assert candidate is not None
+        if lineage.candidate_chain_head_digest != candidate["digest"]:
+            raise ValueError("promotion lineage candidate head differs from frozen candidate")
+    if stage is LifecycleStage.PROMOTE:
+        if result_policy.target_ref != lineage.integration_target_ref:
+            raise ValueError("promotion result target differs from lineage integration target")
+    if lineage.parent_run_spec_digest is None:
+        return
+    parent_content = artifact_store.read(lineage.parent_run_spec_digest)
+    try:
+        parent = json.loads(parent_content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"parent RunSpec is unreadable: {error}") from error
+    if (not isinstance(parent, Mapping) or _canonical_json(parent) != parent_content
+            or parent.get("schema") != _RUN_SPEC_SCHEMA):
+        raise ValueError("parent RunSpec bytes are not canonical RunSpec v2")
+    parent_lineage = parent.get("promotion_lineage")
+    if parent_lineage is None:
+        if stage is not LifecycleStage.EVALUATE or candidate is None:
+            raise ValueError("only evaluate may start lineage from an unlineaged explore candidate")
+        descriptor = parse_candidate_bytes(artifact_store.read(candidate["digest"]))
+        if descriptor.producer["run_spec_digest"] != lineage.parent_run_spec_digest:
+            raise ValueError("new evaluation lineage parent is not the candidate producer RunSpec")
+        return
+    if not isinstance(parent_lineage, Mapping) or any(
+            parent_lineage.get(field) != getattr(lineage, field)
+            for field in ("id", "root_objective_ref_digest", "integration_target_ref")):
+        raise ValueError("parent RunSpec belongs to a different promotion intent")
+    parent_assurance_ref = parent.get("assurance_plan")
+    if not isinstance(parent_assurance_ref, Mapping):
+        raise ValueError("parent RunSpec lacks its assurance descriptor")
+    parent_assurance = parse_assurance_plan_bytes(
+        artifact_store.read(parent_assurance_ref.get("digest")))
+    if parent_assurance.review.get("max_cycles") != assurance.review.get("max_cycles"):
+        raise ValueError("descendant RunSpec attempted to reset max_review_cycles")
+    parent_candidate = parent_lineage.get("candidate_chain_head_digest")
+    current_candidate = lineage.candidate_chain_head_digest
+    if current_candidate != parent_candidate and candidate is not None:
+        descriptor = parse_candidate_bytes(artifact_store.read(candidate["digest"]))
+        if descriptor.supersedes_candidate_digest != parent_candidate:
+            raise ValueError("descendant candidate does not supersede the parent lineage head")
+
+
 def plan_one_task_run(
         task_id: str, *, work_brief_content: bytes,
         completion_contract_content: bytes, assurance_plan_content: bytes,
@@ -833,8 +966,9 @@ def plan_one_task_run(
     if brief.task_id != task_id:
         raise InvalidTaskInputError(task_id, "WorkBrief task_id differs from the requested task")
     stage = LifecycleStage(brief.lifecycle_stage)
-    _validate_assurance_plan(assurance_plan_content, stage)
-    stored_assurance = artifact_store.write(assurance_plan_content)
+    assurance = _validate_assurance_plan(assurance_plan_content, stage)
+    _bind_assurance_completion_contract(
+        assurance, "completion-contract:<pending>", stored_contract.digest)
     _validate_frame_status(frame_status_ref)
     frozen_frame_status = FrameStatusRef(
         commit=frame_status_ref.commit,
@@ -869,6 +1003,11 @@ def plan_one_task_run(
         "candidate-ref" if stage is LifecycleStage.EXPLORE else "evidence-only", None, None)
     frozen_candidate, frozen_evaluation = _validate_stage_payload(
         stage, promotion_lineage, candidate, evaluation, policy)
+    _validate_frozen_assurance_inputs(
+        root, artifact_store, stage, assurance, frozen_candidate, frozen_evaluation)
+    _validate_promotion_lineage(
+        artifact_store, stage, objective, promotion_lineage,
+        frozen_candidate, policy, assurance)
 
     placeholder_contract = ArtifactDescriptor(
         "completion-contract:<pending>", stored_contract.digest, stored_contract.size)
@@ -900,12 +1039,14 @@ def plan_one_task_run(
         revision = 1
         work_brief = ArtifactDescriptor(
             f"work-brief:{run.run_id}:{brief.revision}", stored_brief.digest, stored_brief.size)
-        assurance_plan = ArtifactDescriptor(
-            f"assurance-plan:{run.run_id}:{revision}",
-            stored_assurance.digest, stored_assurance.size)
         completion = ArtifactDescriptor(
             f"completion-contract:{run.run_id}:{revision}",
             stored_contract.digest, stored_contract.size)
+        stored_assurance = artifact_store.write(_bind_assurance_completion_contract(
+            assurance, completion.reference_id, completion.digest))
+        assurance_plan = ArtifactDescriptor(
+            f"assurance-plan:{run.run_id}:{revision}",
+            stored_assurance.digest, stored_assurance.size)
         job_input = _freeze_task(
             task_id, _selected_task(root, task_id), completion, acceptance)
         spec = _new_spec(
@@ -1003,23 +1144,25 @@ def prepare_run_spec_revision(
             previous.run_id, "WorkBrief does not continue the current context/spec lineage")
     if brief.objective.ref.to_dict() != previous.objective_ref.to_dict():
         raise RunSpecArtifactError(previous.run_id, "context resume cannot replace the objective")
-    stored_assurance = artifact_store.write(assurance_plan_content)
-    _validate_assurance_plan(assurance_plan_content, previous.lifecycle_stage)
+    assurance = _validate_assurance_plan(
+        assurance_plan_content, previous.lifecycle_stage)
     revision = previous.revision + 1
     work_brief = ArtifactDescriptor(
         f"work-brief:{previous.run_id}:{brief.revision}",
         stored_brief.digest,
         stored_brief.size,
     )
-    assurance_plan = ArtifactDescriptor(
-        f"assurance-plan:{previous.run_id}:{revision}",
-        stored_assurance.digest,
-        stored_assurance.size,
-    )
     completion = ArtifactDescriptor(
         f"completion-contract:{previous.run_id}:{revision}",
         stored_contract.digest,
         stored_contract.size,
+    )
+    stored_assurance = artifact_store.write(_bind_assurance_completion_contract(
+        assurance, completion.reference_id, completion.digest))
+    assurance_plan = ArtifactDescriptor(
+        f"assurance-plan:{previous.run_id}:{revision}",
+        stored_assurance.digest,
+        stored_assurance.size,
     )
     job_input_candidate = replace(
         previous.job_input,
@@ -1160,7 +1303,7 @@ def _parse_run_spec(
         brief = parse_work_brief_bytes(
             brief_bytes, artifact_store=artifact_store, completion_contract=contract)
         assurance_bytes = artifact_store.read_reference(references[assurance_plan.reference_id])
-        _validate_assurance_plan(assurance_bytes, stage)
+        assurance = _validate_assurance_plan(assurance_bytes, stage)
         frame = _require_mapping(root["frame_status_ref"], "frame_status_ref")
         _exact_keys(frame, {"commit", "path", "status", "digest"}, "frame_status_ref")
         frame_ref = FrameStatusRef(
@@ -1192,6 +1335,12 @@ def _parse_run_spec(
         policy = ResultPolicy(**policy_row)
         frozen_candidate, frozen_evaluation = _validate_stage_payload(
             stage, lineage, root["candidate"], root["evaluation"], policy)
+        _validate_frozen_assurance_inputs(
+            root_path, artifact_store, stage, assurance,
+            frozen_candidate, frozen_evaluation)
+        _validate_promotion_lineage(
+            artifact_store, stage, objective, lineage,
+            frozen_candidate, policy, assurance)
         supersedes = root["supersedes_spec_digest"]
         revision = root["revision"]
         if type(revision) is not int or revision < 1:

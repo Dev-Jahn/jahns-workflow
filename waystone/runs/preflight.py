@@ -659,12 +659,12 @@ class VerificationPlanDefinition:
             toolchains = tuple(sorted(
                 self.required_toolchains, key=lambda item: item.toolchain_id))
             preparation = tuple(sorted(self.environment_preparation))
-            if not checks:
-                raise ValueError("at least one deterministic check is required")
-            if not toolchains:
-                raise ValueError("at least one toolchain requirement is required")
-            if not preparation:
-                raise ValueError("environment preparation must be declared")
+            if not checks and (toolchains or preparation):
+                raise ValueError(
+                    "check-free execution safety cannot carry verification toolchains/preparation")
+            if checks and (not toolchains or not preparation):
+                raise ValueError(
+                    "selected verification checks require toolchains and preparation")
             _unique((item.check_id for item in checks), "check ids")
             _unique((item.toolchain_id for item in toolchains), "toolchain ids")
             _unique((item.step_id for item in preparation), "environment preparation step ids")

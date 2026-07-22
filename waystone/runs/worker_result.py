@@ -464,6 +464,30 @@ class WorkerResultAdapter:
             raise
         except OSError as error:
             raise WorkerResultMissing(f"cannot read reserved worker result: {error}") from error
+        return self._adapt_content(
+            content,
+            run_id=run_id, job_id=job_id, attempt_id=attempt_id,
+            run_spec_digest=run_spec_digest, work_brief_digest=work_brief_digest,
+            base_snapshot_digest=base_snapshot_digest,
+        )
+
+    def adapt_published(
+        self, worker_result_digest: str, *, run_id: str, job_id: str, attempt_id: str,
+        run_spec_digest: str, work_brief_digest: str, base_snapshot_digest: str,
+    ) -> AdaptedWorkerResult:
+        """Observe supervisor-adapted CAS bytes without rereading the worker control file."""
+        content = self.artifact_store.read(validate_sha256_digest(worker_result_digest))
+        return self._adapt_content(
+            content,
+            run_id=run_id, job_id=job_id, attempt_id=attempt_id,
+            run_spec_digest=run_spec_digest, work_brief_digest=work_brief_digest,
+            base_snapshot_digest=base_snapshot_digest,
+        )
+
+    def _adapt_content(
+        self, content: bytes, *, run_id: str, job_id: str, attempt_id: str,
+        run_spec_digest: str, work_brief_digest: str, base_snapshot_digest: str,
+    ) -> AdaptedWorkerResult:
         result = parse_worker_result_bytes(
             content,
             expected_run_spec_digest=run_spec_digest,

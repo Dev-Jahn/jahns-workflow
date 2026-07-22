@@ -38,6 +38,7 @@ _RUNTIME_SCHEMA = "waystone-supervisor-runtime-1"
 _HEARTBEAT_SCHEMA = "waystone-supervisor-heartbeat-1"
 _WAIT_SCHEMA = "waystone-supervisor-wait-1"
 _MARKER_SCHEMA = "waystone-runner-completion-1"
+_MARKER_SCHEMA_V2 = "waystone-runner-completion-2"
 
 
 class SupervisorError(WorkflowError):
@@ -815,6 +816,7 @@ class Supervisor:
             raise SupervisorLaunchRefused(intent.action_id, "runner cwd is not a directory")
         executable = _resolved_executable(invocation.argv[0], cwd)
         principal = self._principal_for_intent(intent)
+        worker_result_binding = self._worker_result_binding(intent.action_id, intent.run_id)
         launch_path = self._launch_path(intent.action_id)
         payload: dict[str, object] = {
             "schema": _LAUNCH_SCHEMA,
@@ -832,6 +834,7 @@ class Supervisor:
             "cwd": str(cwd),
             "heartbeat_interval": self._heartbeat_interval,
             "lease_ttl": self._lease_ttl,
+            "worker_result_binding": worker_result_binding,
         }
 
         def guarded_spawn() -> DetachedSupervisorHandle:
@@ -876,6 +879,31 @@ class Supervisor:
             return DetachedSupervisorHandle(intent.action_id, process.pid, launch_path)
 
         return self._leases.guard_effect_start(principal, guarded_spawn)
+
+    def _worker_result_binding(
+            self, action_id: str, run_id: str) -> dict[str, str] | None:
+        """Freeze staged result-adapter inputs; legacy non-RunSpec fixtures remain v1."""
+        with self._store._connection_lock:  # noqa: SLF001 - immutable spec presence probe
+            row = self._store._connection.execute(  # noqa: SLF001
+                "SELECT 1 FROM artifacts WHERE reference_id LIKE ? LIMIT 1",
+                (f"run-spec:{run_id}:%",),
+            ).fetchone()
+        if row is None:
+            return None
+        from waystone.runs.spec import load_run_spec
+
+        spec = load_run_spec(run_id, start=self.project_root)
+        action = self._store.get_entity(EntityKind.ACTION, action_id)
+        attempt_id = action.parent_attempt_id
+        if not isinstance(attempt_id, str) or not attempt_id:
+            raise SupervisorLaunchRefused(
+                action_id, "staged runner action lacks its exact attempt binding")
+        return {
+            "attempt_id": attempt_id,
+            "run_spec_digest": spec.run_spec_digest,
+            "work_brief_digest": spec.work_brief.digest,
+            "base_snapshot_digest": spec.base_snapshot.digest,
+        }
 
     def runner_executor(self, intent: RunnerLaunchIntent) -> None:
         """``RunnerExecutor`` adapter: launch detached and return without waiting."""
@@ -937,6 +965,8 @@ class Supervisor:
             "stdout_artifact_digest": marker.stdout_artifact_digest,
             "stderr_artifact_digest": marker.stderr_artifact_digest,
         }
+        if marker.worker_result_digest is not None:
+            marker_wait_fields["worker_result_digest"] = marker.worker_result_digest
         if any(wait_receipt.get(key) != value for key, value in marker_wait_fields.items()):
             raise CompletionMarkerRefused(
                 marker.action_id, "marker does not match supervisor wait evidence")
@@ -1008,6 +1038,7 @@ _LAUNCH_FIELDS = {
     "schema", "project_root", "run_id", "job_id", "action_id", "owner_token",
     "fencing_epoch", "entity_version", "invocation_digest", "launch_token",
     "completion_marker_path", "argv", "cwd", "heartbeat_interval", "lease_ttl",
+    "worker_result_binding",
 }
 _RUNTIME_FIELDS = {
     "schema", "run_id", "job_id", "action_id", "owner_token", "fencing_epoch",
@@ -1028,10 +1059,19 @@ _MARKER_FIELDS = {
     "process_identity", "started_at", "finished_at", "returncode", "signal",
     "stdout_artifact_digest", "stderr_artifact_digest",
 }
+_MARKER_FIELDS_V2 = _MARKER_FIELDS | {"worker_result_digest"}
 
 
 def _read_launch(path: Path) -> dict[str, object]:
-    payload = _read_object(path, schema=_LAUNCH_SCHEMA, fields=_LAUNCH_FIELDS)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SupervisorStateError(path, f"launch evidence is unreadable: {error}") from error
+    fields = (_LAUNCH_FIELDS if isinstance(raw, dict)
+              and "worker_result_binding" in raw
+              else _LAUNCH_FIELDS - {"worker_result_binding"})
+    payload = _read_object(path, schema=_LAUNCH_SCHEMA, fields=fields)
+    payload.setdefault("worker_result_binding", None)
     try:
         for field in (
                 "project_root", "run_id", "job_id", "action_id", "owner_token",
@@ -1044,6 +1084,15 @@ def _read_launch(path: Path) -> dict[str, object]:
         ttl = _positive_finite(payload["lease_ttl"], "launch.lease_ttl")
         if ttl <= payload["heartbeat_interval"]:
             raise ValueError("launch lease_ttl must exceed heartbeat_interval")
+        binding = payload["worker_result_binding"]
+        if binding is not None:
+            if not isinstance(binding, dict) or set(binding) != {
+                    "attempt_id", "run_spec_digest", "work_brief_digest",
+                    "base_snapshot_digest"}:
+                raise ValueError("launch worker_result_binding fields are invalid")
+            _nonempty(binding["attempt_id"], "launch.worker_result_binding.attempt_id")
+            for field in ("run_spec_digest", "work_brief_digest", "base_snapshot_digest"):
+                validate_sha256_digest(binding[field])
         argv = payload["argv"]
         if (not isinstance(argv, list) or not argv
                 or any(not isinstance(value, str) for value in argv)):
@@ -1075,7 +1124,13 @@ def _read_heartbeat(path: Path) -> dict[str, object]:
 
 
 def _read_wait(path: Path) -> dict[str, object]:
-    payload = _read_object(path, schema=_WAIT_SCHEMA, fields=_WAIT_FIELDS)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SupervisorStateError(path, f"wait evidence is unreadable: {error}") from error
+    fields = _WAIT_FIELDS | ({"worker_result_digest"} if isinstance(raw, dict)
+                             and "worker_result_digest" in raw else set())
+    payload = _read_object(path, schema=_WAIT_SCHEMA, fields=fields)
     try:
         for field in (
                 "run_id", "job_id", "action_id", "launch_token", "process_identity",
@@ -1091,13 +1146,25 @@ def _read_wait(path: Path) -> dict[str, object]:
                 raise ValueError(f"wait.{field} must be an integer or null")
         validate_sha256_digest(payload["stdout_artifact_digest"])
         validate_sha256_digest(payload["stderr_artifact_digest"])
+        if "worker_result_digest" in payload:
+            validate_sha256_digest(payload["worker_result_digest"])
     except (TypeError, ValueError) as error:
         raise SupervisorStateError(path, f"wait fields are invalid: {error}") from error
     return payload
 
 
 def _read_marker(path: Path) -> RunnerCompletionMarker:
-    payload = _read_object(path, schema=_MARKER_SCHEMA, fields=_MARKER_FIELDS)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SupervisorStateError(path, f"completion marker is unreadable: {error}") from error
+    if not isinstance(raw, dict):
+        raise SupervisorStateError(path, "completion marker is not an object")
+    schema = raw.get("schema")
+    fields = _MARKER_FIELDS_V2 if schema == _MARKER_SCHEMA_V2 else _MARKER_FIELDS
+    payload = _read_object(path, schema=schema, fields=fields)
+    if schema not in {_MARKER_SCHEMA, _MARKER_SCHEMA_V2}:
+        raise SupervisorStateError(path, "completion marker schema is unsupported")
     try:
         marker = RunnerCompletionMarker(
             run_id=payload["run_id"],
@@ -1112,6 +1179,7 @@ def _read_marker(path: Path) -> RunnerCompletionMarker:
             signal=payload["signal"],
             stdout_artifact_digest=payload["stdout_artifact_digest"],
             stderr_artifact_digest=payload["stderr_artifact_digest"],
+            worker_result_digest=payload.get("worker_result_digest"),
         )
         # Reuse the public publisher's dataclass validation without mutating state.
         for value, label in (
@@ -1131,6 +1199,8 @@ def _read_marker(path: Path) -> RunnerCompletionMarker:
                 raise ValueError("marker result must be an integer")
         validate_sha256_digest(marker.stdout_artifact_digest)
         validate_sha256_digest(marker.stderr_artifact_digest)
+        if marker.worker_result_digest is not None:
+            validate_sha256_digest(marker.worker_result_digest)
     except (TypeError, ValueError) as error:
         raise SupervisorStateError(path, f"completion marker fields are invalid: {error}") from error
     return marker
@@ -1280,6 +1350,20 @@ def _run_detached_supervisor(launch_path: Path) -> int:
                 marker_path, "wait completed without a process return code")
         returncode = process.returncode if process.returncode >= 0 else None
         signal = -process.returncode if process.returncode < 0 else None
+        worker_result_digest = None
+        binding = launch["worker_result_binding"]
+        if binding is not None:
+            from waystone.runs.worker_result import WorkerResultAdapter
+
+            adapted = WorkerResultAdapter(Path(launch["cwd"]), artifacts).adapt(
+                run_id=launch["run_id"],
+                job_id=launch["job_id"],
+                attempt_id=binding["attempt_id"],
+                run_spec_digest=binding["run_spec_digest"],
+                work_brief_digest=binding["work_brief_digest"],
+                base_snapshot_digest=binding["base_snapshot_digest"],
+            )
+            worker_result_digest = adapted.worker_result_artifact.digest
         marker = RunnerCompletionMarker(
             run_id=launch["run_id"],
             job_id=launch["job_id"],
@@ -1293,6 +1377,7 @@ def _run_detached_supervisor(launch_path: Path) -> int:
             signal=signal,
             stdout_artifact_digest=stdout_artifact.digest,
             stderr_artifact_digest=stderr_artifact.digest,
+            worker_result_digest=worker_result_digest,
         )
         wait_receipt = {
             "schema": _WAIT_SCHEMA,
@@ -1310,6 +1395,8 @@ def _run_detached_supervisor(launch_path: Path) -> int:
             "stdout_artifact_digest": marker.stdout_artifact_digest,
             "stderr_artifact_digest": marker.stderr_artifact_digest,
         }
+        if marker.worker_result_digest is not None:
+            wait_receipt["worker_result_digest"] = marker.worker_result_digest
 
         def publish_completion() -> None:
             _publish_exclusive(_wait_path(project_root, action_id), wait_receipt)

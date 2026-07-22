@@ -15,6 +15,7 @@ from test_work_brief import completion_contract, init_project, payload
 from waystone.features.review_layout import new_run_id
 from waystone.jobs import completion
 from waystone.runs.artifacts import ArtifactReferenceKind, ArtifactStore
+from waystone.runs.assurance import compile_assurance_plan, parse_assurance_plan_bytes
 from waystone.runs.spec import (
     ResultPolicy,
     RunInputDriftError,
@@ -48,11 +49,7 @@ class RunSpecTests(unittest.TestCase):
         self.contract = completion_contract(self.root, self.frame)
         self.brief_bytes = completion.canonical_json(
             payload(self.head, self.frame, new_run_id()))
-        self.assurance_bytes = (
-            b"schema: waystone-assurance-plan-1\n"
-            b"lifecycle_stage: explore\n"
-            b"actions: []\n"
-        )
+        self.assurance_bytes = compile_assurance_plan("explore").canonical_bytes()
 
     @contextmanager
     def supported_filesystem(self):
@@ -94,6 +91,12 @@ class RunSpecTests(unittest.TestCase):
         self.assertEqual(spec.objective_ref.to_dict(), self.frame.fact_ref("hypothesis/solver").to_dict())
         self.assertEqual(spec.job_input.acceptance_criteria, ("Record the answer or candidate.",))
         self.assertEqual(spec.retry.max_total_attempts, 2)
+        frozen_assurance = parse_assurance_plan_bytes(
+            ArtifactStore(self.root).read(spec.assurance_plan.digest))
+        self.assertEqual(frozen_assurance.completion["contract"], {
+            "reference_id": spec.job_input.completion_contract.reference_id,
+            "digest": spec.job_input.completion_contract.digest,
+        })
 
         with self.supported_filesystem(), RunStore.open(self.root) as store:
             spec_ref = store.get_artifact_reference(f"run-spec:{spec.run_id}:1")
@@ -133,7 +136,11 @@ class RunSpecTests(unittest.TestCase):
             self.assertEqual(load_run_spec(spec.run_id, start=self.root), spec)
 
     def test_stage_mismatch_refuses_before_creating_run_rows(self):
-        invalid_assurance = self.assurance_bytes.replace(b"explore", b"promote")
+        invalid_assurance = compile_assurance_plan(
+            "promote",
+            evaluation_spec={"digest": "sha256:" + "1" * 64, "generation": 1},
+            promotion_lineage_id=new_run_id(),
+        ).canonical_bytes()
         with self.assertRaisesRegex(Exception, "assurance plan schema/stage"):
             with self.supported_filesystem():
                 plan_one_task_run(

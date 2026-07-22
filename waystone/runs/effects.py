@@ -38,6 +38,7 @@ _PLAN_SCHEMA = "waystone-effect-plan-1"
 _INTENT_SCHEMA = "waystone-effect-intent-1"
 _OBSERVATION_SCHEMA = "waystone-effect-observation-1"
 _RUNNER_MARKER_SCHEMA = "waystone-runner-completion-1"
+_RUNNER_MARKER_SCHEMA_V2 = "waystone-runner-completion-2"
 
 
 class EffectError(WorkflowError):
@@ -308,6 +309,7 @@ class RunnerCompletionMarker:
     signal: int | None
     stdout_artifact_digest: str
     stderr_artifact_digest: str
+    worker_result_digest: str | None = None
 
 
 RunnerExecutor = Callable[[RunnerLaunchIntent], None]
@@ -385,8 +387,13 @@ def _marker_payload(marker: RunnerCompletionMarker) -> dict[str, object]:
             raise ValueError(f"marker.{label} must be an integer or null")
     stdout_digest = validate_sha256_digest(marker.stdout_artifact_digest)
     stderr_digest = validate_sha256_digest(marker.stderr_artifact_digest)
-    return {
-        "schema": _RUNNER_MARKER_SCHEMA,
+    worker_result_digest = None
+    if marker.worker_result_digest is not None:
+        worker_result_digest = validate_sha256_digest(marker.worker_result_digest)
+    result = {
+        "schema": (
+            _RUNNER_MARKER_SCHEMA_V2
+            if worker_result_digest is not None else _RUNNER_MARKER_SCHEMA),
         "run_id": marker.run_id,
         "job_id": marker.job_id,
         "action_id": marker.action_id,
@@ -400,6 +407,9 @@ def _marker_payload(marker: RunnerCompletionMarker) -> dict[str, object]:
         "stdout_artifact_digest": stdout_digest,
         "stderr_artifact_digest": stderr_digest,
     }
+    if worker_result_digest is not None:
+        result["worker_result_digest"] = worker_result_digest
+    return result
 
 
 def publish_runner_completion(path: Path, marker: RunnerCompletionMarker) -> None:
@@ -1294,8 +1304,11 @@ class EffectEngine:
             return self._observation(
                 plan, ObservationDisposition.UNKNOWN, evidence,
                 "runner completion marker is not an object")
+        if marker.get("schema") not in {_RUNNER_MARKER_SCHEMA, _RUNNER_MARKER_SCHEMA_V2}:
+            return self._observation(
+                plan, ObservationDisposition.UNKNOWN, evidence,
+                "runner marker schema is unsupported")
         required = {
-            "schema": _RUNNER_MARKER_SCHEMA,
             "run_id": plan.run_id,
             "job_id": plan.job_id,
             "action_id": plan.action_id,
@@ -1316,6 +1329,7 @@ class EffectEngine:
                 returncode=marker.get("returncode"), signal=marker.get("signal"),
                 stdout_artifact_digest=marker["stdout_artifact_digest"],
                 stderr_artifact_digest=marker["stderr_artifact_digest"],
+                worker_result_digest=marker.get("worker_result_digest"),
             )
             normalized = _marker_payload(typed_marker)
         except (KeyError, TypeError, ValueError) as error:
@@ -1341,9 +1355,13 @@ class EffectEngine:
                 plan, ObservationDisposition.UNKNOWN, evidence,
                 "runner process identity does not match supervisor authority")
         output_sizes: dict[str, int] = {}
-        for stream, digest in (
-                ("stdout", typed_marker.stdout_artifact_digest),
-                ("stderr", typed_marker.stderr_artifact_digest)):
+        bound_artifacts = [
+            ("stdout", typed_marker.stdout_artifact_digest),
+            ("stderr", typed_marker.stderr_artifact_digest),
+        ]
+        if typed_marker.worker_result_digest is not None:
+            bound_artifacts.append(("worker_result", typed_marker.worker_result_digest))
+        for stream, digest in bound_artifacts:
             try:
                 output_sizes[f"{stream}_size"] = len(self._artifacts.read(digest))
             except Exception as error:

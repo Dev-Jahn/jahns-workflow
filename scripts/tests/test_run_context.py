@@ -19,6 +19,7 @@ from waystone.jobs.domain import Role
 from waystone.jobs.profile import assemble_run
 from waystone.project.context import resolve_project_context
 from waystone.runs.artifacts import ArtifactReference, ArtifactReferenceKind, ArtifactStore
+from waystone.runs.assurance import compile_assurance_plan
 from waystone.runs.engine import StagedRunEngine
 from waystone.runs.spec import load_run_spec
 from waystone.runs.store import (
@@ -281,11 +282,7 @@ class ContextResumeE2ETests(unittest.TestCase):
     def test_response_publishes_new_brief_spec_and_attempt(self):
         contract = completion_contract(self.root, self.frame)
         brief = completion.canonical_json(payload(self.head, self.frame, new_run_id()))
-        assurance = (
-            b"schema: waystone-assurance-plan-1\n"
-            b"lifecycle_stage: explore\n"
-            b"actions: []\n"
-        )
+        assurance = compile_assurance_plan("explore").canonical_bytes()
         with self.supported_filesystem():
             context = resolve_project_context(self.root, registry=self.registry)
             with assemble_run(context) as assembly:
