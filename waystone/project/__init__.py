@@ -6,7 +6,6 @@ import json
 import os
 import re
 import stat
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -487,58 +486,10 @@ def normalize_config(cfg: dict | None, *, source: Path | None = None) -> dict:
     if "generated_dir" in cfg:
         raise ValueError("generated_dir: is not supported; status owns the canonical read model")
     cfg.setdefault("digest_max_lines", 150)
-    rv = cfg.setdefault("review", {})
-    if not isinstance(rv, dict):
-        raise ValueError("review: must be a mapping (mode/reviewers/require_ci/approvers/operators)")
-    rv.setdefault("mode", "packet")  # packet | pr
-    # `waystone:init` writes role:reviewer explicitly for new projects. A config created by an
-    # older release may omit the field entirely, so preserve that release's implicit literals.
-    rv.setdefault("reviewers", ["codex", "gpt-5.5-pro"])
-    rv.setdefault("require_ci", False)
-    rv.setdefault("approvers", [])  # extra trusted approver logins beyond the repo owner
-    # GitHub actors trusted to POST cycle/result/findings markers (beyond the repo owner). The
-    # logical `reviewer` in a result marker is just a model id; `operators` is who vouched for it
-    # on GitHub — a separate provenance, so a collaborator can't forge a macro reviewer's verdict.
-    rv.setdefault("operators", [])
-    if rv["mode"] not in ("packet", "pr"):
-        raise ValueError(f"review.mode must be 'packet' or 'pr', got {rv['mode']!r}")
-    if not (isinstance(rv["reviewers"], list) and all(isinstance(r, str) for r in rv["reviewers"])):
-        raise ValueError("review.reviewers must be a list of strings")
-    invalid_role_refs = [
-        reviewer for reviewer in rv["reviewers"]
-        if reviewer.startswith("role:") and reviewer != "role:reviewer"
-    ]
-    if invalid_role_refs:
-        raise ValueError(
-            "review.reviewers role references must be exactly 'role:reviewer'; "
-            f"got {invalid_role_refs[0]!r}")
-    if not isinstance(rv["require_ci"], bool):
-        raise ValueError("review.require_ci must be a boolean")
-    if not (isinstance(rv["approvers"], list) and all(isinstance(a, str) for a in rv["approvers"])):
-        raise ValueError("review.approvers must be a list of strings")
-    if not (isinstance(rv["operators"], list) and all(isinstance(o, str) for o in rv["operators"])):
-        raise ValueError("review.operators must be a list of strings")
-    dl = cfg.setdefault("delegation", {})
-    if not isinstance(dl, dict):
-        raise ValueError(
-            "delegation: must be a mapping (enabled/env_prep)")
-    if "codex_runner_verified" in dl:
-        if source is not None:
-            marker_path = source.parent / ".waystone" / "codex-runner-verified"
-            print(
-                f"waystone: legacy delegation.codex_runner_verified in {source} is ignored; "
-                f"remove the key from {source}; Codex runner proof is checkout-local at "
-                f"{marker_path}",
-                file=sys.stderr,
-            )
-        dl.pop("codex_runner_verified")
-    dl.setdefault("enabled", True)
-    if not isinstance(dl["enabled"], bool):
-        raise ValueError("delegation.enabled must be a boolean")
-    dl.setdefault("env_prep", None)  # None -> lockfile auto-detection at delegation time (no sandbox knob, R7)
-    ep = dl["env_prep"]
-    if ep is not None and not (isinstance(ep, list) and all(isinstance(x, str) for x in ep)):
-        raise ValueError("delegation.env_prep must be a list of shell command strings")
+    for retired in ("review", "delegation"):
+        if retired in cfg:
+            raise ValueError(
+                f"{retired}: is not supported by the canonical 0.13 surface")
     policy = cfg.setdefault("policy", {})
     if not isinstance(policy, dict):
         raise ValueError("policy: must be a mapping (start_level)")

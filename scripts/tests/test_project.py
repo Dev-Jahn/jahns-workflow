@@ -6,6 +6,7 @@ from support import *  # noqa: F401,F403
 
 import json
 from waystone.cli import main as cli_main
+from waystone.project import normalize_config
 
 
 class ProjectSurfaceTests(unittest.TestCase):
@@ -36,6 +37,17 @@ class ProjectSurfaceTests(unittest.TestCase):
     def test_legacy_surface_is_not_wired(self):
         self.assertEqual(cli_main.main(["delegate"]), 1)
         self.assertEqual(cli_main.main(["round"]), 1)
+
+    def test_g01305_legacy_review_and_delegation_config_fail_loud(self):
+        canonical = normalize_config({})
+        self.assertNotIn("review", canonical)
+        self.assertNotIn("delegation", canonical)
+        for field, value in (
+                ("review", {"mode": "packet", "reviewers": ["codex"]}),
+                ("delegation", {"enabled": True, "codex_runner_verified": True})):
+            with self.subTest(field=field), self.assertRaisesRegex(
+                    ValueError, rf"{field}: is not supported"):
+                normalize_config({field: value})
 
 
 if __name__ == "__main__":

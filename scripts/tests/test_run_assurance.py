@@ -5,6 +5,7 @@ from support import *  # noqa: F401,F403
 import json
 import sys
 import time
+from types import SimpleNamespace
 from unittest import mock
 
 from test_work_brief import completion_contract, init_project, payload
@@ -408,6 +409,65 @@ class PromotionLineageTests(unittest.TestCase):
                 "promote", evaluation_spec={"digest": self.d(5), "generation": 1},
                 promotion_lineage_id=lineage, consumed_review_cycles=1,
                 review_cycles=(first, second))
+
+    def test_e2e4_durable_review_head_rejects_new_run_budget_reset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "repo"
+            root.mkdir()
+            init_project(root)
+            artifacts = ArtifactStore(root)
+            filesystem = mock.patch(
+                "waystone.runs.store._probe_state_filesystem",
+                return_value=FilesystemInfo("apfs", Path("/"), writable=True),
+            )
+            with filesystem, RunStore.open(root) as store:
+                run = store.create_run(initial_state="dispatch-ready")
+                job_id = f"{run.run_id}:job"
+                store.create_job(run.run_id, job_id, initial_state="running")
+                lineage_id = new_run_id()
+                plan = compile_assurance_plan(
+                    "promote",
+                    evaluation_spec={"digest": self.d(31), "generation": 1},
+                    promotion_lineage_id=lineage_id,
+                    declared_risks=("public-contract",),
+                )
+                plan_artifact = artifacts.write(plan.canonical_bytes())
+                spec = SimpleNamespace(
+                    run_id=run.run_id,
+                    job_id=job_id,
+                    assurance_plan=SimpleNamespace(digest=plan_artifact.digest),
+                    promotion_lineage=PromotionLineage(
+                        lineage_id, self.d(32), "refs/heads/main", None,
+                        self.d(33), None),
+                )
+                context = ProjectContext(
+                    "project:review-cycle", root, root, root / ".git",
+                    "canonical", root / ".waystone" / "state.db",
+                )
+                assembly = ProductionRunAssembly(
+                    context, None, {}, store, artifacts, None, None, None, None)
+                with mock.patch("waystone.runs.engine.load_run_spec", return_value=spec):
+                    cycle = StagedRunEngine(assembly).append_review_cycle(
+                        run.run_id,
+                        target_result_digest=self.d(34),
+                        review_digest=self.d(35),
+                    )
+
+                reference = store.get_artifact_reference(
+                    f"review-cycle:{lineage_id}:1")
+                self.assertEqual(reference.digest, cycle.digest)
+                from waystone.runs.engine import load_review_cycle_chain
+                saved = load_review_cycle_chain(assembly, lineage_id, None)
+                descendant = compile_assurance_plan(
+                    "promote",
+                    evaluation_spec={"digest": self.d(31), "generation": 1},
+                    promotion_lineage_id=lineage_id,
+                    consumed_review_cycles=0,
+                    review_cycles=saved,
+                )
+                self.assertEqual(descendant.review["consumed_cycles"], 1)
+                self.assertEqual(
+                    descendant.review["cycle_chain_head_digest"], cycle.digest)
 
     def test_fix_before_promotion_blocks_until_verified_descendant_clearance(self):
         with tempfile.TemporaryDirectory() as directory:

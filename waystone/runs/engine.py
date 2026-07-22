@@ -6,7 +6,9 @@ the neighbouring run modules into the M1-B one-task vertical path.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import shutil
 import sqlite3
 import stat
 import tempfile
@@ -18,7 +20,8 @@ from typing import Callable, Iterator, Mapping, Sequence
 
 from waystone.adapters.git import GitReadError, git_full_sha, git_read_bytes
 from waystone.core import WorkflowError
-from waystone.jobs.domain import Role
+from waystone.jobs import completion, work_brief
+from waystone.jobs.domain import ExecutionCategory, Role
 from waystone.jobs.profile import RunAssembly as ProductionRunAssembly
 from waystone.project.brief import FrameStatusRef, ProjectFactRef
 from waystone.runs.artifacts import (
@@ -37,6 +40,7 @@ from waystone.runs.assurance import (
     parse_evaluation_evidence_bytes,
     parse_evaluation_spec_bytes,
     parse_review_cycle_bytes,
+    canonical_json as assurance_json,
 )
 from waystone.runs.cancel import CancellationEngine, CancellationResult
 from waystone.runs.effects import (
@@ -128,6 +132,10 @@ class EngineConfigurationUnavailable(EngineAssemblyError):
 
 class EngineBindingRefusal(EngineAssemblyError):
     code = "run_engine_binding_refused"
+
+
+class StageRunnerFailed(EngineAssemblyError):
+    code = "stage_runner_failed"
 
 
 class ReadOnlyStoreUnavailable(EngineAssemblyError):
@@ -229,6 +237,49 @@ class ContextResumeResult:
     attempt_id: str
 
 
+def load_review_cycle_chain(
+        assembly: ProductionRunAssembly,
+        promotion_lineage_id: str,
+        inherited_head_digest: str | None,
+) -> tuple[ReviewCycle, ...]:
+    """Load the inherited CAS chain plus every durable cycle appended to this lineage."""
+    cycles = []
+    head = inherited_head_digest
+    while head is not None:
+        cycle = parse_review_cycle_bytes(assembly.artifact_store.read(head))
+        cycles.append(cycle)
+        head = cycle.supersedes_digest
+    cycles.reverse()
+    indexed = {cycle.cycle: cycle for cycle in cycles}
+    prefix = f"review-cycle:{promotion_lineage_id}:"
+    with assembly.store._connection_lock:  # noqa: SLF001 - lineage-head projection
+        rows = assembly.store._connection.execute(  # noqa: SLF001
+            "SELECT reference_id FROM artifacts WHERE reference_id LIKE ?",
+            (prefix + "%",),
+        ).fetchall()
+    for row in rows:
+        reference_id = row["reference_id"]
+        suffix = reference_id.removeprefix(prefix)
+        if not suffix.isdigit() or int(suffix) < 1:
+            raise EngineBindingRefusal("durable review cycle reference identity is invalid")
+        reference = assembly.store.get_artifact_reference(reference_id)
+        cycle = parse_review_cycle_bytes(
+            assembly.artifact_store.read_reference(reference))
+        prior = indexed.get(cycle.cycle)
+        if prior is not None and prior.digest != cycle.digest:
+            raise EngineBindingRefusal("durable review cycle number is divergent")
+        indexed[cycle.cycle] = cycle
+    ordered = tuple(indexed[index] for index in sorted(indexed))
+    prior_digest = None
+    for index, cycle in enumerate(ordered, start=1):
+        if (cycle.promotion_lineage_id != promotion_lineage_id
+                or cycle.cycle != index
+                or cycle.supersedes_digest != prior_digest):
+            raise EngineBindingRefusal("durable review cycle chain is divergent or non-contiguous")
+        prior_digest = cycle.digest
+    return ordered
+
+
 class StagedRunEngine:
     """A2 production entry point over an already assembled canonical kernel graph."""
 
@@ -301,7 +352,153 @@ class StagedRunEngine:
             reason=TransitionReason.PROCESS_STARTED,
             evidence_digest=spec.run_spec_digest,
         )
+        self._ensure_stage_started(spec, attempt_id)
         return StagedStartResult(spec, attempt_id)
+
+    @staticmethod
+    def _invocation_digest(invocation: RunnerInvocation) -> str:
+        payload = assurance_json({
+            "argv": list(invocation.argv),
+            "cwd": str(invocation.cwd),
+        })
+        return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+    def _worker_result_schema(
+            self, spec: RunSpec, attempt_id: str, *, evaluation: bool) -> StoredArtifact:
+        common = {
+            "schema": {"type": "string", "const": "waystone-worker-result-1"},
+            "status": {"type": "string"},
+            "run_spec_digest": {"type": "string", "const": spec.run_spec_digest},
+            "attempt_id": {"type": "string", "const": attempt_id},
+        }
+        summary: dict[str, object] = {"type": "string", "minLength": 1}
+        if evaluation:
+            summary = {"type": "string", "enum": ["pass", "fail"]}
+        completed = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                **common,
+                "status": {"type": "string", "const": "completed"},
+                "result_summary": summary,
+                "evidence_refs": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "reference_id": {"type": "string", "minLength": 1},
+                            "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+                        },
+                        "required": ["reference_id", "digest"],
+                    },
+                },
+            },
+            "required": [
+                "schema", "status", "run_spec_digest", "attempt_id",
+                "result_summary", "evidence_refs",
+            ],
+        }
+        context_requested = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                **common,
+                "status": {"type": "string", "const": "context-requested"},
+                "context_request": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        field: {"type": "string", "minLength": 1}
+                        for field in ("question", "blocked_decision", "why_required")
+                    },
+                    "required": ["question", "blocked_decision", "why_required"],
+                },
+            },
+            "required": [
+                "schema", "status", "run_spec_digest", "attempt_id", "context_request",
+            ],
+        }
+        return self.assembly.artifact_store.write(assurance_json({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "oneOf": [completed, context_requested],
+        }))
+
+    def _stage_invocation(
+            self, spec: RunSpec, attempt_id: str, role: Role) -> RunnerInvocation:
+        adapter = self.assembly.role_adapters[role]
+        if adapter.execution_category is not ExecutionCategory.EXTERNAL:
+            raise EngineBindingRefusal(
+                f"{role.value} stage execution requires an external binding")
+        transport, separator, model = adapter.backend.partition(":")
+        if transport != "codex" or not separator or not model:
+            raise EngineBindingRefusal(
+                f"{role.value} backend {adapter.backend!r} is not an executable codex binding")
+        executable = shutil.which("codex")
+        if executable is None:
+            raise EngineBindingRefusal("codex executable is unavailable for the frozen binding")
+        contract = completion.parse_completion_contract_bytes(
+            self.input_root,
+            self.assembly.artifact_store.read(
+                spec.job_input.completion_contract.digest),
+            artifact_store=self.assembly.artifact_store,
+        )
+        brief = work_brief.parse_work_brief_bytes(
+            self.assembly.artifact_store.read(spec.work_brief.digest),
+            artifact_store=self.assembly.artifact_store,
+            completion_contract=contract,
+        )
+        schema = self._worker_result_schema(
+            spec, attempt_id, evaluation=spec.lifecycle_stage.value == "evaluate")
+        sandbox = "read-only" if spec.lifecycle_stage.value == "evaluate" else "workspace-write"
+        return RunnerInvocation((
+            executable,
+            "exec",
+            "-m",
+            model,
+            "--sandbox",
+            sandbox,
+            "--ephemeral",
+            "--output-schema",
+            str(schema.path),
+            "-o",
+            str(self.input_root / "WAYSTONE_RESULT.yaml"),
+            work_brief.render_semantic_prompt(brief, contract),
+        ), self.input_root)
+
+    def _runner_action_id(self, attempt_id: str, stage: str) -> str:
+        action = "worker" if stage == "explore" else "read-only-evaluator"
+        return f"{attempt_id}:{action}"
+
+    def _ensure_stage_runner(self, spec: RunSpec, attempt_id: str) -> str:
+        stage = spec.lifecycle_stage.value
+        role = Role.WORKER if stage == "explore" else Role.VERIFIER
+        action_id = self._runner_action_id(attempt_id, stage)
+        invocation = self._stage_invocation(spec, attempt_id, role)
+        invocation_digest = self._invocation_digest(invocation)
+        self.assembly.supervisor.bind_invocation(invocation_digest, invocation)
+        try:
+            action = self.assembly.store.get_entity(EntityKind.ACTION, action_id)
+        except RecordNotFoundError:
+            plan = self.assembly.effect_executor.plan_effect(
+                spec.run_id, spec.job_id, attempt_id, action_id,
+                RunnerExecutionEffect(invocation_digest),
+            )
+            action = self.assembly.store.get_entity(EntityKind.ACTION, action_id)
+        else:
+            plan = self.assembly.effect_executor._load_plan(action_id)  # noqa: SLF001
+            if (plan.kind is not EffectKind.RUNNER_EXECUTION
+                    or plan.spec.get("invocation_digest") != invocation_digest):
+                raise EngineBindingRefusal(
+                    "stage runner action differs from the frozen role invocation")
+        if action.state == "planned":
+            claimed = self.assembly.effect_executor.claim_effect(plan, ttl_seconds=30)
+            self.assembly.effect_executor.execute_effect(claimed)
+        return action_id
+
+    def _ensure_stage_started(self, spec: RunSpec, attempt_id: str) -> None:
+        if spec.lifecycle_stage.value in {"explore", "evaluate"}:
+            self._ensure_stage_runner(spec, attempt_id)
 
     def observe_worker_result(
         self,
@@ -320,10 +517,37 @@ class StagedRunEngine:
         plan = self.assembly.effect_executor._load_plan(action_id)  # noqa: SLF001
         marker_path = Path(plan.spec["completion_marker"])
         try:
-            marker = parse_runner_completion_marker_v2_bytes(marker_path.read_bytes())
-        except (OSError, WorkflowError) as error:
+            marker_content = marker_path.read_bytes()
+            marker_payload = json.loads(marker_content.decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
             raise EngineBindingRefusal(
-                f"completed staged runner lacks a valid marker v2: {error}") from error
+                f"completed staged runner lacks a readable marker: {error}") from error
+        if (not isinstance(marker_payload, dict)
+                or marker_payload.get("run_id") != run_id
+                or marker_payload.get("job_id") != spec.job_id
+                or marker_payload.get("action_id") != action_id):
+            raise EngineBindingRefusal("runner marker identity differs from the bound action")
+        if (marker_payload.get("schema") != "waystone-runner-completion-2"
+                or marker_payload.get("returncode") != 0
+                or marker_payload.get("signal") is not None
+                or "worker_result_digest" not in marker_payload):
+            failure_class = (
+                "runner-signaled" if marker_payload.get("signal") is not None
+                else "runner-exit-nonzero" if marker_payload.get("returncode") != 0
+                else "worker-result-unavailable"
+            )
+            self._record_stage_runner_failure(
+                spec, attempt_id, action_id, marker_payload, failure_class)
+            raise StageRunnerFailed(
+                f"stage action {action_id!r} ended with {failure_class}")
+        try:
+            marker = parse_runner_completion_marker_v2_bytes(marker_content)
+        except WorkflowError as error:
+            self._record_stage_runner_failure(
+                spec, attempt_id, action_id, marker_payload,
+                "worker-result-unavailable")
+            raise StageRunnerFailed(
+                f"stage action {action_id!r} published an invalid result marker") from error
         if (marker.run_id != run_id or marker.job_id != spec.job_id
                 or marker.action_id != action_id):
             raise EngineBindingRefusal("runner marker v2 identity differs from the bound action")
@@ -359,7 +583,95 @@ class StagedRunEngine:
                     ),
                 ),
             )
+        else:
+            reference_id = f"worker-result:{attempt_id}"
+            try:
+                reference = store.get_artifact_reference(reference_id)
+            except RecordNotFoundError:
+                attempt = store.get_entity(EntityKind.ATTEMPT, attempt_id)
+                store.record_transition(
+                    EntityKind.ATTEMPT,
+                    attempt_id,
+                    expected_version=attempt.version,
+                    next_state=attempt.state,
+                    reason=TransitionReason.EFFECT_OBSERVED,
+                    evidence_digest=adapted.worker_result_artifact.digest,
+                    artifact_references=(ArtifactReference(
+                        reference_id,
+                        ArtifactReferenceKind.EVIDENCE,
+                        adapted.worker_result_artifact.digest,
+                        adapted.worker_result_artifact.size,
+                    ),),
+                )
+            else:
+                if reference.digest != adapted.worker_result_artifact.digest:
+                    raise EngineBindingRefusal(
+                        "completed worker result differs from the frozen attempt result")
         return adapted
+
+    def _record_stage_runner_failure(
+            self,
+            spec: RunSpec,
+            attempt_id: str,
+            action_id: str,
+            marker: Mapping[str, object],
+            failure_class: str,
+    ) -> None:
+        payload = {
+            "schema": "waystone-stage-runner-failure-1",
+            "run_id": spec.run_id,
+            "job_id": spec.job_id,
+            "attempt_id": attempt_id,
+            "action_id": action_id,
+            "failure_class": failure_class,
+            "returncode": marker.get("returncode"),
+            "signal": marker.get("signal"),
+            "stdout_artifact_digest": validate_sha256_digest(
+                marker.get("stdout_artifact_digest")),  # type: ignore[arg-type]
+            "stderr_artifact_digest": validate_sha256_digest(
+                marker.get("stderr_artifact_digest")),  # type: ignore[arg-type]
+        }
+        artifact = self.assembly.artifact_store.write(assurance_json(payload))
+        reference_id = f"runner-failure:{attempt_id}"
+        try:
+            reference = self.assembly.store.get_artifact_reference(reference_id)
+        except RecordNotFoundError:
+            reference = None
+        if reference is not None and reference.digest != artifact.digest:
+            raise EngineBindingRefusal("runner failure evidence is divergent")
+        attempt = self.assembly.store.get_entity(EntityKind.ATTEMPT, attempt_id)
+        if attempt.state != "failed":
+            references = () if reference is not None else (ArtifactReference(
+                reference_id,
+                ArtifactReferenceKind.EVIDENCE,
+                artifact.digest,
+                artifact.size,
+            ),)
+            self.assembly.store.record_transition(
+                EntityKind.ATTEMPT,
+                attempt_id,
+                expected_version=attempt.version,
+                next_state="failed",
+                reason=TransitionReason.PROCESS_FAILED,
+                evidence_digest=artifact.digest,
+                artifact_references=references,
+            )
+        for kind, identity in (
+                (EntityKind.JOB, spec.job_id),
+                (EntityKind.RUN, spec.run_id)):
+            entity = (
+                self.assembly.store.get_run(identity)
+                if kind is EntityKind.RUN
+                else self.assembly.store.get_entity(kind, identity))
+            if entity.state != "failed":
+                self.assembly.store.record_transition(
+                    kind,
+                    identity,
+                    expected_version=entity.version,
+                    next_state="failed",
+                    reason=TransitionReason.PROCESS_FAILED,
+                    evidence_digest=artifact.digest,
+                )
 
     def pending_context(self, run_id: str) -> PendingContext:
         store = self.assembly.store
@@ -457,8 +769,189 @@ class StagedRunEngine:
         )
         return ContextResumeResult(prepared.spec, response, transition.attempt.entity_id)
 
+    def _latest_attempt_id(self, spec: RunSpec) -> str:
+        with self.assembly.store._connection_lock:  # noqa: SLF001
+            row = self.assembly.store._connection.execute(  # noqa: SLF001
+                "SELECT attempt_id FROM attempts WHERE run_id = ? AND job_id = ? "
+                "ORDER BY rowid DESC LIMIT 1",
+                (spec.run_id, spec.job_id),
+            ).fetchone()
+        if row is None:
+            raise EngineBindingRefusal("staged run has no attempt")
+        return row["attempt_id"]
+
+    def _apply_candidate(self, spec: RunSpec, attempt_id: str) -> str:
+        assert spec.candidate is not None
+        target_ref = spec.result_policy.target_ref
+        expected_oid = spec.result_policy.expected_oid
+        assert target_ref is not None and expected_oid is not None
+        action_id = f"{spec.run_id}:target-ref-apply"
+        try:
+            plan = self.assembly.effect_executor.plan_effect(
+                spec.run_id, spec.job_id, attempt_id, action_id,
+                GitRefEffect(
+                    self.input_root, target_ref, expected_oid,
+                    spec.candidate["target_oid"]),
+            )
+            claimed = self.assembly.effect_executor.claim_effect(plan, ttl_seconds=30)
+            result = self.assembly.effect_executor.execute_effect(claimed)
+        except EffectStateRefusal:
+            result = self.assembly.effect_executor.reconcile_actions((action_id,))[0]
+        if result.state not in {EffectResultState.COMPLETED, EffectResultState.NOOP}:
+            raise EngineBindingRefusal(result.reason or "promotion apply did not complete")
+        return spec.candidate["target_oid"]
+
+    def _promotion_records(self, spec: RunSpec) -> tuple[str, str, str]:
+        contract = completion.parse_completion_contract_bytes(
+            self.input_root,
+            self.assembly.artifact_store.read(
+                spec.job_input.completion_contract.digest),
+            artifact_store=self.assembly.artifact_store,
+        )
+        brief = work_brief.parse_work_brief_bytes(
+            self.assembly.artifact_store.read(spec.work_brief.digest),
+            artifact_store=self.assembly.artifact_store,
+            completion_contract=contract,
+        )
+        sources = []
+        semantic_items = (
+            *brief.current_state, *brief.known_failures, *brief.constraints,
+            *brief.non_goals, *brief.open_questions,
+        )
+        for item in semantic_items:
+            sources.extend(source.payload for source in item.sources)
+        required = []
+        for prefix in ("regression-contract:", "supported-scope:", "accepted-risks:"):
+            matches = [
+                source for source in sources
+                if str(source.get("reference_id", "")).startswith(prefix)
+            ]
+            if len(matches) != 1:
+                raise EngineBindingRefusal(
+                    f"promotion requires exactly one {prefix} evidence source")
+            digest = validate_sha256_digest(matches[0].get("digest"))  # type: ignore[arg-type]
+            self.assembly.artifact_store.read(digest)
+            required.append(digest)
+        return required[0], required[1], required[2]
+
+    def _execute_public_stage(
+            self, spec: RunSpec, attempt_id: str) -> tuple[tuple[str, object], ...] | None:
+        stage = spec.lifecycle_stage.value
+        if stage in {"explore", "evaluate"}:
+            action_id = self._runner_action_id(attempt_id, stage)
+            adapted = self.observe_worker_result(spec.run_id, attempt_id, action_id)
+            if isinstance(adapted.result, ContextRequestedWorkerResult):
+                return None
+            if not isinstance(adapted.result, CompletedWorkerResult):
+                raise EngineBindingRefusal("stage runner did not publish a completed result")
+        if stage == "explore":
+            target_oid = git_full_sha(self.input_root)
+            if target_oid is None:
+                raise EngineBindingRefusal("explore worker result has no reachable HEAD")
+
+            def publish() -> Candidate:
+                return self.publish_candidate(
+                    spec.run_id,
+                    attempt_id,
+                    adapted,
+                    target_oid=target_oid,
+                    config_digest=self.assembly.profile.content_digest,
+                )
+
+            return self.execute_stage(spec.run_id, {
+                "worker": lambda: action_id,
+                "result-adapter": lambda: adapted,
+                "candidate-publish": publish,
+                "completion": lambda: adapted.worker_result_artifact.digest,
+            })
+        if stage == "evaluate":
+            evidence = None
+
+            def publish_evidence() -> EvaluationEvidence:
+                nonlocal evidence
+                evidence, _reference = self.publish_evaluation_evidence(
+                    spec.run_id,
+                    evaluator_action_id=action_id,
+                    result=adapted.result.result_summary,
+                    metric_artifacts=tuple(
+                        item.to_dict() for item in adapted.result.evidence_refs),
+                )
+                return evidence
+
+            return self.execute_stage(spec.run_id, {
+                "freeze": lambda: spec.candidate["digest"],  # type: ignore[index]
+                "read-only-evaluator": lambda: adapted,
+                "evaluation-evidence": publish_evidence,
+                "completion": lambda: adapted.worker_result_artifact.digest,
+            })
+        assert stage == "promote"
+        regression, supported, risks = self._promotion_records(spec)
+        assert spec.evaluation is not None
+        evidence_ref = spec.evaluation["evidence"]
+        assert isinstance(evidence_ref, Mapping)
+        evidence = parse_evaluation_evidence_bytes(
+            self.assembly.artifact_store.read(evidence_ref["digest"]))
+        evidence_digest = validate_sha256_digest(evidence_ref["digest"])
+        handlers = {
+            "evaluated-candidate-freeze": lambda: spec.candidate["digest"],  # type: ignore[index]
+            "independent-verify": lambda: evidence_digest,
+            "integration-decision": lambda: evidence_digest,
+            "target-ref-apply": lambda: self._apply_candidate(spec, attempt_id),
+            "completion": lambda: evidence_digest,
+        }
+        plan = parse_assurance_plan_bytes(
+            self.assembly.artifact_store.read(spec.assurance_plan.digest))
+        if plan.requires("adversarial-review"):
+            handlers["adversarial-review"] = lambda: evidence_digest
+        return self.execute_stage(
+            spec.run_id,
+            handlers,
+            regression_contract_digest=regression,
+            supported_scope_digest=supported,
+            accepted_risks_digest=risks,
+        )
+
     def resume(self, run_id: str) -> Mapping[str, object]:
-        return self.assembly.transport.actions_next(run_id)
+        run = self.assembly.store.get_run(run_id)
+        if run.state == "closeout-ready":
+            return {
+                "action": None, "engine": "idle", "reason": "run_closeout_ready",
+                "run_state": run.state,
+            }
+        if run.state == "failed":
+            return {
+                "action": None, "engine": "idle", "reason": "run_failed",
+                "run_state": run.state,
+            }
+        if run.state in {"completed", "waiting_context", "waiting_user"}:
+            return self.assembly.transport.actions_next(run_id)
+        spec = load_run_spec(run_id, start=self.root)
+        attempt_id = self._latest_attempt_id(spec)
+        if spec.lifecycle_stage.value in {"explore", "evaluate"}:
+            action_id = self._ensure_stage_runner(spec, attempt_id)
+            action = self.assembly.store.get_entity(EntityKind.ACTION, action_id)
+            if action.state != "completed":
+                try:
+                    branch = self.assembly.transport.actions_next(run_id)
+                except RunNotActionable:
+                    branch = None
+                action = self.assembly.store.get_entity(EntityKind.ACTION, action_id)
+                if action.state != "completed":
+                    if branch is None:
+                        return {
+                            "action": None,
+                            "engine": "busy",
+                            "poll_after_s": 1,
+                            "run_state": self.assembly.store.get_run(run_id).state,
+                        }
+                    return branch
+        completed = self._execute_public_stage(spec, attempt_id)
+        if completed is None:
+            return self.assembly.transport.actions_next(run_id)
+        return {
+            "action": None, "engine": "idle", "reason": "run_closeout_ready",
+            "run_state": self.assembly.store.get_run(run_id).state,
+        }
 
     def close(self, run_id: str, outcome_content: bytes) -> OutcomePublication:
         """Publish one evidence-bound outcome pair before completing the run."""
@@ -724,14 +1217,12 @@ class StagedRunEngine:
                 or plan.review.get("promotion_lineage_id") != spec.promotion_lineage.id
                 or not plan.requires("adversarial-review")):
             raise EngineBindingRefusal("run has no frozen risk-gated review action")
-        cycles = []
-        head = plan.review.get("cycle_chain_head_digest")
-        while head is not None:
-            cycle = parse_review_cycle_bytes(self.assembly.artifact_store.read(head))
-            cycles.append(cycle)
-            head = cycle.supersedes_digest
-        cycles.reverse()
-        if len(cycles) != plan.review["consumed_cycles"]:
+        cycles = load_review_cycle_chain(
+            self.assembly,
+            spec.promotion_lineage.id,
+            plan.review.get("cycle_chain_head_digest"),
+        )
+        if len(cycles) < plan.review["consumed_cycles"]:
             raise EngineBindingRefusal(
                 "AssurancePlan consumed review count does not rederive from its CAS chain")
         maximum = plan.review["max_cycles"]
@@ -746,7 +1237,29 @@ class StagedRunEngine:
             review_digest=review_digest,
             supersedes_digest=(cycles[-1].digest if cycles else None),
         )
-        self.assembly.artifact_store.write(cycle.canonical_bytes())
+        artifact = self.assembly.artifact_store.write(cycle.canonical_bytes())
+        reference_id = f"review-cycle:{spec.promotion_lineage.id}:{cycle.cycle}"
+        try:
+            reference = self.assembly.store.get_artifact_reference(reference_id)
+        except RecordNotFoundError:
+            job = self.assembly.store.get_entity(EntityKind.JOB, spec.job_id)
+            self.assembly.store.record_transition(
+                EntityKind.JOB,
+                spec.job_id,
+                expected_version=job.version,
+                next_state=job.state,
+                reason=TransitionReason.REVIEW_CYCLE,
+                evidence_digest=artifact.digest,
+                artifact_references=(ArtifactReference(
+                    reference_id,
+                    ArtifactReferenceKind.EVIDENCE,
+                    artifact.digest,
+                    artifact.size,
+                ),),
+            )
+        else:
+            if reference.digest != artifact.digest:
+                raise EngineBindingRefusal("durable review cycle reference is divergent")
         return cycle
 
     def _candidate_lineage(self, candidate_digest: object) -> tuple[str, ...]:

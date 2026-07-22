@@ -690,6 +690,17 @@ class Supervisor:
         self.project_root = store.project_root
         self.directory = self.project_root / ".waystone" / "supervisors"
 
+    def bind_invocation(self, digest: str, invocation: RunnerInvocation) -> None:
+        """Bind one stage-owned invocation before its runner effect is launched."""
+        canonical = validate_sha256_digest(digest)
+        if not isinstance(invocation, RunnerInvocation):
+            raise TypeError("invocation must be a RunnerInvocation")
+        existing = self._invocations.get(canonical)
+        if existing is not None and existing != invocation:
+            raise SupervisorLaunchRefused(
+                "invocation-binding", "digest is already bound to a different invocation")
+        self._invocations[canonical] = invocation
+
     def _launch_path(self, action_id: str) -> Path:
         return self.directory / _action_filename(action_id, ".launch.json")
 
@@ -1352,18 +1363,25 @@ def _run_detached_supervisor(launch_path: Path) -> int:
         signal = -process.returncode if process.returncode < 0 else None
         worker_result_digest = None
         binding = launch["worker_result_binding"]
-        if binding is not None:
+        if binding is not None and returncode == 0:
             from waystone.runs.worker_result import WorkerResultAdapter
 
-            adapted = WorkerResultAdapter(Path(launch["cwd"]), artifacts).adapt(
-                run_id=launch["run_id"],
-                job_id=launch["job_id"],
-                attempt_id=binding["attempt_id"],
-                run_spec_digest=binding["run_spec_digest"],
-                work_brief_digest=binding["work_brief_digest"],
-                base_snapshot_digest=binding["base_snapshot_digest"],
-            )
-            worker_result_digest = adapted.worker_result_artifact.digest
+            try:
+                adapted = WorkerResultAdapter(Path(launch["cwd"]), artifacts).adapt(
+                    run_id=launch["run_id"],
+                    job_id=launch["job_id"],
+                    attempt_id=binding["attempt_id"],
+                    run_spec_digest=binding["run_spec_digest"],
+                    work_brief_digest=binding["work_brief_digest"],
+                    base_snapshot_digest=binding["base_snapshot_digest"],
+                )
+            except WorkflowError:
+                # The process exit and stream artifacts remain authoritative even when the
+                # reserved result is absent or invalid.  A v1 marker lets the engine observe
+                # and terminalize that typed stage failure instead of leaving running state.
+                pass
+            else:
+                worker_result_digest = adapted.worker_result_artifact.digest
         marker = RunnerCompletionMarker(
             run_id=launch["run_id"],
             job_id=launch["job_id"],

@@ -6,7 +6,7 @@ import stat
 from pathlib import Path
 from typing import Mapping
 
-from waystone.adapters.git import GitReadError, git_full_sha, git_read_bytes
+from waystone.adapters.git import GitReadError, git_full_sha, git_rc, git_read_bytes
 from waystone.core import WorkflowError
 from waystone.jobs import completion
 from waystone.jobs.profile import RunAssembly as ProductionRunAssembly, assemble_run
@@ -19,13 +19,13 @@ from waystone.runs.assurance import (
     digest_bytes,
     parse_candidate_bytes,
     parse_evaluation_evidence_bytes,
-    parse_review_cycle_bytes,
 )
 from waystone.runs.engine import (
     CancelReason,
     ResumeResult,
     RunEngine,
     StagedRunEngine,
+    load_review_cycle_chain,
 )
 from waystone.runs.spec import PromotionLineage, ResultPolicy, load_run_spec
 from waystone.runs.transport import (
@@ -191,7 +191,7 @@ def _evidence_sources(brief) -> tuple[Mapping[str, object], ...]:
     for item in items:
         for source in item.sources:
             payload = source.to_dict()
-            if payload.get("kind") == "evidence" and "reference_id" in payload:
+            if "reference_id" in payload:
                 sources.append(payload)
     return tuple(sources)
 
@@ -244,11 +244,11 @@ def _evaluation_spec_input(brief) -> Mapping[str, object]:
 
 
 def _integration_target(root: Path) -> str:
-    try:
-        target = git_read_bytes(root, "symbolic-ref", "-q", "HEAD").decode("ascii").strip()
-    except (GitReadError, UnicodeDecodeError) as error:
+    returncode, target, error = git_rc(root, "symbolic-ref", "--quiet", "HEAD")
+    if returncode != 0:
         raise ActionPlanRefusal(
-            "candidate-producing explore requires an attached integration target ref") from error
+            "candidate-producing explore requires an attached integration target ref: "
+            + (error or f"git exited {returncode}"))
     if not target.startswith("refs/heads/"):
         raise ActionPlanRefusal("integration target must be an attached refs/heads/* ref")
     return target
@@ -256,15 +256,6 @@ def _integration_target(root: Path) -> str:
 
 def _root_objective_digest(brief) -> str:
     return digest_bytes(completion.canonical_json(brief.objective.ref.to_dict()))
-
-
-def _review_cycle_chain(assembly: ProductionRunAssembly, head: str | None):
-    cycles = []
-    while head is not None:
-        cycle = parse_review_cycle_bytes(assembly.artifact_store.read(head))
-        cycles.append(cycle)
-        head = cycle.supersedes_digest
-    return tuple(reversed(cycles))
 
 
 def _start_with_assembly(
@@ -352,12 +343,15 @@ def _start_with_assembly(
                 raise ActionPlanRefusal(
                     "promotion requires passed evidence for the exact candidate/spec generation")
             inherited = evaluation_producer.promotion_lineage
+            review_cycles = load_review_cycle_chain(
+                assembly, inherited.id, inherited.review_cycle_head_digest)
+            review_cycle_head = (
+                review_cycles[-1].digest if review_cycles
+                else inherited.review_cycle_head_digest)
             promotion_lineage = PromotionLineage(
                 inherited.id, inherited.root_objective_ref_digest,
                 inherited.integration_target_ref, evaluation_producer.run_spec_digest,
-                candidate_descriptor["digest"], inherited.review_cycle_head_digest)
-            review_cycles = _review_cycle_chain(
-                assembly, inherited.review_cycle_head_digest)
+                candidate_descriptor["digest"], review_cycle_head)
             evaluation = {
                 "spec": dict(evaluation_spec),
                 "evidence": {
