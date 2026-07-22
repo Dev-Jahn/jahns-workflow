@@ -131,11 +131,13 @@ class UninitializedArtifactProjectError(ArtifactError):
 
 
 class ArtifactReferenceKind(str, Enum):
-    """Immutable artifact-reference roles owned by the store-kernel slice."""
+    """Immutable artifact-reference roles owned by the store kernel."""
 
     ATTEMPT = "attempt"
+    INPUT = "input"
     EVIDENCE = "evidence"
     DECISION = "decision"
+    OUTCOME = "outcome"
 
 
 def validate_sha256_digest(digest: str) -> str:
@@ -160,7 +162,7 @@ class ArtifactReference:
         try:
             kind = ArtifactReferenceKind(self.kind)
         except (TypeError, ValueError) as error:
-            raise ValueError("artifact reference kind is not supported by schema v1") from error
+            raise ValueError("artifact reference kind is not supported by schema v2") from error
         if isinstance(self.size, bool) or not isinstance(self.size, int) or self.size < 0:
             raise ValueError("artifact reference size must be a non-negative integer")
         object.__setattr__(self, "kind", kind)

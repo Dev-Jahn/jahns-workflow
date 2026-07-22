@@ -95,7 +95,7 @@ class _StoreFixture(unittest.TestCase):
 
 
 class RunStoreTests(_StoreFixture):
-    def test_schema_v1_has_required_authority_audit_telemetry_reference_and_cache_tables(self):
+    def test_schema_v2_has_required_authority_audit_telemetry_reference_and_cache_tables(self):
         root = self.project()
         store = self.open_store(root)
 
@@ -114,7 +114,7 @@ class RunStoreTests(_StoreFixture):
             self.assertIn("version", columns)
             self.assertIn("record_digest", columns)
         self.assertEqual(
-            store._connection.execute("SELECT version FROM schema_version").fetchone()[0], 1)
+            store._connection.execute("SELECT version FROM schema_version").fetchone()[0], 2)
         self.assertEqual(
             store._connection.execute("PRAGMA journal_mode").fetchone()[0].lower(), "wal")
         self.assertGreater(
@@ -142,7 +142,7 @@ class RunStoreTests(_StoreFixture):
             stores = list(executor.map(lambda _: open_together(), range(2)))
         for store in stores:
             self.addCleanup(store.close)
-            self.assertEqual(store.schema_version, 1)
+            self.assertEqual(store.schema_version, 2)
             self.assertEqual(
                 store._connection.execute("PRAGMA journal_mode").fetchone()[0].lower(), "wal")
         self.assertEqual((root / ".waystone" / ".gitignore").read_bytes(), b"*\n")
@@ -179,7 +179,7 @@ class RunStoreTests(_StoreFixture):
             raise RuntimeError("injected migration failure")
 
         with self.supported_filesystem(), mock.patch.dict(
-                store_module._MIGRATIONS, {1: fail_after_ddl}, clear=True):  # noqa: SLF001
+                store_module._MIGRATIONS, {2: fail_after_ddl}, clear=True):  # noqa: SLF001
             with self.assertRaisesRegex(RuntimeError, "injected migration failure"):
                 RunStore.open(root)
 
@@ -190,16 +190,17 @@ class RunStoreTests(_StoreFixture):
         store = self.open_store(root)
         store.close()
         reopened = self.open_store(root)
-        self.assertEqual(reopened.schema_version, 1)
+        self.assertEqual(reopened.schema_version, 2)
         reopened.close()
 
-        connection.execute("UPDATE schema_version SET version = 2")
+        connection.execute("UPDATE schema_version SET version = 1")
         with self.supported_filesystem(), mock.patch.object(
                 store_module, "_enable_wal",
-                side_effect=AssertionError("newer schema must be refused before journal mutation")):
+                side_effect=AssertionError("v1 schema must be refused before journal mutation")):
             with self.assertRaises(UnsupportedSchemaVersionError) as raised:
                 RunStore.open(root)
-        self.assertEqual(raised.exception.code, "unsupported_schema_version")
+        self.assertEqual(raised.exception.code, "schema_version_unsupported")
+        self.assertEqual((raised.exception.found, raised.exception.supported), (1, 2))
 
         fake = mock.Mock()
         fake.in_transaction = True
@@ -227,7 +228,8 @@ class RunStoreTests(_StoreFixture):
         }
         self.assertEqual(public_methods, {
             "close", "create_action", "create_attempt", "create_job", "create_run",
-            "get_artifact_reference", "get_entity", "get_run", "record_transition",
+            "get_artifact_reference", "get_entity", "get_run", "provide_context",
+            "record_context_request", "record_transition",
         })
 
         def crash(stage: str) -> None:

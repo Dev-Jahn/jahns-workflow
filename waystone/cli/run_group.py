@@ -4,11 +4,22 @@ from __future__ import annotations
 import json
 import stat
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Mapping
 
+from waystone.adapters.git import git_full_sha
 from waystone.core import WorkflowError
-from waystone.runs.engine import CancelReason, ResumeResult, RunEngine
-from waystone.runs.spec import UninitializedRunSpecError
+from waystone.jobs import completion
+from waystone.jobs.profile import RunAssembly as ProductionRunAssembly, assemble_run
+from waystone.jobs.work_brief import import_owner_source_file, parse_work_brief_bytes
+from waystone.project.brief import ProjectFactRef, read_project_frame_at_commit
+from waystone.project.context import resolve_project_context
+from waystone.runs.artifacts import ArtifactReference, ArtifactReferenceKind
+from waystone.runs.engine import (
+    CancelReason,
+    ResumeResult,
+    RunEngine,
+    StagedRunEngine,
+)
 from waystone.runs.transport import (
     ActionPlanRefusal,
     TransportError,
@@ -17,33 +28,192 @@ from waystone.runs.transport import (
 )
 
 
-EngineFactory = Callable[[Path], RunEngine]
-
-
-def _default_engine_factory(root: Path) -> RunEngine:
-    return RunEngine(root)
-
-
-_engine_factory: EngineFactory = _default_engine_factory
-
-
-def _project_root(start: Path) -> Path:
+def _regular_bytes(path: Path, label: str) -> bytes:
     try:
-        current = start.resolve(strict=True)
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise ActionPlanRefusal(f"{label} must be a regular non-symlink file")
+        return path.read_bytes()
+    except ActionPlanRefusal:
+        raise
     except OSError as error:
-        raise UninitializedRunSpecError(start) from error
-    for candidate in (current, *current.parents):
-        marker = candidate / ".waystone.yml"
-        try:
-            info = marker.lstat()
-        except FileNotFoundError:
-            continue
-        except OSError as error:
-            raise UninitializedRunSpecError(start) from error
-        if stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode):
-            return candidate
-        raise UninitializedRunSpecError(start)
-    raise UninitializedRunSpecError(start)
+        raise ActionPlanRefusal(f"cannot read {label}: {error}") from error
+
+
+def _start_arguments(args: list[str]) -> tuple[str, Path, Path | None, str | None, Path | None]:
+    if not args:
+        raise ActionPlanRefusal("start requires a task id and --work-brief <file>")
+    task_id = args[0]
+    work_brief = None
+    owner_request = None
+    stage = None
+    from_worktree = None
+    index = 1
+    seen: set[str] = set()
+    while index < len(args):
+        option = args[index]
+        if option not in {"--work-brief", "--owner-request", "--stage", "--from-worktree"}:
+            raise ActionPlanRefusal(f"unexpected start argument {option!r}")
+        if option in seen or index + 1 >= len(args):
+            raise ActionPlanRefusal(f"{option} requires exactly one value")
+        seen.add(option)
+        value = args[index + 1]
+        if option == "--work-brief":
+            work_brief = Path(value)
+        elif option == "--owner-request":
+            owner_request = Path(value)
+        elif option == "--stage":
+            stage = value
+        else:
+            from_worktree = Path(value)
+        index += 2
+    if work_brief is None:
+        raise ActionPlanRefusal("start requires --work-brief <file>")
+    return task_id, work_brief, owner_request, stage, from_worktree
+
+
+def _project_fact_refs(payload: object) -> tuple[ProjectFactRef, ...]:
+    found: dict[tuple[object, ...], ProjectFactRef] = {}
+
+    def visit(value: object) -> None:
+        if isinstance(value, dict):
+            if value.get("kind") == "project-fact":
+                key = (
+                    value.get("commit"), value.get("path"), value.get("fact_id"),
+                    value.get("fact_digest"), value.get("binding"),
+                )
+                found[key] = ProjectFactRef(
+                    commit=value["commit"],
+                    path=value["path"],
+                    fact_id=value["fact_id"],
+                    fact_digest=value["fact_digest"],
+                    binding=value["binding"],
+                )
+            for nested in value.values():
+                visit(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                visit(nested)
+
+    visit(payload)
+    return tuple(found[key] for key in sorted(found))
+
+
+def _compile_completion(
+    assembly: ProductionRunAssembly,
+    brief,
+) -> completion.CompletionContract:
+    objective = brief.objective.ref.to_dict()
+    prefix = objective.get("fact_id", "").partition("/")[0]
+    if brief.lifecycle_stage == "explore" and (
+            objective.get("kind") != "project-fact"
+            or prefix not in {"hypothesis", "question"}
+            or objective.get("binding") != "nonbinding"):
+        raise ActionPlanRefusal(
+            "the WorkBrief does not identify authority for an explore learning criterion; "
+            "A2 will not infer it from prose")
+    if brief.lifecycle_stage == "evaluate":
+        raise ActionPlanRefusal(
+            "evaluate CompletionContract source selection belongs to the B2 assurance compiler")
+    if objective["kind"] == "project-fact":
+        source_frame = read_project_frame_at_commit(
+            assembly.context.active_worktree_root, objective["commit"])
+        criterion_text = source_frame.fact(objective["fact_id"]).raw_bytes.decode(
+            "utf-8", "strict").strip()
+    elif objective["kind"] == "owner-request":
+        criterion_text = assembly.artifact_store.read(objective["digest"]).decode(
+            "utf-8", "strict").strip()
+    else:
+        raise ActionPlanRefusal(
+            "the WorkBrief does not carry criterion authority for this objective variant")
+    mode = {
+        "explore": "learning",
+        "promote": "promotion",
+    }[brief.lifecycle_stage]
+    criteria = [{
+        "id": expectation.criterion_id,
+        "mode": mode,
+        "text": criterion_text,
+        "source": objective,
+        "binding": objective["binding"],
+        "evidence": {"kind": expectation.kind},
+    } for expectation in brief.evidence_expected]
+    return completion.compile_completion_contract(
+        assembly.context.active_worktree_root,
+        brief.lifecycle_stage,
+        brief.objective.ref,
+        criteria,
+        artifact_store=assembly.artifact_store,
+    )
+
+
+def _start_with_assembly(
+    assembly: ProductionRunAssembly,
+    task_id: str,
+    work_brief_path: Path,
+    owner_request_path: Path | None,
+    stage_assertion: str | None,
+):
+    brief_content = _regular_bytes(work_brief_path, "WorkBrief")
+    assembly.artifact_store.write(brief_content)
+    brief = parse_work_brief_bytes(
+        brief_content, artifact_store=assembly.artifact_store)
+    if stage_assertion is not None and stage_assertion != brief.lifecycle_stage:
+        raise ActionPlanRefusal(
+            f"--stage {stage_assertion!r} differs from WorkBrief stage "
+            f"{brief.lifecycle_stage!r}")
+    objective = brief.objective.ref.to_dict()
+    owner_reference = None
+    if objective["kind"] == "owner-request":
+        if owner_request_path is None:
+            raise ActionPlanRefusal(
+                "--owner-request is required for an owner-request WorkBrief objective")
+        ingress = import_owner_source_file(
+            assembly.context.active_worktree_root,
+            owner_request_path,
+            reference_id=objective["artifact_reference_id"],
+            declared_digest=objective["digest"],
+            artifact_store=assembly.artifact_store,
+        )
+        owner_reference = ArtifactReference(
+            ingress.reference_id,
+            ArtifactReferenceKind.INPUT,
+            ingress.artifact.digest,
+            ingress.artifact.size,
+        )
+    elif owner_request_path is not None:
+        raise ActionPlanRefusal(
+            "--owner-request is forbidden unless objective_ref.kind is owner-request")
+    contract = _compile_completion(assembly, brief)
+    assurance_content = completion.canonical_json({
+        "actions": [],
+        "lifecycle_stage": brief.lifecycle_stage,
+        "schema": "waystone-assurance-plan-1",
+    })
+    head = git_full_sha(assembly.context.active_worktree_root)
+    if head is None:
+        raise ActionPlanRefusal("active worktree HEAD cannot be resolved")
+    frame = read_project_frame_at_commit(
+        assembly.context.active_worktree_root, head)
+    facts = _project_fact_refs(brief.to_dict())
+    return StagedRunEngine(assembly).start(
+        task_id,
+        work_brief_content=brief_content,
+        completion_contract_content=contract.canonical_bytes(),
+        assurance_plan_content=assurance_content,
+        frame_status_ref=frame.status_ref,
+        project_fact_refs=facts,
+        owner_request_reference=owner_reference,
+    )
+
+
+def _latest_run_id(assembly: ProductionRunAssembly) -> str:
+    with assembly.store._connection_lock:  # noqa: SLF001 - public latest-run projection
+        row = assembly.store._connection.execute(  # noqa: SLF001
+            "SELECT run_id FROM runs ORDER BY run_id DESC LIMIT 1").fetchone()
+    if row is None:
+        raise ActionPlanRefusal("no run exists")
+    return row["run_id"]
 
 
 def _json(value: Mapping[str, object]) -> str:
@@ -109,27 +279,67 @@ def main(argv: list[str]) -> int:
         if not argv:
             raise ActionPlanRefusal(
                 "expected start, resume, status, watch, cancel, or actions")
-        # PC-31 is intentionally before command-specific parsing and file reads.
-        root = _project_root(Path.cwd())
-        engine = _engine_factory(root)
         command, args = argv[0], argv[1:]
 
         if command == "start":
-            if len(args) != 1:
-                raise ActionPlanRefusal("start requires exactly one task id")
-            result = engine.start(args[0])
+            task_id, work_brief, owner_request, stage, from_worktree = _start_arguments(args)
+            # ProjectContext is proven before profile/config/intent/DB/file ingress.
+            context = resolve_project_context(
+                Path.cwd(),
+                from_worktree=from_worktree,
+                require_run_input=True,
+            )
+            with assemble_run(context) as assembly:
+                result = _start_with_assembly(
+                    assembly, task_id, work_brief, owner_request, stage)
             print(
-                f"Run {result.run_id} started via the new engine; "
-                "legacy delegate remains unchanged."
+                f"Run {result.spec.run_id} started at {result.spec.lifecycle_stage.value} "
+                f"with RunSpec revision {result.spec.revision}."
             )
             return 0
 
         if command == "resume":
             if len(args) > 1:
                 raise ActionPlanRefusal("resume accepts at most one run id")
-            result = engine.resume(_run_id(engine, args[0] if args else None))
-            print(_resume_text(result))
+            context = resolve_project_context(Path.cwd())
+            with assemble_run(context) as assembly:
+                identity = args[0] if args else _latest_run_id(assembly)
+                branch = StagedRunEngine(assembly).resume(identity)
+            print(_resume_text(ResumeResult(identity, dispatch=branch)))
             return 0
+
+        if command == "context":
+            if not args or args[0] not in {"show", "provide"}:
+                raise ActionPlanRefusal("context requires show or provide")
+            context = resolve_project_context(Path.cwd())
+            with assemble_run(context) as assembly:
+                staged = StagedRunEngine(assembly)
+                if args[0] == "show":
+                    if len(args) != 2:
+                        raise ActionPlanRefusal("context show requires exactly one run id")
+                    pending = staged.pending_context(args[1])
+                    print(_json({
+                        "request": dict(pending.request),
+                        "request_digest": pending.request_digest,
+                        "run_id": pending.run_id,
+                    }))
+                else:
+                    if len(args) != 4 or args[2] != "--response":
+                        raise ActionPlanRefusal(
+                            "context provide requires <run-id> --response <file>")
+                    response = _regular_bytes(Path(args[3]), "context response")
+                    resumed = staged.provide_context(args[1], response)
+                    print(
+                        f"Run {resumed.spec.run_id} resumed with RunSpec revision "
+                        f"{resumed.spec.revision} and attempt {resumed.attempt_id}."
+                    )
+            return 0
+
+        # Read/cancel/action surfaces still use the existing M1-B facade, but canonical
+        # context is resolved before they can discover or open project-local state.
+        context = resolve_project_context(Path.cwd())
+        root = context.canonical_root
+        engine = RunEngine(root)
 
         if command == "status":
             run_id, as_json = _parse_optional_json(args)

@@ -6,6 +6,7 @@ the neighbouring run modules into the M1-B one-task vertical path.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import stat
 import tempfile
@@ -13,10 +14,13 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Iterator, Mapping
+from typing import Callable, Iterator, Mapping, Sequence
 
 from waystone.core import WorkflowError
 from waystone.jobs.domain import Role
+from waystone.jobs.profile import RunAssembly as ProductionRunAssembly
+from waystone.project.brief import FrameStatusRef, ProjectFactRef
+from waystone.runs.artifacts import ArtifactReference, ArtifactReferenceKind
 from waystone.runs.cancel import CancellationEngine, CancellationResult
 from waystone.runs.effects import (
     EffectEngine,
@@ -46,8 +50,14 @@ from waystone.runs.preflight import (
     load_dispatch_ready,
     preflight_for_dispatch,
 )
-from waystone.runs.spec import RunSpec, load_run_spec, plan_one_task_run
+from waystone.runs.spec import (
+    RunSpec,
+    load_run_spec,
+    plan_one_task_run,
+    prepare_run_spec_revision,
+)
 from waystone.runs.store import (
+    ContextNotCurrent,
     EntityKind,
     FilesystemInfo,
     RecordNotFoundError,
@@ -60,6 +70,14 @@ from waystone.runs.transport import (
     ActionTransport,
     EngineExecutorUnavailable,
     RunNotActionable,
+)
+from waystone.runs.worker_result import (
+    AdaptedWorkerResult,
+    ContextRequestedWorkerResult,
+    ContextResponse,
+    WorkerResultAdapter,
+    parse_context_response_bytes,
+    revise_work_brief_for_response,
 )
 from waystone.runs.verify import (
     ActorIdentity,
@@ -174,6 +192,239 @@ class ResumeResult:
     dispatch: Mapping[str, object] | None = None
     cancellation: CancellationResult | None = None
     completion: CompletionResult | None = None
+
+
+@dataclass(frozen=True)
+class StagedStartResult:
+    spec: RunSpec
+    attempt_id: str
+
+
+@dataclass(frozen=True)
+class PendingContext:
+    run_id: str
+    request_digest: str
+    request: Mapping[str, object]
+
+
+@dataclass(frozen=True)
+class ContextResumeResult:
+    spec: RunSpec
+    response: ContextResponse
+    attempt_id: str
+
+
+class StagedRunEngine:
+    """A2 production entry point over an already assembled canonical kernel graph."""
+
+    def __init__(self, assembly: ProductionRunAssembly):
+        if not isinstance(assembly, ProductionRunAssembly):
+            raise TypeError("assembly must be a production RunAssembly")
+        self.assembly = assembly
+        self.root = assembly.context.canonical_root
+        self.input_root = assembly.context.active_worktree_root
+
+    def start(
+        self,
+        task_id: str,
+        *,
+        work_brief_content: bytes,
+        completion_contract_content: bytes,
+        assurance_plan_content: bytes,
+        frame_status_ref: FrameStatusRef,
+        project_fact_refs: Sequence[ProjectFactRef],
+        owner_request_reference: ArtifactReference | None = None,
+    ) -> StagedStartResult:
+        spec = plan_one_task_run(
+            task_id,
+            work_brief_content=work_brief_content,
+            completion_contract_content=completion_contract_content,
+            assurance_plan_content=assurance_plan_content,
+            frame_status_ref=frame_status_ref,
+            project_fact_refs=project_fact_refs,
+            owner_request_reference=owner_request_reference,
+            artifact_store=self.assembly.artifact_store,
+            run_store=self.assembly.store,
+            start=self.input_root,
+        )
+        store = self.assembly.store
+        run = store.get_run(spec.run_id)
+        ready = store.record_transition(
+            EntityKind.RUN,
+            spec.run_id,
+            expected_version=run.version,
+            next_state="dispatch-ready",
+            reason=TransitionReason.PLANNED,
+            evidence_digest=spec.run_spec_digest,
+        )
+        del ready
+        job = store.get_entity(EntityKind.JOB, spec.job_id)
+        store.record_transition(
+            EntityKind.JOB,
+            spec.job_id,
+            expected_version=job.version,
+            next_state="running",
+            reason=TransitionReason.PROCESS_STARTED,
+            evidence_digest=spec.run_spec_digest,
+        )
+        attempt_id = f"{spec.run_id}:attempt:1"
+        attempt = store.create_attempt(
+            spec.run_id, spec.job_id, attempt_id, initial_state="dispatch-ready")
+        store.record_transition(
+            EntityKind.ATTEMPT,
+            attempt_id,
+            expected_version=attempt.version,
+            next_state="running",
+            reason=TransitionReason.PROCESS_STARTED,
+            evidence_digest=spec.run_spec_digest,
+        )
+        return StagedStartResult(spec, attempt_id)
+
+    def observe_worker_result(
+        self,
+        run_id: str,
+        attempt_id: str,
+        action_id: str,
+    ) -> AdaptedWorkerResult:
+        """Follow an observed runner effect to its reserved union result exactly once."""
+        store = self.assembly.store
+        action = store.get_entity(EntityKind.ACTION, action_id)
+        if (action.run_id != run_id or action.parent_attempt_id != attempt_id
+                or action.state != "completed"):
+            raise EngineBindingRefusal(
+                "worker result may be consumed only after its bound runner action is observed")
+        spec = load_run_spec(run_id, start=self.root)
+        adapted = WorkerResultAdapter(
+            self.input_root, self.assembly.artifact_store).adapt(
+                run_id=run_id,
+                job_id=spec.job_id,
+                attempt_id=attempt_id,
+                run_spec_digest=spec.run_spec_digest,
+                work_brief_digest=spec.work_brief.digest,
+                base_snapshot_digest=spec.base_snapshot.digest,
+            )
+        if isinstance(adapted.result, ContextRequestedWorkerResult):
+            assert adapted.context_request_artifact is not None
+            store.record_context_request(
+                run_id,
+                spec.job_id,
+                attempt_id,
+                context_request_digest=adapted.context_request_artifact.digest,
+                artifact_references=(
+                    ArtifactReference(
+                        f"worker-result:{attempt_id}",
+                        ArtifactReferenceKind.EVIDENCE,
+                        adapted.worker_result_artifact.digest,
+                        adapted.worker_result_artifact.size,
+                    ),
+                    ArtifactReference(
+                        f"context-request:{run_id}:{spec.revision}",
+                        ArtifactReferenceKind.EVIDENCE,
+                        adapted.context_request_artifact.digest,
+                        adapted.context_request_artifact.size,
+                    ),
+                ),
+            )
+        return adapted
+
+    def pending_context(self, run_id: str) -> PendingContext:
+        store = self.assembly.store
+        run = store.get_run(run_id)
+        if run.state != "waiting_context":
+            raise ContextNotCurrent(run_id, f"run state is {run.state!r}")
+        with store._connection_lock:  # noqa: SLF001 - package context-head projection
+            row = store._connection.execute(  # noqa: SLF001
+                "SELECT reference_id FROM artifacts WHERE run_id = ? "
+                "AND reference_id LIKE ? ORDER BY transition_id DESC LIMIT 1",
+                (run_id, f"context-request:{run_id}:%"),
+            ).fetchone()
+        if row is None:
+            raise ContextNotCurrent(run_id, "waiting run has no context request head")
+        reference = store.get_artifact_reference(row["reference_id"])
+        content = self.assembly.artifact_store.read_reference(reference)
+        try:
+            request = json.loads(content.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise EngineBindingRefusal(f"context request artifact is invalid: {error}") from error
+        if not isinstance(request, dict):
+            raise EngineBindingRefusal("context request artifact is not an object")
+        return PendingContext(run_id, reference.digest, request)
+
+    def provide_context(self, run_id: str, response_content: bytes) -> ContextResumeResult:
+        """Bind a response, derived semantic revisions, and the next attempt in one store CAS."""
+        pending = self.pending_context(run_id)
+        response_artifact = self.assembly.artifact_store.write(response_content)
+        coordinator = self.assembly.profile.binding_for(Role.COORDINATOR)
+        response = parse_context_response_bytes(
+            response_content,
+            expected_request_digest=pending.request_digest,
+            expected_binding_digest=coordinator.binding_digest,
+        )
+        source_digest = response.answer_source.get("digest")
+        if response.answer_source.get("kind") in {"owner-artifact", "evidence"}:
+            try:
+                self.assembly.artifact_store.read(source_digest)  # type: ignore[arg-type]
+            except WorkflowError as error:
+                raise EngineBindingRefusal(
+                    "context answer source bytes are not present in canonical CAS") from error
+        previous = load_run_spec(run_id, start=self.root)
+        prior_brief = self.assembly.artifact_store.read(previous.work_brief.digest)
+        revised_brief = revise_work_brief_for_response(prior_brief, response)
+        assurance = self.assembly.artifact_store.read(previous.assurance_plan.digest)
+        completion = self.assembly.artifact_store.read(
+            previous.job_input.completion_contract.digest)
+        prepared = prepare_run_spec_revision(
+            previous,
+            work_brief_content=revised_brief,
+            completion_contract_content=completion,
+            assurance_plan_content=assurance,
+            resolves_context_request_digest=pending.request_digest,
+            start=self.root,
+        )
+        revision = prepared.spec.revision
+        transition = self.assembly.store.provide_context(
+            run_id,
+            previous.job_id,
+            request_digest=pending.request_digest,
+            run_spec_digest=prepared.spec.run_spec_digest,
+            max_total_attempts=previous.retry.max_total_attempts,
+            artifact_references=(
+                ArtifactReference(
+                    f"context-response:{run_id}:{revision}",
+                    ArtifactReferenceKind.INPUT,
+                    response_artifact.digest,
+                    response_artifact.size,
+                ),
+                ArtifactReference(
+                    prepared.spec.work_brief.reference_id,
+                    ArtifactReferenceKind.INPUT,
+                    prepared.work_brief_artifact.digest,
+                    prepared.work_brief_artifact.size,
+                ),
+                ArtifactReference(
+                    prepared.spec.assurance_plan.reference_id,
+                    ArtifactReferenceKind.INPUT,
+                    prepared.assurance_plan_artifact.digest,
+                    prepared.assurance_plan_artifact.size,
+                ),
+                ArtifactReference(
+                    prepared.spec.job_input.completion_contract.reference_id,
+                    ArtifactReferenceKind.INPUT,
+                    prepared.completion_contract_artifact.digest,
+                    prepared.completion_contract_artifact.size,
+                ),
+                ArtifactReference(
+                    f"run-spec:{run_id}:{revision}",
+                    ArtifactReferenceKind.INPUT,
+                    prepared.run_spec_artifact.digest,
+                    prepared.run_spec_artifact.size,
+                ),
+            ),
+        )
+        return ContextResumeResult(prepared.spec, response, transition.attempt.entity_id)
+
+    def resume(self, run_id: str) -> Mapping[str, object]:
+        return self.assembly.transport.actions_next(run_id)
 
 
 _CANCELLATION_STATES = {
@@ -789,14 +1040,18 @@ class RunEngine:
 __all__ = [
     "CancelReason",
     "CompletionResult",
+    "ContextResumeResult",
     "EngineAssemblyError",
     "EngineBindingRefusal",
     "EngineConfigurationUnavailable",
     "PreflightInputs",
+    "PendingContext",
     "ReadOnlyStoreUnavailable",
     "ResumeResult",
     "RunAssembly",
     "RunEngine",
+    "StagedRunEngine",
+    "StagedStartResult",
     "StartResult",
     "open_read_only_store",
 ]

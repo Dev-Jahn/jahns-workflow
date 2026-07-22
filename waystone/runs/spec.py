@@ -1,49 +1,49 @@
-"""Frozen one-task RunSpec planning and read-only base snapshot capture."""
+"""Stage-aware RunSpec v2 planning and read-only base snapshot capture."""
 from __future__ import annotations
 
 import base64
 import hashlib
 import json
 import os
+import re
 import stat
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
-from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 import yaml
 
 from waystone.adapters.git import GitReadError, git_full_sha, git_read_bytes
 from waystone.core import WorkflowError
+from waystone.jobs.completion import (
+    CompletionContract,
+    LifecycleStage,
+    ObjectiveRef,
+    parse_completion_contract_bytes,
+    parse_objective_ref,
+)
+from waystone.jobs.work_brief import parse_work_brief_bytes
 from waystone.project import find_project_root, load_tasks
+from waystone.project.brief import FrameStatusRef, ProjectFactRef, SourceSpan
 from waystone.runs.artifacts import (
     ArtifactReference,
     ArtifactReferenceKind,
     ArtifactStore,
+    StoredArtifact,
     validate_sha256_digest,
 )
-from waystone.runs.store import EntityKind, RunStore, TransitionReason
+from waystone.runs.store import EntityKind, RecordNotFoundError, RunStore, TransitionReason
 
 
-_RUN_SPEC_SCHEMA = "waystone-run-spec-1"
+_RUN_SPEC_SCHEMA = "waystone-run-spec-2"
 _SNAPSHOT_SCHEMA = "waystone-run-base-snapshot-1"
 _RUN_SPEC_REFERENCE_PREFIX = "run-spec:"
 _SNAPSHOT_REFERENCE_PREFIX = "base-snapshot:"
 _TIME_UNITS = frozenset({"day"})
 _COST_UNITS = frozenset({"attempt"})
 _COST_METERS = frozenset({"attempt-start"})
-_REVIEW_REQUIRED_REASONS = frozenset({
-    "trust-surface-store",
-    "trust-surface-review-binding",
-    "trust-surface-completion-gate",
-    "trust-surface-migration",
-    "trust-surface-sandbox",
-    "trust-surface-evidence-authority",
-    "owner-required",
-})
-_REVIEW_NONE_REASONS = frozenset({
-    "no-review-trigger",
-})
+_RESULT_POLICY_MODES = frozenset({"candidate-ref", "evidence-only", "integration-ref"})
 
 
 def _canonical_json(payload: object) -> bytes:
@@ -201,52 +201,111 @@ class RetryPolicy:
 
 
 DEFAULT_RETRY_POLICY = RetryPolicy(
-    max_attempts_per_job=1,
-    max_total_attempts=1,
+    max_attempts_per_job=2,
+    max_total_attempts=2,
     time_budget=BudgetLimit(limit=1, unit="day"),
-    cost_budget=CostBudget(limit=1, unit="attempt", meter="attempt-start"),
+    cost_budget=CostBudget(limit=2, unit="attempt", meter="attempt-start"),
     retryable_failure_classes=(),
     budget_exhaustion_policy="stop",
 )
 
 
-class ReviewRequirement(str, Enum):
-    NONE = "none"
-    REQUIRED = "required"
+@dataclass(frozen=True)
+class ArtifactDescriptor:
+    reference_id: str
+    digest: str
+    size: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.reference_id, str) or not self.reference_id.strip():
+            raise ValueError("artifact descriptor reference_id must be non-empty")
+        object.__setattr__(self, "digest", validate_sha256_digest(self.digest))
+        if isinstance(self.size, bool) or not isinstance(self.size, int) or self.size < 0:
+            raise ValueError("artifact descriptor size must be a non-negative integer")
+
+    def to_dict(self, *, include_size: bool = False) -> dict[str, object]:
+        result: dict[str, object] = {
+            "reference_id": self.reference_id,
+            "digest": self.digest,
+        }
+        if include_size:
+            result["size"] = self.size
+        return result
 
 
 @dataclass(frozen=True)
-class ReviewDecision:
-    requirement: ReviewRequirement
-    reason: str
-    rule_id: str
-    policy_digest: str
+class PromotionLineage:
+    id: str
+    root_objective_ref_digest: str
+    integration_target_ref: str
+    parent_run_spec_digest: str | None
+    candidate_chain_head_digest: str | None
+    review_cycle_head_digest: str | None
 
     def __post_init__(self) -> None:
-        try:
-            requirement = ReviewRequirement(self.requirement)
-        except (TypeError, ValueError) as error:
-            raise ValueError("review requirement must be 'none' or 'required'") from error
-        reasons = (
-            _REVIEW_REQUIRED_REASONS
-            if requirement is ReviewRequirement.REQUIRED else _REVIEW_NONE_REASONS)
-        if self.reason not in reasons:
-            raise ValueError(
-                f"review reason {self.reason!r} is invalid for {requirement.value}")
-        if not isinstance(self.rule_id, str) or not self.rule_id.strip():
-            raise ValueError("review rule_id must be non-empty")
-        object.__setattr__(self, "requirement", requirement)
-        object.__setattr__(self, "policy_digest", validate_sha256_digest(self.policy_digest))
+        if not isinstance(self.id, str) or not self.id.strip():
+            raise ValueError("promotion lineage id must be non-empty")
+        object.__setattr__(
+            self, "root_objective_ref_digest",
+            validate_sha256_digest(self.root_objective_ref_digest))
+        if (not isinstance(self.integration_target_ref, str)
+                or not self.integration_target_ref.startswith("refs/")):
+            raise ValueError("promotion lineage integration target must be a full refs/* name")
+        for field in (
+                "parent_run_spec_digest", "candidate_chain_head_digest",
+                "review_cycle_head_digest"):
+            value = getattr(self, field)
+            if value is not None:
+                object.__setattr__(self, field, validate_sha256_digest(value))
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "id": self.id,
+            "root_objective_ref_digest": self.root_objective_ref_digest,
+            "integration_target_ref": self.integration_target_ref,
+            "parent_run_spec_digest": self.parent_run_spec_digest,
+            "candidate_chain_head_digest": self.candidate_chain_head_digest,
+            "review_cycle_head_digest": self.review_cycle_head_digest,
+        }
+
+
+@dataclass(frozen=True)
+class ResultPolicy:
+    mode: str
+    target_ref: str | None
+    expected_oid: str | None
+
+    def __post_init__(self) -> None:
+        if self.mode not in _RESULT_POLICY_MODES:
+            raise ValueError("result policy mode is invalid")
+        if self.mode == "integration-ref":
+            if (not isinstance(self.target_ref, str) or not self.target_ref.startswith("refs/")
+                    or not isinstance(self.expected_oid, str)
+                    or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", self.expected_oid) is None):
+                raise ValueError("integration-ref requires target_ref and expected_oid")
+        elif self.expected_oid is not None:
+            raise ValueError("expected_oid is valid only for integration-ref")
+        elif self.target_ref is not None and (
+                not isinstance(self.target_ref, str) or not self.target_ref.startswith("refs/")):
+            raise ValueError("result policy target_ref must be a full refs/* name")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "mode": self.mode,
+            "target_ref": self.target_ref,
+            "expected_oid": self.expected_oid,
+        }
 
 
 @dataclass(frozen=True)
 class FrozenJobInput:
     task_id: str
     title: str
-    acceptance_criteria: tuple[str, ...]
+    completion_contract: ArtifactDescriptor
     scope: tuple[str, ...]
     dependencies: tuple[str, ...]
     input_digest: str
+    acceptance_criteria: tuple[str, ...] = ()
 
     def canonical_bytes(self) -> bytes:
         return _canonical_json(_job_input_payload(self, include_digest=False))
@@ -292,17 +351,37 @@ class BaseSnapshot:
 class RunSpec:
     run_id: str
     job_id: str
+    promotion_lineage: PromotionLineage | None
     revision: int
-    readiness: str
-    critic_disposition: str
+    supersedes_spec_digest: str | None
+    lifecycle_stage: LifecycleStage
+    frame_status_ref: FrameStatusRef
+    objective_ref: ObjectiveRef
+    project_fact_refs: tuple[ProjectFactRef, ...]
+    work_brief: ArtifactDescriptor
+    assurance_plan: ArtifactDescriptor
     job_input: FrozenJobInput
+    candidate: Mapping[str, object] | None
+    evaluation: Mapping[str, object]
+    result_policy: ResultPolicy
     base_snapshot: BaseSnapshotReference
     retry: RetryPolicy
-    review_decision: ReviewDecision | None
     run_spec_digest: str
 
     def canonical_bytes(self) -> bytes:
         return _canonical_json(_run_spec_payload(self))
+
+    @property
+    def readiness(self) -> str:
+        return "frozen-ready"
+
+    @property
+    def critic_disposition(self) -> str:
+        return "critic-not-applicable"
+
+    @property
+    def review_decision(self) -> None:
+        return None
 
 
 @dataclass(frozen=True)
@@ -312,6 +391,15 @@ class RunInputDrift:
     frozen_digest: str
     current_digest: str | None
     changed_fields: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PreparedRunSpecRevision:
+    spec: RunSpec
+    work_brief_artifact: StoredArtifact
+    assurance_plan_artifact: StoredArtifact
+    completion_contract_artifact: StoredArtifact
+    run_spec_artifact: StoredArtifact
 
 
 def _find_root(start: Path | None) -> Path:
@@ -360,31 +448,32 @@ def _string_tuple(task_id: str, value: object, field: str) -> tuple[str, ...]:
     return tuple(value)
 
 
-def _freeze_task(task_id: str, task: dict) -> FrozenJobInput:
+def _freeze_task(
+    task_id: str,
+    task: dict,
+    completion_contract: ArtifactDescriptor,
+    acceptance_criteria: tuple[str, ...] = (),
+) -> FrozenJobInput:
     title = task.get("title")
     if not isinstance(title, str) or not title.strip():
         raise InvalidTaskInputError(task_id, "title must be a non-empty string")
-    acceptance = _string_tuple(task_id, task.get("accept"), "accept")
-    if not acceptance:
-        raise AcceptanceReadinessError(task_id)
-    if len(set(acceptance)) != len(acceptance):
-        raise DuplicateCriterionError(task_id)
     scope = _string_tuple(task_id, task.get("scope"), "scope")
     dependencies = _string_tuple(task_id, task.get("deps"), "deps")
     candidate = FrozenJobInput(
         task_id=task_id,
         title=title,
-        acceptance_criteria=acceptance,
+        completion_contract=completion_contract,
         scope=scope,
         dependencies=dependencies,
         input_digest="sha256:" + "0" * 64,
+        acceptance_criteria=acceptance_criteria,
     )
     return replace(candidate, input_digest=_digest(candidate.canonical_bytes()))
 
 
 def _job_input_payload(job_input: FrozenJobInput, *, include_digest: bool) -> dict[str, object]:
     payload: dict[str, object] = {
-        "acceptance_criteria": list(job_input.acceptance_criteria),
+        "completion_contract": job_input.completion_contract.to_dict(),
         "dependencies": list(job_input.dependencies),
         "scope": list(job_input.scope),
         "task_id": job_input.task_id,
@@ -557,17 +646,6 @@ def _capture_snapshot(root: Path) -> BaseSnapshot:
     return BaseSnapshot(head=before.head, entries=first)
 
 
-def _review_payload(decision: ReviewDecision | None) -> dict[str, str] | None:
-    if decision is None:
-        return None
-    return {
-        "policy_digest": decision.policy_digest,
-        "reason": decision.reason,
-        "requirement": decision.requirement.value,
-        "rule_id": decision.rule_id,
-    }
-
-
 def _retry_payload(retry: RetryPolicy) -> dict[str, object]:
     return {
         "budget_exhaustion_policy": retry.budget_exhaustion_policy,
@@ -594,52 +672,224 @@ def _run_spec_payload(spec: RunSpec) -> dict[str, object]:
             "reference_id": spec.base_snapshot.reference_id,
             "size": spec.base_snapshot.size,
         },
-        "critic_disposition": spec.critic_disposition,
+        "assurance_plan": spec.assurance_plan.to_dict(),
+        "candidate": None if spec.candidate is None else dict(spec.candidate),
+        "evaluation": dict(spec.evaluation),
+        "frame_status_ref": {
+            "commit": spec.frame_status_ref.commit,
+            "path": spec.frame_status_ref.path,
+            "status": spec.frame_status_ref.status,
+            "digest": spec.frame_status_ref.digest,
+        },
         "job_id": spec.job_id,
         "job_input": _job_input_payload(spec.job_input, include_digest=True),
-        "readiness": spec.readiness,
-        "review_decision": _review_payload(spec.review_decision),
+        "lifecycle_stage": spec.lifecycle_stage.value,
+        "objective_ref": spec.objective_ref.to_dict(),
+        "project_fact_refs": [reference.to_dict() for reference in spec.project_fact_refs],
+        "promotion_lineage": (
+            None if spec.promotion_lineage is None else spec.promotion_lineage.to_dict()),
+        "result_policy": spec.result_policy.to_dict(),
         "retry": _retry_payload(spec.retry),
         "revision": spec.revision,
         "run_id": spec.run_id,
         "schema": _RUN_SPEC_SCHEMA,
+        "supersedes_spec_digest": spec.supersedes_spec_digest,
+        "work_brief": spec.work_brief.to_dict(),
     }
 
 
 def _new_spec(
-        run_id: str, job_id: str, job_input: FrozenJobInput,
-        snapshot: BaseSnapshotReference, review_decision: ReviewDecision | None) -> RunSpec:
-    candidate = RunSpec(
+        run_id: str, job_id: str, *, revision: int,
+        supersedes_spec_digest: str | None, lifecycle_stage: LifecycleStage,
+        promotion_lineage: PromotionLineage | None, frame_status_ref: FrameStatusRef,
+        objective_ref: ObjectiveRef, project_fact_refs: tuple[ProjectFactRef, ...],
+        work_brief: ArtifactDescriptor, assurance_plan: ArtifactDescriptor,
+        job_input: FrozenJobInput, candidate: Mapping[str, object] | None,
+        evaluation: Mapping[str, object], result_policy: ResultPolicy,
+        snapshot: BaseSnapshotReference, retry: RetryPolicy) -> RunSpec:
+    constructed = RunSpec(
         run_id=run_id,
         job_id=job_id,
-        revision=1,
-        readiness="frozen-ready",
-        critic_disposition="critic-not-required",
+        promotion_lineage=promotion_lineage,
+        revision=revision,
+        supersedes_spec_digest=supersedes_spec_digest,
+        lifecycle_stage=lifecycle_stage,
+        frame_status_ref=frame_status_ref,
+        objective_ref=objective_ref,
+        project_fact_refs=project_fact_refs,
+        work_brief=work_brief,
+        assurance_plan=assurance_plan,
         job_input=job_input,
+        candidate=candidate,
+        evaluation=evaluation,
+        result_policy=result_policy,
         base_snapshot=snapshot,
-        retry=DEFAULT_RETRY_POLICY,
-        review_decision=review_decision,
+        retry=retry,
         run_spec_digest="sha256:" + "0" * 64,
     )
-    return replace(candidate, run_spec_digest=_digest(candidate.canonical_bytes()))
+    return replace(constructed, run_spec_digest=_digest(constructed.canonical_bytes()))
+
+
+def _validate_assurance_plan(content: bytes, stage: LifecycleStage) -> None:
+    try:
+        document = yaml.safe_load(content.decode("utf-8"))
+    except (UnicodeDecodeError, yaml.YAMLError) as error:
+        raise RunSpecArtifactError("<planning>", f"assurance plan is invalid YAML: {error}") from error
+    if (not isinstance(document, Mapping)
+            or document.get("schema") != "waystone-assurance-plan-1"
+            or document.get("lifecycle_stage") != stage.value):
+        raise RunSpecArtifactError(
+            "<planning>", "assurance plan schema/stage does not match the WorkBrief")
+
+
+def _validate_frame_status(reference: FrameStatusRef) -> None:
+    if not isinstance(reference, FrameStatusRef):
+        raise TypeError("frame_status_ref must be a FrameStatusRef")
+    if (not isinstance(reference.commit, str)
+            or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", reference.commit) is None):
+        raise ValueError("frame status ref requires a full Git commit")
+    if reference.status not in ("provisional", "committed", "superseded"):
+        raise ValueError("frame status ref has an invalid status")
+    validate_sha256_digest(reference.digest)
+
+
+def _validate_stage_payload(
+    stage: LifecycleStage,
+    promotion_lineage: PromotionLineage | None,
+    candidate: Mapping[str, object] | None,
+    evaluation: Mapping[str, object] | None,
+    result_policy: ResultPolicy,
+) -> tuple[Mapping[str, object] | None, Mapping[str, object]]:
+    if stage is LifecycleStage.EXPLORE:
+        if candidate is not None or evaluation not in (None, {"spec": None, "evidence": None}):
+            raise ValueError("explore requires candidate/evaluation to be null")
+        if result_policy.mode not in ("candidate-ref", "evidence-only"):
+            raise ValueError("explore result policy cannot integrate")
+        return None, {"spec": None, "evidence": None}
+    if promotion_lineage is None:
+        raise ValueError("evaluate/promote requires promotion_lineage")
+    if not isinstance(candidate, Mapping):
+        raise ValueError("evaluate/promote requires a candidate descriptor")
+    candidate_fields = {
+        "reference_id", "digest", "target_ref", "target_oid", "code_sha",
+        "config_digest", "producer_result_digest",
+    }
+    if set(candidate) != candidate_fields:
+        raise ValueError("candidate descriptor fields are not canonical")
+    for field in ("digest", "config_digest", "producer_result_digest"):
+        validate_sha256_digest(candidate[field])  # type: ignore[arg-type]
+    for field in ("target_oid", "code_sha"):
+        if (not isinstance(candidate[field], str)
+                or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", candidate[field]) is None):
+            raise ValueError(f"candidate {field} is invalid")
+    if not isinstance(candidate["target_ref"], str) or not candidate["target_ref"].startswith("refs/"):
+        raise ValueError("candidate target_ref must be a full refs/* name")
+    if not isinstance(evaluation, Mapping) or set(evaluation) != {"spec", "evidence"}:
+        raise ValueError("evaluation fields must be spec/evidence")
+    spec_ref = evaluation["spec"]
+    if not isinstance(spec_ref, Mapping) or set(spec_ref) != {
+            "commit", "path", "digest", "generation"}:
+        raise ValueError("evaluation spec descriptor is invalid")
+    validate_sha256_digest(spec_ref["digest"])  # type: ignore[arg-type]
+    if type(spec_ref["generation"]) is not int or spec_ref["generation"] < 1:
+        raise ValueError("evaluation generation must be positive")
+    evidence = evaluation["evidence"]
+    if stage is LifecycleStage.EVALUATE:
+        if evidence is not None or result_policy.mode != "evidence-only":
+            raise ValueError("evaluate requires null evidence and evidence-only result policy")
+    else:
+        if not isinstance(evidence, Mapping) or set(evidence) != {
+                "reference_id", "digest", "generation"}:
+            raise ValueError("promote requires evaluation evidence")
+        validate_sha256_digest(evidence["digest"])  # type: ignore[arg-type]
+        if evidence["generation"] != spec_ref["generation"]:
+            raise ValueError("evaluation evidence generation does not match its spec")
+        if result_policy.mode != "integration-ref":
+            raise ValueError("promote requires integration-ref result policy")
+    return dict(candidate), dict(evaluation)
 
 
 def plan_one_task_run(
-        task_id: str, *, start: Path | None = None,
-        review_decision: ReviewDecision | None = None) -> RunSpec:
-    """Freeze one registry task and its read-only Git snapshot into one run and one job."""
+        task_id: str, *, work_brief_content: bytes,
+        completion_contract_content: bytes, assurance_plan_content: bytes,
+        frame_status_ref: FrameStatusRef, project_fact_refs: Sequence[ProjectFactRef],
+        owner_request_reference: ArtifactReference | None = None,
+        artifact_store: ArtifactStore | None = None,
+        run_store: RunStore | None = None,
+        start: Path | None = None, promotion_lineage: PromotionLineage | None = None,
+        candidate: Mapping[str, object] | None = None,
+        evaluation: Mapping[str, object] | None = None,
+        result_policy: ResultPolicy | None = None,
+        retry: RetryPolicy = DEFAULT_RETRY_POLICY) -> RunSpec:
+    """Freeze typed semantic inputs and one read-only Git snapshot into RunSpec v2."""
     root = _find_root(start)
-    job_input = _freeze_task(task_id, _selected_task(root, task_id))
+    artifact_store = artifact_store or ArtifactStore(root)
+    stored_contract = artifact_store.write(completion_contract_content)
+    contract = parse_completion_contract_bytes(
+        root, completion_contract_content, artifact_store=artifact_store)
+    stored_brief = artifact_store.write(work_brief_content)
+    brief = parse_work_brief_bytes(
+        work_brief_content, artifact_store=artifact_store, completion_contract=contract)
+    if brief.task_id != task_id:
+        raise InvalidTaskInputError(task_id, "WorkBrief task_id differs from the requested task")
+    stage = LifecycleStage(brief.lifecycle_stage)
+    _validate_assurance_plan(assurance_plan_content, stage)
+    stored_assurance = artifact_store.write(assurance_plan_content)
+    _validate_frame_status(frame_status_ref)
+    frozen_frame_status = FrameStatusRef(
+        commit=frame_status_ref.commit,
+        path=frame_status_ref.path,
+        status=frame_status_ref.status,
+        digest=frame_status_ref.digest,
+        source_span=SourceSpan(0, 0, 0, 0),
+    )
+    facts = tuple(project_fact_refs)
+    if any(not isinstance(reference, ProjectFactRef) for reference in facts):
+        raise TypeError("project_fact_refs must contain ProjectFactRef values")
+    if len({reference.fact_id for reference in facts}) != len(facts):
+        raise ValueError("project_fact_refs must not duplicate fact ids")
+    objective = brief.objective.ref
+    if objective.to_dict() != contract.objective_ref.to_dict():
+        raise ValueError("WorkBrief and CompletionContract objective refs differ")
+    objective_payload = objective.to_dict()
+    if objective_payload.get("kind") == "owner-request":
+        if (not isinstance(owner_request_reference, ArtifactReference)
+                or owner_request_reference.kind is not ArtifactReferenceKind.INPUT
+                or owner_request_reference.reference_id
+                != objective_payload["artifact_reference_id"]
+                or owner_request_reference.digest != objective_payload["digest"]):
+            raise ValueError("owner-request objective requires its exact imported input reference")
+    elif owner_request_reference is not None:
+        raise ValueError("owner_request_reference is valid only for an owner-request objective")
+    if (objective.to_dict().get("kind") == "project-fact"
+            and not any(objective.to_dict() == reference.to_dict() for reference in facts)):
+        raise ValueError("project-fact objective must appear in project_fact_refs")
+    policy_is_default = result_policy is None
+    policy = result_policy or ResultPolicy(
+        "candidate-ref" if stage is LifecycleStage.EXPLORE else "evidence-only", None, None)
+    frozen_candidate, frozen_evaluation = _validate_stage_payload(
+        stage, promotion_lineage, candidate, evaluation, policy)
+
+    placeholder_contract = ArtifactDescriptor(
+        "completion-contract:<pending>", stored_contract.digest, stored_contract.size)
+    acceptance = tuple(criterion.text for criterion in contract.criteria)
+    job_input = _freeze_task(
+        task_id, _selected_task(root, task_id), placeholder_contract, acceptance)
     snapshot_content = _capture_snapshot(root)
-    confirmed_input = _freeze_task(task_id, _selected_task(root, task_id))
+    confirmed_input = _freeze_task(
+        task_id, _selected_task(root, task_id), placeholder_contract, acceptance)
     if confirmed_input.input_digest != job_input.input_digest:
         raise RunInputChangedDuringPlanningError(task_id)
 
-    with RunStore.open(root) as store:
+    with (RunStore.open(root) if run_store is None else nullcontext(run_store)) as store:
         run = store.create_run(initial_state="candidate")
+        frozen_policy = policy
+        if (policy_is_default and stage is LifecycleStage.EXPLORE
+                and policy.mode == "candidate-ref"):
+            frozen_policy = ResultPolicy(
+                "candidate-ref", f"refs/waystone/candidates/{run.run_id}", None)
         job_id = f"{run.run_id}:job"
         store.create_job(run.run_id, job_id, initial_state="planned")
-        artifact_store = ArtifactStore(root)
         stored_snapshot = artifact_store.write(snapshot_content.canonical_bytes())
         snapshot_reference = BaseSnapshotReference(
             head=snapshot_content.head,
@@ -647,8 +897,35 @@ def plan_one_task_run(
             digest=stored_snapshot.digest,
             size=stored_snapshot.size,
         )
+        revision = 1
+        work_brief = ArtifactDescriptor(
+            f"work-brief:{run.run_id}:{brief.revision}", stored_brief.digest, stored_brief.size)
+        assurance_plan = ArtifactDescriptor(
+            f"assurance-plan:{run.run_id}:{revision}",
+            stored_assurance.digest, stored_assurance.size)
+        completion = ArtifactDescriptor(
+            f"completion-contract:{run.run_id}:{revision}",
+            stored_contract.digest, stored_contract.size)
+        job_input = _freeze_task(
+            task_id, _selected_task(root, task_id), completion, acceptance)
         spec = _new_spec(
-            run.run_id, job_id, job_input, snapshot_reference, review_decision)
+            run.run_id, job_id,
+            revision=revision,
+            supersedes_spec_digest=None,
+            lifecycle_stage=stage,
+            promotion_lineage=promotion_lineage,
+            frame_status_ref=frozen_frame_status,
+            objective_ref=objective,
+            project_fact_refs=facts,
+            work_brief=work_brief,
+            assurance_plan=assurance_plan,
+            job_input=job_input,
+            candidate=frozen_candidate,
+            evaluation=frozen_evaluation,
+            result_policy=frozen_policy,
+            snapshot=snapshot_reference,
+            retry=retry,
+        )
         stored_spec = artifact_store.write(spec.canonical_bytes())
         if stored_spec.digest != spec.run_spec_digest:
             raise RunSpecArtifactError(run.run_id, "stored RunSpec digest changed")
@@ -661,20 +938,128 @@ def plan_one_task_run(
             evidence_digest=stored_spec.digest,
             artifact_references=(
                 ArtifactReference(
-                    reference_id=f"{_RUN_SPEC_REFERENCE_PREFIX}{run.run_id}",
-                    kind=ArtifactReferenceKind.EVIDENCE,
+                    reference_id=f"{_RUN_SPEC_REFERENCE_PREFIX}{run.run_id}:1",
+                    kind=ArtifactReferenceKind.INPUT,
                     digest=stored_spec.digest,
                     size=stored_spec.size,
                 ),
                 ArtifactReference(
+                    reference_id=work_brief.reference_id,
+                    kind=ArtifactReferenceKind.INPUT,
+                    digest=work_brief.digest,
+                    size=work_brief.size,
+                ),
+                ArtifactReference(
+                    reference_id=assurance_plan.reference_id,
+                    kind=ArtifactReferenceKind.INPUT,
+                    digest=assurance_plan.digest,
+                    size=assurance_plan.size,
+                ),
+                ArtifactReference(
+                    reference_id=completion.reference_id,
+                    kind=ArtifactReferenceKind.INPUT,
+                    digest=completion.digest,
+                    size=completion.size,
+                ),
+                ArtifactReference(
                     reference_id=snapshot_reference.reference_id,
-                    kind=ArtifactReferenceKind.EVIDENCE,
+                    kind=ArtifactReferenceKind.INPUT,
                     digest=stored_snapshot.digest,
                     size=stored_snapshot.size,
                 ),
+                *((owner_request_reference,) if owner_request_reference is not None else ()),
             ),
         )
         return spec
+
+
+def prepare_run_spec_revision(
+        previous: RunSpec, *, work_brief_content: bytes,
+        completion_contract_content: bytes, assurance_plan_content: bytes,
+        resolves_context_request_digest: str, start: Path | None = None,
+) -> PreparedRunSpecRevision:
+    """Validate and materialize immutable CAS inputs for one context-resume revision."""
+    if not isinstance(previous, RunSpec):
+        raise TypeError("previous must be a RunSpec")
+    root = _find_root(start)
+    request_digest = validate_sha256_digest(resolves_context_request_digest)
+    artifact_store = ArtifactStore(root)
+    stored_contract = artifact_store.write(completion_contract_content)
+    contract = parse_completion_contract_bytes(
+        root, completion_contract_content, artifact_store=artifact_store)
+    stored_brief = artifact_store.write(work_brief_content)
+    brief = parse_work_brief_bytes(
+        work_brief_content,
+        artifact_store=artifact_store,
+        completion_contract=contract,
+        context_resume=True,
+    )
+    if (brief.task_id != previous.job_input.task_id
+            or brief.lifecycle_stage != previous.lifecycle_stage.value
+            or brief.revision != previous.revision + 1
+            or brief.supersedes_digest != previous.work_brief.digest
+            or brief.resolves_context_request_digest != request_digest):
+        raise RunSpecArtifactError(
+            previous.run_id, "WorkBrief does not continue the current context/spec lineage")
+    if brief.objective.ref.to_dict() != previous.objective_ref.to_dict():
+        raise RunSpecArtifactError(previous.run_id, "context resume cannot replace the objective")
+    stored_assurance = artifact_store.write(assurance_plan_content)
+    _validate_assurance_plan(assurance_plan_content, previous.lifecycle_stage)
+    revision = previous.revision + 1
+    work_brief = ArtifactDescriptor(
+        f"work-brief:{previous.run_id}:{brief.revision}",
+        stored_brief.digest,
+        stored_brief.size,
+    )
+    assurance_plan = ArtifactDescriptor(
+        f"assurance-plan:{previous.run_id}:{revision}",
+        stored_assurance.digest,
+        stored_assurance.size,
+    )
+    completion = ArtifactDescriptor(
+        f"completion-contract:{previous.run_id}:{revision}",
+        stored_contract.digest,
+        stored_contract.size,
+    )
+    job_input_candidate = replace(
+        previous.job_input,
+        completion_contract=completion,
+        input_digest="sha256:" + "0" * 64,
+        acceptance_criteria=tuple(criterion.text for criterion in contract.criteria),
+    )
+    job_input = replace(
+        job_input_candidate,
+        input_digest=_digest(job_input_candidate.canonical_bytes()),
+    )
+    spec = _new_spec(
+        previous.run_id,
+        previous.job_id,
+        revision=revision,
+        supersedes_spec_digest=previous.run_spec_digest,
+        lifecycle_stage=previous.lifecycle_stage,
+        promotion_lineage=previous.promotion_lineage,
+        frame_status_ref=previous.frame_status_ref,
+        objective_ref=previous.objective_ref,
+        project_fact_refs=previous.project_fact_refs,
+        work_brief=work_brief,
+        assurance_plan=assurance_plan,
+        job_input=job_input,
+        candidate=previous.candidate,
+        evaluation=previous.evaluation,
+        result_policy=previous.result_policy,
+        snapshot=previous.base_snapshot,
+        retry=previous.retry,
+    )
+    stored_spec = artifact_store.write(spec.canonical_bytes())
+    if stored_spec.digest != spec.run_spec_digest:
+        raise RunSpecArtifactError(previous.run_id, "stored RunSpec revision digest changed")
+    return PreparedRunSpecRevision(
+        spec,
+        stored_brief,
+        stored_assurance,
+        stored_contract,
+        stored_spec,
+    )
 
 
 def _require_mapping(value: object, label: str) -> dict[str, Any]:
@@ -694,28 +1079,51 @@ def _parse_string_list(value: object, label: str) -> tuple[str, ...]:
     return tuple(value)
 
 
-def _parse_run_spec(payload: bytes, expected_run_id: str, digest: str) -> RunSpec:
+def _descriptor(
+    value: object, label: str, references: Mapping[str, ArtifactReference],
+) -> ArtifactDescriptor:
+    row = _require_mapping(value, label)
+    _exact_keys(row, {"reference_id", "digest"}, label)
+    reference_id = row["reference_id"]
+    if not isinstance(reference_id, str) or reference_id not in references:
+        raise ValueError(f"{label} durable reference is missing")
+    reference = references[reference_id]
+    if reference.digest != row["digest"]:
+        raise ValueError(f"{label} digest differs from its durable reference")
+    return ArtifactDescriptor(reference.reference_id, reference.digest, reference.size)
+
+
+def _parse_run_spec(
+    payload: bytes, expected_run_id: str, digest: str, *, root_path: Path,
+    references: Mapping[str, ArtifactReference], artifact_store: ArtifactStore,
+) -> RunSpec:
     try:
         decoded = json.loads(payload.decode("utf-8"))
         root = _require_mapping(decoded, "RunSpec")
         _exact_keys(root, {
-            "base_snapshot", "critic_disposition", "job_id", "job_input", "readiness",
-            "review_decision", "retry", "revision", "run_id", "schema",
+            "assurance_plan", "base_snapshot", "candidate", "evaluation", "frame_status_ref",
+            "job_id", "job_input", "lifecycle_stage", "objective_ref",
+            "project_fact_refs", "promotion_lineage", "result_policy", "retry", "revision",
+            "run_id", "schema", "supersedes_spec_digest", "work_brief",
         }, "RunSpec")
         if root["schema"] != _RUN_SPEC_SCHEMA or root["run_id"] != expected_run_id:
             raise ValueError("RunSpec schema or run identity does not match its reference")
         job = _require_mapping(root["job_input"], "job_input")
         _exact_keys(job, {
-            "acceptance_criteria", "dependencies", "input_digest", "scope", "task_id", "title",
+            "completion_contract", "dependencies", "input_digest", "scope", "task_id", "title",
         }, "job_input")
+        completion = _descriptor(job["completion_contract"], "completion_contract", references)
+        contract_bytes = artifact_store.read_reference(references[completion.reference_id])
+        contract = parse_completion_contract_bytes(
+            root_path, contract_bytes, artifact_store=artifact_store)
         job_input = FrozenJobInput(
             task_id=job["task_id"],
             title=job["title"],
-            acceptance_criteria=_parse_string_list(
-                job["acceptance_criteria"], "acceptance_criteria"),
+            completion_contract=completion,
             scope=_parse_string_list(job["scope"], "scope"),
             dependencies=_parse_string_list(job["dependencies"], "dependencies"),
             input_digest=validate_sha256_digest(job["input_digest"]),
+            acceptance_criteria=tuple(criterion.text for criterion in contract.criteria),
         )
         if _digest(job_input.canonical_bytes()) != job_input.input_digest:
             raise ValueError("job input digest does not match canonical owner fields")
@@ -745,35 +1153,74 @@ def _parse_run_spec(payload: bytes, expected_run_id: str, digest: str) -> RunSpe
                 retry_payload["retryable_failure_classes"], "retryable_failure_classes"),
             budget_exhaustion_policy=retry_payload["budget_exhaustion_policy"],
         )
-        review_payload = root["review_decision"]
-        review = None
-        if review_payload is not None:
-            review_row = _require_mapping(review_payload, "review_decision")
-            _exact_keys(
-                review_row, {"policy_digest", "reason", "requirement", "rule_id"},
-                "review_decision")
-            review = ReviewDecision(
-                requirement=ReviewRequirement(review_row["requirement"]),
-                reason=review_row["reason"],
-                rule_id=review_row["rule_id"],
-                policy_digest=review_row["policy_digest"],
-            )
+        stage = LifecycleStage(root["lifecycle_stage"])
+        work_brief = _descriptor(root["work_brief"], "work_brief", references)
+        assurance_plan = _descriptor(root["assurance_plan"], "assurance_plan", references)
+        brief_bytes = artifact_store.read_reference(references[work_brief.reference_id])
+        brief = parse_work_brief_bytes(
+            brief_bytes, artifact_store=artifact_store, completion_contract=contract)
+        assurance_bytes = artifact_store.read_reference(references[assurance_plan.reference_id])
+        _validate_assurance_plan(assurance_bytes, stage)
+        frame = _require_mapping(root["frame_status_ref"], "frame_status_ref")
+        _exact_keys(frame, {"commit", "path", "status", "digest"}, "frame_status_ref")
+        frame_ref = FrameStatusRef(
+            commit=frame["commit"], path=frame["path"], status=frame["status"],
+            digest=frame["digest"], source_span=SourceSpan(0, 0, 0, 0))
+        _validate_frame_status(frame_ref)
+        raw_facts = root["project_fact_refs"]
+        if not isinstance(raw_facts, list):
+            raise ValueError("project_fact_refs must be a list")
+        facts = tuple(ProjectFactRef(
+            commit=row["commit"], path=row["path"], fact_id=row["fact_id"],
+            fact_digest=row["fact_digest"], binding=row["binding"],
+        ) for row in (_require_mapping(value, "project_fact_ref") for value in raw_facts))
+        objective = parse_objective_ref(root["objective_ref"])
+        if brief.objective.ref.to_dict() != objective.to_dict():
+            raise ValueError("RunSpec objective differs from WorkBrief")
+        lineage_row = root["promotion_lineage"]
+        lineage = None
+        if lineage_row is not None:
+            row = _require_mapping(lineage_row, "promotion_lineage")
+            _exact_keys(row, {
+                "id", "root_objective_ref_digest", "integration_target_ref",
+                "parent_run_spec_digest", "candidate_chain_head_digest",
+                "review_cycle_head_digest",
+            }, "promotion_lineage")
+            lineage = PromotionLineage(**row)
+        policy_row = _require_mapping(root["result_policy"], "result_policy")
+        _exact_keys(policy_row, {"mode", "target_ref", "expected_oid"}, "result_policy")
+        policy = ResultPolicy(**policy_row)
+        frozen_candidate, frozen_evaluation = _validate_stage_payload(
+            stage, lineage, root["candidate"], root["evaluation"], policy)
+        supersedes = root["supersedes_spec_digest"]
+        revision = root["revision"]
+        if type(revision) is not int or revision < 1:
+            raise ValueError("revision must be positive")
+        if revision == 1:
+            if supersedes is not None:
+                raise ValueError("revision 1 cannot supersede another RunSpec")
+        else:
+            supersedes = validate_sha256_digest(supersedes)
         spec = RunSpec(
             run_id=root["run_id"],
             job_id=root["job_id"],
-            revision=root["revision"],
-            readiness=root["readiness"],
-            critic_disposition=root["critic_disposition"],
+            promotion_lineage=lineage,
+            revision=revision,
+            supersedes_spec_digest=supersedes,
+            lifecycle_stage=stage,
+            frame_status_ref=frame_ref,
+            objective_ref=objective,
+            project_fact_refs=facts,
+            work_brief=work_brief,
+            assurance_plan=assurance_plan,
             job_input=job_input,
+            candidate=frozen_candidate,
+            evaluation=frozen_evaluation,
+            result_policy=policy,
             base_snapshot=base_snapshot,
             retry=retry,
-            review_decision=review,
             run_spec_digest=validate_sha256_digest(digest),
         )
-        if (not isinstance(spec.revision, int) or isinstance(spec.revision, bool)
-                or spec.revision != 1 or spec.readiness != "frozen-ready"
-                or spec.critic_disposition != "critic-not-required"):
-            raise ValueError("RunSpec readiness metadata is invalid")
         if spec.canonical_bytes() != payload or _digest(payload) != spec.run_spec_digest:
             raise ValueError("RunSpec bytes are not canonical or do not match their digest")
         return spec
@@ -783,12 +1230,39 @@ def _parse_run_spec(payload: bytes, expected_run_id: str, digest: str) -> RunSpe
 
 def load_run_spec(run_id: str, *, start: Path | None = None) -> RunSpec:
     """Load and revalidate one immutable RunSpec from its durable store reference."""
-    root = _find_root(start)
-    with RunStore.open(root) as store:
+    root_path = _find_root(start)
+    with RunStore.open(root_path) as store:
         store.get_run(run_id)
-        reference = store.get_artifact_reference(f"{_RUN_SPEC_REFERENCE_PREFIX}{run_id}")
-        payload = ArtifactStore(root).read_reference(reference)
-    return _parse_run_spec(payload, run_id, reference.digest)
+        with store._connection_lock:  # noqa: SLF001 - immutable spec-head lookup
+            rows = store._connection.execute(  # noqa: SLF001
+                "SELECT reference_id FROM artifacts WHERE reference_id LIKE ?",
+                (f"{_RUN_SPEC_REFERENCE_PREFIX}{run_id}:%",),
+            ).fetchall()
+        revisions = []
+        for row in rows:
+            suffix = row["reference_id"].removeprefix(f"{_RUN_SPEC_REFERENCE_PREFIX}{run_id}:")
+            if suffix.isdigit() and int(suffix) >= 1:
+                revisions.append((int(suffix), row["reference_id"]))
+        if not revisions:
+            raise RecordNotFoundError("run spec", run_id)
+        revision, reference_id = max(revisions)
+        if len([item for item in revisions if item[0] == revision]) != 1:
+            raise RunSpecArtifactError(run_id, "RunSpec revision head is ambiguous")
+        reference = store.get_artifact_reference(reference_id)
+        artifact_store = ArtifactStore(root_path)
+        payload = artifact_store.read_reference(reference)
+        decoded = json.loads(payload.decode("utf-8"))
+        descriptor_ids = (
+            decoded["work_brief"]["reference_id"],
+            decoded["assurance_plan"]["reference_id"],
+            decoded["job_input"]["completion_contract"]["reference_id"],
+        )
+        references = {
+            identity: store.get_artifact_reference(identity) for identity in descriptor_ids
+        }
+    return _parse_run_spec(
+        payload, run_id, reference.digest, root_path=root_path,
+        references=references, artifact_store=artifact_store)
 
 
 def _parse_snapshot(payload: bytes, expected_head: str) -> BaseSnapshot:
@@ -835,9 +1309,7 @@ def read_base_snapshot(run_id: str, *, start: Path | None = None) -> BaseSnapsho
 
 
 def _changed_fields(frozen: FrozenJobInput, current: FrozenJobInput) -> tuple[str, ...]:
-    fields = (
-        "acceptance_criteria", "dependencies", "scope", "task_id", "title",
-    )
+    fields = ("dependencies", "scope", "task_id", "title")
     return tuple(field for field in fields if getattr(frozen, field) != getattr(current, field))
 
 
@@ -850,9 +1322,10 @@ def detect_task_input_drift(
         current = _freeze_task(
             spec.job_input.task_id,
             _selected_task(root, spec.job_input.task_id),
+            spec.job_input.completion_contract,
+            spec.job_input.acceptance_criteria,
         )
-    except (TaskNotFoundError, InvalidTaskInputError, AcceptanceReadinessError,
-            DuplicateCriterionError):
+    except (TaskNotFoundError, InvalidTaskInputError):
         return RunInputDrift(
             run_id=run_id,
             task_id=spec.job_input.task_id,
@@ -880,17 +1353,17 @@ def assert_task_input_current(run_id: str, *, start: Path | None = None) -> RunS
 
 
 __all__ = [
-    "AcceptanceReadinessError",
+    "ArtifactDescriptor",
     "BaseSnapshot",
     "BaseSnapshotReference",
     "BudgetLimit",
     "CostBudget",
     "DEFAULT_RETRY_POLICY",
-    "DuplicateCriterionError",
     "FrozenJobInput",
     "InvalidTaskInputError",
-    "ReviewDecision",
-    "ReviewRequirement",
+    "PreparedRunSpecRevision",
+    "PromotionLineage",
+    "ResultPolicy",
     "RetryPolicy",
     "RunInputDrift",
     "RunInputDriftError",
@@ -906,5 +1379,6 @@ __all__ = [
     "detect_task_input_drift",
     "load_run_spec",
     "plan_one_task_run",
+    "prepare_run_spec_revision",
     "read_base_snapshot",
 ]

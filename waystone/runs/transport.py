@@ -178,6 +178,7 @@ class OutwardActionPlan:
 class IdleReason(str, Enum):
     RUN_COMPLETED = "run_completed"
     RUN_WAITING_USER = "run_waiting_user"
+    RUN_WAITING_CONTEXT = "run_waiting_context"
     RUN_BLOCKED = "run_blocked"
     EFFECT_UNKNOWN = "effect_unknown"
     EFFECT_CONFLICT = "effect_conflict"
@@ -383,6 +384,7 @@ def _validate_envelope(value: dict[str, object]) -> None:
         expected = {
             IdleReason.RUN_COMPLETED: "completed",
             IdleReason.RUN_WAITING_USER: "waiting_user",
+            IdleReason.RUN_WAITING_CONTEXT: "waiting_context",
             IdleReason.RUN_BLOCKED: "blocked",
             IdleReason.EFFECT_UNKNOWN: "blocked",
             IdleReason.EFFECT_CONFLICT: "blocked",
@@ -733,6 +735,7 @@ class ActionTransport:
         expected = {
             IdleReason.RUN_COMPLETED: "completed",
             IdleReason.RUN_WAITING_USER: "waiting_user",
+            IdleReason.RUN_WAITING_CONTEXT: "waiting_context",
             IdleReason.RUN_BLOCKED: "blocked",
             IdleReason.EFFECT_UNKNOWN: "blocked",
             IdleReason.EFFECT_CONFLICT: "blocked",
@@ -774,6 +777,8 @@ class ActionTransport:
                     return self._idle(IdleReason.RUN_COMPLETED, run.state)
                 if run.state == "waiting_user":
                     return self._idle(IdleReason.RUN_WAITING_USER, run.state)
+                if run.state == "waiting_context":
+                    return self._idle(IdleReason.RUN_WAITING_CONTEXT, run.state)
                 if run.state == "blocked":
                     return self._idle(IdleReason.RUN_BLOCKED, run.state)
                 raise RunNotActionable(

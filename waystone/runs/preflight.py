@@ -10,17 +10,14 @@ from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Sequence
 
-import yaml
-
 from waystone.core import WorkflowError
-from waystone.jobs import profile_v1 as profile_v1_adapter
 from waystone.jobs.domain import ExecutionCategory, ExecutorKind, Role, RoleBinding
-from waystone.jobs.profile_v1 import (
-    AdaptedRoleBinding,
-    ProfileV1,
-    ProfileV1Refusal,
-    ProfileV1RefusalCode,
-    read_profile_v1,
+from waystone.jobs.profile import (
+    PROFILE_SCHEMA,
+    CanonicalProfile,
+    ProfileError,
+    ProfileUnreadable,
+    read_profile_bytes,
 )
 from waystone.project import find_project_root
 from waystone.runs.artifacts import (
@@ -155,13 +152,13 @@ class VerificationPlanStateError(PreflightError):
 class ProfilePreflightRefusal(PreflightError):
     code = "verification_profile_refused"
 
-    def __init__(self, refusal: ProfileV1Refusal):
+    def __init__(self, refusal: ProfileError):
         self.refusal = refusal
         self.profile_code = refusal.code
-        self.profile_reason = refusal.reason
-        self.legacy_role = refusal.legacy_role
-        self.legacy_execution = refusal.legacy_execution
-        super().__init__(f"{refusal.code.value}: {refusal.reason}")
+        self.profile_reason = refusal.detail
+        self.legacy_role = None
+        self.legacy_execution = None
+        super().__init__(f"{refusal.code}: {refusal.detail}")
 
 
 class CapabilityPreflightRefusal(PreflightError):
@@ -1298,46 +1295,29 @@ def _project_root(start: Path | None) -> Path:
             f"project root cannot be resolved: {error}") from error
 
 
-def _read_profile(root: Path) -> tuple[bytes, ProfileV1]:
+def _read_profile(root: Path) -> tuple[bytes, CanonicalProfile]:
     path = root / _PROFILE_LOCATOR
     try:
         payload = path.read_bytes()
     except OSError as error:
-        result = read_profile_v1(path)
-        if isinstance(result, ProfileV1Refusal):
-            raise ProfilePreflightRefusal(result)
-        raise ProfilePreflightRefusal(ProfileV1Refusal(
-            ProfileV1RefusalCode.UNREADABLE,
-            f"profile v1 snapshot cannot be read from {path!r}: {error}",
+        raise ProfilePreflightRefusal(ProfileUnreadable(
+            f"canonical profile snapshot cannot be read from {path!r}: {error}",
         )) from error
     try:
-        document = yaml.load(
-            payload.decode("utf-8"), Loader=profile_v1_adapter._UniqueKeyLoader)
-    except (UnicodeDecodeError, yaml.YAMLError) as error:
-        raise ProfilePreflightRefusal(ProfileV1Refusal(
-            ProfileV1RefusalCode.INVALID_PROFILE,
-            f"profile v1 is not valid UTF-8 YAML: {error}",
-        )) from error
-    result = profile_v1_adapter._adapt_profile(document)
-    if isinstance(result, ProfileV1Refusal):
-        raise ProfilePreflightRefusal(result)
-    return payload, result
+        return payload, read_profile_bytes(payload)
+    except ProfileError as error:
+        raise ProfilePreflightRefusal(error) from error
 
 
-def _frozen_role_bindings(profile: ProfileV1) -> tuple[FrozenRoleBinding, ...]:
+def _frozen_role_bindings(profile: CanonicalProfile) -> tuple[FrozenRoleBinding, ...]:
     selected: list[FrozenRoleBinding] = []
     for role in (Role.WORKER, Role.VERIFIER):
-        matches = tuple(
-            item for item in profile.role_bindings if item.binding.role is role)
-        if len(matches) != 1:
-            raise VerificationPlanIncompleteError(
-                f"profile must provide exactly one {role.value} role binding")
-        adapted: AdaptedRoleBinding = matches[0]
+        adapted = profile.binding_for(role)
         selected.append(FrozenRoleBinding(
             binding=adapted.binding,
-            source_schema=adapted.provenance.source_schema,
-            legacy_role=adapted.provenance.legacy_role,
-            legacy_execution=adapted.provenance.legacy_execution,
+            source_schema=PROFILE_SCHEMA,
+            legacy_role=role.value,
+            legacy_execution=None,
         ))
     return tuple(selected)
 

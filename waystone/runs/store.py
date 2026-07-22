@@ -27,7 +27,7 @@ from waystone.runs.artifacts import (
 )
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _BUSY_TIMEOUT_MS = 5_000
 _MAX_RUN_ID_ATTEMPTS = 32
 _RUN_ID_PATTERN = re.compile(
@@ -148,14 +148,15 @@ class EngineOwnedPathUnverifiableError(StoreError):
 
 
 class UnsupportedSchemaVersionError(StoreError):
-    """This engine must not open a database created by a newer schema."""
+    """This release accepts fresh schema v2 only; it performs no migration."""
 
-    code = "unsupported_schema_version"
+    code = "schema_version_unsupported"
 
     def __init__(self, found: int, supported: int = SCHEMA_VERSION):
         self.found = found
         self.supported = supported
-        super().__init__(f"database schema {found} is newer than supported schema {supported}")
+        super().__init__(
+            f"database schema {found} is unsupported; this release requires schema {supported}")
 
 
 class StateSchemaError(StoreError):
@@ -283,6 +284,27 @@ class RunIdCollisionError(StoreError):
         super().__init__(f"could not allocate a unique UUIDv7 after {attempts} attempts")
 
 
+class ContextNotCurrent(StoreError):
+    """A context response lost the state/request/cancel CAS race."""
+
+    code = "context_not_current"
+
+    def __init__(self, run_id: str, detail: str):
+        self.run_id = run_id
+        self.detail = detail
+        super().__init__(f"run {run_id!r}: {detail}")
+
+
+class AttemptBudgetExhausted(StoreError):
+    code = "attempt_budget_exhausted"
+
+    def __init__(self, run_id: str, used: int, limit: int):
+        self.run_id = run_id
+        self.used = used
+        self.limit = limit
+        super().__init__(f"run {run_id!r} consumed {used} of {limit} attempts")
+
+
 class EntityKind(str, Enum):
     RUN = "run"
     JOB = "job"
@@ -291,7 +313,7 @@ class EntityKind(str, Enum):
 
 
 class TransitionReason(str, Enum):
-    """Closed v1 vocabulary taken from accepted runtime lifecycle documents."""
+    """Closed schema-v2 vocabulary taken from accepted runtime lifecycle documents."""
 
     CREATED = "created"
     PLANNED = "planned"
@@ -300,6 +322,8 @@ class TransitionReason(str, Enum):
     EFFECT_OBSERVED = "effect-observed"
     COMPLETED = "completed"
     CANCEL_REQUESTED = "cancel-requested"
+    CONTEXT_REQUESTED = "context-requested"
+    CONTEXT_PROVIDED = "context-provided"
 
 
 @dataclass(frozen=True)
@@ -319,6 +343,20 @@ class EntityRecord:
     version: int
     parent_job_id: str | None = None
     parent_attempt_id: str | None = None
+
+
+@dataclass(frozen=True)
+class ContextRequestTransition:
+    run: EntityRecord
+    job: EntityRecord
+    attempt: EntityRecord
+
+
+@dataclass(frozen=True)
+class ContextProvideTransition:
+    run: EntityRecord
+    job: EntityRecord
+    attempt: EntityRecord
 
 
 _TABLES = {
@@ -735,8 +773,8 @@ def _kind_sql(enum_type: type[Enum]) -> str:
     return ", ".join(f"'{entry.value}'" for entry in enum_type)
 
 
-def _migration_v1(connection: sqlite3.Connection) -> None:
-    """Create schema v1. The caller owns the surrounding immediate transaction."""
+def _migration_v2(connection: sqlite3.Connection) -> None:
+    """Create fresh schema v2. The caller owns the surrounding immediate transaction."""
     entity_kinds = _kind_sql(EntityKind)
     reasons = _reason_sql()
     artifact_kinds = _kind_sql(ArtifactReferenceKind)
@@ -875,13 +913,13 @@ def _migration_v1(connection: sqlite3.Connection) -> None:
            BEFORE DELETE ON actions BEGIN
                SELECT RAISE(ABORT, 'action identity is immutable');
            END""",
-        "INSERT INTO schema_version(singleton, version) VALUES (1, 1)",
+        "INSERT INTO schema_version(singleton, version) VALUES (1, 2)",
     )
     for statement in statements:
         connection.execute(statement)
 
 
-_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {1: _migration_v1}
+_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {2: _migration_v2}
 
 
 def _existing_schema_version(connection: sqlite3.Connection) -> int:
@@ -909,22 +947,19 @@ def _existing_schema_version(connection: sqlite3.Connection) -> int:
 
 
 def _migrate(connection: sqlite3.Connection) -> int:
-    while True:
-        with _immediate_transaction(connection):
-            version = _existing_schema_version(connection)
-            if version > SCHEMA_VERSION:
-                raise UnsupportedSchemaVersionError(version)
-            if version == SCHEMA_VERSION:
-                return version
-            target = version + 1
-            migration = _MIGRATIONS.get(target)
-            if migration is None:
-                raise StateSchemaError(f"no migration registered for schema version {target}")
-            migration(connection)
-            migrated = _existing_schema_version(connection)
-            if migrated != target:
-                raise StateSchemaError(
-                    f"migration {target} produced schema version {migrated} instead of {target}")
+    with _immediate_transaction(connection):
+        version = _existing_schema_version(connection)
+        if version == SCHEMA_VERSION:
+            return version
+        if version != 0:
+            raise UnsupportedSchemaVersionError(version)
+        migration = _MIGRATIONS[SCHEMA_VERSION]
+        migration(connection)
+        migrated = _existing_schema_version(connection)
+        if migrated != SCHEMA_VERSION:
+            raise StateSchemaError(
+                f"fresh schema creation produced version {migrated} instead of {SCHEMA_VERSION}")
+        return migrated
 
 
 def _validate_schema(connection: sqlite3.Connection) -> None:
@@ -938,7 +973,7 @@ def _validate_schema(connection: sqlite3.Connection) -> None:
     }
     missing_tables = sorted(required_tables - tables)
     if missing_tables:
-        raise StateSchemaError(f"schema v1 is missing tables: {', '.join(missing_tables)}")
+        raise StateSchemaError(f"schema v2 is missing tables: {', '.join(missing_tables)}")
     required_columns = {
         "schema_version": {"singleton", "version"},
         "runs": {"run_id", "state", "version", "record_digest"},
@@ -972,7 +1007,7 @@ def _validate_schema(connection: sqlite3.Connection) -> None:
         missing = sorted(expected - observed)
         if missing:
             raise StateSchemaError(
-                f"schema v1 table {table} is missing columns: {', '.join(missing)}")
+                f"schema v2 table {table} is missing columns: {', '.join(missing)}")
     required_triggers = {
         "transitions_no_update", "transitions_no_delete", "artifacts_no_update",
         "artifacts_no_delete", "runs_identity_no_update", "runs_no_delete",
@@ -985,7 +1020,7 @@ def _validate_schema(connection: sqlite3.Connection) -> None:
     }
     missing_triggers = sorted(required_triggers - triggers)
     if missing_triggers:
-        raise StateSchemaError(f"schema v1 is missing triggers: {', '.join(missing_triggers)}")
+        raise StateSchemaError(f"schema v2 is missing triggers: {', '.join(missing_triggers)}")
 
 
 def _store_authorizer(action, table, column, database, source):
@@ -1140,7 +1175,7 @@ class RunStore:
                 raise StateDatabaseError("open", "SQLite foreign_keys could not be enabled")
 
             existing_version = _existing_schema_version(connection)
-            if existing_version > SCHEMA_VERSION:
+            if existing_version not in (0, SCHEMA_VERSION):
                 raise UnsupportedSchemaVersionError(existing_version)
 
             _negotiate_wal(connection, state_directory, filesystem)
@@ -1665,6 +1700,190 @@ class RunStore:
         except sqlite3.DatabaseError as error:
             raise StateDatabaseError("read run", str(error)) from error
 
+    def _context_transition_entity(
+            self, current: EntityRecord, next_state: str, reason: TransitionReason,
+            evidence_digest: str, references: Sequence[ArtifactReference] = ()) \
+            -> tuple[EntityRecord, int]:
+        """Transition one non-action context-FSM entity inside the caller's transaction."""
+        if current.entity_kind is EntityKind.ACTION:
+            raise ValueError("context FSM cannot transition actions through this helper")
+        updated = replace(current, state=next_state, version=current.version + 1)
+        cursor = self._connection.execute(
+            "INSERT INTO transitions(run_id, entity_kind, entity_id, prev_state, next_state, "
+            "entity_version, reason, evidence_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (current.run_id, current.entity_kind.value, current.entity_id, current.state,
+             next_state, updated.version, reason.value, evidence_digest),
+        )
+        transition_id = int(cursor.lastrowid)
+        table, identity_column = _TABLES[current.entity_kind]
+        result = self._connection.execute(
+            f"UPDATE {table} SET state = ?, version = ?, record_digest = ? "
+            f"WHERE {identity_column} = ? AND version = ?",
+            (updated.state, updated.version, _record_digest(updated), current.entity_id,
+             current.version),
+        )
+        if result.rowcount != 1:
+            raise EntityVersionConflict(
+                current.entity_kind, current.entity_id, current.version, current.version + 1)
+        for reference in references:
+            self._connection.execute(
+                "INSERT INTO artifacts(reference_id, run_id, transition_id, entity_kind, "
+                "entity_id, entity_version, reference_kind, digest, size) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (reference.reference_id, current.run_id, transition_id,
+                 current.entity_kind.value, current.entity_id, updated.version,
+                 reference.kind.value, reference.digest, reference.size),
+            )
+        return updated, transition_id
+
+    def record_context_request(
+            self, run_id: str, job_id: str, attempt_id: str, *,
+            context_request_digest: str,
+            artifact_references: Sequence[ArtifactReference]) -> ContextRequestTransition:
+        """Atomically finish one unchanged attempt and put its run/job in waiting_context."""
+        run_identity = _nonempty(run_id, "run_id")
+        job_identity = _nonempty(job_id, "job_id")
+        attempt_identity = _nonempty(attempt_id, "attempt_id")
+        digest = validate_sha256_digest(context_request_digest)
+        references = tuple(artifact_references)
+        if len(references) != 2 or any(
+                not isinstance(reference, ArtifactReference) for reference in references):
+            raise ValueError("context request requires worker-result and context-request references")
+        if any(reference.kind is not ArtifactReferenceKind.EVIDENCE for reference in references):
+            raise ValueError("context request references must be evidence")
+        if len({reference.reference_id for reference in references}) != 2:
+            raise AppendOnlyConflict("artifact reference", references[0].reference_id)
+        if not any(reference.digest == digest for reference in references):
+            raise ValueError("context request digest is not present in artifact references")
+
+        try:
+            with self._connection_lock, _immediate_transaction(self._connection):
+                run = self._load_record(EntityKind.RUN, run_identity)
+                job = self._load_record(EntityKind.JOB, job_identity)
+                attempt = self._load_record(EntityKind.ATTEMPT, attempt_identity)
+                if (job.run_id != run_identity or attempt.run_id != run_identity
+                        or attempt.parent_job_id != job_identity):
+                    raise ContextNotCurrent(run_identity, "attempt lineage does not match run/job")
+                if run.state not in {"dispatch-ready", "running"}:
+                    raise ContextNotCurrent(run_identity, f"run state is {run.state!r}")
+                if job.state not in {"planned", "running"} or attempt.state != "running":
+                    raise ContextNotCurrent(run_identity, "job/attempt is not the active attempt")
+                for reference in references:
+                    if self._connection.execute(
+                            "SELECT 1 FROM artifacts WHERE reference_id = ?",
+                            (reference.reference_id,)).fetchone() is not None:
+                        raise AppendOnlyConflict("artifact reference", reference.reference_id)
+                self._transaction_fault_point("context_request_before_publication")
+                finished_attempt, _ = self._context_transition_entity(
+                    attempt, "context_requested", TransitionReason.CONTEXT_REQUESTED,
+                    digest, references)
+                waiting_job, _ = self._context_transition_entity(
+                    job, "waiting_context", TransitionReason.CONTEXT_REQUESTED, digest)
+                waiting_run, _ = self._context_transition_entity(
+                    run, "waiting_context", TransitionReason.CONTEXT_REQUESTED, digest)
+                self._transaction_fault_point("context_request_after_publication")
+            return ContextRequestTransition(waiting_run, waiting_job, finished_attempt)
+        except StoreError:
+            raise
+        except sqlite3.IntegrityError as error:
+            raise StateDatabaseError("record context request", str(error)) from error
+        except sqlite3.DatabaseError as error:
+            raise StateDatabaseError("record context request", str(error)) from error
+
+    def provide_context(
+            self, run_id: str, job_id: str, *, request_digest: str,
+            run_spec_digest: str, max_total_attempts: int,
+            artifact_references: Sequence[ArtifactReference]) -> ContextProvideTransition:
+        """Win the response/cancel CAS and bind all revision inputs plus a new attempt."""
+        run_identity = _nonempty(run_id, "run_id")
+        job_identity = _nonempty(job_id, "job_id")
+        request = validate_sha256_digest(request_digest)
+        spec_digest = validate_sha256_digest(run_spec_digest)
+        if (isinstance(max_total_attempts, bool) or not isinstance(max_total_attempts, int)
+                or max_total_attempts < 1):
+            raise ValueError("max_total_attempts must be positive")
+        references = tuple(artifact_references)
+        if not references or any(
+                not isinstance(reference, ArtifactReference) for reference in references):
+            raise ValueError("context response references must be ArtifactReference values")
+        if len({reference.reference_id for reference in references}) != len(references):
+            raise AppendOnlyConflict("artifact reference", "duplicate context response reference")
+        if not any(reference.digest == spec_digest for reference in references):
+            raise ValueError("new RunSpec digest is not present in artifact references")
+
+        try:
+            with self._connection_lock, _immediate_transaction(self._connection):
+                run = self._load_record(EntityKind.RUN, run_identity)
+                job = self._load_record(EntityKind.JOB, job_identity)
+                if (job.run_id != run_identity or run.state != "waiting_context"
+                        or job.state != "waiting_context"):
+                    raise ContextNotCurrent(
+                        run_identity, "run/job is no longer waiting for context")
+                current = self._connection.execute(
+                    "SELECT a.digest, a.entity_id, t.transition_id, t.next_state, t.reason "
+                    "FROM artifacts a JOIN transitions t ON t.transition_id = a.transition_id "
+                    "WHERE a.run_id = ? AND a.reference_id LIKE ? "
+                    "ORDER BY t.transition_id DESC LIMIT 1",
+                    (run_identity, f"context-request:{run_identity}:%"),
+                ).fetchone()
+                if (current is None or current["digest"] != request
+                        or current["next_state"] != "context_requested"
+                        or current["reason"] != TransitionReason.CONTEXT_REQUESTED.value):
+                    raise ContextNotCurrent(
+                        run_identity, "response does not resolve the current context request")
+                used = int(self._connection.execute(
+                    "SELECT count(*) FROM attempts WHERE run_id = ? AND job_id = ?",
+                    (run_identity, job_identity),
+                ).fetchone()[0])
+                if used >= max_total_attempts:
+                    raise AttemptBudgetExhausted(run_identity, used, max_total_attempts)
+                for reference in references:
+                    if self._connection.execute(
+                            "SELECT 1 FROM artifacts WHERE reference_id = ?",
+                            (reference.reference_id,)).fetchone() is not None:
+                        raise AppendOnlyConflict("artifact reference", reference.reference_id)
+                self._transaction_fault_point("context_response_before_publication")
+                attempt_id = f"{run_identity}:attempt:{used + 1}"
+                dispatch_ready_attempt = EntityRecord(
+                    entity_kind=EntityKind.ATTEMPT,
+                    entity_id=attempt_id,
+                    run_id=run_identity,
+                    state="dispatch-ready",
+                    version=0,
+                    parent_job_id=job_identity,
+                )
+                self._connection.execute(
+                    "INSERT INTO attempts(attempt_id, run_id, job_id, state, version, record_digest) "
+                    "VALUES (?, ?, ?, ?, 0, ?)",
+                    (attempt_id, run_identity, job_identity, dispatch_ready_attempt.state,
+                     _record_digest(dispatch_ready_attempt)),
+                )
+                self._connection.execute(
+                    "INSERT INTO transitions(run_id, entity_kind, entity_id, prev_state, next_state, "
+                    "entity_version, reason, evidence_digest) VALUES (?, ?, ?, NULL, ?, 0, ?, ?)",
+                    (run_identity, EntityKind.ATTEMPT.value, attempt_id,
+                     dispatch_ready_attempt.state, TransitionReason.CREATED.value, spec_digest),
+                )
+                running_attempt, _ = self._context_transition_entity(
+                    dispatch_ready_attempt,
+                    "running",
+                    TransitionReason.CONTEXT_PROVIDED,
+                    spec_digest,
+                )
+                ready_job, _ = self._context_transition_entity(
+                    job, "dispatch-ready", TransitionReason.CONTEXT_PROVIDED, spec_digest)
+                ready_run, _ = self._context_transition_entity(
+                    run, "dispatch-ready", TransitionReason.CONTEXT_PROVIDED,
+                    spec_digest, references)
+                self._transaction_fault_point("context_response_after_publication")
+            return ContextProvideTransition(ready_run, ready_job, running_attempt)
+        except StoreError:
+            raise
+        except sqlite3.IntegrityError as error:
+            raise StateDatabaseError("provide context", str(error)) from error
+        except sqlite3.DatabaseError as error:
+            raise StateDatabaseError("provide context", str(error)) from error
+
     def record_transition(
             self, entity_kind: EntityKind, entity_id: str, *, expected_version: int,
             next_state: str, reason: TransitionReason, evidence_digest: str | None = None,
@@ -1676,7 +1895,7 @@ class RunStore:
         try:
             typed_reason = TransitionReason(reason)
         except (TypeError, ValueError) as error:
-            raise ValueError("reason must be a TransitionReason supported by schema v1") from error
+            raise ValueError("reason must be a TransitionReason supported by schema v2") from error
         if (isinstance(expected_version, bool) or not isinstance(expected_version, int)
                 or expected_version < 0):
             raise ValueError("expected_version must be a non-negative integer")
@@ -1769,7 +1988,7 @@ class RunStore:
         try:
             typed_reason = TransitionReason(reason)
         except (TypeError, ValueError) as error:
-            raise ValueError("reason must be a TransitionReason supported by schema v1") from error
+            raise ValueError("reason must be a TransitionReason supported by schema v2") from error
         if evidence_digest is not None:
             evidence_digest = validate_sha256_digest(evidence_digest)
         references = tuple(artifact_references)
