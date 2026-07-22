@@ -1,6 +1,6 @@
 ---
 schema: waystone-project-brief-1
-status: provisional
+status: committed
 ---
 # waystone
 
