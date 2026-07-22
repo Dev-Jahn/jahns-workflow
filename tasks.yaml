@@ -707,5 +707,5 @@ tasks:
     severity: "blocker"
   - id: fix/013-worker-result-null-decode
     title: "G013-07 폐쇄 — WorkerResult nullable projection의 canonical decode 정규화: 허용되는 모든 모델 출력이 결정론적으로 canonical화 또는 typed refusal (evidence_refs null→[], 필수 내용 null은 거부 유지)"
-    status: "pending"
+    status: "done"
     severity: "blocker"
