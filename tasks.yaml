@@ -691,7 +691,7 @@ tasks:
     deps: ["feat/013-outcome-status"]
   - id: gate/013-intent-control-plane
     title: "0.13 exit gate: 핵심 e2e 7·touched kernel focused regression·real backend smoke·독립 적대 리뷰·삭제 audit"
-    status: "pending"
+    status: "done"
     deps: ["feat/013-realignment-surface-cutover"]
   - id: decision/013-plan-open-questions
     ruling: "Q1–Q6 전부 기체 잠정안 채택 (2026-07-22 main, 세션 자율권한). Q1 Prototype scope=commitment subtype / Q2 owner confirmation digest 결속으로 충분 / Q3 owner-only accept-risk 경계 확정 / Q4 compiler 제안값 2, engine default 없음 / Q5 coordinator 기록·independent evidence 필수 / Q6 principal:null accepted risk. 전문: dev_docs/0.13-redesign-plan.md §12"
@@ -709,3 +709,6 @@ tasks:
     title: "G013-07 폐쇄 — WorkerResult nullable projection의 canonical decode 정규화: 허용되는 모든 모델 출력이 결정론적으로 canonical화 또는 typed refusal (evidence_refs null→[], 필수 내용 null은 거부 유지)"
     status: "done"
     severity: "blocker"
+  - id: chore/013-legacy-migration-script
+    title: "기존 프로젝트용 일회성 migration script — SSOT.md→PROJECT_BRIEF.md(fact marker 부여)·ssot:→brief: config·legacy 상태 이관 (사용자 지시: 임시 script 1개, waystone repo 자신 포함)"
+    status: "pending"
