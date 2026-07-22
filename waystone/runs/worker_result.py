@@ -340,7 +340,7 @@ def parse_worker_result_bytes(
 
 
 def _canonical_backend_projection_bytes(content: bytes) -> bytes:
-    """Remove only the inactive null branch required by Codex structured output."""
+    """Decode the required nullable backend projection into the canonical union."""
     try:
         document = yaml.load(content.decode("utf-8"), Loader=_UniqueKeyLoader)
     except (UnicodeDecodeError, yaml.YAMLError, TypeError) as error:
@@ -359,9 +359,12 @@ def _canonical_backend_projection_bytes(content: bytes) -> bytes:
         if document["context_request"] is not None:
             raise WorkerResultSchemaRefusal(
                 "completed worker result cannot include context_request")
-        return _canonical_json({
+        canonical = {
             key: value for key, value in document.items() if key != "context_request"
-        })
+        }
+        if canonical["evidence_refs"] is None:
+            canonical["evidence_refs"] = []
+        return _canonical_json(canonical)
     if status == "context-requested":
         if document["result_summary"] is not None or document["evidence_refs"] is not None:
             raise WorkerResultSchemaRefusal(
@@ -370,7 +373,7 @@ def _canonical_backend_projection_bytes(content: bytes) -> bytes:
             key: value for key, value in document.items()
             if key not in {"result_summary", "evidence_refs"}
         })
-    return content
+    raise WorkerResultSchemaRefusal("status must be completed or context-requested")
 
 
 def parse_context_response_bytes(

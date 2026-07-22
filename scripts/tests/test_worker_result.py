@@ -110,6 +110,92 @@ class WorkerResultTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, "worker_result_schema_refusal")
 
+    def test_adapter_normalizes_completed_null_evidence_refs(self):
+        base = _capture_snapshot(self.root)
+        base_digest = "sha256:" + hashlib.sha256(base.canonical_bytes()).hexdigest()
+        (self.root / "WAYSTONE_RESULT.yaml").write_text(
+            "schema: waystone-worker-result-1\n"
+            "status: completed\n"
+            f"run_spec_digest: {self.spec_digest}\n"
+            f"attempt_id: {self.attempt_id}\n"
+            "result_summary: Implemented the bounded change.\n"
+            "evidence_refs: null\n"
+            "context_request: null\n",
+            encoding="utf-8",
+        )
+
+        adapted = WorkerResultAdapter(self.root).adapt(
+            run_id=self.run_id,
+            job_id=self.job_id,
+            attempt_id=self.attempt_id,
+            run_spec_digest=self.spec_digest,
+            work_brief_digest=self.work_brief_digest,
+            base_snapshot_digest=base_digest,
+        )
+
+        self.assertIsInstance(adapted.result, CompletedWorkerResult)
+        self.assertEqual(adapted.result.evidence_refs, ())
+        self.assertEqual(
+            json.loads(adapted.worker_result_artifact.path.read_bytes())["evidence_refs"], [])
+
+    def test_adapter_rejects_completed_null_result_summary(self):
+        base = _capture_snapshot(self.root)
+        base_digest = "sha256:" + hashlib.sha256(base.canonical_bytes()).hexdigest()
+        (self.root / "WAYSTONE_RESULT.yaml").write_text(
+            "schema: waystone-worker-result-1\n"
+            "status: completed\n"
+            f"run_spec_digest: {self.spec_digest}\n"
+            f"attempt_id: {self.attempt_id}\n"
+            "result_summary: null\n"
+            "evidence_refs: []\n"
+            "context_request: null\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(WorkerResultSchemaRefusal) as raised:
+            WorkerResultAdapter(self.root).adapt(
+                run_id=self.run_id,
+                job_id=self.job_id,
+                attempt_id=self.attempt_id,
+                run_spec_digest=self.spec_digest,
+                work_brief_digest=self.work_brief_digest,
+                base_snapshot_digest=base_digest,
+            )
+
+        self.assertEqual(raised.exception.code, "worker_result_schema_refusal")
+        self.assertEqual(raised.exception.detail, "result_summary must be a non-empty string")
+
+    def test_adapter_normalizes_context_requested_inactive_null_fields(self):
+        base = _capture_snapshot(self.root)
+        base_digest = "sha256:" + hashlib.sha256(base.canonical_bytes()).hexdigest()
+        projected = (
+            "schema: waystone-worker-result-1\n"
+            "status: context-requested\n"
+            f"run_spec_digest: {self.spec_digest}\n"
+            f"attempt_id: {self.attempt_id}\n"
+            "result_summary: null\n"
+            "evidence_refs: null\n"
+            "context_request:\n"
+            "  question: Which contract is authoritative?\n"
+            "  blocked_decision: Preserve or replace the public API\n"
+            "  why_required: The answer changes the implementation scope\n"
+        ).encode()
+        (self.root / "WAYSTONE_RESULT.yaml").write_bytes(projected)
+
+        adapted = WorkerResultAdapter(self.root).adapt(
+            run_id=self.run_id,
+            job_id=self.job_id,
+            attempt_id=self.attempt_id,
+            run_spec_digest=self.spec_digest,
+            work_brief_digest=self.work_brief_digest,
+            base_snapshot_digest=base_digest,
+        )
+
+        self.assertIsInstance(adapted.result, ContextRequestedWorkerResult)
+        canonical = json.loads(adapted.worker_result_artifact.path.read_bytes())
+        self.assertNotIn("result_summary", canonical)
+        self.assertNotIn("evidence_refs", canonical)
+
     def test_union_parses_completed_and_context_requested_without_stdout_inference(self):
         completed = parse_worker_result_bytes((
             "schema: waystone-worker-result-1\n"
