@@ -472,8 +472,7 @@ class PromotionLineageTests(unittest.TestCase):
     def test_fix_before_promotion_blocks_until_verified_descendant_clearance(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / ".waystone.yml").write_text(
-                "version: 1\nproject: assurance-test\n", encoding="utf-8")
+            _, frame = init_project(root)
             reviews = root / "docs" / "reviews"
             run_id = new_run_id()
             finding_id = new_run_id()
@@ -493,6 +492,7 @@ class PromotionLineageTests(unittest.TestCase):
                 "c" * 40, self.d(11), "refs/waystone/candidates/new",
                 "c" * 40, old_candidate, ())
             new_candidate = artifacts.write(new_descriptor.canonical_bytes()).digest
+            validation_evidence = artifacts.write(b"reproduced promotion failure")
             claim = findings.write_claim(reviews, {
                 "schema": findings.CLAIM_SCHEMA, "finding_id": finding_id,
                 "review_run_id": run_id,
@@ -508,18 +508,16 @@ class PromotionLineageTests(unittest.TestCase):
                 "schema": findings.VALIDATION_SCHEMA, "finding_id": finding_id,
                 "finding_digest": claim.digest, "revision": 1, "supersedes_digest": None,
                 "validity": "confirmed", "failure_mechanism": "X because Y",
-                "evidence_refs": [{"kind": "code", "digest": self.d(16)}],
+                "evidence_refs": [{"kind": "code", "digest": validation_evidence.digest}],
                 "validated_by": {"role": "coordinator", "binding_digest": self.d(17),
                                  "principal": None},
-            })
+            }, root=root)
             base = {
                 "schema": findings.DISPOSITION_SCHEMA, "finding_id": finding_id,
                 "finding_digest": claim.digest,
                 "confirmed_validation_digest": validation.digest,
                 "revision": 1, "supersedes_digest": None,
-                "objective_ref": {"kind": "project-fact", "commit": "a" * 40,
-                                  "path": "PROJECT_BRIEF.md", "fact_id": "commitment/outcome",
-                                  "fact_digest": self.d(18), "binding": "binding"},
+                "objective_ref": frame.fact_ref("commitment/outcome").to_dict(),
                 "lifecycle_stage": "promote",
                 "applies_to": {"promotion_lineage_id": lineage,
                                "candidate_digest": old_candidate, "result_digest": self.d(19)},
@@ -529,7 +527,8 @@ class PromotionLineageTests(unittest.TestCase):
                 "decided_by": {"role": "coordinator", "binding_digest": self.d(20),
                                "principal": None}, "materialized_task_id": None,
             }
-            initial = findings.append_disposition(reviews, run_id, finding_id, base)
+            initial = findings.append_disposition(
+                reviews, run_id, finding_id, base, root=root)
             with self.assertRaises(PromotionBlocked):
                 assert_promotion_unblocked(reviews, lineage, (old_candidate, new_candidate))
 
@@ -570,7 +569,8 @@ class PromotionLineageTests(unittest.TestCase):
                               "supersedes_candidate_digest": old_candidate,
                               "verification_evidence_digest": verification.digest},
             })
-            findings.append_disposition(reviews, run_id, finding_id, cleared)
+            findings.append_disposition(
+                reviews, run_id, finding_id, cleared, root=root)
             assert_promotion_unblocked(reviews, lineage, (old_candidate, new_candidate))
 
 

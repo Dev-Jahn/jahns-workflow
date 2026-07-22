@@ -173,7 +173,8 @@ def validate_file(root: Path, run_id: str, finding_id: str, source_file: Path) -
     require_initialized_root(root)
     raw = Path(source_file).read_bytes()
     payload = findings.parse_artifact(raw, findings.VALIDATION_SCHEMA)
-    return findings.append_validation(_reviews_dir(root), run_id, finding_id, payload)
+    return findings.append_validation(
+        _reviews_dir(root), run_id, finding_id, payload, root=root)
 
 
 def disposition_file(root: Path, run_id: str, finding_id: str, source_file: Path) -> findings.Artifact:
@@ -181,7 +182,8 @@ def disposition_file(root: Path, run_id: str, finding_id: str, source_file: Path
     require_initialized_root(root)
     raw = Path(source_file).read_bytes()
     payload = findings.parse_artifact(raw, findings.DISPOSITION_SCHEMA)
-    return findings.append_disposition(_reviews_dir(root), run_id, finding_id, payload)
+    return findings.append_disposition(
+        _reviews_dir(root), run_id, finding_id, payload, root=root)
 
 
 def resolve_finding_run(root: Path, finding_id: str) -> str:
@@ -219,6 +221,8 @@ def materialize(root: Path, run_id: str, finding_id: str) -> str:
     if validation is None or disposition.payload["confirmed_validation_digest"] != validation.digest:
         raise findings.StaleDisposition(
             "latest validation changed after this disposition; record a new disposition revision")
+    findings.validate_validation_authority(root, validation.payload)
+    findings.validate_disposition_authority(root, disposition.payload)
     row = disposition.payload
     if row["disposition"] not in ("fix-now", "fix-before-promotion"):
         raise MaterializationRefused(
@@ -243,7 +247,8 @@ def materialize(root: Path, run_id: str, finding_id: str) -> str:
         revision["revision"] = row["revision"] + 1
         revision["supersedes_digest"] = disposition.digest
         revision["materialized_task_id"] = task_id
-        findings.append_disposition(reviews_dir, run_id, finding_id, revision)
+        findings.append_disposition(
+            reviews_dir, run_id, finding_id, revision, root=root)
     return task_id
 
 

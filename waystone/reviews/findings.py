@@ -15,6 +15,16 @@ import yaml
 
 from waystone.core import WorkflowError
 from waystone.features import review_layout
+from waystone.jobs.completion import (
+    AuthorityRefRefusal,
+    AuthorityResolver,
+    CompletionError,
+    ProjectFactObjectiveRef,
+    parse_authority_ref,
+    parse_objective_ref,
+)
+from waystone.project.brief import ProjectBriefError
+from waystone.runs.artifacts import ArtifactError
 
 
 CLAIM_SCHEMA = "waystone-review-finding-1"
@@ -33,6 +43,10 @@ COSTS = frozenset(("low", "medium", "high", "unknown"))
 LIFECYCLE_STAGES = frozenset(("explore", "evaluate", "promote"))
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _TASK_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,15}/[a-z0-9](?:[a-z0-9-]{2,47})$")
+_TYPED_AUTHORITY_KINDS = frozenset((
+    "project-fact", "owner-request", "milestone", "accepted-adr",
+    "evaluation-spec", "evaluation-evidence",
+))
 
 
 class FindingError(WorkflowError):
@@ -61,6 +75,13 @@ class OwnerDecisionRequired(FindingError):
 
 class StaleDisposition(FindingError):
     code = "stale-finding-disposition"
+
+
+class AuthorityValidationRefusal(FindingError):
+    code = "finding-authority-validation-refusal"
+
+    def __init__(self, message: str):
+        super().__init__(f"{self.code}: {message}")
 
 
 @dataclass(frozen=True)
@@ -198,8 +219,15 @@ def validate_validation(payload: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(refs, list) or any(not isinstance(ref, Mapping) for ref in refs):
         raise ArtifactValidationError("evidence_refs: must be a list of mappings")
     for i, ref in enumerate(refs):
-        _string(ref.get("kind"), f"evidence_refs[{i}].kind")
-        _digest(ref.get("digest"), f"evidence_refs[{i}].digest")
+        kind = _string(ref.get("kind"), f"evidence_refs[{i}].kind")
+        if kind in _TYPED_AUTHORITY_KINDS:
+            try:
+                parse_authority_ref(ref, f"evidence_refs[{i}]")
+            except AuthorityRefRefusal as error:
+                raise ArtifactValidationError(str(error)) from error
+        else:
+            _allowed(ref, frozenset(("kind", "digest")), f"evidence_refs[{i}]")
+            _digest(ref.get("digest"), f"evidence_refs[{i}].digest")
     _role(row.get("validated_by"), "validated_by", ("coordinator",))
     return row
 
@@ -222,14 +250,12 @@ def validate_disposition(payload: Mapping[str, Any]) -> dict[str, Any]:
         _digest(row["supersedes_digest"], "supersedes_digest")
 
     objective = _mapping(row.get("objective_ref"), "objective_ref")
-    for field in ("kind", "commit", "path", "fact_id", "fact_digest", "binding"):
-        if field == "binding":
-            if objective.get(field) is None:
-                raise ArtifactValidationError("objective_ref.binding: required")
-        elif field == "fact_digest":
-            _digest(objective.get(field), "objective_ref.fact_digest")
-        else:
-            _string(objective.get(field), f"objective_ref.{field}")
+    try:
+        objective_ref = parse_objective_ref(objective, "objective_ref")
+    except AuthorityRefRefusal as error:
+        raise ArtifactValidationError(str(error)) from error
+    if not isinstance(objective_ref, ProjectFactObjectiveRef):
+        raise ArtifactValidationError("objective_ref.kind: must be project-fact")
     stage = _string(row.get("lifecycle_stage"), "lifecycle_stage")
     if stage not in LIFECYCLE_STAGES:
         raise ArtifactValidationError(f"lifecycle_stage: must be one of {sorted(LIFECYCLE_STAGES)}")
@@ -445,20 +471,52 @@ def _append(
     return _publish(Path(reviews_dir), run_id, finding_id, kind, row["revision"], row, validator)
 
 
+def validate_validation_authority(root: Path, payload: Mapping[str, Any]) -> None:
+    """Require every validation evidence ref to resolve to rehashed Git or CAS bytes."""
+    row = validate_validation(payload)
+    resolver = AuthorityResolver(Path(root))
+    for index, raw_ref in enumerate(row["evidence_refs"]):
+        ref = dict(raw_ref)
+        try:
+            if ref["kind"] in _TYPED_AUTHORITY_KINDS:
+                resolver.validate(parse_authority_ref(ref, f"evidence_refs[{index}]"))
+            else:
+                resolver.artifact_store.read(ref["digest"])
+        except (ArtifactError, CompletionError, ProjectBriefError, KeyError, TypeError, ValueError) as error:
+            raise AuthorityValidationRefusal(
+                f"evidence_refs[{index}] does not resolve to authoritative bytes: {error}"
+            ) from error
+
+
+def validate_disposition_authority(root: Path, payload: Mapping[str, Any]) -> None:
+    """Require the disposition objective to match exact committed project authority."""
+    row = validate_disposition(payload)
+    try:
+        objective = parse_objective_ref(row["objective_ref"], "objective_ref")
+        AuthorityResolver(Path(root)).validate(objective)
+    except (CompletionError, ProjectBriefError, KeyError, TypeError, ValueError) as error:
+        raise AuthorityValidationRefusal(
+            f"objective_ref does not resolve to authoritative bytes: {error}"
+        ) from error
+
+
 def append_validation(
-        reviews_dir: Path, run_id: str, finding_id: str, payload: Mapping[str, Any],
+        reviews_dir: Path, run_id: str, finding_id: str, payload: Mapping[str, Any], *,
+        root: Path,
 ) -> Artifact:
     claim = read_claim(Path(reviews_dir), run_id, finding_id)
     row = dict(payload)
     if row.get("finding_digest") != claim.digest:
         raise ChainConflict("validation.finding_digest must equal the immutable claim digest")
+    validate_validation_authority(Path(root), row)
     return _append(
         Path(reviews_dir), run_id, finding_id, review_layout.FINDING_VALIDATION,
         VALIDATION_SCHEMA, row, validate_validation)
 
 
 def append_disposition(
-        reviews_dir: Path, run_id: str, finding_id: str, payload: Mapping[str, Any],
+        reviews_dir: Path, run_id: str, finding_id: str, payload: Mapping[str, Any], *,
+        root: Path,
 ) -> Artifact:
     claim = read_claim(Path(reviews_dir), run_id, finding_id)
     validation = validation_head(Path(reviews_dir), run_id, finding_id)
@@ -470,6 +528,7 @@ def append_disposition(
     if row.get("confirmed_validation_digest") != validation.digest:
         raise StaleDisposition(
             "disposition.confirmed_validation_digest must equal the current confirmed validation head")
+    validate_disposition_authority(Path(root), row)
     return _append(
         Path(reviews_dir), run_id, finding_id, review_layout.FINDING_DISPOSITION,
         DISPOSITION_SCHEMA, row, validate_disposition)
