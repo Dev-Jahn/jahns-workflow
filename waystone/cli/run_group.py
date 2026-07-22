@@ -80,6 +80,12 @@ def _start_arguments(args: list[str]) -> tuple[str, Path, Path | None, str | Non
     return task_id, work_brief, owner_request, stage, from_worktree
 
 
+def _close_arguments(args: list[str]) -> tuple[str, Path]:
+    if len(args) != 3 or args[1] != "--outcome":
+        raise ActionPlanRefusal("close requires <run-id> --outcome <file>")
+    return args[0], Path(args[2])
+
+
 def _project_fact_refs(payload: object) -> tuple[ProjectFactRef, ...]:
     found: dict[tuple[object, ...], ProjectFactRef] = {}
 
@@ -500,6 +506,18 @@ def main(argv: list[str]) -> int:
                 identity = args[0] if args else _latest_run_id(assembly)
                 branch = StagedRunEngine(assembly).resume(identity)
             print(_resume_text(ResumeResult(identity, dispatch=branch)))
+            return 0
+
+        if command == "close":
+            identity, outcome_path = _close_arguments(args)
+            context = resolve_project_context(Path.cwd())
+            outcome_content = _regular_bytes(outcome_path, "OutcomeDelta")
+            with assemble_run(context) as assembly:
+                result = StagedRunEngine(assembly).close(identity, outcome_content)
+            print(
+                f"Run {result.run_id} completed with outcome ledger commit "
+                f"{result.commit_oid}."
+            )
             return 0
 
         if command == "context":

@@ -1,6 +1,7 @@
 """Read-only run status, JSON, and watch projections."""
 from __future__ import annotations
 
+import json
 import math
 import sqlite3
 import time
@@ -8,8 +9,12 @@ from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Callable, Iterator, Mapping
 
+import yaml
+
+from waystone.adapters.git import git_full_sha
 from waystone.core import WorkflowError
 from waystone.runs import spec as spec_module, store as store_module
 from waystone.runs.artifacts import ArtifactError, ArtifactStore
@@ -39,6 +44,9 @@ from waystone.runs.supervisor import (
     SupervisorError,
     _read_runtime,
 )
+from waystone.project.brief import read_project_frame_at_commit
+from waystone.runs.assurance import parse_candidate_bytes, promotion_blockers
+from waystone.runs.outcome import LedgerEntry, read_outcome_ledger
 
 
 _TERMINAL_JOB_STATES = frozenset({"accepted", "canceled", "completed", "failed"})
@@ -749,15 +757,301 @@ def watch_run(
         yield render_human(snapshotter())
 
 
+@dataclass(frozen=True)
+class ProjectStatusProjection:
+    """Objective-first read model; operational counts remain audit-only."""
+
+    frame_status: str
+    objective_ref: Mapping[str, object] | None
+    active_run: Mapping[str, object] | None
+    last_delta: Mapping[str, object] | None
+    last_positive_delta: Mapping[str, object] | None
+    unresolved_owner_rulings: tuple[str, ...]
+    promotion_blockers: tuple[str, ...]
+    advisory: Mapping[str, object] | None
+    audit: Mapping[str, object]
+
+
+def _status_spec(store: RunStore, root: Path, run_id: str):
+    with store._connection_lock:  # noqa: SLF001 - immutable spec-head projection
+        rows = store._connection.execute(  # noqa: SLF001
+            "SELECT reference_id FROM artifacts WHERE reference_id LIKE ?",
+            (f"run-spec:{run_id}:%",),
+        ).fetchall()
+    revisions = []
+    for row in rows:
+        suffix = row["reference_id"].removeprefix(f"run-spec:{run_id}:")
+        if suffix.isdigit() and int(suffix) >= 1:
+            revisions.append((int(suffix), row["reference_id"]))
+    if not revisions:
+        raise StatusUnavailable(run_id, "frozen RunSpec is unavailable")
+    revision, reference_id = max(revisions)
+    if len([item for item in revisions if item[0] == revision]) != 1:
+        raise StatusUnavailable(run_id, "RunSpec revision head is ambiguous")
+    reference = store.get_artifact_reference(reference_id)
+    artifacts = ArtifactStore(root)
+    payload = artifacts.read_reference(reference)
+    try:
+        decoded = json.loads(payload.decode("utf-8"))
+        descriptor_ids = (
+            decoded["work_brief"]["reference_id"],
+            decoded["assurance_plan"]["reference_id"],
+            decoded["job_input"]["completion_contract"]["reference_id"],
+        )
+        references = {
+            identity: store.get_artifact_reference(identity) for identity in descriptor_ids
+        }
+        return spec_module._parse_run_spec(  # noqa: SLF001 - package read projection
+            payload, run_id, reference.digest, root_path=root,
+            references=references, artifact_store=artifacts)
+    except (KeyError, TypeError, ValueError, UnicodeError, json.JSONDecodeError) as error:
+        raise StatusUnavailable(run_id, f"RunSpec projection failed: {error}") from error
+
+
+def _active_run_projection(store: RunStore, root: Path):
+    with store._connection_lock:  # noqa: SLF001 - project status projection
+        row = store._connection.execute(  # noqa: SLF001
+            "SELECT run_id, state FROM runs WHERE state NOT IN "
+            "('completed', 'canceled', 'failed') ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+    if row is None:
+        return None, None, ()
+    spec = _status_spec(store, root, row["run_id"])
+    blockers: tuple[str, ...] = ()
+    readiness = "not-applicable"
+    if spec.lifecycle_stage.value == "promote":
+        readiness = "ready"
+        if spec.promotion_lineage is None or spec.candidate is None:
+            readiness = "unavailable"
+        else:
+            lineage = []
+            current = spec.candidate["digest"]
+            artifacts = ArtifactStore(root)
+            seen = set()
+            while current is not None:
+                if current in seen:
+                    raise StatusUnavailable(spec.run_id, "candidate lineage contains a cycle")
+                seen.add(current)
+                lineage.append(current)
+                current = parse_candidate_bytes(
+                    artifacts.read(current)).supersedes_candidate_digest
+            blockers = promotion_blockers(
+                root / "docs" / "reviews",
+                spec.promotion_lineage.id,
+                tuple(reversed(lineage)),
+            )
+            if blockers:
+                readiness = "blocked"
+    return ({
+        "run_id": spec.run_id,
+        "state": row["state"],
+        "lifecycle_stage": spec.lifecycle_stage.value,
+        "waiting_context": row["state"] == "waiting_context",
+        "promotion_readiness": readiness,
+    }, spec, blockers)
+
+
+def _task_projection(root: Path) -> tuple[tuple[str, ...], dict[str, int]]:
+    path = root / "tasks.yaml"
+    try:
+        document = yaml.safe_load(path.read_bytes())
+    except (OSError, UnicodeError, yaml.YAMLError) as error:
+        raise StatusUnavailable("<project>", f"tasks audit unavailable: {error}") from error
+    tasks = document.get("tasks") if isinstance(document, dict) else None
+    if not isinstance(tasks, list):
+        raise StatusUnavailable("<project>", "tasks audit is not a task list")
+    rulings = []
+    states = []
+    for item in tasks:
+        if not isinstance(item, dict):
+            raise StatusUnavailable("<project>", "tasks audit contains a malformed item")
+        task_id = item.get("id")
+        state = item.get("status")
+        if isinstance(state, str):
+            states.append(state)
+        if (isinstance(task_id, str) and task_id.startswith("decision/")
+                and state not in {"done", "canceled"}
+                and not (isinstance(item.get("ruling"), str) and item["ruling"].strip())):
+            rulings.append(task_id)
+    return tuple(sorted(rulings)), dict(sorted(Counter(states).items()))
+
+
+def _delta_payload(entry: LedgerEntry) -> dict[str, object]:
+    return {
+        "commit_oid": entry.commit_oid,
+        "run_id": entry.outcome.run_id,
+        "lifecycle_stage": entry.outcome.lifecycle_stage,
+        "objective_ref": dict(entry.outcome.objective_ref),
+        "kind": entry.outcome.kind,
+        "summary": entry.outcome.summary,
+        "result_digest": entry.outcome.result_digest,
+        "rationale": entry.outcome.rationale,
+        "progress": entry.outcome.kind != "no-objective-delta",
+    }
+
+
+def _direction_advisory(entries: tuple[LedgerEntry, ...]):
+    for entry in reversed(entries):
+        conflicts = tuple(
+            evidence for evidence in entry.outcome.evidence_refs
+            if evidence.kind == "owner-conflict")
+        if conflicts:
+            return {
+                "reason": "project-direction-may-be-stale",
+                "gate": False,
+                "suggestion": "/waystone:ideate",
+                "evidence": [{
+                    "run_id": entry.outcome.run_id,
+                    "commit_oid": entry.commit_oid,
+                    "kind": evidence.kind,
+                    "reference_id": evidence.reference_id,
+                    "digest": evidence.digest,
+                } for evidence in conflicts],
+            }
+    if len(entries) < 2:
+        return None
+    latest = entries[-1]
+    previous = entries[-2]
+    if (latest.outcome.kind != "no-objective-delta"
+            or previous.outcome.kind != "no-objective-delta"
+            or dict(latest.outcome.objective_ref) != dict(previous.outcome.objective_ref)):
+        return None
+    return {
+        "reason": "project-direction-may-be-stale",
+        "gate": False,
+        "suggestion": "/waystone:ideate",
+        "evidence": [
+            {"run_id": previous.outcome.run_id, "commit_oid": previous.commit_oid},
+            {"run_id": latest.outcome.run_id, "commit_oid": latest.commit_oid},
+        ],
+    }
+
+
+def project_status_projection(
+    root: Path, store: RunStore | None = None,
+) -> ProjectStatusProjection:
+    """Project brief, active stage, ledger delta, decisions, advisory, then audit."""
+    root = Path(root).resolve()
+    head = git_full_sha(root)
+    if head is None:
+        raise StatusUnavailable("<project>", "project HEAD is unavailable")
+    frame = read_project_frame_at_commit(root, head)
+    entries = read_outcome_ledger(root)
+    active = None
+    active_spec = None
+    blockers: tuple[str, ...] = ()
+    run_counts: dict[str, int] = {}
+    job_counts: dict[str, int] = {}
+    if store is not None:
+        active, active_spec, blockers = _active_run_projection(store, root)
+        with store._connection_lock:  # noqa: SLF001 - audit counts only
+            run_rows = store._connection.execute(  # noqa: SLF001
+                "SELECT state, count(*) AS count FROM runs GROUP BY state").fetchall()
+            job_rows = store._connection.execute(  # noqa: SLF001
+                "SELECT state, count(*) AS count FROM jobs GROUP BY state").fetchall()
+        run_counts = {row["state"]: row["count"] for row in run_rows}
+        job_counts = {row["state"]: row["count"] for row in job_rows}
+    latest = None if not entries else _delta_payload(entries[-1])
+    positive = next(
+        (_delta_payload(entry) for entry in reversed(entries)
+         if entry.outcome.kind != "no-objective-delta"),
+        None,
+    )
+    objective = (
+        active_spec.objective_ref.to_dict()
+        if active_spec is not None
+        else (None if not entries else dict(entries[-1].outcome.objective_ref))
+    )
+    if objective is None:
+        fact = next(
+            (item for item in frame.facts
+             if item.binding == "binding" and item.kind in {"commitment", "prototype"}),
+            None,
+        )
+        if fact is not None:
+            objective = frame.fact_ref(fact.id).to_dict()
+    rulings, task_counts = _task_projection(root)
+    findings_root = root / "docs" / "reviews" / "runs"
+    finding_count = (
+        sum(1 for _ in findings_root.glob("*/findings/*/claim.yaml"))
+        if findings_root.is_dir() else 0)
+    return ProjectStatusProjection(
+        frame_status=frame.status,
+        objective_ref=objective,
+        active_run=active,
+        last_delta=latest,
+        last_positive_delta=positive,
+        unresolved_owner_rulings=rulings,
+        promotion_blockers=blockers,
+        advisory=_direction_advisory(entries),
+        audit={
+            "tasks": task_counts,
+            "runs": dict(sorted(run_counts.items())),
+            "jobs": dict(sorted(job_counts.items())),
+            "tests": {"count": None, "reason": "no canonical test-count authority"},
+            "findings": {"total": finding_count},
+        },
+    )
+
+
+def project_status_json(status: ProjectStatusProjection) -> dict[str, object]:
+    if not isinstance(status, ProjectStatusProjection):
+        raise TypeError("status must be a ProjectStatusProjection")
+    return {
+        "project_brief": {
+            "status": status.frame_status,
+            "current_objective": (
+                None if status.objective_ref is None else dict(status.objective_ref)),
+        },
+        "active_run": None if status.active_run is None else dict(status.active_run),
+        "outcome": {
+            "last_delta": None if status.last_delta is None else dict(status.last_delta),
+            "last_positive_delta": (
+                None if status.last_positive_delta is None
+                else dict(status.last_positive_delta)),
+        },
+        "decisions": {
+            "unresolved_owner_rulings": list(status.unresolved_owner_rulings),
+            "promotion_blockers": list(status.promotion_blockers),
+        },
+        "advisory": None if status.advisory is None else dict(status.advisory),
+        "audit": dict(status.audit),
+    }
+
+
+def render_project_status(status: ProjectStatusProjection) -> str:
+    payload = project_status_json(status)
+    objective = payload["project_brief"]["current_objective"]  # type: ignore[index]
+    active = payload["active_run"]
+    outcome = payload["outcome"]  # type: ignore[assignment]
+    decisions = payload["decisions"]  # type: ignore[assignment]
+    advisory = payload["advisory"]
+    return "\n".join((
+        f"Project Brief: {status.frame_status}",
+        f"Current objective: {json.dumps(objective, ensure_ascii=False, sort_keys=True)}",
+        f"Active run: {json.dumps(active, ensure_ascii=False, sort_keys=True)}",
+        f"Last outcome delta: {json.dumps(outcome['last_delta'], ensure_ascii=False, sort_keys=True)}",
+        f"Last positive delta: {json.dumps(outcome['last_positive_delta'], ensure_ascii=False, sort_keys=True)}",
+        f"Unresolved rulings: {json.dumps(decisions['unresolved_owner_rulings'], ensure_ascii=False)}",
+        f"Promotion blockers: {json.dumps(decisions['promotion_blockers'], ensure_ascii=False)}",
+        f"Advisory: {json.dumps(advisory, ensure_ascii=False, sort_keys=True)}",
+        "Audit: " + json.dumps(payload["audit"], ensure_ascii=False, sort_keys=True),
+    ))
+
+
 __all__ = [
     "ActionProjection",
     "CurrentProjection",
     "LivenessProjection",
     "ProgressProjection",
+    "ProjectStatusProjection",
     "RunSnapshot",
     "StatusUnavailable",
     "json_projection",
+    "project_status_json",
+    "project_status_projection",
     "render_human",
+    "render_project_status",
     "snapshot_run",
     "watch_run",
 ]

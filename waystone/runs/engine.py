@@ -67,6 +67,7 @@ from waystone.runs.preflight import (
     load_dispatch_ready,
     preflight_for_dispatch,
 )
+from waystone.runs.outcome import OutcomePublication, publish_outcome
 from waystone.runs.spec import (
     RunSpec,
     load_run_spec,
@@ -459,6 +460,10 @@ class StagedRunEngine:
     def resume(self, run_id: str) -> Mapping[str, object]:
         return self.assembly.transport.actions_next(run_id)
 
+    def close(self, run_id: str, outcome_content: bytes) -> OutcomePublication:
+        """Publish one evidence-bound outcome pair before completing the run."""
+        return publish_outcome(self.assembly, run_id, outcome_content)
+
     def execute_stage(
         self,
         run_id: str,
@@ -776,14 +781,27 @@ class StagedRunEngine:
                 )
 
     def _record_stage_completion(self, spec: RunSpec, evidence_digest: str) -> None:
-        for kind, identity in ((EntityKind.JOB, spec.job_id), (EntityKind.RUN, spec.run_id)):
+        with self.assembly.store._connection_lock:  # noqa: SLF001 - final attempt projection
+            row = self.assembly.store._connection.execute(  # noqa: SLF001
+                "SELECT attempt_id FROM attempts WHERE run_id = ? AND job_id = ? "
+                "ORDER BY rowid DESC LIMIT 1",
+                (spec.run_id, spec.job_id),
+            ).fetchone()
+        if row is None:
+            raise EngineBindingRefusal("stage completion requires a final attempt")
+        attempt_id = row["attempt_id"]
+        for kind, identity, next_state in (
+                (EntityKind.ATTEMPT, attempt_id, "completed"),
+                (EntityKind.JOB, spec.job_id, "completed"),
+                (EntityKind.RUN, spec.run_id, "closeout-ready")):
             entity = (
-                self.assembly.store.get_entity(kind, identity)
-                if kind is EntityKind.JOB else self.assembly.store.get_run(identity))
-            if entity.state != "completed":
+                self.assembly.store.get_run(identity)
+                if kind is EntityKind.RUN
+                else self.assembly.store.get_entity(kind, identity))
+            if entity.state != next_state:
                 self.assembly.store.record_transition(
                     kind, identity, expected_version=entity.version,
-                    next_state="completed", reason=TransitionReason.COMPLETED,
+                    next_state=next_state, reason=TransitionReason.COMPLETED,
                     evidence_digest=evidence_digest,
                 )
 

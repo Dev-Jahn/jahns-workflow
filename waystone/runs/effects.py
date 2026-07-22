@@ -743,7 +743,8 @@ class EffectEngine:
 
     def plan_effect(
             self, run_id: str, job_id: str, attempt_id: str, action_id: str,
-            effect: EffectSpec | str, *, retry_of: str | None = None) -> EffectPlan:
+            effect: EffectSpec | str, *, retry_of: str | None = None,
+            artifact_references: Iterable[ArtifactReference] = ()) -> EffectPlan:
         """Persist an immutable input digest and semantic idempotency key before claiming."""
         run_identity = _nonempty(run_id, "run_id")
         job_identity = _nonempty(job_id, "job_id")
@@ -798,6 +799,13 @@ class EffectEngine:
             size=stored.size,
         )
         references = [reference]
+        supplied_references = tuple(artifact_references)
+        for supplied in supplied_references:
+            if not isinstance(supplied, ArtifactReference):
+                raise TypeError("artifact_references must contain ArtifactReference values")
+            if supplied.reference_id == reference.reference_id:
+                raise ValueError("artifact_references cannot replace the effect plan reference")
+        references.extend(supplied_references)
         runner_lineage_key = None
         if kind is EffectKind.RUNNER_EXECUTION:
             runner_lineage_key = self._runner_lineage_key(
