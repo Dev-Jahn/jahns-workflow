@@ -1,22 +1,10 @@
 version: 1
 project: waystone
-ssot: SSOT.md
 progress: PROGRESS.md
 adr_dir: docs/adr
 reviews_dir: docs/reviews
 progress_archive_dir: docs/progress
-generated_dir: docs/ssot
 digest_max_lines: 150
-review:
-  mode: packet
-  reviewers: [role:reviewer]
-  require_ci: false
 policy:
   start_level: warn-allowed
-delegation:
-  enabled: true
-  env_prep:
-    - uv sync --script scripts/tests/run_tests.py --locked
-    - uv tool run ruff@0.15.22 --version
-state:
-  last_round_commit: 885a7ad311d3aca063628f78053503e8c21b767f
+brief: PROJECT_BRIEF.md
