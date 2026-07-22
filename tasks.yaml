@@ -697,3 +697,7 @@ tasks:
     ruling: "Q1–Q6 전부 기체 잠정안 채택 (2026-07-22 main, 세션 자율권한). Q1 Prototype scope=commitment subtype / Q2 owner confirmation digest 결속으로 충분 / Q3 owner-only accept-risk 경계 확정 / Q4 compiler 제안값 2, engine default 없음 / Q5 coordinator 기록·independent evidence 필수 / Q6 principal:null accepted risk. 전문: dev_docs/0.13-redesign-plan.md §12"
     title: "0.13 계획 열린 질문 Q1–Q6 ruling — 전부 설계 잠정안 채택(상세: 계획서 §12 인수 기록)"
     status: "pending"
+  - id: fix/013-gate-closure
+    title: "0.13 gate FAIL 폐쇄 — G013-01~05: public staged 실행 조립(start→DAG→close happy path)·WorkerResult outcome lineage·review-cycle head 영속화·failed child 종결·legacy config 잔재 (RED-first, evidence: dev_docs/0.13-gate-evidence.md)"
+    status: "pending"
+    severity: "blocker"
