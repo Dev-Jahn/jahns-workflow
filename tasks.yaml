@@ -675,7 +675,7 @@ tasks:
     status: "done"
   - id: feat/013-staged-run-context-resume
     title: "0.13 A2: ProjectContext·production RunAssembly·RunSpec/store v2·worker result union·context_request/waiting_context resume·typed run start"
-    status: "pending"
+    status: "done"
     deps: ["feat/013-project-frame-work-brief"]
   - id: feat/013-stage-assurance
     title: "0.13 B2: stage별 AssurancePlan action DAG·candidate/evaluation freeze·promotion lineage·review cycle budget·test lifecycle"
