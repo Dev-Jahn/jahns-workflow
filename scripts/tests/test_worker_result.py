@@ -9,7 +9,10 @@ from __future__ import annotations
 from support import *  # noqa: F401,F403
 
 import json
+from types import SimpleNamespace
 
+from waystone.runs.artifacts import ArtifactStore
+from waystone.runs.engine import StagedRunEngine
 from waystone.runs.spec import _capture_snapshot
 from waystone.runs.worker_result import (
     CompletedWorkerResult,
@@ -20,6 +23,7 @@ from waystone.runs.worker_result import (
     RunnerCompletionMarkerV2,
     WorkerResultAdapter,
     WorkerResultBindingMismatch,
+    WorkerResultSchemaRefusal,
     capture_result_snapshot,
     parse_context_response_bytes,
     parse_runner_completion_marker_v2_bytes,
@@ -56,6 +60,55 @@ class WorkerResultTests(unittest.TestCase):
             "  blocked_decision: Preserve or replace the public API\n"
             "  why_required: The answer changes the implementation scope\n"
         ).encode()
+
+    def test_backend_schema_is_object_root_with_status_discriminator(self):
+        engine = object.__new__(StagedRunEngine)
+        engine.assembly = SimpleNamespace(artifact_store=ArtifactStore(self.root))
+
+        artifact = engine._worker_result_schema(  # noqa: SLF001
+            SimpleNamespace(run_spec_digest=self.spec_digest),
+            self.attempt_id,
+            evaluation=False,
+        )
+        schema = json.loads(artifact.path.read_bytes())
+
+        self.assertEqual(schema["type"], "object")
+        self.assertFalse(schema["additionalProperties"])
+        self.assertEqual(
+            schema["properties"]["status"],
+            {"type": "string", "enum": ["completed", "context-requested"]},
+        )
+        self.assertNotIn("oneOf", schema)
+        self.assertNotIn("anyOf", schema)
+
+    def test_adapter_rejects_completed_result_with_context_request(self):
+        base = _capture_snapshot(self.root)
+        base_digest = "sha256:" + hashlib.sha256(base.canonical_bytes()).hexdigest()
+        (self.root / "WAYSTONE_RESULT.yaml").write_text(
+            "schema: waystone-worker-result-1\n"
+            "status: completed\n"
+            f"run_spec_digest: {self.spec_digest}\n"
+            f"attempt_id: {self.attempt_id}\n"
+            "result_summary: Implemented the bounded change.\n"
+            "evidence_refs: []\n"
+            "context_request:\n"
+            "  question: Which contract is authoritative?\n"
+            "  blocked_decision: Preserve or replace the public API\n"
+            "  why_required: The answer changes the implementation scope\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(WorkerResultSchemaRefusal) as raised:
+            WorkerResultAdapter(self.root).adapt(
+                run_id=self.run_id,
+                job_id=self.job_id,
+                attempt_id=self.attempt_id,
+                run_spec_digest=self.spec_digest,
+                work_brief_digest=self.work_brief_digest,
+                base_snapshot_digest=base_digest,
+            )
+
+        self.assertEqual(raised.exception.code, "worker_result_schema_refusal")
 
     def test_union_parses_completed_and_context_requested_without_stdout_inference(self):
         completed = parse_worker_result_bytes((

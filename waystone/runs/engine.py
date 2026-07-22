@@ -367,61 +367,58 @@ class StagedRunEngine:
             self, spec: RunSpec, attempt_id: str, *, evaluation: bool) -> StoredArtifact:
         common = {
             "schema": {"type": "string", "const": "waystone-worker-result-1"},
-            "status": {"type": "string"},
+            "status": {
+                "type": "string",
+                "enum": ["completed", "context-requested"],
+            },
             "run_spec_digest": {"type": "string", "const": spec.run_spec_digest},
             "attempt_id": {"type": "string", "const": attempt_id},
         }
         summary: dict[str, object] = {"type": "string", "minLength": 1}
         if evaluation:
             summary = {"type": "string", "enum": ["pass", "fail"]}
-        completed = {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                **common,
-                "status": {"type": "string", "const": "completed"},
-                "result_summary": summary,
-                "evidence_refs": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {
-                            "reference_id": {"type": "string", "minLength": 1},
-                            "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
-                        },
-                        "required": ["reference_id", "digest"],
-                    },
+        evidence_refs = {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "reference_id": {"type": "string", "minLength": 1},
+                    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
                 },
+                "required": ["reference_id", "digest"],
             },
-            "required": [
-                "schema", "status", "run_spec_digest", "attempt_id",
-                "result_summary", "evidence_refs",
-            ],
         }
-        context_requested = {
+        context_request = {
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                **common,
-                "status": {"type": "string", "const": "context-requested"},
-                "context_request": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        field: {"type": "string", "minLength": 1}
-                        for field in ("question", "blocked_decision", "why_required")
-                    },
-                    "required": ["question", "blocked_decision", "why_required"],
-                },
+                field: {"type": "string", "minLength": 1}
+                for field in ("question", "blocked_decision", "why_required")
             },
-            "required": [
-                "schema", "status", "run_spec_digest", "attempt_id", "context_request",
-            ],
+            "required": ["question", "blocked_decision", "why_required"],
+        }
+        properties = {
+            **common,
+            "result_summary": {
+                "anyOf": [summary, {"type": "null"}],
+                "description": "Non-null only when status is completed.",
+            },
+            "evidence_refs": {
+                "anyOf": [evidence_refs, {"type": "null"}],
+                "description": "Non-null only when status is completed.",
+            },
+            "context_request": {
+                "anyOf": [context_request, {"type": "null"}],
+                "description": "Non-null only when status is context-requested.",
+            },
         }
         return self.assembly.artifact_store.write(assurance_json({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "oneOf": [completed, context_requested],
+            "type": "object",
+            "additionalProperties": False,
+            "properties": properties,
+            "required": list(properties),
         }))
 
     def _stage_invocation(

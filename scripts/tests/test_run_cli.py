@@ -85,9 +85,10 @@ class RunCliTests(unittest.TestCase):
             "  raise SystemExit(1)\n"
             "args = sys.argv[1:]\n"
             "schema = json.loads(Path(args[args.index('--output-schema') + 1]).read_text())\n"
-            "properties = schema['oneOf'][0]['properties']\n"
+            "properties = schema['properties']\n"
             "assert properties['attempt_id']['type'] == 'string'\n"
-            "evaluation = 'enum' in properties['result_summary']\n"
+            "summary = properties['result_summary']['anyOf'][0]\n"
+            "evaluation = 'enum' in summary\n"
             "if not evaluation:\n"
             "  Path('candidate.txt').write_text('fixture candidate\\n', encoding='utf-8')\n"
             "  subprocess.run(['git', 'add', 'candidate.txt'], check=True)\n"
@@ -99,6 +100,7 @@ class RunCliTests(unittest.TestCase):
             "  'attempt_id': properties['attempt_id']['const'],\n"
             "  'result_summary': 'pass' if evaluation else 'Candidate explored.',\n"
             "  'evidence_refs': [],\n"
+            "  'context_request': None,\n"
             "}\n"
             "Path(args[args.index('-o') + 1]).write_text(json.dumps(result), encoding='utf-8')\n",
             encoding="utf-8",

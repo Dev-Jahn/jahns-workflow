@@ -339,6 +339,40 @@ def parse_worker_result_bytes(
     raise WorkerResultSchemaRefusal("status must be completed or context-requested")
 
 
+def _canonical_backend_projection_bytes(content: bytes) -> bytes:
+    """Remove only the inactive null branch required by Codex structured output."""
+    try:
+        document = yaml.load(content.decode("utf-8"), Loader=_UniqueKeyLoader)
+    except (UnicodeDecodeError, yaml.YAMLError, TypeError) as error:
+        raise WorkerResultSchemaRefusal(
+            f"worker result must be UTF-8 YAML: {error}") from error
+    if not isinstance(document, Mapping):
+        raise WorkerResultSchemaRefusal("worker result must contain one mapping")
+    projected_fields = {
+        "schema", "status", "run_spec_digest", "attempt_id",
+        "result_summary", "evidence_refs", "context_request",
+    }
+    if set(document) != projected_fields:
+        return content
+    status = document.get("status")
+    if status == "completed":
+        if document["context_request"] is not None:
+            raise WorkerResultSchemaRefusal(
+                "completed worker result cannot include context_request")
+        return _canonical_json({
+            key: value for key, value in document.items() if key != "context_request"
+        })
+    if status == "context-requested":
+        if document["result_summary"] is not None or document["evidence_refs"] is not None:
+            raise WorkerResultSchemaRefusal(
+                "context-requested worker result cannot include completed fields")
+        return _canonical_json({
+            key: value for key, value in document.items()
+            if key not in {"result_summary", "evidence_refs"}
+        })
+    return content
+
+
 def parse_context_response_bytes(
     content: bytes, *, expected_request_digest: str | None = None,
     expected_binding_digest: str | None = None,
@@ -488,12 +522,13 @@ class WorkerResultAdapter:
         self, content: bytes, *, run_id: str, job_id: str, attempt_id: str,
         run_spec_digest: str, work_brief_digest: str, base_snapshot_digest: str,
     ) -> AdaptedWorkerResult:
+        canonical_content = _canonical_backend_projection_bytes(content)
         result = parse_worker_result_bytes(
-            content,
+            canonical_content,
             expected_run_spec_digest=run_spec_digest,
             expected_attempt_id=attempt_id,
         )
-        result_artifact = self.artifact_store.write(content)
+        result_artifact = self.artifact_store.write(canonical_content)
         snapshot = capture_result_snapshot(self.root)
         context_request = None
         context_artifact = None
