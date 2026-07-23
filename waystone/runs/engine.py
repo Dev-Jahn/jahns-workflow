@@ -640,6 +640,7 @@ class StagedRunEngine:
                 None if invocation.candidate_context is None
                 else invocation.candidate_context.to_payload()
             ),
+            "environment_digest": invocation.environment.digest,
         })
         return "sha256:" + hashlib.sha256(payload).hexdigest()
 
@@ -1420,7 +1421,7 @@ class StagedRunEngine:
             raise EngineBindingRefusal(
                 "promotion verifier launch lacks candidate context")
         payload = assurance_json({
-            "schema": "waystone-promotion-verifier-launch-1",
+            "schema": "waystone-promotion-verifier-launch-2",
             "run_id": spec.run_id,
             "job_id": spec.job_id,
             "attempt_id": attempt_id,
@@ -1430,6 +1431,7 @@ class StagedRunEngine:
             "root_fingerprint": context.root_fingerprint,
             "run_spec_digest": context.run_spec_digest,
             "invocation_digest": self._invocation_digest(invocation),
+            "environment_digest": invocation.environment.digest,
         })
         artifact = self.assembly.artifact_store.write(payload)
         reference = ArtifactReference(
@@ -1557,6 +1559,7 @@ class StagedRunEngine:
                     completed = subprocess.run(
                         invocation.argv,
                         cwd=invocation.cwd,
+                        env=invocation.environment.as_dict(),
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
                         check=False,

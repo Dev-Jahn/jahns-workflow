@@ -88,9 +88,9 @@ class RunCliTests(unittest.TestCase):
         binary.parent.mkdir()
         binary.write_text(
             f"#!{sys.executable}\n"
-            "import json, os, subprocess, sys\n"
+            "import json, subprocess, sys\n"
             "from pathlib import Path\n"
-            "if os.environ.get('FIXTURE_CODEX_HTTP_400') == '1':\n"
+            "if Path(__file__).with_name('fixture-codex-http-400').exists():\n"
             "  sys.stderr.write(\"HTTP 400: invalid_json_schema for attempt_id\\n\")\n"
             "  raise SystemExit(1)\n"
             "args = sys.argv[1:]\n"
@@ -973,9 +973,10 @@ class RunCliTests(unittest.TestCase):
 
     def test_g01304_http_400_child_failure_terminalizes_marker_and_run_state(self):
         binary = self.install_fixture_codex()
+        binary.with_name("fixture-codex-http-400").write_text(
+            "enabled\n", encoding="utf-8")
         environment = {
             "PATH": f"{binary.parent}{os.pathsep}{os.environ['PATH']}",
-            "FIXTURE_CODEX_HTTP_400": "1",
         }
         with self.runtime() as output, mock.patch.dict(os.environ, environment):
             self.assertEqual(run_group.main([

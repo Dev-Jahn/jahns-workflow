@@ -15,7 +15,7 @@ import sys
 import tempfile
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -29,11 +29,13 @@ from waystone.runs.effects import (
     RunnerLaunchIntent,
     publish_runner_completion,
 )
+from waystone.runs.environment import RunnerEnvironment, build_runner_environment
 from waystone.runs.lease import LeaseManager, LeasePrincipal
 from waystone.runs.store import EntityKind, RunStore
 
 
-_LAUNCH_SCHEMA = "waystone-supervisor-launch-1"
+_LAUNCH_SCHEMA = "waystone-supervisor-launch-2"
+_LEGACY_LAUNCH_SCHEMA = "waystone-supervisor-launch-1"
 _RUNTIME_SCHEMA = "waystone-supervisor-runtime-1"
 _HEARTBEAT_SCHEMA = "waystone-supervisor-heartbeat-1"
 _WAIT_SCHEMA = "waystone-supervisor-wait-1"
@@ -411,6 +413,7 @@ class RunnerInvocation:
     argv: tuple[str, ...]
     cwd: Path
     candidate_context: RunnerCandidateContext | None = None
+    environment: RunnerEnvironment = field(default_factory=build_runner_environment)
 
     def __post_init__(self) -> None:
         if (not isinstance(self.argv, tuple) or not self.argv
@@ -422,6 +425,8 @@ class RunnerInvocation:
                 and not isinstance(self.candidate_context, RunnerCandidateContext)):
             raise TypeError(
                 "candidate_context must be a RunnerCandidateContext or None")
+        if not isinstance(self.environment, RunnerEnvironment):
+            raise TypeError("environment must be a RunnerEnvironment")
 
 
 @dataclass(frozen=True)
@@ -449,6 +454,7 @@ def host_boot_identity() -> str:
             result = subprocess.run(
                 [str(executable), "-n", "kern.boottime"],
                 capture_output=True, text=True, check=False,
+                env=build_runner_environment().as_dict(),
             )
         except OSError as error:
             raise ProcessIdentityUnavailable(
@@ -643,7 +649,8 @@ def heartbeat_freshness(
     )
 
 
-def _resolved_executable(argv0: str, cwd: Path) -> Path:
+def _resolved_executable(
+        argv0: str, cwd: Path, environment: RunnerEnvironment) -> Path:
     value = _nonempty(argv0, "argv[0]")
     candidate: Path | None
     if os.sep in value or (os.altsep is not None and os.altsep in value):
@@ -654,7 +661,7 @@ def _resolved_executable(argv0: str, cwd: Path) -> Path:
         except OSError as error:
             raise SupervisorLaunchRefused(value, f"executable is unavailable: {error}") from error
     else:
-        found = shutil.which(value)
+        found = shutil.which(value, path=environment.values.get("PATH", ""))
         if found is None:
             raise SupervisorLaunchRefused(value, "executable is unavailable on PATH")
         candidate = Path(found).resolve()
@@ -853,16 +860,6 @@ class Supervisor:
             return f"identity-unknown:{type(error).__name__}"
         return observation.state.value + ":" + observation.reason
 
-    def _supervisor_environment(self) -> dict[str, str]:
-        environment = dict(os.environ)
-        package_root = str(Path(__file__).resolve().parents[2])
-        existing = environment.get("PYTHONPATH", "")
-        entries = [entry for entry in existing.split(os.pathsep) if entry]
-        if package_root not in entries:
-            entries.insert(0, package_root)
-        environment["PYTHONPATH"] = os.pathsep.join(entries)
-        return environment
-
     def launch(self, intent: RunnerLaunchIntent) -> DetachedSupervisorHandle:
         """Fence one detached supervisor at the exact callback-internal spawn edge."""
         if not isinstance(intent, RunnerLaunchIntent):
@@ -894,7 +891,8 @@ class Supervisor:
         mismatch = _candidate_context_mismatch(cwd, invocation.candidate_context)
         if mismatch is not None:
             raise SupervisorLaunchRefused(intent.action_id, mismatch)
-        executable = _resolved_executable(invocation.argv[0], cwd)
+        executable = _resolved_executable(
+            invocation.argv[0], cwd, invocation.environment)
         principal = self._principal_for_intent(intent)
         worker_result_binding = self._worker_result_binding(intent.action_id, intent.run_id)
         if worker_result_binding is not None and invocation.candidate_context is not None:
@@ -915,6 +913,7 @@ class Supervisor:
             "fencing_epoch": intent.fencing_epoch,
             "entity_version": principal.entity_version,
             "invocation_digest": digest,
+            "environment_digest": invocation.environment.digest,
             "launch_token": intent.launch_token,
             "completion_marker_path": str(expected_marker),
             "argv": [str(executable), *invocation.argv[1:]],
@@ -938,11 +937,12 @@ class Supervisor:
                 sys.executable, "-m", "waystone.runs.supervisor",
                 "--supervise", str(launch_path),
             )
+            package_root = Path(__file__).resolve().parents[2]
             try:
                 process = subprocess.Popen(
                     command,
-                    cwd=self.project_root,
-                    env=self._supervisor_environment(),
+                    cwd=package_root,
+                    env=invocation.environment.as_dict(),
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
@@ -1127,10 +1127,12 @@ class Supervisor:
 
 _LAUNCH_FIELDS = {
     "schema", "project_root", "run_id", "job_id", "action_id", "owner_token",
-    "fencing_epoch", "entity_version", "invocation_digest", "launch_token",
-    "completion_marker_path", "argv", "cwd", "heartbeat_interval", "lease_ttl",
-    "worker_result_binding", "candidate_context",
+    "fencing_epoch", "entity_version", "invocation_digest", "environment_digest",
+    "launch_token", "completion_marker_path", "argv", "cwd",
+    "heartbeat_interval", "lease_ttl", "worker_result_binding",
+    "candidate_context",
 }
+_LEGACY_LAUNCH_FIELDS = _LAUNCH_FIELDS - {"environment_digest"}
 _RUNTIME_FIELDS = {
     "schema", "run_id", "job_id", "action_id", "owner_token", "fencing_epoch",
     "entity_version", "invocation_digest", "launch_token", "started_at",
@@ -1158,12 +1160,18 @@ def _read_launch(path: Path) -> dict[str, object]:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise SupervisorStateError(path, f"launch evidence is unreadable: {error}") from error
+    schema = raw.get("schema") if isinstance(raw, dict) else None
+    if schema not in {_LAUNCH_SCHEMA, _LEGACY_LAUNCH_SCHEMA}:
+        raise SupervisorStateError(path, "launch schema is unsupported")
+    base_fields = (
+        _LAUNCH_FIELDS if schema == _LAUNCH_SCHEMA else _LEGACY_LAUNCH_FIELDS)
     optional = {"worker_result_binding", "candidate_context"}
     present_optional = optional & set(raw) if isinstance(raw, dict) else set()
-    fields = _LAUNCH_FIELDS - (optional - present_optional)
-    payload = _read_object(path, schema=_LAUNCH_SCHEMA, fields=fields)
+    fields = base_fields - (optional - present_optional)
+    payload = _read_object(path, schema=schema, fields=fields)
     payload.setdefault("worker_result_binding", None)
     payload.setdefault("candidate_context", None)
+    payload.setdefault("environment_digest", None)
     try:
         for field in (
                 "project_root", "run_id", "job_id", "action_id", "owner_token",
@@ -1172,6 +1180,10 @@ def _read_launch(path: Path) -> dict[str, object]:
         _positive_int(payload["fencing_epoch"], "launch.fencing_epoch")
         _nonnegative_int(payload["entity_version"], "launch.entity_version")
         validate_sha256_digest(payload["invocation_digest"])
+        if payload["environment_digest"] is not None:
+            validate_sha256_digest(payload["environment_digest"])
+        if schema == _LAUNCH_SCHEMA and payload["environment_digest"] is None:
+            raise ValueError("launch environment_digest is required")
         _positive_finite(payload["heartbeat_interval"], "launch.heartbeat_interval")
         ttl = _positive_finite(payload["lease_ttl"], "launch.lease_ttl")
         if ttl <= payload["heartbeat_interval"]:
@@ -1331,6 +1343,13 @@ def _wait_path(project_root: Path, action_id: str) -> Path:
 
 def _run_detached_supervisor(launch_path: Path) -> int:
     launch = _read_launch(Path(launch_path))
+    environment = build_runner_environment()
+    if (launch["environment_digest"] is None
+            or environment.digest != launch["environment_digest"]):
+        raise SupervisorStateError(
+            Path(launch_path),
+            "supervisor child environment differs from the frozen launch",
+        )
     project_root = Path(launch["project_root"])
     action_id = launch["action_id"]
     expected_launch_path = (
@@ -1378,6 +1397,7 @@ def _run_detached_supervisor(launch_path: Path) -> int:
                 process = subprocess.Popen(
                     launch["argv"],
                     cwd=launch["cwd"],
+                    env=environment.as_dict(),
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,

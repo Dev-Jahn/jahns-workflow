@@ -31,6 +31,7 @@ MODULES = (
     "test_run_lease",
     "test_run_store",
     "test_run_supervisor",
+    "test_runner_env_provenance",
     "test_run_transport",
     "test_run_verify",
     "test_run_spec",
