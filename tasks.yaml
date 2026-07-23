@@ -715,7 +715,7 @@ tasks:
   - id: chore/013-release-prep
     notes: "staleness 조사(2026-07-22): ①README·docs/CONVENTIONS.md·references/·skills/·templates/·hooks는 이미 0.13 현행으로 확인 — 재작성 불요, docs gate 통과 여부만 확인 ②release-to-main.sh 정리 필요: SHIP_PATHS에 삭제된 스크립트 6종 잔존(dashboard/delegate/lanes/review/round/ssot.py)+waystone/ 패키지·신 CLI 모듈 미반영 여부 점검, DEV_ONLY_PATHS의 SSOT.md, L112 'SSOT §3' 주석 좌표 소멸 ③templates/project-policy-schema.json의 delegation-*-v1 rule 2종 소비자 grep 0건 — 생사 확정 후 처분 ④(0.11.x의) run_tests.py 버전 핀 규율이 0.13 suite에 없음 — 버전 결속 게이트 재도입 여부 판단"
     title: "0.13 release 준비 — README·docs를 신 canonical surface로 재작성, release-to-main.sh SHIP_PATHS 갱신(삭제된 SSOT.md 참조 제거·PROJECT_BRIEF.md/waystone 패키지 반영), docs gate 충족 확인; 착수 시점은 owner 결정"
-    status: "pending"
+    status: "active"
   - id: fix/promote-actor-evidence-separation
     result: "dev a2c661d 머지(+418d6b1 cli 소정리) — promote e2e 완주, suite 249 green, 수리 2회전(checkout_identity digest화 + run-owned candidate exact-object 검증), 후속 2건 분리 등록"
     title: "promote의 verifier/reviewer/decision actor·evidence 실분리: engine promote handler가 independent-verify·integration-decision·adversarial-review 결과를 전부 evaluation evidence digest로 alias(engine.py:894-902)하고 execute_assurance_dag는 action 이름 집합·mutation 경계만 검사 — VerifierEvidence 실제 생성/로드, 별도 coordinator decision artifact, lineage-결속 ReviewCycle 소비, accepted-risks→declared_risks 컴파일 연결(public run start 미전달로 risk-gated review 사실상 비활성) + 회귀 3종(동일 artifact/actor 겸직 거부·declared risk에 reviewer artifact 부재 거부·타 candidate digest 참조 거부) (외부 리뷰 필수수정 1)"
@@ -730,31 +730,31 @@ tasks:
     origin: "review-2026-07-22-013-intent-control-plane"
   - id: fix/brief-role-model-realignment
     title: "PROJECT_BRIEF commitment/roles-over-model-names(6-role: main·orchestrator·implementer·clerk·verifier·reviewer)를 canonical 4-role(coordinator/worker/verifier/reviewer)로 realignment 후 재-adopt: binding commitment가 코드(jobs/domain.py:9-13)와 모순 — fact 개정 + owner adoption record 재결속, 코드를 6-role로 되돌리지 않음 (외부 리뷰 정합성 지적; ruling 자율확정: 0.13 mandate의 4-role이 canonical)"
-    status: "pending"
+    status: "active"
     severity: "major"
     origin: "review-2026-07-22-013-intent-control-plane"
   - id: feat/workbrief-scaffold
     title: "coordinator burden 축소용 deterministic scaffold: run start --work-brief·close --outcome이 canonical sorted compact JSON 수제작 요구(run_group.py:53·79·84) — brief_id/revision·ProjectFactRef·binding digest·lineage·schema boilerplate·CAS ref는 harness script가 생성하고 모델은 why-now·desired delta·semantic context·fixed/free/escalation·expected evidence만 작성하게 skill 내부 scaffold 제공, 신규 사용자 명령 추가 없이 (외부 리뷰 UX 권고)"
-    status: "pending"
+    status: "active"
     severity: "major"
     origin: "review-2026-07-22-013-intent-control-plane"
   - id: spike/013-lifecycle-dogfood
     title: "0.13 lifecycle 관료제화 검증 dogfood 3종: ① 불확실한 architecture exploration(semantic brief·context request가 판단 품질을 실제로 높이는가) ② confirmed major+accept-risk(task 미생성·objective-first status 정상 확인) ③ 평범한 국소 bugfix(가짜 hypothesis나 과잉 evaluation ceremony를 요구하는지 — explore learning criterion은 hypothesis/question만 허용, owner-request 불가: jobs/completion.py:594-600) — 불편이 실제 반복되기 전 구현 금지, 필요시 owner request의 nonbinding explore objective 허용·low-risk maintenance assurance profile·deterministic focused check의 최소 evidence 인정 검토 (외부 리뷰 전략 권고)"
-    status: "pending"
+    status: "active"
     severity: "minor"
     origin: "review-2026-07-22-013-intent-control-plane"
   - id: docs/013-v1-execution-scope
     title: "0.13 v1 실행 범위 문서 한정: staged execution이 non-external을 거부하고 직접 실행 가능한 Codex binding만 허용(runs/engine.py:429) — v1 지원 범위를 'external Codex worker/evaluator'로 명시하고 in-session/subagent carrier 지원 주장 금지, context-transfer-cost 기반 canonical routing은 미구현임을 문서화, README 재작성(chore/013-release-prep)과 정합 (외부 리뷰 §3 남은 한계)"
-    status: "pending"
+    status: "active"
     severity: "minor"
     origin: "review-2026-07-22-013-intent-control-plane"
   - id: fix/promote-reject-terminal-closeout
     title: "정당한 verifier reject의 promotion terminal 상태 설계: reject IntegrationDecision 발행 → accept-only evidence 검증 거부 → published verifier evidence terminal → effect retry 거부 고착으로 run이 closeout-ready에 도달 불가 — 실패 위장이나 evidence 재사용은 없으나(정직) closeout 가능한 terminal reject 상태와 retry lineage 정책을 promotion DAG에 함께 설계 필요 (w0723 promote-sep 수리 회전 실측, 임시 reject fixture로 재현)"
-    status: "pending"
+    status: "active"
     severity: "minor"
     origin: "review-2026-07-22-013-intent-control-plane"
   - id: chore/store-transient-read-ioerror
     title: "resume polling 중 transient sqlite 'disk I/O error' 조사: detached supervisor 종료와 빠른 resume poll이 겹친 시점 RunStore.get_run()의 transition chain SELECT에서 sqlite3.OperationalError 2회 재현, 다음 poll에서 자연 회복 — APFS/WAL 상호작용 원인 규명 후 typed transient 분류 여부 판단(무리한 retry/fallback 추가 금지, w0723 promote-sep 수리 회전 관측)"
-    status: "pending"
+    status: "active"
     severity: "minor"
     origin: "review-2026-07-22-013-intent-control-plane"
