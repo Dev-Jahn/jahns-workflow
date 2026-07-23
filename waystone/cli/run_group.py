@@ -10,6 +10,7 @@ from waystone.adapters.git import GitReadError, git_full_sha, git_rc, git_read_b
 from waystone.core import WorkflowError
 from waystone.jobs import completion
 from waystone.jobs.profile import RunAssembly as ProductionRunAssembly, assemble_run
+from waystone.jobs.run_scaffold import scaffold_outcome_delta, scaffold_work_brief
 from waystone.jobs.work_brief import import_owner_source_file, parse_work_brief_bytes
 from waystone.project.brief import ProjectFactRef, read_project_frame_at_commit
 from waystone.project.context import resolve_project_context
@@ -49,11 +50,15 @@ def _regular_bytes(path: Path, label: str) -> bytes:
         raise ActionPlanRefusal(f"cannot read {label}: {error}") from error
 
 
-def _start_arguments(args: list[str]) -> tuple[str, Path, Path | None, str | None, Path | None]:
+def _start_arguments(
+    args: list[str],
+) -> tuple[str, Path, bool, Path | None, str | None, Path | None]:
     if not args:
-        raise ActionPlanRefusal("start requires a task id and --work-brief <file>")
+        raise ActionPlanRefusal(
+            "start requires a task id and exactly one of --work-brief or --work-brief-draft")
     task_id = args[0]
     work_brief = None
+    semantic_draft = False
     owner_request = None
     stage = None
     from_worktree = None
@@ -61,14 +66,25 @@ def _start_arguments(args: list[str]) -> tuple[str, Path, Path | None, str | Non
     seen: set[str] = set()
     while index < len(args):
         option = args[index]
-        if option not in {"--work-brief", "--owner-request", "--stage", "--from-worktree"}:
+        if option not in {
+                "--work-brief", "--work-brief-draft", "--owner-request", "--stage",
+                "--from-worktree"}:
             raise ActionPlanRefusal(f"unexpected start argument {option!r}")
         if option in seen or index + 1 >= len(args):
             raise ActionPlanRefusal(f"{option} requires exactly one value")
         seen.add(option)
         value = args[index + 1]
         if option == "--work-brief":
+            if work_brief is not None:
+                raise ActionPlanRefusal(
+                    "start accepts exactly one of --work-brief or --work-brief-draft")
             work_brief = Path(value)
+        elif option == "--work-brief-draft":
+            if work_brief is not None:
+                raise ActionPlanRefusal(
+                    "start accepts exactly one of --work-brief or --work-brief-draft")
+            work_brief = Path(value)
+            semantic_draft = True
         elif option == "--owner-request":
             owner_request = Path(value)
         elif option == "--stage":
@@ -77,14 +93,16 @@ def _start_arguments(args: list[str]) -> tuple[str, Path, Path | None, str | Non
             from_worktree = Path(value)
         index += 2
     if work_brief is None:
-        raise ActionPlanRefusal("start requires --work-brief <file>")
-    return task_id, work_brief, owner_request, stage, from_worktree
+        raise ActionPlanRefusal(
+            "start requires exactly one of --work-brief or --work-brief-draft")
+    return task_id, work_brief, semantic_draft, owner_request, stage, from_worktree
 
 
-def _close_arguments(args: list[str]) -> tuple[str, Path]:
-    if len(args) != 3 or args[1] != "--outcome":
-        raise ActionPlanRefusal("close requires <run-id> --outcome <file>")
-    return args[0], Path(args[2])
+def _close_arguments(args: list[str]) -> tuple[str, Path, bool]:
+    if len(args) != 3 or args[1] not in {"--outcome", "--outcome-draft"}:
+        raise ActionPlanRefusal(
+            "close requires <run-id> and exactly one of --outcome or --outcome-draft")
+    return args[0], Path(args[2]), args[1] == "--outcome-draft"
 
 
 def _project_fact_refs(payload: object) -> tuple[ProjectFactRef, ...]:
@@ -283,10 +301,14 @@ def _start_with_assembly(
     assembly: ProductionRunAssembly,
     task_id: str,
     work_brief_path: Path,
+    semantic_draft: bool,
     owner_request_path: Path | None,
     stage_assertion: str | None,
 ):
-    brief_content = _regular_bytes(work_brief_path, "WorkBrief")
+    brief_content = _regular_bytes(
+        work_brief_path, "WorkBrief semantic draft" if semantic_draft else "WorkBrief")
+    if semantic_draft:
+        brief_content = scaffold_work_brief(assembly, task_id, brief_content)
     assembly.artifact_store.write(brief_content)
     brief = parse_work_brief_bytes(
         brief_content, artifact_store=assembly.artifact_store)
@@ -503,7 +525,8 @@ def main(argv: list[str]) -> int:
         command, args = argv[0], argv[1:]
 
         if command == "start":
-            task_id, work_brief, owner_request, stage, from_worktree = _start_arguments(args)
+            (task_id, work_brief, semantic_draft, owner_request,
+             stage, from_worktree) = _start_arguments(args)
             # ProjectContext is proven before profile/config/intent/DB/file ingress.
             context = resolve_project_context(
                 Path.cwd(),
@@ -512,7 +535,7 @@ def main(argv: list[str]) -> int:
             )
             with assemble_run(context) as assembly:
                 result = _start_with_assembly(
-                    assembly, task_id, work_brief, owner_request, stage)
+                    assembly, task_id, work_brief, semantic_draft, owner_request, stage)
             print(
                 f"Run {result.spec.run_id} started at {result.spec.lifecycle_stage.value} "
                 f"with RunSpec revision {result.spec.revision}."
@@ -530,10 +553,16 @@ def main(argv: list[str]) -> int:
             return 0
 
         if command == "close":
-            identity, outcome_path = _close_arguments(args)
+            identity, outcome_path, semantic_draft = _close_arguments(args)
             context = resolve_project_context(Path.cwd())
-            outcome_content = _regular_bytes(outcome_path, "OutcomeDelta")
+            outcome_content = _regular_bytes(
+                outcome_path,
+                "OutcomeDelta semantic draft" if semantic_draft else "OutcomeDelta",
+            )
             with assemble_run(context) as assembly:
+                if semantic_draft:
+                    outcome_content = scaffold_outcome_delta(
+                        assembly, identity, outcome_content)
                 result = StagedRunEngine(assembly).close(identity, outcome_content)
             print(
                 f"Run {result.run_id} completed with outcome ledger commit "

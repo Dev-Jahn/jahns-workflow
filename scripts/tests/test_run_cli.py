@@ -24,9 +24,12 @@ import yaml
 from test_work_brief import init_project, item, payload
 from waystone.cli import review_group, run_group
 from waystone.features.review_layout import new_run_id
-from waystone.jobs import completion
+from waystone.jobs import completion, work_brief
 from waystone.jobs.domain import Role
-from waystone.jobs.profile import read_profile
+from waystone.jobs.profile import assemble_run, read_profile
+from waystone.jobs.run_scaffold import RunScaffoldRefusal, scaffold_work_brief
+from waystone.project.brief import read_project_frame_at_commit
+from waystone.project.context import resolve_project_context
 from waystone.runs.artifacts import ArtifactStore
 from waystone.runs.spec import load_run_spec
 from waystone.runs.store import (
@@ -123,6 +126,34 @@ class RunCliTests(unittest.TestCase):
                 yield output
         finally:
             os.chdir(old)
+
+    def semantic_draft(self, stage: str, objective_fact_id: str) -> dict:
+        return {
+            "lifecycle_stage": stage,
+            "objective_fact_id": objective_fact_id,
+            "desired_delta": "Compare the candidate approaches.",
+            "why_now": "The current uncertainty blocks the first supported result.",
+            "current_state": ["The baseline does not yet contain a candidate."],
+            "decisions": {
+                "fixed": ["Preserve the intended result."],
+                "worker_may_choose": ["Choose the smallest sound comparison."],
+                "requires_escalation": ["Escalate before widening the task scope."],
+            },
+            "constraints": ["Keep the public seam stable."],
+            "non_goals": ["Do not build a distributed scheduler."],
+            "known_failures": [],
+            "evidence_expected": [{
+                "criterion_id": "candidate-produced",
+                "kind": "candidate",
+                "text": "Produce a reviewable candidate.",
+            }],
+            "references": [{
+                "path": "src.py",
+                "anchor": "baseline",
+                "purpose": "Current implementation seam.",
+            }],
+            "open_questions": ["Which candidate is the smallest sound option?"],
+        }
 
     def test_start_uses_production_assembly_and_freezes_typed_ingress(self):
         binary = self.install_fixture_codex()
@@ -231,6 +262,230 @@ class RunCliTests(unittest.TestCase):
                     filesystem="apfs", mount_point=Path("/"), writable=True)), \
                 RunStore.open(self.root) as store:
             self.assertEqual(store.get_run(run_id).state, "completed")
+
+    def test_scaffold_e2e_explore_starts_and_closes_from_semantic_drafts(self):
+        brief_draft = self.base / "work-brief-draft.yaml"
+        brief_draft.write_text(yaml.safe_dump(
+            self.semantic_draft("explore", "hypothesis/solver"), sort_keys=False,
+        ), encoding="utf-8")
+        binary = self.install_fixture_codex()
+        start_head = git(self.root, "rev-parse", "HEAD").stdout.strip()
+        start_frame = read_project_frame_at_commit(self.root, start_head)
+
+        with self.runtime() as output, mock.patch.dict(
+                os.environ, {"PATH": f"{binary.parent}{os.pathsep}{os.environ['PATH']}"}):
+            self.assertEqual(run_group.main([
+                "start", "feat/semantic-brief",
+                "--work-brief-draft", str(brief_draft),
+                "--stage", "explore",
+            ]), 0, output.getvalue())
+            run_id = output.getvalue().split()[1]
+            self._resume_until_closeout(output, run_id)
+            spec = load_run_spec(run_id, start=self.root)
+            brief_bytes = ArtifactStore(self.root).read(spec.work_brief.digest)
+            brief = work_brief.parse_work_brief_bytes(brief_bytes)
+            self.assertEqual(brief_bytes, brief.canonical_bytes())
+            self.assertEqual(brief.task_id, "feat/semantic-brief")
+            self.assertEqual(brief.revision, 1)
+            self.assertEqual(brief.objective.ref.to_dict(), start_frame.fact_ref(
+                "hypothesis/solver").to_dict())
+            self.assertEqual(brief.objective.desired_delta, "Compare the candidate approaches.")
+            self.assertEqual(brief.current_state[0].text,
+                             "The baseline does not yet contain a candidate.")
+            self.assertEqual(brief.references[0].digest,
+                             "sha256:" + hashlib.sha256(b"baseline = False\n").hexdigest())
+
+            outcome_draft = self.base / "outcome-draft.yaml"
+            outcome_draft.write_text(yaml.safe_dump({
+                "kind": "no-objective-delta",
+                "summary": "The explore run produced a candidate for evaluation.",
+                "evidence_refs": [],
+                "finding_refs": [],
+                "rationale": "Evaluation is required before claiming objective progress.",
+            }, sort_keys=False), encoding="utf-8")
+            output.seek(0)
+            output.truncate(0)
+            self.assertEqual(run_group.main([
+                "close", run_id, "--outcome-draft", str(outcome_draft),
+            ]), 0, output.getvalue())
+
+        with mock.patch(
+                "waystone.runs.store._probe_state_filesystem",
+                return_value=FilesystemInfo(
+                    filesystem="apfs", mount_point=Path("/"), writable=True)), \
+                RunStore.open(self.root) as store:
+            self.assertEqual(store.get_run(run_id).state, "completed")
+
+    def test_scaffold_refuses_missing_semantic_fields_without_creating_a_run(self):
+        draft = self.base / "incomplete-draft.yaml"
+        draft.write_text(yaml.safe_dump({
+            "lifecycle_stage": "explore",
+            "objective_fact_id": "hypothesis/solver",
+            "desired_delta": "Compare candidates.",
+        }, sort_keys=False), encoding="utf-8")
+
+        with self.runtime() as output:
+            context = resolve_project_context(Path.cwd(), require_run_input=True)
+            with assemble_run(context) as assembly, self.assertRaisesRegex(
+                    RunScaffoldRefusal, "missing .*why_now"):
+                scaffold_work_brief(
+                    assembly, "feat/semantic-brief", draft.read_bytes())
+            output.seek(0)
+            output.truncate(0)
+            result = run_group.main([
+                "start", "feat/semantic-brief", "--work-brief-draft", str(draft),
+            ])
+
+        self.assertEqual(result, 2, output.getvalue())
+        failure = json.loads(output.getvalue())
+        self.assertEqual(failure["code"], "action_plan_invalid")
+        with mock.patch(
+                "waystone.runs.store._probe_state_filesystem",
+                return_value=FilesystemInfo(
+                    filesystem="apfs", mount_point=Path("/"), writable=True)), \
+                RunStore.open(self.root) as store:
+            count = store._connection.execute(  # noqa: SLF001
+                "SELECT count(*) FROM runs").fetchone()[0]
+        self.assertEqual(count, 0)
+
+    def test_scaffold_derives_candidate_evaluation_and_promotion_lineage(self):
+        binary = self.install_fixture_codex()
+        path = f"{binary.parent}{os.pathsep}{os.environ['PATH']}"
+        explore_draft = self.base / "explore-draft.yaml"
+        explore_draft.write_text(yaml.safe_dump(
+            self.semantic_draft("explore", "hypothesis/solver"), sort_keys=False,
+        ), encoding="utf-8")
+        with self.runtime() as output, mock.patch.dict(os.environ, {"PATH": path}):
+            self.assertEqual(run_group.main([
+                "start", "feat/semantic-brief", "--work-brief-draft", str(explore_draft),
+            ]), 0, output.getvalue())
+            explore_id = output.getvalue().split()[1]
+            self._resume_until_closeout(output, explore_id)
+            explore_outcome = self.base / "explore-outcome-draft.yaml"
+            explore_outcome.write_text(yaml.safe_dump({
+                "kind": "no-objective-delta",
+                "summary": "The candidate is ready for evaluation.",
+                "evidence_refs": [],
+                "finding_refs": [],
+                "rationale": "Evaluation remains outstanding.",
+            }, sort_keys=False), encoding="utf-8")
+            output.seek(0)
+            output.truncate(0)
+            self.assertEqual(run_group.main([
+                "close", explore_id, "--outcome-draft", str(explore_outcome),
+            ]), 0, output.getvalue())
+
+        head = git(self.root, "rev-parse", "HEAD").stdout.strip()
+        frame = read_project_frame_at_commit(self.root, head)
+        evaluation_body = {
+            "schema": "waystone-evaluation-spec-1",
+            "evaluation_id": new_run_id(),
+            "generation": 1,
+            "objective_ref": frame.fact_ref("commitment/outcome").to_dict(),
+            "criteria": [{
+                "id": "representative", "metric": "exact-match",
+                "operator": "gte", "threshold": 1,
+            }],
+            "datasets": [{
+                "id": "fixture", "artifact_reference_id": "dataset:fixture",
+                "digest": "sha256:" + "d" * 64, "visibility": "harness-only",
+            }],
+            "seed": 7,
+            "supersedes_spec_digest": None,
+        }
+        evaluation_path = self.root / "docs/evaluations/scaffold/spec.yaml"
+        evaluation_path.parent.mkdir(parents=True)
+        evaluation_path.write_text(
+            yaml.safe_dump(evaluation_body, sort_keys=False), encoding="utf-8")
+        git(self.root, "add", str(evaluation_path.relative_to(self.root)))
+        self.assertEqual(git(self.root, "commit", "-qm", "scaffold evaluation").returncode, 0)
+        evaluate = self.semantic_draft("evaluate", "commitment/outcome")
+        evaluate["evaluation_spec_path"] = str(evaluation_path.relative_to(self.root))
+        evaluate["evidence_expected"] = [{
+            "criterion_id": "representative",
+            "kind": "evaluation-evidence",
+            "text": "Measure the frozen candidate on the representative fixture.",
+        }]
+        evaluate_draft = self.base / "evaluate-draft.yaml"
+        evaluate_draft.write_text(
+            yaml.safe_dump(evaluate, sort_keys=False), encoding="utf-8")
+
+        with self.runtime() as output, mock.patch.dict(os.environ, {"PATH": path}):
+            self.assertEqual(run_group.main([
+                "start", "feat/semantic-brief", "--work-brief-draft", str(evaluate_draft),
+            ]), 0, output.getvalue())
+            evaluate_id = output.getvalue().split()[1]
+            evaluate_spec = load_run_spec(evaluate_id, start=self.root)
+            self.assertEqual(
+                evaluate_spec.candidate["reference_id"], f"candidate:{explore_id}")
+            self._resume_until_closeout(output, evaluate_id)
+            evaluate_outcome = self.base / "evaluate-outcome-draft.yaml"
+            evaluate_outcome.write_text(yaml.safe_dump({
+                "kind": "no-objective-delta",
+                "summary": "The representative evaluation is frozen for promotion.",
+                "evidence_refs": [],
+                "finding_refs": [],
+                "rationale": "Promotion has not yet established objective progress.",
+            }, sort_keys=False), encoding="utf-8")
+            output.seek(0)
+            output.truncate(0)
+            self.assertEqual(run_group.main([
+                "close", evaluate_id, "--outcome-draft", str(evaluate_outcome),
+            ]), 0, output.getvalue())
+
+        records = self.root / "docs/promotion/scaffold"
+        records.mkdir(parents=True)
+        records.joinpath("regression.txt").write_text(
+            "representative regression\n", encoding="utf-8")
+        records.joinpath("scope.txt").write_text("candidate.txt\n", encoding="utf-8")
+        records.joinpath("risks.txt").write_text("none\n", encoding="utf-8")
+        git(self.root, "add", "docs/promotion/scaffold/regression.txt",
+            "docs/promotion/scaffold/scope.txt", "docs/promotion/scaffold/risks.txt")
+        self.assertEqual(git(
+            self.root, "commit", "-qm", "scaffold promotion records").returncode, 0)
+        promote = self.semantic_draft("promote", "commitment/outcome")
+        promote["promotion_records"] = {
+            "regression_contract": "docs/promotion/scaffold/regression.txt",
+            "supported_scope": "docs/promotion/scaffold/scope.txt",
+            "accepted_risks": "docs/promotion/scaffold/risks.txt",
+        }
+        promote["evidence_expected"] = [{
+            "criterion_id": "representative",
+            "kind": "regression-contract",
+            "text": "Promote only the passed representative generation.",
+        }]
+        with self.runtime():
+            context = resolve_project_context(Path.cwd(), require_run_input=True)
+            with assemble_run(context) as assembly:
+                content = scaffold_work_brief(
+                    assembly, "feat/semantic-brief",
+                    yaml.safe_dump(promote, sort_keys=False).encode("utf-8"),
+                )
+        brief = work_brief.parse_work_brief_bytes(content)
+        lineage_sources = {
+            source.payload["reference_id"]
+            for source in brief.current_state[-1].sources
+        }
+        self.assertIn(f"candidate:{explore_id}", lineage_sources)
+        self.assertIn(f"evaluation-evidence:{evaluate_id}", lineage_sources)
+        self.assertIn("regression-contract:scaffold", lineage_sources)
+        self.assertIn("supported-scope:scaffold", lineage_sources)
+        self.assertIn("accepted-risks:scaffold", lineage_sources)
+        promote_draft = self.base / "promote-draft.yaml"
+        promote_draft.write_text(
+            yaml.safe_dump(promote, sort_keys=False), encoding="utf-8")
+        with self.runtime() as output, mock.patch.dict(os.environ, {"PATH": path}):
+            self.assertEqual(run_group.main([
+                "start", "feat/semantic-brief", "--work-brief-draft", str(promote_draft),
+            ]), 0, output.getvalue())
+            promote_id = output.getvalue().split()[1]
+            promote_spec = load_run_spec(promote_id, start=self.root)
+            self.assertEqual(
+                promote_spec.candidate["reference_id"], f"candidate:{explore_id}")
+            self.assertEqual(
+                promote_spec.evaluation["evidence"]["reference_id"],
+                f"evaluation-evidence:{evaluate_id}",
+            )
 
     def test_e2e6_public_evaluate_then_promote_executes_frozen_full_chain(self):
         evaluation_body = {
