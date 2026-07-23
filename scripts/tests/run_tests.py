@@ -42,6 +42,7 @@ MODULES = (
     "test_review_runs_layout",
     "test_review_findings",
     "test_review_protocol",
+    "test_review_canonical_root",
     "test_review_settlement",
     "test_improve",
     "test_overlay",

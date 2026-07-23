@@ -30,7 +30,11 @@ class ReviewProtocolTests(unittest.TestCase):
         promotion_run_id = new_run_id()
         review_run_id = new_run_id()
         with tempfile.TemporaryDirectory() as directory, \
-                mock.patch.object(review_group, "_root", return_value=Path(directory)), \
+                mock.patch.object(
+                    review_group,
+                    "_review_context",
+                    return_value=SimpleNamespace(canonical_root=Path(directory)),
+                ), \
                 mock.patch.object(
                     review_group, "attach_review",
                     return_value=SimpleNamespace(cycle=1),

@@ -11,7 +11,12 @@ import yaml
 
 from waystone.core import WorkflowError
 from waystone.features import review_layout
-from waystone.project import find_project_root, load_config, load_tasks, require_initialized_root, hold_project_lock
+from waystone.project import load_config, load_tasks, require_initialized_root, hold_project_lock
+from waystone.project.context import (
+    CanonicalRootIsLinkedWorktree,
+    ProjectContext,
+    resolve_project_context,
+)
 from waystone.project import tasks_cli
 from waystone.reviews import findings
 
@@ -207,9 +212,15 @@ def _task_id(finding_id: str) -> str:
     return "fix/review-finding-" + finding_id.replace("-", "")[:32]
 
 
-def materialize(root: Path, run_id: str, finding_id: str) -> str:
+def materialize(context: ProjectContext, run_id: str, finding_id: str) -> str:
     """Materialize only explicitly selected remediation dispositions into tasks.yaml."""
-    root = Path(root).resolve()
+    if not isinstance(context, ProjectContext):
+        raise MaterializationRefused(
+            "finding materialization requires canonical ProjectContext proof")
+    if not context.is_canonical_checkout:
+        raise CanonicalRootIsLinkedWorktree(
+            "review mutation cannot use a linked worktree as project authority")
+    root = context.canonical_root
     require_initialized_root(root)
     reviews_dir = _reviews_dir(root)
     projection = findings.load_finding(reviews_dir, run_id, finding_id)
@@ -252,11 +263,12 @@ def materialize(root: Path, run_id: str, finding_id: str) -> str:
     return task_id
 
 
-def _root(value: str | None) -> Path:
-    root = Path(value).resolve() if value else find_project_root(Path.cwd())
-    if root is None:
-        raise ReviewGroupError("review: no initialized project; pass the project root")
-    return root
+def _review_context(value: str | None) -> ProjectContext:
+    context = resolve_project_context(Path.cwd() if value is None else Path(value))
+    if not context.is_canonical_checkout:
+        raise CanonicalRootIsLinkedWorktree(
+            "review mutation cannot use a linked worktree as project authority")
+    return context
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -283,7 +295,8 @@ def main(argv: list[str] | None = None) -> int:
     materialize_parser.add_argument("--root")
     args = parser.parse_args(argv)
     try:
-        root = _root(getattr(args, "root", None))
+        context = _review_context(getattr(args, "root", None))
+        root = context.canonical_root
         if args.command == "ingest":
             result = ingest_feedback(
                 root, args.run_id, args.file, binding_digest=args.binding_digest)
@@ -298,10 +311,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"review disposition: recorded {result.payload['revision']:04d}.yaml")
         else:
             run_id = args.run_id or resolve_finding_run(root, args.finding_id)
-            task_id = materialize(root, run_id, args.finding_id)
+            task_id = materialize(context, run_id, args.finding_id)
             print(f"review materialize: {task_id}")
         return 0
-    except (FindingError, ReviewGroupError, OSError, yaml.YAMLError) as error:
+    except (FindingError, ReviewGroupError, WorkflowError, OSError, yaml.YAMLError) as error:
         print(f"waystone review: {error}", file=sys.stderr)
         return 1
 
@@ -314,7 +327,6 @@ def attach_review(root: Path, promotion_run_id: str, review_run_id: str):
     """Attach one ingested reviewer result to its exact frozen promotion lineage."""
     from waystone.jobs.domain import Role
     from waystone.jobs.profile import assemble_run
-    from waystone.project.context import resolve_project_context
     from waystone.runs.assurance import ReviewerEvidence
     from waystone.runs.engine import StagedRunEngine
     from waystone.runs.spec import load_run_spec
@@ -412,7 +424,8 @@ def main(argv: list[str] | None = None) -> int:
     attach_parser = sub.add_parser("attach"); attach_parser.add_argument("promotion_run_id"); attach_parser.add_argument("review_run_id"); attach_parser.add_argument("--root")
     args = parser.parse_args(argv)
     try:
-        root = _root(args.root)
+        context = _review_context(args.root)
+        root = context.canonical_root
         cycle = attach_review(root, args.promotion_run_id, args.review_run_id)
         print(f"review attach: recorded promotion cycle {cycle.cycle}")
         return 0

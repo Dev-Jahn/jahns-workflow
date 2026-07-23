@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import tempfile
 import unittest
@@ -10,6 +11,7 @@ import yaml
 from test_work_brief import init_project
 from waystone.cli import review_group
 from waystone.features import review_layout
+from waystone.project.context import resolve_project_context
 from waystone.reviews import findings
 from waystone.runs.artifacts import ArtifactStore
 
@@ -24,6 +26,15 @@ class FindingChainTests(unittest.TestCase):
         self.finding_id = review_layout.new_run_id()
         self.lineage_id = review_layout.new_run_id()
         self.evidence = ArtifactStore(self.root).write(b"reproduced code observation")
+        self.machine = self.root / "machine"
+        self.machine.mkdir()
+        self.registry = self.machine / "projects.json"
+        self.registry.write_text(json.dumps({"projects": [{
+            "project_id": "project:review-findings",
+            "name": "demo",
+            "path": str(self.root.resolve()),
+        }]}), encoding="utf-8")
+        self.context = resolve_project_context(self.root, registry=self.registry)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -124,7 +135,7 @@ class FindingChainTests(unittest.TestCase):
                                       disposition="accept-risk", relevance="future"),
             root=self.root)
         with self.assertRaises(review_group.MaterializationRefused):
-            review_group.materialize(self.root, self.run_id, self.finding_id)
+            review_group.materialize(self.context, self.run_id, self.finding_id)
 
     def test_q3_owner_only_boundaries(self):
         claim = findings.write_claim(self.reviews, self.claim_payload())
@@ -165,7 +176,7 @@ class FindingChainTests(unittest.TestCase):
         findings.append_validation(
             self.reviews, self.run_id, self.finding_id, newer, root=self.root)
         with self.assertRaises(findings.StaleDisposition):
-            review_group.materialize(self.root, self.run_id, self.finding_id)
+            review_group.materialize(self.context, self.run_id, self.finding_id)
 
     def test_ingest_validate_disposition_and_materialize(self):
         (self.root / ".waystone.yml").write_text("version: 1\nproject: test\n")
@@ -190,7 +201,8 @@ class FindingChainTests(unittest.TestCase):
                                      disposition="fix-before-promotion", relevance="promotion-bound")))
         review_group.disposition_file(
             self.root, self.run_id, claim.payload["finding_id"], disposition_file)
-        task_id = review_group.materialize(self.root, self.run_id, claim.payload["finding_id"])
+        task_id = review_group.materialize(
+            self.context, self.run_id, claim.payload["finding_id"])
         registry = yaml.safe_load((self.root / "tasks.yaml").read_text())
         self.assertEqual(registry["tasks"][0]["id"], task_id)
         head = findings.disposition_head(self.reviews, self.run_id, claim.payload["finding_id"])
@@ -298,7 +310,7 @@ class FindingChainTests(unittest.TestCase):
         self.commit("realign brief", "PROJECT_BRIEF.md")
 
         with self.assertRaises(findings.FindingError) as raised:
-            review_group.materialize(self.root, self.run_id, self.finding_id)
+            review_group.materialize(self.context, self.run_id, self.finding_id)
 
         self.assertEqual(raised.exception.code, "objective-superseded")
         self.assertEqual(yaml.safe_load((self.root / "tasks.yaml").read_text())["tasks"], [])
