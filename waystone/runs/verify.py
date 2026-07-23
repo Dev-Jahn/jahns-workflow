@@ -1158,7 +1158,11 @@ def _effect_engine(
 
 
 def _refuse_successful_verifier_retry(
-        root: Path, *, run_id: str, job_id: str, invocation_digest: str) -> None:
+        root: Path, *, spec: RunSpec, plan: VerificationPlan,
+        dispatch: DispatchReady, invocation_digest: str,
+        retry_of: str | None) -> None:
+    run_id = spec.run_id
+    job_id = spec.job_id
     lineage_key = _digest(_canonical_json({
         "kind": "runner-execution",
         "run_id": run_id,
@@ -1169,7 +1173,7 @@ def _refuse_successful_verifier_retry(
     with RunStore.open(root) as store:
         with store._connection_lock:  # noqa: SLF001 - terminal lineage query
             rows = store._connection.execute(  # noqa: SLF001
-                "SELECT x.action_id FROM actions x "
+                "SELECT x.action_id, v.reference_id FROM actions x "
                 "JOIN artifacts l ON l.entity_kind = ? AND l.entity_id = x.action_id "
                 "JOIN artifacts v ON v.run_id = x.run_id "
                 "AND v.reference_id = 'verifier-evidence:' || x.action_id "
@@ -1178,11 +1182,33 @@ def _refuse_successful_verifier_retry(
                 "ORDER BY v.transition_id",
                 (EntityKind.ACTION.value, run_id, job_id, lineage_prefix),
             ).fetchall()
-    if rows:
-        terminal_action = rows[-1]["action_id"]
+    published = tuple((
+        row["action_id"],
+        _load_verifier_evidence(
+            root, row["reference_id"], spec=spec, plan=plan, dispatch=dispatch),
+    ) for row in rows)
+    successful = tuple(
+        action_id for action_id, evidence in published
+        if (all(item.passed for item in evidence.criterion_results)
+            and all(item.passed for item in evidence.engine_checks.results)
+            and not evidence.blockers)
+    )
+    if successful:
         raise EffectRetryRefused(
-            terminal_action,
+            successful[-1],
             "published verifier evidence is terminal and cannot be retried",
+        )
+    if not published:
+        return
+    if retry_of is None:
+        raise EffectRetryRefused(
+            published[-1][0],
+            "rejected verifier evidence requires explicit retry lineage",
+        )
+    if retry_of != published[-1][0]:
+        raise EffectRetryRefused(
+            retry_of,
+            "retry lineage does not name the latest rejected verifier evidence",
         )
 
 
@@ -1301,9 +1327,11 @@ def _execute_verifier_locked(
     )
     _refuse_successful_verifier_retry(
         root,
-        run_id=spec.run_id,
-        job_id=spec.job_id,
+        spec=spec,
+        plan=plan,
+        dispatch=dispatch,
         invocation_digest=invocation_digest,
+        retry_of=retry_of,
     )
     captured: list[FixtureVerifierResult] = []
     captured_checks: list[EngineCheckResult] = []

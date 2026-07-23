@@ -28,6 +28,7 @@ from waystone.runs.assurance import parse_evaluation_evidence_bytes
 from waystone.runs.effects import EffectResultState, EffectStateRefusal, GitRefEffect
 from waystone.runs.spec import RunSpec, load_run_spec
 from waystone.runs.store import EntityKind, RecordNotFoundError, TransitionReason
+from waystone.runs.verify import DecisionOutcome, IntegrationDecision, reload_integration_decision
 from waystone.runs.worker_result import CompletedWorkerResult, parse_worker_result_bytes
 
 
@@ -519,6 +520,49 @@ def _final_attempt(assembly, spec: RunSpec):
     return assembly.store.get_entity(EntityKind.ATTEMPT, row["attempt_id"])
 
 
+def _rejected_promotion_decision(
+        assembly, spec: RunSpec, attempt) -> IntegrationDecision:
+    with assembly.store._connection_lock:  # noqa: SLF001 - terminal evidence pair
+        rows = assembly.store._connection.execute(  # noqa: SLF001
+            "SELECT reference_id FROM artifacts WHERE run_id = ? "
+            "AND entity_kind = ? AND entity_id = ? AND (reference_id LIKE ? "
+            "OR reference_id LIKE ?) ORDER BY transition_id",
+            (
+                spec.run_id,
+                EntityKind.ATTEMPT.value,
+                attempt.entity_id,
+                "verifier-evidence:%",
+                "integration-decision:%",
+            ),
+        ).fetchall()
+    verifier_ids = [
+        row["reference_id"] for row in rows
+        if row["reference_id"].startswith("verifier-evidence:")
+    ]
+    decision_ids = [
+        row["reference_id"] for row in rows
+        if row["reference_id"].startswith("integration-decision:")
+    ]
+    if len(verifier_ids) != 1 or len(decision_ids) != 1:
+        raise OutcomeBindingRefusal(
+            "failed promotion lacks one exact verifier/decision terminal pair")
+    try:
+        decision = reload_integration_decision(
+            spec.run_id,
+            attempt.entity_id,
+            decision_ids[0].removeprefix("integration-decision:"),
+            verifier_ids[0].removeprefix("verifier-evidence:"),
+            start=assembly.context.canonical_root,
+        )
+    except WorkflowError as error:
+        raise OutcomeBindingRefusal(
+            f"promotion rejection decision cannot be revalidated: {error}") from error
+    if decision.outcome is not DecisionOutcome.REJECT:
+        raise OutcomeBindingRefusal(
+            "failed promotion closeout requires an exact reject decision")
+    return decision
+
+
 def _reference_owner(assembly, reference_id: str) -> str | None:
     with assembly.store._connection_lock:  # noqa: SLF001 - immutable attribution query
         row = assembly.store._connection.execute(  # noqa: SLF001
@@ -729,6 +773,8 @@ def _complete_run(assembly, spec: RunSpec, outcome_digest: str) -> None:
     run = assembly.store.get_run(spec.run_id)
     if run.state == "completed":
         return
+    if run.state == "failed":
+        return
     if run.state != "closeout-ready":
         raise OutcomeBindingRefusal(
             f"run must be closeout-ready before publication, found {run.state!r}")
@@ -754,15 +800,42 @@ def publish_outcome(assembly, run_id: str, outcome_content: bytes) -> OutcomePub
         if outcome.run_id != run_id:
             raise OutcomeBindingRefusal("CLI run id differs from OutcomeDelta run_id")
         run = assembly.store.get_run(run_id)
-        if run.state not in {"closeout-ready", "completed"}:
+        if run.state not in {"closeout-ready", "completed", "failed"}:
             raise OutcomeBindingRefusal(
                 f"run must be closeout-ready before close, found {run.state!r}")
         attempt, completion_references = _validate_outcome_lineage(
             assembly, spec, outcome)
+        rejection = None
+        if run.state == "failed":
+            if (spec.lifecycle_stage.value != "promote"
+                    or outcome.kind != "no-objective-delta"):
+                raise OutcomeBindingRefusal(
+                    "only a rejected promotion can close failed with no-objective-delta")
+            rejection = _rejected_promotion_decision(
+                assembly, spec, attempt)
     except OutcomeBindingRefusal as error:
         audit = _record_incomplete(
             assembly, spec, action_id, str(error), outcome_artifact)
         raise CloseoutIncomplete(str(error), audit) from error
+    if rejection is not None:
+        completion_references = (*completion_references, {
+            "reference_id": rejection.verifier_reference_id,
+            "digest": rejection.verifier_artifact_digest,
+        }, {
+            "reference_id": rejection.artifact_reference.reference_id,
+            "digest": rejection.artifact_reference.digest,
+        })
+        deduplicated = {}
+        for reference in completion_references:
+            prior = deduplicated.get(reference["reference_id"])
+            if prior is not None and prior != reference["digest"]:
+                raise OutcomeBindingRefusal(
+                    "promotion rejection completion evidence has conflicting digests")
+            deduplicated[reference["reference_id"]] = reference["digest"]
+        completion_references = tuple({
+            "reference_id": reference_id,
+            "digest": digest,
+        } for reference_id, digest in deduplicated.items())
     closeout_content = _closeout_bytes(
         spec, outcome, action_id, completion_references)
     closeout_artifact = assembly.artifact_store.write(closeout_content)

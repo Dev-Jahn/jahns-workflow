@@ -132,6 +132,7 @@ from waystone.runs.verify import (
     VerifierOutput,
     execute_verifier,
     record_integration_decision,
+    reload_integration_decision,
 )
 from waystone.runs import store as store_module
 
@@ -156,6 +157,12 @@ class EngineBindingRefusal(EngineAssemblyError):
 
 class StageRunnerFailed(EngineAssemblyError):
     code = "stage_runner_failed"
+
+
+class _PromotionRejected(Exception):
+    def __init__(self, decision: IntegrationDecision):
+        self.decision = decision
+        super().__init__("promotion rejected")
 
 
 class ReadOnlyStoreUnavailable(EngineAssemblyError):
@@ -300,9 +307,10 @@ def load_review_cycle_chain(
     return ordered
 
 
-def validate_promotion_evidence(
+def _validate_promotion_decision(
     plan: AssurancePlan,
     *,
+    expected_outcome: DecisionOutcome,
     expected_run_id: str,
     expected_run_spec_digest: str,
     expected_candidate_digest: str,
@@ -313,7 +321,7 @@ def validate_promotion_evidence(
     review: tuple[ReviewCycle, ReviewerEvidence] | None,
     decision: object,
 ) -> None:
-    """Refuse promotion unless verifier, reviewer, and coordinator evidence stays separate."""
+    """Validate one exact promotion evidence tuple for its declared decision outcome."""
     if not isinstance(plan, AssurancePlan) or plan.lifecycle_stage.value != "promote":
         raise EngineBindingRefusal("promotion evidence requires a frozen promote AssurancePlan")
     if not isinstance(verifier, VerifierEvidence):
@@ -357,7 +365,7 @@ def validate_promotion_evidence(
     expected_reviewers = () if reviewer_digest is None else (reviewer_digest,)
     if (decision.run_id != expected_run_id
             or decision.actor.role is not Role.COORDINATOR
-            or decision.outcome.value != "accept"
+            or decision.outcome is not expected_outcome
             or decision.result_digest != verifier.result.result_digest
             or decision.verifier_reference_id != verifier.artifact_reference.reference_id
             or decision.verifier_artifact_digest != verifier.artifact_reference.digest
@@ -383,6 +391,64 @@ def validate_promotion_evidence(
     if len(artifact_digests) != len(set(artifact_digests)):
         raise EngineBindingRefusal(
             "verifier, reviewer, and decision artifacts must be distinct")
+
+
+def validate_promotion_evidence(
+    plan: AssurancePlan,
+    *,
+    expected_run_id: str,
+    expected_run_spec_digest: str,
+    expected_candidate_digest: str,
+    expected_candidate_oid: str,
+    expected_evaluation_evidence_digest: str,
+    expected_target_result_digest: str,
+    verifier: object,
+    review: tuple[ReviewCycle, ReviewerEvidence] | None,
+    decision: object,
+) -> None:
+    """Require an accept decision over one exact, actor-separated promotion tuple."""
+    _validate_promotion_decision(
+        plan,
+        expected_outcome=DecisionOutcome.ACCEPT,
+        expected_run_id=expected_run_id,
+        expected_run_spec_digest=expected_run_spec_digest,
+        expected_candidate_digest=expected_candidate_digest,
+        expected_candidate_oid=expected_candidate_oid,
+        expected_evaluation_evidence_digest=expected_evaluation_evidence_digest,
+        expected_target_result_digest=expected_target_result_digest,
+        verifier=verifier,
+        review=review,
+        decision=decision,
+    )
+
+
+def validate_promotion_rejection(
+    plan: AssurancePlan,
+    *,
+    expected_run_id: str,
+    expected_run_spec_digest: str,
+    expected_candidate_digest: str,
+    expected_candidate_oid: str,
+    expected_evaluation_evidence_digest: str,
+    expected_target_result_digest: str,
+    verifier: object,
+    review: tuple[ReviewCycle, ReviewerEvidence] | None,
+    decision: object,
+) -> None:
+    """Require a reject decision over one exact, actor-separated promotion tuple."""
+    _validate_promotion_decision(
+        plan,
+        expected_outcome=DecisionOutcome.REJECT,
+        expected_run_id=expected_run_id,
+        expected_run_spec_digest=expected_run_spec_digest,
+        expected_candidate_digest=expected_candidate_digest,
+        expected_candidate_oid=expected_candidate_oid,
+        expected_evaluation_evidence_digest=expected_evaluation_evidence_digest,
+        expected_target_result_digest=expected_target_result_digest,
+        verifier=verifier,
+        review=review,
+        decision=decision,
+    )
 
 
 class StagedRunEngine:
@@ -984,6 +1050,147 @@ class StagedRunEngine:
             raise EngineBindingRefusal("staged run has no attempt")
         return row["attempt_id"]
 
+    @staticmethod
+    def _promotion_action_id(spec: RunSpec, attempt_id: str, action: str) -> str:
+        if attempt_id == f"{spec.run_id}:attempt:1":
+            return f"{spec.run_id}:{action}"
+        return f"{attempt_id}:{action}"
+
+    def _promotion_decision_for_attempt(
+            self, spec: RunSpec, attempt_id: str) -> IntegrationDecision | None:
+        with self.assembly.store._connection_lock:  # noqa: SLF001 - attempt evidence head
+            rows = self.assembly.store._connection.execute(  # noqa: SLF001
+                "SELECT reference_id FROM artifacts WHERE run_id = ? "
+                "AND entity_kind = ? AND entity_id = ? AND (reference_id LIKE ? "
+                "OR reference_id LIKE ?) ORDER BY transition_id",
+                (
+                    spec.run_id,
+                    EntityKind.ATTEMPT.value,
+                    attempt_id,
+                    "verifier-evidence:%",
+                    "integration-decision:%",
+                ),
+            ).fetchall()
+        verifier_ids = [
+            row["reference_id"] for row in rows
+            if row["reference_id"].startswith("verifier-evidence:")
+        ]
+        decision_ids = [
+            row["reference_id"] for row in rows
+            if row["reference_id"].startswith("integration-decision:")
+        ]
+        if not verifier_ids and not decision_ids:
+            return None
+        if len(verifier_ids) != 1 or len(decision_ids) != 1:
+            raise EngineBindingRefusal(
+                "promotion attempt does not have one exact verifier/decision terminal pair")
+        verifier_action_id = verifier_ids[0].removeprefix("verifier-evidence:")
+        decision_action_id = decision_ids[0].removeprefix("integration-decision:")
+        try:
+            return reload_integration_decision(
+                spec.run_id,
+                attempt_id,
+                decision_action_id,
+                verifier_action_id,
+                start=self.root,
+            )
+        except WorkflowError as error:
+            raise EngineBindingRefusal(
+                f"promotion terminal decision cannot be revalidated: {error}") from error
+
+    def _previous_promotion_decision(
+            self, spec: RunSpec, attempt_id: str) -> IntegrationDecision | None:
+        with self.assembly.store._connection_lock:  # noqa: SLF001 - attempt lineage query
+            rows = self.assembly.store._connection.execute(  # noqa: SLF001
+                "SELECT attempt_id FROM attempts WHERE run_id = ? AND job_id = ? "
+                "ORDER BY rowid",
+                (spec.run_id, spec.job_id),
+            ).fetchall()
+        attempt_ids = [row["attempt_id"] for row in rows]
+        try:
+            index = attempt_ids.index(attempt_id)
+        except ValueError as error:
+            raise EngineBindingRefusal("promotion attempt is absent from its run") from error
+        for previous_id in reversed(attempt_ids[:index]):
+            decision = self._promotion_decision_for_attempt(spec, previous_id)
+            if decision is not None:
+                return decision
+        return None
+
+    def retry_rejected_promotion(self, run_id: str) -> str:
+        """Start one explicit fresh attempt from the latest unclosed reject decision."""
+        spec = load_run_spec(run_id, start=self.root)
+        if spec.lifecycle_stage.value != "promote":
+            raise EngineBindingRefusal("only a promotion rejection can be retried")
+        store = self.assembly.store
+        run = store.get_run(run_id)
+        job = store.get_entity(EntityKind.JOB, spec.job_id)
+        if run.state != "failed" or job.state != "failed":
+            raise EngineBindingRefusal(
+                "promotion retry requires a failed run/job rejection terminal")
+        try:
+            store.get_entity(EntityKind.ACTION, f"{run_id}:outcome-publication")
+        except RecordNotFoundError:
+            pass
+        else:
+            raise EngineBindingRefusal(
+                "a promotion rejection with a published outcome cannot be retried")
+        attempt_id = self._latest_attempt_id(spec)
+        attempt = store.get_entity(EntityKind.ATTEMPT, attempt_id)
+        decision = self._promotion_decision_for_attempt(spec, attempt_id)
+        if (attempt.state != "completed" or decision is None
+                or decision.outcome is not DecisionOutcome.REJECT):
+            raise EngineBindingRefusal(
+                "latest promotion attempt is not an exact completed rejection")
+        target_ref = spec.result_policy.target_ref
+        expected_oid = spec.result_policy.expected_oid
+        if (target_ref is None or expected_oid is None
+                or git_full_sha(self.input_root, target_ref) != expected_oid):
+            raise EngineBindingRefusal(
+                "promotion target changed after rejection; retry requires the frozen old OID")
+        with store._connection_lock:  # noqa: SLF001 - bounded attempt count
+            used = int(store._connection.execute(  # noqa: SLF001
+                "SELECT count(*) FROM attempts WHERE run_id = ? AND job_id = ?",
+                (spec.run_id, spec.job_id),
+            ).fetchone()[0])
+        limit = min(spec.retry.max_attempts_per_job, spec.retry.max_total_attempts)
+        if used >= limit:
+            raise EngineBindingRefusal(
+                f"promotion retry budget exhausted at {used} of {limit} attempts")
+        next_attempt_id = f"{spec.run_id}:attempt:{used + 1}"
+        next_attempt = store.create_attempt(
+            spec.run_id,
+            spec.job_id,
+            next_attempt_id,
+            initial_state="dispatch-ready",
+        )
+        store.record_transition(
+            EntityKind.JOB,
+            spec.job_id,
+            expected_version=job.version,
+            next_state="running",
+            reason=TransitionReason.PROCESS_STARTED,
+            evidence_digest=decision.artifact_reference.digest,
+        )
+        store.record_transition(
+            EntityKind.RUN,
+            spec.run_id,
+            expected_version=run.version,
+            next_state="dispatch-ready",
+            reason=TransitionReason.PROCESS_STARTED,
+            evidence_digest=decision.artifact_reference.digest,
+        )
+        store.record_transition(
+            EntityKind.ATTEMPT,
+            next_attempt_id,
+            expected_version=next_attempt.version,
+            next_state="running",
+            reason=TransitionReason.PROCESS_STARTED,
+            evidence_digest=spec.run_spec_digest,
+        )
+        self._ensure_stage_started(spec, next_attempt_id)
+        return next_attempt_id
+
     def _apply_candidate(self, spec: RunSpec, attempt_id: str) -> str:
         assert spec.candidate is not None
         target_ref = spec.result_policy.target_ref
@@ -1090,16 +1297,27 @@ class StagedRunEngine:
                 "check-free promotion verification cannot execute an engine check")
 
         assert spec.candidate is not None
+        action_id = self._promotion_action_id(
+            spec, attempt_id, "typed-independent-verify")
+        retry_of = None
+        if attempt_id != f"{spec.run_id}:attempt:1":
+            previous = self._previous_promotion_decision(spec, attempt_id)
+            if previous is None or previous.outcome is not DecisionOutcome.REJECT:
+                raise EngineBindingRefusal(
+                    "promotion verifier retry requires a prior exact reject decision")
+            retry_of = previous.verifier_reference_id.removeprefix(
+                "verifier-evidence:")
         return execute_verifier(
             spec.run_id,
             attempt_id,
-            f"{spec.run_id}:typed-independent-verify",
+            action_id,
             self.root,
             spec.candidate["target_ref"],
             self.assembly.profile.binding_for(Role.WORKER).binding_digest,
             actor,
             no_engine_check,
             adapter,
+            retry_of=retry_of,
             start=self.root,
             assurance_plan=plan,
             require_registered_result_worktree=False,
@@ -1161,7 +1379,8 @@ class StagedRunEngine:
         return record_integration_decision(
             spec.run_id,
             attempt_id,
-            f"{spec.run_id}:integration-decision",
+            self._promotion_action_id(
+                spec, attempt_id, "integration-decision"),
             decision_input,
             start=self.root,
         )
@@ -1280,6 +1499,17 @@ class StagedRunEngine:
                 "run_state": run.state,
             }
         if run.state == "failed":
+            spec = load_run_spec(run_id, start=self.root)
+            if spec.lifecycle_stage.value == "promote":
+                decision = self._promotion_decision_for_attempt(
+                    spec, self._latest_attempt_id(spec))
+                if decision is not None and decision.outcome is DecisionOutcome.REJECT:
+                    return {
+                        "action": None,
+                        "engine": "idle",
+                        "reason": "promotion_rejected",
+                        "run_state": run.state,
+                    }
             return {
                 "action": None, "engine": "idle", "reason": "run_failed",
                 "run_state": run.state,
@@ -1309,14 +1539,63 @@ class StagedRunEngine:
         completed = self._execute_public_stage(spec, attempt_id)
         if completed is None:
             return self.assembly.transport.actions_next(run_id)
+        current = self.assembly.store.get_run(run_id)
+        if current.state == "failed":
+            return {
+                "action": None,
+                "engine": "idle",
+                "reason": "promotion_rejected",
+                "run_state": current.state,
+            }
         return {
             "action": None, "engine": "idle", "reason": "run_closeout_ready",
-            "run_state": self.assembly.store.get_run(run_id).state,
+            "run_state": current.state,
         }
 
     def close(self, run_id: str, outcome_content: bytes) -> OutcomePublication:
         """Publish one evidence-bound outcome pair before completing the run."""
         return publish_outcome(self.assembly, run_id, outcome_content)
+
+    def _record_promotion_rejection(
+            self, spec: RunSpec, decision: IntegrationDecision) -> None:
+        attempt_id = self._latest_attempt_id(spec)
+        if (decision.run_id != spec.run_id or decision.attempt_id != attempt_id
+                or decision.outcome is not DecisionOutcome.REJECT):
+            raise EngineBindingRefusal(
+                "promotion rejection terminal requires the latest exact reject decision")
+        store = self.assembly.store
+        attempt = store.get_entity(EntityKind.ATTEMPT, attempt_id)
+        job = store.get_entity(EntityKind.JOB, spec.job_id)
+        run = store.get_run(spec.run_id)
+        if run.state == "failed":
+            if attempt.state != "completed" or job.state != "failed":
+                raise EngineBindingRefusal(
+                    "promotion rejection terminal state is internally inconsistent")
+            return
+        store.record_transition(
+            EntityKind.ATTEMPT,
+            attempt_id,
+            expected_version=attempt.version,
+            next_state="completed",
+            reason=TransitionReason.COMPLETED,
+            evidence_digest=decision.artifact_reference.digest,
+        )
+        store.record_transition(
+            EntityKind.JOB,
+            spec.job_id,
+            expected_version=job.version,
+            next_state="failed",
+            reason=TransitionReason.PROCESS_FAILED,
+            evidence_digest=decision.artifact_reference.digest,
+        )
+        store.record_transition(
+            EntityKind.RUN,
+            spec.run_id,
+            expected_version=run.version,
+            next_state="failed",
+            reason=TransitionReason.PROCESS_FAILED,
+            evidence_digest=decision.artifact_reference.digest,
+        )
 
     def execute_stage(
         self,
@@ -1414,7 +1693,13 @@ class StagedRunEngine:
                 promotion_results["integration-decision"] = result
                 evidence_ref = spec.evaluation["evidence"]
                 assert isinstance(evidence_ref, Mapping)
-                validate_promotion_evidence(
+                validator = (
+                    validate_promotion_rejection
+                    if (isinstance(result, IntegrationDecision)
+                        and result.outcome is DecisionOutcome.REJECT)
+                    else validate_promotion_evidence
+                )
+                validator(
                     plan,
                     expected_run_id=spec.run_id,
                     expected_run_spec_digest=spec.run_spec_digest,
@@ -1427,14 +1712,21 @@ class StagedRunEngine:
                     review=promotion_results.get("adversarial-review"),  # type: ignore[arg-type]
                     decision=result,
                 )
+                if (isinstance(result, IntegrationDecision)
+                        and result.outcome is DecisionOutcome.REJECT):
+                    raise _PromotionRejected(result)
                 return result
 
             handlers["integration-decision"] = integration_decision
-        results = execute_assurance_dag(
-            plan,
-            handlers,
-            mutation_digest=lambda: capture_result_snapshot(self.input_root).digest,
-        )
+        try:
+            results = execute_assurance_dag(
+                plan,
+                handlers,
+                mutation_digest=lambda: capture_result_snapshot(self.input_root).digest,
+            )
+        except _PromotionRejected as rejection:
+            self._record_promotion_rejection(spec, rejection.decision)
+            return (("integration-decision", rejection.decision),)
         if stage == "explore":
             try:
                 reference = self.assembly.store.get_artifact_reference(
@@ -2181,4 +2473,5 @@ __all__ = [
     "load_review_cycle_chain",
     "open_read_only_store",
     "validate_promotion_evidence",
+    "validate_promotion_rejection",
 ]
