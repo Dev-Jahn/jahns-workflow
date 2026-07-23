@@ -38,6 +38,7 @@ MODULES = (
     "test_run_preflight",
     "test_run_observe",
     "test_run_cli",
+    "test_promotion_integration_ref",
     "test_review_runs_layout",
     "test_review_findings",
     "test_review_protocol",

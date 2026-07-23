@@ -766,10 +766,10 @@ class RunCliTests(unittest.TestCase):
         }]
         promote_path = self.base / "promote-brief.json"
         promote_path.write_bytes(completion.canonical_json(promote_payload))
-        expected_target = git(self.root, "rev-parse", "HEAD").stdout.strip()
+        integration_base = git(self.root, "rev-parse", "HEAD").stdout.strip()
         candidate_oid = git(
             self.root, "rev-parse", f"refs/waystone/candidates/{explore_id}").stdout.strip()
-        self.assertNotEqual(expected_target, candidate_oid)
+        self.assertNotEqual(integration_base, candidate_oid)
 
         with self.runtime() as output, mock.patch.dict(os.environ, {"PATH": path}):
             self.assertEqual(run_group.main([
@@ -778,6 +778,13 @@ class RunCliTests(unittest.TestCase):
             ]), 0, output.getvalue())
             promote_id = output.getvalue().split()[1]
             promote_spec = load_run_spec(promote_id, start=self.root)
+            private_ref = (
+                f"refs/waystone/integration/{promote_spec.promotion_lineage.id}")
+            self.assertEqual(promote_spec.result_policy.target_ref, private_ref)
+            self.assertEqual(
+                git(self.root, "rev-parse", private_ref).stdout.strip(),
+                integration_base,
+            )
             reviewer_binding = read_profile(
                 self.root / ".waystone" / "profile.yml").binding_for(
                     Role.REVIEWER).binding_digest
@@ -801,15 +808,46 @@ class RunCliTests(unittest.TestCase):
                 binding_digest=reviewer_binding,
             )
             review_group.attach_review(self.root, promote_id, review_run_id)
+            git(self.root, "add", "docs/reviews")
+            self.assertEqual(git(
+                self.root, "commit", "-qm", "promotion review fixture").returncode, 0)
+            public_ref = git(self.root, "symbolic-ref", "HEAD").stdout.strip()
+            public_oid = git(self.root, "rev-parse", "HEAD").stdout.strip()
+            public_bytes = {
+                name: (self.root / name).read_bytes()
+                for name in ("evaluate-verdict.txt", "promote-verdict.txt")
+            }
+            public_index = git(self.root, "write-tree").stdout.strip()
+            public_status = git(
+                self.root, "status", "--porcelain=v1").stdout
+            self.assertEqual(public_status, "")
             self._resume_until_closeout(output, promote_id)
 
-        self.assertEqual(git(self.root, "rev-parse", "HEAD").stdout.strip(), candidate_oid)
+        self.assertIn(private_ref, output.getvalue())
+        self.assertIn("Live-tree delivery is not performed", output.getvalue())
+        self.assertEqual(git(self.root, "symbolic-ref", "HEAD").stdout.strip(), public_ref)
+        self.assertEqual(git(self.root, "rev-parse", "HEAD").stdout.strip(), public_oid)
+        self.assertEqual(
+            git(self.root, "rev-parse", public_ref).stdout.strip(), public_oid)
+        self.assertEqual(
+            git(self.root, "rev-parse", private_ref).stdout.strip(), candidate_oid)
+        self.assertEqual(
+            {
+                name: (self.root / name).read_bytes()
+                for name in ("evaluate-verdict.txt", "promote-verdict.txt")
+            },
+            public_bytes,
+        )
+        self.assertFalse((self.root / "candidate.txt").exists())
+        self.assertEqual(git(self.root, "write-tree").stdout.strip(), public_index)
+        self.assertEqual(
+            git(self.root, "status", "--porcelain=v1").stdout, public_status)
         for name in ("evaluate-verdict.txt", "promote-verdict.txt"):
             (self.root / name).write_text("pass\n", encoding="utf-8")
         fail_worktree = self.base / "fail-candidate-worktree"
         self.assertEqual(git(
             self.root, "worktree", "add", "-q", "-b", "fixture-fail-candidate",
-            str(fail_worktree)).returncode, 0)
+            str(fail_worktree), candidate_oid).returncode, 0)
         for name in ("evaluate-verdict.txt", "promote-verdict.txt"):
             (fail_worktree / name).write_text("fail\n", encoding="utf-8")
         git(fail_worktree, "add", "evaluate-verdict.txt", "promote-verdict.txt")

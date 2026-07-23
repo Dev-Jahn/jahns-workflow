@@ -284,14 +284,47 @@ def _evaluation_spec_input(brief) -> Mapping[str, object]:
             "digest": source["digest"], "generation": source["generation"]}
 
 
-def _integration_target(root: Path) -> str:
-    returncode, target, error = git_rc(root, "symbolic-ref", "--quiet", "HEAD")
-    if returncode != 0:
+def _integration_target(root: Path, lineage_id: str) -> str:
+    target = f"refs/waystone/integration/{lineage_id}"
+    valid_rc, _, valid_error = git_rc(root, "check-ref-format", target)
+    if valid_rc != 0:
         raise ActionPlanRefusal(
-            "candidate-producing explore requires an attached integration target ref: "
-            + (error or f"git exited {returncode}"))
-    if not target.startswith("refs/heads/"):
-        raise ActionPlanRefusal("integration target must be an attached refs/heads/* ref")
+            "promotion lineage does not form a valid private integration ref: "
+            + (valid_error or f"git exited {valid_rc}"))
+    symbolic_rc, symbolic_target, symbolic_error = git_rc(
+        root, "symbolic-ref", "--quiet", target)
+    if symbolic_rc == 0:
+        raise ActionPlanRefusal(
+            f"private integration target must be a direct ref, not {symbolic_target!r}")
+    if symbolic_rc != 1 or symbolic_target or symbolic_error:
+        raise ActionPlanRefusal(
+            "private integration target direct-ref authority is unavailable: "
+            + (symbolic_error or f"git exited {symbolic_rc}"))
+    target_object_rc, target_object, target_error = git_rc(
+        root, "rev-parse", "--verify", target)
+    current = git_full_sha(root, target)
+    if target_object_rc == 0:
+        if not target_object or current is None:
+            raise ActionPlanRefusal(
+                "private integration target does not resolve to a commit")
+        return target
+    if target_object_rc != 128 or target_object:
+        raise ActionPlanRefusal(
+            "private integration target cannot be observed: "
+            + (target_error or f"git exited {target_object_rc}"))
+    head = git_full_sha(root)
+    if head is None:
+        raise ActionPlanRefusal("active worktree HEAD cannot seed private integration ref")
+    zero = "0" * len(head)
+    create_rc, _, create_error = git_rc(
+        root, "update-ref", "--no-deref", target, head, zero)
+    if create_rc != 0:
+        raise ActionPlanRefusal(
+            "private integration target creation CAS failed: "
+            + (create_error or f"git exited {create_rc}"))
+    if git_full_sha(root, target) != head:
+        raise ActionPlanRefusal(
+            "private integration target differs after creation")
     return target
 
 
@@ -353,7 +386,7 @@ def _start_with_assembly(
             assembly, brief)
         if brief.lifecycle_stage == "evaluate":
             evaluation_spec = _evaluation_spec_input(brief)
-            target = _integration_target(root)
+            target = _integration_target(root, brief.brief_id)
             promotion_lineage = PromotionLineage(
                 id=brief.brief_id,
                 root_objective_ref_digest=_root_objective_digest(brief),
@@ -498,6 +531,14 @@ def _resume_text(result: ResumeResult) -> str:
         return f"Run {result.run_id} cancellation state: {result.cancellation.state}"
     if result.dispatch is not None:
         branch = result.dispatch
+        target_ref = branch.get("promotion_target_ref")
+        if (branch.get("reason") == "run_closeout_ready"
+                and isinstance(target_ref, str)):
+            return (
+                f"Run {result.run_id}: run_closeout_ready; promoted candidate to "
+                "private integration ref "
+                f"{target_ref}. Live-tree delivery is not performed."
+            )
         if branch.get("engine") == "busy":
             return f"Run {result.run_id} is progressing; poll after {branch['poll_after_s']}s."
         if branch.get("engine") == "idle":
@@ -556,6 +597,13 @@ def main(argv: list[str]) -> int:
             with assemble_run(context) as assembly:
                 identity = args[0] if args else _latest_run_id(assembly)
                 branch = StagedRunEngine(assembly).resume(identity)
+                if branch.get("reason") == "run_closeout_ready":
+                    spec = load_run_spec(identity, start=context.canonical_root)
+                    if spec.lifecycle_stage.value == "promote":
+                        branch = {
+                            **branch,
+                            "promotion_target_ref": spec.result_policy.target_ref,
+                        }
             print(_resume_text(ResumeResult(identity, dispatch=branch)))
             return 0
 

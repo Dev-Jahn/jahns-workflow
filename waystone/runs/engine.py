@@ -141,6 +141,7 @@ from waystone.runs.verify import (
     record_integration_decision,
     reload_integration_decision,
     reload_verifier_evidence,
+    _checked_out_target_ref,
 )
 from waystone.runs import store as store_module
 
@@ -1303,6 +1304,7 @@ class StagedRunEngine:
         target_ref = spec.result_policy.target_ref
         expected_oid = spec.result_policy.expected_oid
         assert target_ref is not None and expected_oid is not None
+        _checked_out_target_ref(self.input_root, target_ref)
         action_id = f"{spec.run_id}:target-ref-apply"
         try:
             plan = self.assembly.effect_executor.plan_effect(
